@@ -1,0 +1,13 @@
+[package]
+name = "cudad"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nom           = { version = "7", features = ["std"] }
+petgraph      = "0.6"
+lazy_static   = "1"        # only for test
+regex         = "1"
+
+[dev-dependencies]
+pretty_assertions = "1"
