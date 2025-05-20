@@ -2,7 +2,7 @@
 //! * 仅面向单函数、同一段线性指令。
 //! * 使用 petgraph::Graph 表示 CFG。
 
-//! 基本块划分 & CFG 构建（改进：使用 Operand 类型）
+//! 基本块划分 & CFG 构建
 
 use crate::parser::{Instruction, Operand};
 use petgraph::{
@@ -16,7 +16,14 @@ pub struct BasicBlock {
     pub instrs: Vec<Instruction>,
 }
 
-pub type ControlFlowGraph = Graph<BasicBlock, ()>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EdgeKind {
+    FallThrough,
+    CondBranch,
+    UncondBranch,
+}
+
+pub type ControlFlowGraph = Graph<BasicBlock, EdgeKind>;
 
 fn is_branch(op: &str) -> bool { matches!(op, "BRA" | "JMP" | "JMPP" | "RET" | "EXIT") }
 
@@ -66,7 +73,17 @@ pub fn build_cfg(mut instrs: Vec<Instruction>) -> ControlFlowGraph {
         // 跳转目标边
         if is_branch(&last.opcode) {
             if let Some(tgt) = branch_target_addr(last) {
-                if let Some(&tidx) = addr2node.get(&tgt) { g.update_edge(idx, tidx, ()); }
+                if let Some(&tidx) = addr2node.get(&tgt) {
+                    // 区分有无谓词
+                    let ek = if last.pred.is_some() {
+                        EdgeKind::CondBranch
+                    } else if last.opcode == "BRA" {
+                        EdgeKind::UncondBranch
+                    } else {
+                        EdgeKind::CondBranch // 其他分支默认条件分支
+                    };
+                    g.update_edge(idx, tidx, ek);
+                }
             }
         }
         let last = g[idx].instrs.last().unwrap();
@@ -75,7 +92,9 @@ pub fn build_cfg(mut instrs: Vec<Instruction>) -> ControlFlowGraph {
         let unconditional_jump = matches!(last.opcode.as_str(), "BRA" | "JMP" | "JMPP") && last.pred.is_none();
         if !(unconditional_term || unconditional_jump) {
             if let Some((&_next_addr, &nidx)) = addr2node.iter().filter(|(&a, _)| a > bb_start).min_by_key(|(&a, _)| a) {
-                if g.find_edge(idx, nidx).is_none() { g.update_edge(idx, nidx, ()); }
+                if g.find_edge(idx, nidx).is_none() {
+                    g.update_edge(idx, nidx, EdgeKind::FallThrough);
+                }
             }
         }
     }

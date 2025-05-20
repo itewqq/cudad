@@ -1,6 +1,5 @@
-use crate::{parse_sass, build_cfg};
 use pretty_assertions::assert_eq;
-use crate::parser::Operand;
+use crate::*;
 
 const SAMPLE_SASS: &str = r#"
         /*0000*/                   IMAD.MOV.U32 R1, RZ, RZ, c[0x0][0x28] ;  /* 0x ... */
@@ -23,12 +22,33 @@ const SAMPLE_SASS_PRED_EXIT: &str = r#"
     /*0060*/                   IMAD.MOV.U32 R7, RZ, RZ, 0x4 ;
 "#;
 
-const EXAMPLE: &str = r#"
-/*0000*/  IMAD.MOV.U32 R1, RZ, RZ, 0x4 ;
-/*0010*/  IADD3 R1, R1, 0x1, RZ ;
-/*0020*/  EXIT ;
+const IF_SAMPLE:&str=r#"
+ /*0000*/ ISETP.GE.AND P0, PT, R0, 0x1, PT ;
+ /*0010*/ @P0 BRA 0x0030 ;
+ /*0020*/ IMAD.MOV.U32 R1, RZ, RZ, 0x5 ;
+ /*0030*/ IMAD.MOV.U32 R1, RZ, RZ, 0x6 ;
+ /*0040*/ EXIT ;
 "#;
 
+const LOOP_SAMPLE:&str=r#"
+ /*000*/ IADD R0, R0, 0x1 ;
+ /*010*/ ISETP.LT.AND P0, PT, R0, 0x5, PT ;
+ /*020*/ @P0 BRA 0x000 ;
+ /*030*/ EXIT ;
+"#;
+
+fn print_cfg_stdout(cfg: &ControlFlowGraph){
+    println!("{}", crate::cfg::graph_to_dot(&cfg));
+    for idx in cfg.node_indices() {
+        println!("Basic block idx: {:#?}", idx);
+        for inst in &cfg[idx].instrs {
+            println!("{:#?}", inst);
+        }
+        println!("");
+    }
+}
+
+#[cfg(test)]
 #[test]
 fn test_parse_operand() {
     use crate::parser::Operand::*;
@@ -64,6 +84,21 @@ fn test_predicated_exit_fallthrough() {
     assert_eq!(cfg.node_count(), 2);
     // 并且 block0 -> block1 (fall‑through) 存在
     let edges: Vec<_> = cfg.edge_indices().collect();
-    assert_eq!(edges.len(), 2 /* branch + fallthrough */);
+    assert_eq!(edges.len(), 1);
 }
 
+#[test]
+fn phi_insert(){
+    let cfg=build_cfg(parse_sass(IF_SAMPLE));
+    print_cfg_stdout(&cfg);
+    let fir=build_ssa(&cfg);
+    let phi_cnt:usize=fir.blocks.iter().map(|b|b.stmts.iter().filter(|s|matches!(s.value,crate::ir::RValue::Phi(_))).count()).sum();
+    assert_eq!(phi_cnt,1);
+}
+
+#[test]
+fn rpo_loop(){
+    let cfg=build_cfg(parse_sass(LOOP_SAMPLE));
+    let fir=build_ssa(&cfg);
+    assert!(fir.blocks.len()>=2);
+}

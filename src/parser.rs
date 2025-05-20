@@ -19,7 +19,7 @@ use regex::Regex;
 /* --------------------------------- 数据结构 -------------------------------- */
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Predicate {
+pub struct PredicateUse {
     pub reg: String, // P0 / P1
     pub sense: bool, // true = @P0, false = @!P0
 }
@@ -37,7 +37,7 @@ pub enum Operand {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Instruction {
     pub addr: u32,
-    pub pred: Option<Predicate>,
+    pub pred: Option<PredicateUse>,
     pub opcode: String,
     pub operands: Vec<Operand>,
     pub raw: String,
@@ -46,7 +46,7 @@ pub struct Instruction {
 /* --------------------------------- 正则预编译 -------------------------------- */
 
 lazy_static! {
-    static ref RE_REG   : Regex = Regex::new(r"^(?P<cls>UR|R)(?P<idx>\d+|Z)$").unwrap();
+    static ref RE_REG   : Regex = Regex::new(r"^(?P<cls>UR|R|P)(?P<idx>\d+|Z|T)$").unwrap();
     static ref RE_CONST : Regex = Regex::new(r"^c\[(?P<bank>0x[0-9A-Fa-f]+)\]\[(?P<off>0x[0-9A-Fa-f]+)\]$").unwrap();
     static ref RE_HEX_I : Regex = Regex::new(r"^-?0x[0-9A-Fa-f]+$").unwrap();
     static ref RE_DEC_I : Regex = Regex::new(r"^-?\d+$").unwrap();
@@ -83,10 +83,10 @@ fn parse_addr(input: &str) -> IResult<&str, u32> {
 }
 
 /// @P0 / @!P1 前缀
-fn parse_pred(input: &str) -> IResult<&str, Predicate> {
+fn parse_pred(input: &str) -> IResult<&str, PredicateUse> {
     map(
         tuple((tag("@"), opt(tag("!")), take_while(|c: char| c.is_ascii_alphanumeric()))),
-        |(_, neg, reg): (_, Option<&str>, &str)| Predicate { reg: reg.to_owned(), sense: neg.is_none() },
+        |(_, neg, reg): (_, Option<&str>, &str)| PredicateUse { reg: reg.to_owned(), sense: neg.is_none() },
     )(input)
 }
 
@@ -96,12 +96,31 @@ fn parse_opcode(input: &str) -> IResult<&str, &str> { take_while(is_opcode_char)
 /* ---------- Operand 解析 ---------- */
 fn classify_operand(tok: &str) -> Operand {
     let t = tok.trim();
-    // 1) Register / Uniform
+    // 只去除结尾的 .reuse 后缀，不影响如 SR_CTAID.X
+    let t = t.strip_suffix(".reuse").unwrap_or(t);
+
+    // 1) Register/Uniform/PT/P0-P6/RZ
     if let Some(cap) = RE_REG.captures(t) {
         let class = cap["cls"].to_string();
         let idx_raw = &cap["idx"];
-        let idx = if idx_raw.eq_ignore_ascii_case("Z") { -1 } else { idx_raw.parse::<i32>().unwrap_or(-1) };
-        return if class == "UR" { Operand::Uniform { idx } } else { Operand::Register { class, idx } };
+        return match (class.as_str(), idx_raw.to_ascii_uppercase().as_str()) {
+            ("R", "Z") => Operand::Register { class: "RZ".to_string(), idx: 0 },
+            ("P", "T") => Operand::Register { class: "PT".to_string(), idx: 0 },
+            ("P", n) => {
+                if let Ok(pidx) = n.parse::<i32>() {
+                    if (0..=6).contains(&pidx) {
+                        Operand::Register { class: "P".to_string(), idx: pidx }
+                    } else {
+                        Operand::Raw(t.to_string())
+                    }
+                } else {
+                    Operand::Raw(t.to_string())
+                }
+            },
+            ("UR", n) => Operand::Uniform { idx: n.parse::<i32>().unwrap_or(-1) },
+            ("R", n) => Operand::Register { class: "R".to_string(), idx: n.parse::<i32>().unwrap_or(-1) },
+            _ => Operand::Raw(t.to_string()),
+        };
     }
     // 2) Const mem c[bank][off]
     if let Some(cap) = RE_CONST.captures(t) {
