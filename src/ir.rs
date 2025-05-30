@@ -2,7 +2,7 @@
 //! fully implements Cytron 91 algorithm (minimal Φ + rename)
 //! no string cached inside nodes; all printing via DisplayCtx
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use crate::parser::{Instruction, Operand};
 use crate::cfg::{ControlFlowGraph, EdgeKind};
 use petgraph::{
@@ -51,7 +51,7 @@ impl DisplayCtx for DefaultDisplay {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RegType { BitWidth(u32) }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub struct RegId {
     pub class:String, pub idx:i32, pub sign:i32, pub ssa:Option<usize>
 }
@@ -215,7 +215,7 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
 
     /* ---------- step-0: build IR blocks & defsites ---------- */
     let mut ir_blocks = HashMap::<usize, IRBlock>::new();
-    let mut defsites = HashMap::<RegId, HashSet<NodeIndex>>::new();
+    let mut defsites=BTreeMap::<RegId,BTreeSet<NodeIndex>>::new();
 
     for n in cfg.node_indices() {
         let bb = &cfg[n];
@@ -335,7 +335,7 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
     /* ---------- step-1: DomTree + DF ---------- */
     let entry = NodeIndex::new(0);
     let doms = simple_fast(cfg, entry);
-    let mut idom = HashMap::<NodeIndex, NodeIndex>::new();
+    let mut idom = BTreeMap::<NodeIndex, NodeIndex>::new();
     for n in cfg.node_indices() {
         if let Some(i) = doms.immediate_dominator(n) {
             idom.insert(n, i);
@@ -344,12 +344,12 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
     let df = compute_df(cfg, &idom);
 
     /* ---------- step-2: Φ placement ---------- */
-    let mut phi_needed = HashSet::<(NodeIndex, RegId)>::new();
+    let mut phi_needed = BTreeSet::<(NodeIndex, RegId)>::new();
     for (reg, defs) in &defsites {
         let mut work: Vec<_> = defs.iter().copied().collect();
         let mut seen = HashSet::<NodeIndex>::new();
         while let Some(x) = work.pop() {
-            for &y in df.get(&x).unwrap_or(&HashSet::new()) {
+            for &y in df.get(&x).unwrap_or(&BTreeSet::new()) {
                 if seen.insert(y) {
                     phi_needed.insert((y, reg.clone()));
                     if !defs.contains(&y) {
@@ -382,7 +382,7 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
 
     /* ---------- step-3: Rename (Cytron WHICH-PRED) ---------- */
     // dom children
-    let mut children = HashMap::<NodeIndex, Vec<NodeIndex>>::new();
+    let mut children = BTreeMap::<NodeIndex, Vec<NodeIndex>>::new();
     for (&b, &p) in &idom {
         children.entry(p).or_default().push(b);
     }
@@ -393,7 +393,7 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
     fn rename(
         n: NodeIndex,
         cfg: &ControlFlowGraph,
-        children: &HashMap<NodeIndex, Vec<NodeIndex>>,
+        children: &BTreeMap<NodeIndex, Vec<NodeIndex>>,
         ir_blocks: &mut HashMap<usize, IRBlock>,
         stack: &mut HashMap<RegId, Vec<RegId>>,
         counter: &mut HashMap<RegId, usize>,
@@ -521,10 +521,10 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
 }
 
 /* ==================== DF helper ==================== */
-fn compute_df(cfg:&ControlFlowGraph,idom:&HashMap<NodeIndex,NodeIndex>)
-->HashMap<NodeIndex,HashSet<NodeIndex>>
+fn compute_df(cfg:&ControlFlowGraph,idom:&BTreeMap<NodeIndex,NodeIndex>)
+->HashMap<NodeIndex,BTreeSet<NodeIndex>>
 {
-    let mut local=HashMap::<NodeIndex,HashSet<NodeIndex>>::new();
+    let mut local=HashMap::<NodeIndex,BTreeSet<NodeIndex>>::new();
     for n in cfg.node_indices(){
         for succ in cfg.neighbors_directed(n,Direction::Outgoing){
             if idom.get(&succ).copied()!=Some(n){
@@ -532,11 +532,11 @@ fn compute_df(cfg:&ControlFlowGraph,idom:&HashMap<NodeIndex,NodeIndex>)
             }
         }
     }
-    let mut children:HashMap<NodeIndex,Vec<NodeIndex>>=HashMap::new();
+    let mut children:BTreeMap<NodeIndex,Vec<NodeIndex>>=BTreeMap::new();
     for (&b,&p) in idom{ children.entry(p).or_default().push(b); }
 
-    fn up(n:NodeIndex,child:&HashMap<NodeIndex,Vec<NodeIndex>>,
-          df:&mut HashMap<NodeIndex,HashSet<NodeIndex>>,idom:&HashMap<NodeIndex,NodeIndex>)
+    fn up(n:NodeIndex,child:&BTreeMap<NodeIndex,Vec<NodeIndex>>,
+          df:&mut HashMap<NodeIndex,BTreeSet<NodeIndex>>,idom:&BTreeMap<NodeIndex,NodeIndex>)
     {
         if let Some(ch)=child.get(&n){ for &c in ch{ up(c,child,df,idom); } }
         for &c in child.get(&n).unwrap_or(&Vec::new()){
