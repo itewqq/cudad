@@ -24,9 +24,15 @@ pub struct PredicateUse {
     pub sense: bool, // true = @P0, false = @!P0
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegType {
+    BitWidth(u32),
+    // 可扩展更多类型修饰符
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Operand {
-    Register { class: String, idx: i32 },      // R0 / RZ / R255
+    Register { class: String, idx: i32, sign: i32, ty: Option<RegType> },      // R0 / RZ / R255 / -R2 / R4.64
     Uniform  { idx: i32 },                      // UR*
     ImmediateI(i64),                            // 整数立即数
     ImmediateF(f64),                            // 浮点立即数
@@ -96,51 +102,52 @@ fn parse_opcode(input: &str) -> IResult<&str, &str> { take_while(is_opcode_char)
 /* ---------- Operand 解析 ---------- */
 fn classify_operand(tok: &str) -> Operand {
     let t = tok.trim();
-    // 只去除结尾的 .reuse 后缀，不影响如 SR_CTAID.X
-    let t = t.strip_suffix(".reuse").unwrap_or(t);
-
-    // 1) Register/Uniform/PT/P0-P6/RZ
-    if let Some(cap) = RE_REG.captures(t) {
-        let class = cap["cls"].to_string();
-        let idx_raw = &cap["idx"];
-        return match (class.as_str(), idx_raw.to_ascii_uppercase().as_str()) {
-            ("R", "Z") => Operand::Register { class: "RZ".to_string(), idx: 0 },
-            ("P", "T") => Operand::Register { class: "PT".to_string(), idx: 0 },
-            ("P", n) => {
-                if let Ok(pidx) = n.parse::<i32>() {
-                    if (0..=6).contains(&pidx) {
-                        Operand::Register { class: "P".to_string(), idx: pidx }
-                    } else {
-                        Operand::Raw(t.to_string())
-                    }
-                } else {
-                    Operand::Raw(t.to_string())
-                }
-            },
-            ("UR", n) => Operand::Uniform { idx: n.parse::<i32>().unwrap_or(-1) },
-            ("R", n) => Operand::Register { class: "R".to_string(), idx: n.parse::<i32>().unwrap_or(-1) },
-            _ => Operand::Raw(t.to_string()),
-        };
+    // 1. [expr] 递归解析内存表达式，parser层直接Raw
+    if t.starts_with('[') && t.ends_with(']') {
+        return Operand::Raw(t.to_string());
     }
-    // 2) Const mem c[bank][off]
-    if let Some(cap) = RE_CONST.captures(t) {
-        let bank = u32::from_str_radix(&cap["bank"][2..], 16).unwrap();
-        let off  = u32::from_str_radix(&cap["off"][2..], 16).unwrap();
-        return Operand::ConstMem { bank, offset: off };
-    }
-    // 3) Float literal (必须在整数之前检测)
+    // 2. 浮点数优先
     if RE_FLOAT.is_match(t) {
         let v: f64 = t.parse().unwrap();
         return Operand::ImmediateF(v);
     }
-    // 4) Hex / Dec integer
+    // 3. 整数
     if RE_HEX_I.is_match(t) {
         let neg = t.starts_with("-");
         let v = parse_hex(t).unwrap();
         return Operand::ImmediateI(if neg { -v } else { v });
     }
     if RE_DEC_I.is_match(t) { return Operand::ImmediateI(t.parse::<i64>().unwrap()); }
-
+    // 4. Register/Uniform/PT/P0-P6/RZ
+    if let Some(cap) = RE_REG.captures(t) {
+        let class = cap["cls"].to_string();
+        let idx_raw = &cap["idx"];
+        // 新增：解析如R4.64后缀
+        let (t, ty) = if let Some((base, bits)) = t.rsplit_once('.') {
+            if let Ok(bits) = bits.parse::<u32>() {
+                (base, Some(RegType::BitWidth(bits)))
+            } else {
+                (t, None)
+            }
+        } else {
+            (t, None)
+        };
+        let idx = match (class.as_str(), idx_raw.to_ascii_uppercase().as_str()) {
+            ("R", "Z") => 0,
+            ("P", "T") => 0,
+            ("P", n) | ("R", n) | ("UR", n) => n.parse::<i32>().unwrap_or(-1),
+            _ => -1,
+        };
+        let sign = if t.starts_with('-') { -1 } else { 1 };
+        return Operand::Register { class, idx, sign, ty };
+    }
+    // 5. Const mem c[bank][off]
+    if let Some(cap) = RE_CONST.captures(t) {
+        let bank = u32::from_str_radix(&cap["bank"][2..], 16).unwrap();
+        let off  = u32::from_str_radix(&cap["off"][2..], 16).unwrap();
+        return Operand::ConstMem { bank, offset: off };
+    }
+    // 6. 其它情况
     Operand::Raw(t.to_string())
 }
 

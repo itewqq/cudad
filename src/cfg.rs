@@ -9,7 +9,7 @@ use petgraph::{
     graph::{Graph, NodeIndex},
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BasicBlock {
     pub id: usize,
     pub start: u32,

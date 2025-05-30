@@ -200,10 +200,18 @@ struct Args {
     /// Output SSA DOT file (if not given, print to stdout)
     #[clap(short, long)]
     output: Option<String>,
+    /// Dump CFG as DOT
+    #[clap(long)]
+    cfg_dot: bool,
     /// Dump SSA IR as DOT
     #[clap(long)]
     ssa_dot: bool,
+    /// Dump structured block tree as text
+    #[clap(long)]
+    struct_dot: bool,
 }
+
+
 
 fn main() {
     let args = Args::parse();
@@ -214,13 +222,26 @@ fn main() {
     };
     let instrs = parse_sass(&sass);
     let cfg = build_cfg(instrs);
+    if args.cfg_dot {
+        println!("{}", graph_to_dot(&cfg));
+    }
     if args.ssa_dot {
         let fir = build_ssa(&cfg);
-        let dot = ssa_to_dot(&cfg, &fir);
-        if let Some(path) = args.output {
+        let dot = fir.to_dot(&cfg, &DefaultDisplay);
+        if let Some(ref path) = args.output {
             fs::write(path, dot).expect("Failed to write DOT file");
         } else {
             println!("{}", dot);
+        }
+    }
+    if args.struct_dot {
+        let fir = build_ssa(&cfg);
+        let sb = cudad::structurizer::structurize(&cfg, &fir);
+        let txt = structured_block_to_text(&sb, 0);
+        if let Some(ref path) = args.output {
+            fs::write(path, txt).expect("Failed to write struct file");
+        } else {
+            println!("{}", txt);
         }
     }
     // for idx in cfg.node_indices() {

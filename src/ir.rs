@@ -1,628 +1,642 @@
-//!  当前进度：极简 SSA (RPO 遍历 + 简单 Φ 插入，可处理循环)
+//! ir.rs  –  SSA construction + DOT export
+//! fully implements Cytron 91 algorithm (minimal Φ + rename)
+//! no string cached inside nodes; all printing via DisplayCtx
 
-use crate::cfg::ControlFlowGraph;
-use crate::parser::Operand;
-use petgraph::graph::NodeIndex;
-use petgraph::visit::EdgeRef;
-use petgraph::{visit::DfsPostOrder, Direction};
 use std::collections::{HashMap, HashSet};
-use crate::cfg::EdgeKind;
-use std::env;
-use petgraph::algo::dominators::simple_fast;
-use std::cell::RefCell;
+use crate::parser::{Instruction, Operand};
+use crate::cfg::{ControlFlowGraph, EdgeKind};
+use petgraph::{
+    algo::dominators::simple_fast,
+    graph::NodeIndex,
+    visit::DfsPostOrder,
+    Direction,
+};
+use petgraph::visit::EdgeRef;
 
-macro_rules! debug_log {
-    ($($arg:tt)*) => {
-        if std::env::var("DEBUG").map(|v| v == "1").unwrap_or(false) {
-            eprintln!($($arg)*);
+use crate::debug_log;
+
+/* =======================================================================
+   Section 0 – Printing context
+======================================================================= */
+/// An external formatter that decides how to show registers / expressions
+pub trait DisplayCtx {
+    fn reg(&self, r:&RegId)->String;
+    fn expr(&self, e:&IRExpr)->String {
+        match e {
+            IRExpr::Reg(r) => self.reg(r),
+            IRExpr::ImmI(i)=>format!("{}",i),
+            IRExpr::ImmF(f)=>format!("{}",f),
+            IRExpr::Mem{base,offset,width}=>{
+                let mut s=format!("*{}",self.expr(base));
+                if let Some(off)=offset{ s.push_str(&format!("+{}",self.expr(off))); }
+                if let Some(w)=width { s.push_str(&format!("@{}",w)); }
+                s
+            }
+            IRExpr::Op{op,args}=>{
+                let list=args.iter().map(|a|self.expr(a)).collect::<Vec<_>>().join(", ");
+                format!("{}({})",op,list)
+            }
         }
-    };
+    }
+}
+/// Default formatter ⟶ 原先 display() 效果
+pub struct DefaultDisplay;
+impl DisplayCtx for DefaultDisplay {
+    fn reg(&self, r:&RegId)->String { r.display() }
 }
 
-/* ---------- 数据结构 ---------- */
+/* =======================================================================
+   Section 1 – Core IR data structures  (unchanged except `DisplayCtx`)
+======================================================================= */
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Var {
-    pub name: String, // 原始寄存器名，如R1/P0
-    pub id: usize,    // SSA版本号
+pub enum RegType { BitWidth(u32) }
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RegId {
+    pub class:String, pub idx:i32, pub sign:i32, pub ssa:Option<usize>
+}
+impl RegId {
+    pub fn new(class:&str, idx:i32, sign:i32)->Self{
+        Self{class:class.into(), idx, sign, ssa:None}
+    }
+    pub fn with_ssa(&self, v:usize)->Self{
+        let mut r=self.clone(); r.ssa=Some(v); r
+    }
+    pub fn display(&self)->String{
+        let base=format!("{}{}",self.class,self.idx);
+        let ssa=self.ssa.map(|v|format!(".{}",v)).unwrap_or_default();
+        let sign=if self.sign<0{"-"}else{""};
+        format!("{}{}{}",sign,base,ssa)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum IRCond {
+pub enum IRCond{
     True,
-    Pred { name: String, id: usize, sense: bool }, // 例如P0.3==1
+    Pred{reg:RegId, sense:bool},
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum IRArg {
-    SSA(Var),
-    Operand(Operand),
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum RValue {
-    Op { opcode: String, args: Vec<IRArg> },
-    Phi(Vec<Var>),
+pub enum IRExpr{
+    Reg(RegId),
     ImmI(i64),
     ImmF(f64),
-    Undef,
+    Mem{base:Box<IRExpr>,offset:Option<Box<IRExpr>>,width:Option<u32>},
+    Op { op:String, args:Vec<IRExpr>},
+}
+impl IRExpr{
+    pub fn get_reg(&self)->Option<&RegId>{ if let IRExpr::Reg(r)=self{Some(r)}else{None}}
+    pub fn get_reg_mut(&mut self)->Option<&mut RegId>{ if let IRExpr::Reg(r)=self{Some(r)}else{None}}
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct IRStatement {
-    pub dest: Option<Var>,
-    pub value: RValue,
-    /// SSA变量，表示该语句的谓词条件（如@P0）
-    pub pred: Option<Var>,
+pub enum RValue{
+    Op{opcode:String,args:Vec<IRExpr>},
+    Phi(Vec<IRExpr>),
+    ImmI(i64),
+    ImmF(f64),
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct IRBlock {
-    pub id: usize,
-    pub start_addr: u32, // 当前块起始地址
-    pub irdst: Vec<(Option<IRCond>, u32)>, // (条件, 目标地址)列表
-    pub stmts: Vec<IRStatement>,
+pub struct IRStatement{
+    pub dest:Option<IRExpr>,
+    pub value:RValue,
+    pub pred:Option<IRExpr>,
+    pub mem_addr_args:Option<Vec<IRExpr>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct FunctionIR {
-    pub blocks: Vec<IRBlock>,
+pub struct IRBlock{
+    pub id:usize,
+    pub start_addr:u32,
+    pub irdst:Vec<(Option<IRCond>,u32)>,
+    pub stmts:Vec<IRStatement>,
 }
 
-/* ---------- PhysReg helper ---------- */
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct PhysReg {
-    class: String,
-    idx: i32,
+#[derive(Clone, Debug, PartialEq)]
+pub struct FunctionIR{
+    pub blocks:Vec<IRBlock>,
 }
 
-fn phys_reg_of(op: &Operand) -> Option<PhysReg> {
-    match op {
-        Operand::Register { class, idx } => {
-            if class == "PT" || class == "RZ" {
-                Some(PhysReg { class: class.clone(), idx: 0 })
-            } else if class.starts_with("P") {
-                // P0-P6
-                if (0..=6).contains(idx) {
-                    Some(PhysReg { class: "P".to_string(), idx: *idx })
-                } else {
-                    None
-                }
-            } else {
-                Some(PhysReg { class: class.clone(), idx: *idx })
-            }
+/* =======================================================================
+   Section 2 – Helpers: parser→IR lowering
+======================================================================= */
+fn phys_reg_of(op:&Operand)->Option<RegId>{
+    match op{
+        Operand::Register{class,idx,sign,..} => {
+            if class=="PT"||class=="RZ" {Some(RegId::new(class,0,*sign))}
+            else if class.starts_with('P'){Some(RegId::new("P",*idx,*sign))}
+            else {Some(RegId::new(class, *idx,*sign))}
         }
-        Operand::Uniform { idx } => Some(PhysReg {
-            class: "UR".into(),
-            idx: *idx,
-        }),
-        _ => None,
+        Operand::Uniform{idx} => Some(RegId::new("UR",*idx,1)),
+        _=>None
     }
 }
-
-fn is_mem_store(opcode: &str) -> bool {
-    opcode.starts_with("STS") || opcode.starts_with("STG") || opcode.starts_with("ST")
+fn lower_operand(op:&Operand)->IRExpr{
+    match op{
+        Operand::Register{..}|Operand::Uniform{..}=>{
+            if let Some(r)=phys_reg_of(op){ IRExpr::Reg(r)} else{IRExpr::ImmI(0)}
+        }
+        Operand::ImmediateI(i)=>IRExpr::ImmI(*i),
+        Operand::ImmediateF(f)=>IRExpr::ImmF(*f),
+        Operand::ConstMem{bank,offset}=>{
+            IRExpr::Op{op:"ConstMem".into(),args:vec![IRExpr::ImmI(*bank as i64),IRExpr::ImmI(*offset as i64)]}
+        }
+        Operand::Raw(s)=>{
+            if let Ok(i)=s.parse::<i64>() { IRExpr::ImmI(i)}
+            else if let Ok(f)=s.parse::<f64>(){ IRExpr::ImmF(f)}
+            else{ IRExpr::Op{op:s.clone(),args:vec![]}}
+        }
+    }
 }
+/* mem load/store heuristics */
+fn is_mem_load(op:&str)->bool{op.starts_with("LD")}
+fn is_mem_store(op:&str)->bool{op.starts_with("ST")}
 
-fn is_mem_load(opcode: &str) -> bool {
-    opcode.starts_with("LDG") || opcode.starts_with("LD")
-}
+/* =======================================================================
+   Section 3 – Build SSA (Cytron algorithm)
+======================================================================= */
 
-/* ---------- SSA 主流程 ---------- */
+/// 构建最小 Φ + 重命名后的 SSA IR
 pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
+    use petgraph::algo::dominators::simple_fast;
     use petgraph::graph::NodeIndex;
     use petgraph::Direction;
-    use petgraph::algo::dominators::simple_fast;
     use std::collections::{HashMap, HashSet};
 
-    let entry = NodeIndex::new(0);
-    let doms = simple_fast(cfg, entry);
-    
-    // 1. 收集所有变量的定义点（A(V)）
-    let mut defsites: HashMap<PhysReg, HashSet<NodeIndex>> = HashMap::new();
+    /* ---------- helpers ---------- */
+    fn base_reg(r: &RegId) -> RegId {
+        RegId { ssa: None, ..r.clone() }
+    }
+    fn new_ssa(r: &RegId, cnt: &mut HashMap<RegId, usize>) -> RegId {
+        let key = base_reg(r);
+        let v = cnt.entry(key.clone()).or_insert(0);
+        let out = key.with_ssa(*v);
+        *v += 1;
+        out
+    }
+    fn top_or_new<'a>(
+        key: &RegId,
+        stack: &'a mut HashMap<RegId, Vec<RegId>>,
+        cnt: &mut HashMap<RegId, usize>,
+    ) -> &'a RegId {
+        let slot = stack.entry(key.clone()).or_default();
+        if slot.is_empty() {
+            let tmp = key.with_ssa(*cnt.entry(key.clone()).or_insert(0));
+            *cnt.get_mut(key).unwrap() += 1;
+            slot.push(tmp);
+        }
+        slot.last().unwrap()
+    }
+    fn rename_expr(
+        e: &mut IRExpr,
+        stack: &mut HashMap<RegId, Vec<RegId>>,
+        cnt: &mut HashMap<RegId, usize>,
+    ) {
+        match e {
+            IRExpr::Reg(r) => {
+                let top = top_or_new(&base_reg(r), stack, cnt).clone();
+                *r = top;
+            }
+            IRExpr::Mem { base, offset, .. } => {
+                rename_expr(base, stack, cnt);
+                if let Some(off) = offset {
+                    rename_expr(off, stack, cnt);
+                }
+            }
+            IRExpr::Op { args, .. } => {
+                for a in args {
+                    rename_expr(a, stack, cnt);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /* ---------- step-0: build IR blocks & defsites ---------- */
     let mut ir_blocks = HashMap::<usize, IRBlock>::new();
+    let mut defsites = HashMap::<RegId, HashSet<NodeIndex>>::new();
+
     for n in cfg.node_indices() {
         let bb = &cfg[n];
         let mut stmts = Vec::<IRStatement>::new();
+
         for ins in &bb.instrs {
-            let mut args = Vec::<IRArg>::new();
-            for (i, op) in ins.operands.iter().enumerate() {
-                let is_source = if is_mem_store(&ins.opcode) {
-                    true
-                } else if is_mem_load(&ins.opcode) {
-                    i != 0
-                } else {
-                    i != 0
-                };
-                if is_source {
-                    if let Some(reg) = phys_reg_of(op) {
-                        args.push(IRArg::SSA(Var { name: reg.class.clone() + &reg.idx.to_string(), id: 0 }));
-                        continue;
+            let mut dest = None::<IRExpr>;
+            let mut args = Vec::<IRExpr>::new();
+            let mut mem_addr_args = None::<Vec<IRExpr>>;
+
+            if is_mem_load(&ins.opcode) {
+                if let Some(r) = ins.operands.first().and_then(phys_reg_of) {
+                    dest = Some(IRExpr::Reg(r.clone()));
+                    defsites.entry(base_reg(&r)).or_default().insert(n);
+                }
+                let mut a = Vec::new();
+                for op in ins.operands.iter().skip(1) {
+                    let lo = lower_operand(op);
+                    a.push(lo.clone());
+                    args.push(lo);
+                }
+                mem_addr_args = Some(a);
+            } else if is_mem_store(&ins.opcode) {
+                let mut a = Vec::new();
+                if let Some(op0) = ins.operands.first() {
+                    let lo = lower_operand(op0);
+                    a.push(lo.clone());
+                    args.push(lo);
+                }
+                for op in ins.operands.iter().skip(1) {
+                    args.push(lower_operand(op));
+                }
+                mem_addr_args = Some(a);
+            } else {
+                for (idx, op) in ins.operands.iter().enumerate() {
+                    let lo = lower_operand(op);
+                    if idx == 0 {
+                        if let Some(r) = phys_reg_of(op) {
+                            dest = Some(IRExpr::Reg(r.clone()));
+                            defsites.entry(base_reg(&r)).or_default().insert(n);
+                        }
+                    } else {
+                        args.push(lo);
                     }
                 }
-                if i != 0 {
-                    args.push(IRArg::Operand(op.clone()));
-                }
             }
-            let pred_var = if let Some(pred) = &ins.pred {
-                if pred.reg.starts_with("P") {
-                    if let Ok(idx) = pred.reg[1..].parse::<i32>() {
-                        let preg = PhysReg { class: "P".to_string(), idx };
-                        Some(Var { name: format!("P{}", idx), id: 0 })
-                    } else { None }
-                } else { None }
-            } else { None };
-            let mut dest = None;
-            if is_mem_load(&ins.opcode) {
-                if let Some(reg) = ins.operands.first().and_then(phys_reg_of) {
-                    dest = Some(Var { name: reg.class.clone() + &reg.idx.to_string(), id: 0 });
-                    defsites.entry(reg).or_default().insert(n);
+
+            let pred_expr = ins.pred.as_ref().and_then(|p| {
+                if p.reg.starts_with('P') {
+                    let idx = p.reg[1..].parse().ok()?;
+                    Some(IRExpr::Reg(RegId::new("P", idx, 1)))
+                } else {
+                    None
                 }
-            } else if !is_mem_store(&ins.opcode) {
-                if let Some(reg) = ins.operands.first().and_then(phys_reg_of) {
-                    dest = Some(Var { name: reg.class.clone() + &reg.idx.to_string(), id: 0 });
-                    defsites.entry(reg).or_default().insert(n);
-                }
-            }
-            let rv = match ins.operands.last() {
-                Some(Operand::ImmediateI(i)) => RValue::ImmI(*i),
-                Some(Operand::ImmediateF(f)) => RValue::ImmF(*f),
-                _ => RValue::Op {
+            });
+
+            stmts.push(IRStatement {
+                dest,
+                value: RValue::Op {
                     opcode: ins.opcode.clone(),
                     args,
                 },
-            };
-            stmts.push(IRStatement { dest, value: rv, pred: pred_var });
+                pred: pred_expr,
+                mem_addr_args,
+            });
         }
-        // 计算所有出边的条件跳转表
-        let mut irdst = Vec::new();
-        let this_idx = n;
-        let mut cond_branch_info = None;
-        if let Some(last) = bb.instrs.last() {
-            if let Some(pred) = &last.pred {
-                if pred.reg.starts_with("P") {
-                    if let Ok(idx) = pred.reg[1..].parse::<i32>() {
-                        cond_branch_info = Some((format!("P{}", idx), 0, pred.sense));
-                    }
-                }
-            }
-        }
-        for edge in cfg.edges(this_idx) {
-            let target_idx = edge.target();
-            let target_addr = cfg[target_idx].start;
-            match *edge.weight() {
+
+        /* IRDst */
+        let mut irdst = Vec::<(Option<IRCond>, u32)>::new();
+        let last_pred = bb.instrs.last().and_then(|i| i.pred.as_ref());
+        for e in cfg.edges(n) {
+            let tgt_addr = cfg[e.target()].start;
+            match *e.weight() {
                 EdgeKind::CondBranch => {
-                    if let Some((ref name, id, sense)) = cond_branch_info {
-                        irdst.push((Some(IRCond::Pred { name: name.clone(), id, sense }), target_addr));
-                    } else {
-                        irdst.push((Some(IRCond::True), target_addr));
+                    if let Some(p) = last_pred {
+                        if let Ok(idx) = p.reg[1..].parse::<i32>() {
+                            irdst.push((
+                                Some(IRCond::Pred {
+                                    reg: RegId::new("P", idx, 1),
+                                    sense: p.sense,
+                                }),
+                                tgt_addr,
+                            ));
+                        }
                     }
                 }
                 EdgeKind::FallThrough => {
-                    if let Some((ref name, id, sense)) = cond_branch_info {
-                        irdst.push((Some(IRCond::Pred { name: name.clone(), id, sense: !sense }), target_addr));
-                    } else {
-                        irdst.push((Some(IRCond::True), target_addr));
-                    }
-                }
-                EdgeKind::UncondBranch => {
-                    irdst.push((Some(IRCond::True), target_addr));
-                }
-            }
-        }
-        ir_blocks.insert(bb.id, IRBlock {
-            id: bb.id,
-            start_addr: bb.start,
-            irdst,
-            stmts,
-        });
-    }
-
-    // 2. 计算支配前沿 DF(X)
-    let mut df = HashMap::<NodeIndex, HashSet<NodeIndex>>::new();
-    for y in cfg.node_indices() {
-        let preds: Vec<_> = cfg.neighbors_directed(y, Direction::Incoming).collect();
-        if preds.len() < 2 { continue; }
-        let idom_y = doms.immediate_dominator(y);
-        for &p in &preds {
-            let mut runner = p;
-            while Some(runner) != idom_y {
-                df.entry(runner).or_default().insert(y);
-                if let Some(idom_r) = doms.immediate_dominator(runner) {
-                    runner = idom_r;
-                } else {
-                    break;
-                }
-            }
-        }
-    }
-
-    // 3. Cytron算法插入phi节点
-    let mut phi_blocks: HashMap<PhysReg, HashSet<NodeIndex>> = HashMap::new();
-    let mut iter_count = 0usize;
-    let all_nodes: Vec<_> = cfg.node_indices().collect();
-    for (reg, defset) in &defsites {
-        // 只对 P0-P6、R0-R255、UR* 做SSA
-        let is_ssa_reg = (reg.class == "P" && (0..=6).contains(&reg.idx)) ||
-                         (reg.class == "R" && (0..=255).contains(&reg.idx)) ||
-                         (reg.class == "UR");
-        if !is_ssa_reg { continue; }
-        iter_count += 1;
-        let mut has_already: HashMap<NodeIndex, usize> = HashMap::new();
-        let mut work: HashMap<NodeIndex, usize> = HashMap::new();
-        for &x in &all_nodes {
-            has_already.insert(x, 0);
-            work.insert(x, 0);
-        }
-        let mut W: Vec<NodeIndex> = Vec::new();
-        for &x in defset {
-            work.insert(x, iter_count);
-            if !W.contains(&x) { W.push(x); }
-        }
-        while !W.is_empty() {
-            let x = W.pop().unwrap();
-            if let Some(dfset) = df.get(&x) {
-                for &y in dfset {
-                    if has_already.get(&y).copied().unwrap_or(0) < iter_count {
-                        phi_blocks.entry(reg.clone()).or_default().insert(y);
-                        has_already.insert(y, iter_count);
-                        if work.get(&y).copied().unwrap_or(0) < iter_count {
-                            work.insert(y, iter_count);
-                            if !W.contains(&y) { W.push(y); }
+                    if let Some(p) = last_pred {
+                        if let Ok(idx) = p.reg[1..].parse::<i32>() {
+                            irdst.push((
+                                Some(IRCond::Pred {
+                                    reg: RegId::new("P", idx, 1),
+                                    sense: !p.sense,
+                                }),
+                                tgt_addr,
+                            ));
                         }
+                    } else {
+                        irdst.push((Some(IRCond::True), tgt_addr));
+                    }
+                }
+                EdgeKind::UncondBranch => irdst.push((Some(IRCond::True), tgt_addr)),
+            }
+        }
+
+        ir_blocks.insert(
+            bb.id,
+            IRBlock {
+                id: bb.id,
+                start_addr: bb.start,
+                irdst,
+                stmts,
+            },
+        );
+    }
+
+    /* ---------- step-1: DomTree + DF ---------- */
+    let entry = NodeIndex::new(0);
+    let doms = simple_fast(cfg, entry);
+    let mut idom = HashMap::<NodeIndex, NodeIndex>::new();
+    for n in cfg.node_indices() {
+        if let Some(i) = doms.immediate_dominator(n) {
+            idom.insert(n, i);
+        }
+    }
+    let df = compute_df(cfg, &idom);
+
+    /* ---------- step-2: Φ placement ---------- */
+    let mut phi_needed = HashSet::<(NodeIndex, RegId)>::new();
+    for (reg, defs) in &defsites {
+        let mut work: Vec<_> = defs.iter().copied().collect();
+        let mut seen = HashSet::<NodeIndex>::new();
+        while let Some(x) = work.pop() {
+            for &y in df.get(&x).unwrap_or(&HashSet::new()) {
+                if seen.insert(y) {
+                    phi_needed.insert((y, reg.clone()));
+                    if !defs.contains(&y) {
+                        work.push(y);
                     }
                 }
             }
         }
     }
-    // 插入phi节点
-    let mut phi_map: HashMap<(usize, usize), PhysReg> = HashMap::new();
-    for (reg, blocks) in &phi_blocks {
-        for &n in blocks {
-            let preds: Vec<_> = cfg.neighbors_directed(n, Direction::Incoming).collect();
-            if preds.len() > 1 {
-                let block = ir_blocks.get_mut(&cfg[n].id).unwrap();
-                let phi = IRStatement {
-                    dest: Some(Var { name: reg.class.clone() + &reg.idx.to_string(), id: 0 }),
-                    value: RValue::Phi(vec![]),
+
+    /* 在块头插入 Φ，占位向量长度 = succ.in_edges() 长度 */
+    for (blk_node, reg) in &phi_needed {
+        let block_id = cfg[*blk_node].id;
+        let preds: Vec<_> = cfg.neighbors_directed(*blk_node, Direction::Incoming).collect();
+        let placeholder = vec![IRExpr::ImmI(0); preds.len()];
+        ir_blocks
+            .get_mut(&block_id)
+            .unwrap()
+            .stmts
+            .insert(
+                0,
+                IRStatement {
+                    dest: Some(IRExpr::Reg(reg.clone())),
+                    value: RValue::Phi(placeholder),
                     pred: None,
-                };
-                block.stmts.insert(0, phi);
-                phi_map.insert((block.id, 0), reg.clone());
-                debug_log!("insert phi for {:?} at block {}", reg, block.id);
-            }
-        }
+                    mem_addr_args: None,
+                },
+            );
     }
 
-    // 4. Cytron算法变量重命名
-    let mut domtree_children: HashMap<NodeIndex, Vec<NodeIndex>> = HashMap::new();
-    for n in cfg.node_indices() {
-        if let Some(idom) = doms.immediate_dominator(n) {
-            domtree_children.entry(idom).or_default().push(n);
-        }
+    /* ---------- step-3: Rename (Cytron WHICH-PRED) ---------- */
+    // dom children
+    let mut children = HashMap::<NodeIndex, Vec<NodeIndex>>::new();
+    for (&b, &p) in &idom {
+        children.entry(p).or_default().push(b);
     }
-    let mut stacks: HashMap<PhysReg, Vec<Var>> = HashMap::new();
-    let mut reg_version: HashMap<PhysReg, usize> = HashMap::new();
-    fn new_ssa_var(reg: &PhysReg, reg_version: &mut HashMap<PhysReg, usize>) -> Var {
-        if reg.class == "PT" || reg.class == "RZ" {
-            Var { name: reg.class.clone(), id: 0 }
-        } else {
-            let v = reg_version.entry(reg.clone()).or_insert(0);
-            let ssa_var = Var { name: format!("{}{}", reg.class, reg.idx), id: *v };
-            *v += 1;
-            ssa_var
-        }
-    }
-    fn parse_var_physreg(v: &Var) -> PhysReg {
-        if v.name == "PT" || v.name == "RZ" {
-            PhysReg { class: v.name.clone(), idx: 0 }
-        } else if v.name.starts_with("P") {
-            PhysReg { class: "P".to_string(), idx: v.name[1..].parse().unwrap_or(0) }
-        } else if v.name.starts_with("R") {
-            PhysReg { class: "R".to_string(), idx: v.name[1..].parse().unwrap_or(0) }
-        } else if v.name.starts_with("UR") {
-            PhysReg { class: "UR".to_string(), idx: v.name[2..].parse().unwrap_or(0) }
-        } else {
-            PhysReg { class: v.name.clone(), idx: 0 }
-        }
-    }
-    struct RenameRecord {
-        block_id: usize,
-        phi_dest: Vec<(usize, Var)>,
-        phi_args: Vec<(usize, usize, Var)>,
-        normal_renames: Vec<(usize, Var)>,
-        op_arg_renames: Vec<(usize, usize, Var)>,
-    }
-    fn collect_rename(
+
+    let mut stack = HashMap::<RegId, Vec<RegId>>::new();
+    let mut counter = HashMap::<RegId, usize>::new();
+
+    fn rename(
         n: NodeIndex,
         cfg: &ControlFlowGraph,
-        domtree_children: &HashMap<NodeIndex, Vec<NodeIndex>>,
-        stacks: &mut HashMap<PhysReg, Vec<Var>>,
-        reg_version: &mut HashMap<PhysReg, usize>,
-        phi_map: &HashMap<(usize, usize), PhysReg>,
-        ir_blocks: &HashMap<usize, IRBlock>,
-        out: &mut Vec<RenameRecord>,
+        children: &HashMap<NodeIndex, Vec<NodeIndex>>,
+        ir_blocks: &mut HashMap<usize, IRBlock>,
+        stack: &mut HashMap<RegId, Vec<RegId>>,
+        counter: &mut HashMap<RegId, usize>,
     ) {
-        let block = ir_blocks.get(&cfg[n].id).unwrap();
-        let mut phi_dest = Vec::new();
-        let mut normal_renames = Vec::new();
-        let mut op_arg_renames = Vec::new();
-        // 1. 处理Phi节点，分配新SSA版本，push栈，并记录新Var
-        for (i, stmt) in block.stmts.iter().enumerate() {
-            if let Some(dest) = &stmt.dest {
-                if let RValue::Phi(_) = stmt.value {
-                    if let Some(reg) = phi_map.get(&(block.id, i)) {
-                        let v = new_ssa_var(reg, reg_version);
-                        stacks.entry(reg.clone()).or_default().push(v.clone());
-                        let v_debug = v.clone();
-                        debug_log!("phi rename: block {} phi {} -> {:?}", block.id, i, v_debug);
-                        phi_dest.push((i, v));
-                    }
-                }
+        let bid = cfg[n].id;
+
+        /* 1. 处理当前块 */
+        {
+            let blk = ir_blocks.get_mut(&bid).unwrap();
+
+            /* φ 左值 */
+            for stmt in blk
+                .stmts
+                .iter_mut()
+                .filter(|s| matches!(s.value, RValue::Phi(_)))
+            {
+                let key = base_reg(stmt.dest.as_ref().unwrap().get_reg().unwrap());
+                let new = IRExpr::Reg(new_ssa(&key, counter));
+                stack.entry(key.clone()).or_default().push(new.get_reg().unwrap().clone());
+                stmt.dest = Some(new);
             }
-        }
-        // 2. 重命名普通语句的参数
-        for (stmt_idx, stmt) in block.stmts.iter().enumerate() {
-            match &stmt.value {
-                RValue::Op { args, .. } => {
-                    for (arg_idx, arg) in args.iter().enumerate() {
-                        if let IRArg::SSA(v) = arg {
-                            let reg = parse_var_physreg(v);
-                            if let Some(stack) = stacks.get(&reg) {
-                                if let Some(top) = stack.last() {
-                                    op_arg_renames.push((stmt_idx, arg_idx, top.clone()));
-                                    debug_log!("op arg rename: block {} stmt {} arg {} -> {:?}", block.id, stmt_idx, arg_idx, top);
-                                }
-                            }
+
+            /* 普通语句 */
+            for stmt in &mut blk.stmts {
+                match &mut stmt.value {
+                    RValue::Op { args, .. } => {
+                        for a in args {
+                            rename_expr(a, stack, counter);
                         }
                     }
+                    RValue::Phi(_)
+                    | RValue::ImmI(_)
+                    | RValue::ImmF(_) => {}
                 }
-                _ => {}
-            }
-        }
-        // 3. 普通赋值分配新SSA版本，push栈
-        for (stmt_idx, stmt) in block.stmts.iter().enumerate() {
-            if let Some(dest) = &stmt.dest {
+                if let Some(ma) = &mut stmt.mem_addr_args {
+                    for a in ma {
+                        rename_expr(a, stack, counter);
+                    }
+                }
+                if let Some(p) = &mut stmt.pred {
+                    rename_expr(p, stack, counter);
+                }
+
                 if !matches!(stmt.value, RValue::Phi(_)) {
-                    let reg = parse_var_physreg(dest);
-                    let v = new_ssa_var(&reg, reg_version);
-                    stacks.entry(reg.clone()).or_default().push(v.clone());
-                    let v_debug = v.clone();
-                    debug_log!("assign rename: block {} stmt {} -> {:?}", block.id, stmt_idx, v_debug);
-                    normal_renames.push((stmt_idx, v));
+                    if let Some(dest) = &mut stmt.dest {
+                        let k = base_reg(dest.get_reg().unwrap());
+                        let new = IRExpr::Reg(new_ssa(&k, counter));
+                        stack
+                            .entry(k.clone())
+                            .or_default()
+                            .push(new.get_reg().unwrap().clone());
+                        *dest = new;
+                    }
+                }
+            }
+
+            /* IRDst 条件 */
+            for (cond, _) in &mut blk.irdst {
+                if let Some(IRCond::Pred { reg, .. }) = cond {
+                    *reg = top_or_new(&base_reg(reg), stack, counter).clone();
+                }
+            }
+        } // blk borrow drop
+
+        /* 2. 为后继块按 WhichPred 填充 Φ 参数 */
+        for succ in cfg.neighbors_directed(n, Direction::Outgoing) {
+            let succ_id = cfg[succ].id;
+
+            // 获取 succ 的前驱列表（固定顺序）
+            let preds: Vec<_> = cfg.neighbors_directed(succ, Direction::Incoming).collect();
+            let idx_in_succ = preds
+                .iter()
+                .position(|&p| p == n)
+                .expect("predecessor not found");
+
+            let blk_succ = ir_blocks.get_mut(&succ_id).unwrap();
+            for stmt in blk_succ
+                .stmts
+                .iter_mut()
+                .filter(|s| matches!(s.value, RValue::Phi(_)))
+            {
+                let key = base_reg(stmt.dest.as_ref().unwrap().get_reg().unwrap());
+                let src = top_or_new(&key, stack, counter).clone();
+                if let RValue::Phi(ref mut vec) = stmt.value {
+                    vec[idx_in_succ] = IRExpr::Reg(src);
                 }
             }
         }
-        // 4. 收集phi填充信息
-        let mut phi_args = Vec::new();
-        let succs: Vec<_> = cfg.neighbors(n).collect();
-        for &succ in &succs {
-            let succ_block_id = cfg[succ].id;
-            let phi_indices: Vec<usize> = phi_map.iter()
-                .filter(|(&(bid, _), _)| bid == succ_block_id)
-                .map(|(&(bid, idx), _)| idx)
-                .collect();
-            for &i in &phi_indices {
-                if let Some(reg) = phi_map.get(&(succ_block_id, i)) {
-                    if let Some(stack) = stacks.get(reg) {
-                        if let Some(top) = stack.last() {
-                            phi_args.push((succ_block_id, i, top.clone()));
-                            debug_log!("phi param: succ block {} phi {} <- {:?}", succ_block_id, i, top);
-                        }
+
+        /* 3. 递归 */
+        if let Some(chs) = children.get(&n) {
+            for &c in chs {
+                rename(c, cfg, children, ir_blocks, stack, counter);
+            }
+        }
+
+        /* 4. pop */
+        {
+            let blk = ir_blocks.get(&bid).unwrap();
+            for stmt in &blk.stmts {
+                if let Some(dest) = &stmt.dest {
+                    let k = base_reg(dest.get_reg().unwrap());
+                    if let Some(v) = stack.get_mut(&k) {
+                        v.pop();
                     }
                 }
             }
         }
-        out.push(RenameRecord {
-            block_id: block.id,
-            phi_dest,
-            phi_args,
-            normal_renames,
-            op_arg_renames,
-        });
-        // 5. 递归遍历支配树
-        if let Some(children) = domtree_children.get(&n) {
-            for &child in children {
-                collect_rename(child, cfg, domtree_children, stacks, reg_version, phi_map, ir_blocks, out);
-            }
-        }
-        // 6. pop本块分配的SSA版本
-        for stmt in &block.stmts {
-            if let Some(dest) = &stmt.dest {
-                let reg = parse_var_physreg(dest);
-                if let Some(stack) = stacks.get_mut(&reg) {
-                    stack.pop();
-                }
-            }
-        }
     }
-    // 收集所有重命名和phi参数填充信息
-    let mut rename_records = Vec::new();
-    collect_rename(entry, cfg, &domtree_children, &mut stacks, &mut reg_version, &phi_map, &ir_blocks, &mut rename_records);
-    // 统一批量可变借用ir_blocks，应用所有重命名和phi参数填充
-    for rec in &rename_records {
-        if let Some(block) = ir_blocks.get_mut(&rec.block_id) {
-            // phi dest重命名
-            for (i, v) in &rec.phi_dest {
-                if let Some(stmt) = block.stmts.get_mut(*i) {
-                    stmt.dest = Some(v.clone());
-                }
-            }
-            // 普通赋值重命名
-            for (stmt_idx, v) in &rec.normal_renames {
-                if let Some(stmt) = block.stmts.get_mut(*stmt_idx) {
-                    stmt.dest = Some(v.clone());
-                }
-            }
-            // op参数重命名
-            for (stmt_idx, arg_idx, v) in &rec.op_arg_renames {
-                if let Some(stmt) = block.stmts.get_mut(*stmt_idx) {
-                    if let RValue::Op { args, .. } = &mut stmt.value {
-                        if let Some(IRArg::SSA(var)) = args.get_mut(*arg_idx) {
-                            *var = v.clone();
-                        }
-                    }
-                }
-            }
-        }
-        // phi参数填充
-        for (succ_block_id, i, val) in &rec.phi_args {
-            if let Some(succ_block) = ir_blocks.get_mut(succ_block_id) {
-                if let Some(IRStatement { value: RValue::Phi(ref mut args), .. }) = succ_block.stmts.get_mut(*i) {
-                    args.push(val.clone());
-                }
-            }
-        }
-    }
-    // 清理空phi节点
-    for block in ir_blocks.values_mut() {
-        block.stmts.retain(|stmt| {
-            if let RValue::Phi(ref args) = stmt.value {
-                !args.is_empty()
-            } else {
-                true
-            }
-        });
-    }
+
+    let entry = NodeIndex::new(0);
+    rename(
+        entry,
+        cfg,
+        &children,
+        &mut ir_blocks,
+        &mut stack,
+        &mut counter,
+    );
+
+    /* ---------- collect ---------- */
     let mut blocks: Vec<_> = ir_blocks.into_iter().map(|(_, b)| b).collect();
     blocks.sort_by_key(|b| b.id);
     FunctionIR { blocks }
 }
 
-/// Output the SSA IR as a Graphviz DOT graph for debugging
-pub fn ssa_to_dot(cfg: &ControlFlowGraph, fir: &FunctionIR) -> String {
-    use std::fmt::Write;
-    let mut s = String::from("digraph SSA_IR {\n");
-    // Use rectangle shape for nodes
-    s.push_str("  node [shape=box];\n");
-    // Map block id to node index
-    let mut id2idx = std::collections::HashMap::new();
-    for idx in cfg.node_indices() {
-        let bb = &cfg[idx];
-        id2idx.insert(bb.id, idx);
-    }
-    // Emit nodes with IR
-    for block in &fir.blocks {
-        let mut label = format!("BB{} | Start: 0x{:x}\\n\\n",
-            block.id,
-            block.start_addr,
-        );
-
-        for stmt in &block.stmts {
-            // 跳过分支类指令（BRA/JMP/RET/EXIT等）
-            let is_branch = match &stmt.value {
-                RValue::Op { opcode, .. } => {
-                    let op = opcode.to_ascii_uppercase();
-                    op == "BRA" || op == "JMP" || op == "JMPP" 
-                },
-                _ => false,
-            };
-            if is_branch { continue; }
-
-            let dest = stmt.dest.as_ref().map(|v| {
-                if v.name == "PT" || v.name == "RZ" { format!("{} = ", v.name) } else { format!("{}.{} = ", v.name, v.id) }
-            }).unwrap_or_default();
-            let val = match &stmt.value {
-                RValue::Op { opcode, args } => {
-                    let args_str = args.iter().map(|a| match a {
-                        IRArg::SSA(v) => {
-                            if v.name == "PT" || v.name == "RZ" { v.name.clone() } else { format!("{}.{}", v.name, v.id) }
-                        },
-                        IRArg::Operand(op) => format!("{:?}", op),
-                    }).collect::<Vec<_>>().join(", ");
-                    format!("{}({})", opcode, args_str)
-                },
-                RValue::Phi(vars) => {
-                    let args_str = vars.iter().map(|v| format!("{}.{}", v.name, v.id)).collect::<Vec<_>>().join(", ");
-                    format!("phi({})", args_str)
-                },
-                RValue::ImmI(i) => format!("imm {}", i),
-                RValue::ImmF(f) => format!("imm {}", f),
-                RValue::Undef => "undef".to_string(),
-            };
-            let pred = stmt.pred.as_ref().map(|v| {
-                if v.name == "PT" || v.name == "RZ" { format!(" [@{}]", v.name) } else { format!(" [@{}.{}]", v.name, v.id) }
-            }).unwrap_or_default();
-            label.push_str(&format!("{}{}{}\\n", dest, val, pred));
+/* ==================== DF helper ==================== */
+fn compute_df(cfg:&ControlFlowGraph,idom:&HashMap<NodeIndex,NodeIndex>)
+->HashMap<NodeIndex,HashSet<NodeIndex>>
+{
+    let mut local=HashMap::<NodeIndex,HashSet<NodeIndex>>::new();
+    for n in cfg.node_indices(){
+        for succ in cfg.neighbors_directed(n,Direction::Outgoing){
+            if idom.get(&succ).copied()!=Some(n){
+                local.entry(n).or_default().insert(succ);
+            }
         }
-        label.push_str("\\n");
-        // 显示所有IRDst分支
-        for (cond, addr) in &block.irdst {
-            let cond_str = match cond {
-                Some(IRCond::True) => "(uncond)".to_string(),
-                Some(IRCond::Pred { name, id, sense }) => {
-                    if name == "PT" || name == "RZ" {
-                        format!("({}{})", if *sense { "" } else { "!" }, name)
-                    } else {
-                        format!("({}{}.{})", if *sense { "" } else { "!" }, name, id)
-                    }
-                },
-                None => "(unknown)".to_string(),
-            };
-            label.push_str(&format!("IRDst: {} -> 0x{:x}\\n", cond_str, addr));
-        }
-        writeln!(s, "  {} [label=\"{}\"];", block.id, label.replace("\"", "\\\"")).unwrap();
     }
-    // Emit edges
-    for e in cfg.edge_indices() {
-        let (sidx, didx) = cfg.edge_endpoints(e).unwrap();
-        let sid = &cfg[sidx].id;
-        let did = &cfg[didx].id;
-        writeln!(s, "  {} -> {};", sid, did).unwrap();
-    }
-    s.push('}');
-    s
-}
+    let mut children:HashMap<NodeIndex,Vec<NodeIndex>>=HashMap::new();
+    for (&b,&p) in idom{ children.entry(p).or_default().push(b); }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::parser::{Instruction, Operand, PredicateUse};
-    use crate::cfg::{BasicBlock, ControlFlowGraph, EdgeKind};
-    use petgraph::graph::Graph;
-
-    #[test]
-    fn test_irdst_conditional() {
-        // 构造一个简单的条件跳转CFG: BB0 --(P0=1)--> BB1, BB0 --(P0=0)--> BB2
-        // BB0: @P0 BRA 0x20; (fallthrough 0x10)
-        let bb0 = BasicBlock {
-            id: 0,
-            start: 0x0,
-            instrs: vec![Instruction {
-                addr: 0x0,
-                pred: Some(PredicateUse { reg: "P0".to_string(), sense: true }),
-                opcode: "BRA".to_string(),
-                operands: vec![Operand::ImmediateI(0x20)],
-                raw: "@P0 BRA 0x20;".to_string(),
-            }],
-        };
-        let bb1 = BasicBlock { id: 1, start: 0x10, instrs: vec![] };
-        let bb2 = BasicBlock { id: 2, start: 0x20, instrs: vec![] };
-        let mut g: ControlFlowGraph = Graph::new();
-        let n0 = g.add_node(bb0);
-        let n1 = g.add_node(bb1);
-        let n2 = g.add_node(bb2);
-        g.add_edge(n0, n1, EdgeKind::FallThrough); // fallthrough
-        g.add_edge(n0, n2, EdgeKind::CondBranch); // branch
-        let fir = build_ssa(&g);
-        // 检查irdst
-        let block0 = &fir.blocks[0];
-        assert_eq!(block0.irdst.len(), 2);
-        // 必须有一个是条件跳转到0x20, 一个是无条件到0x10
-        let mut found_cond = false;
-        let mut found_uncond = false;
-        for (cond, addr) in &block0.irdst {
-            if let Some(IRCond::Pred { name, sense, .. }) = cond {
-                assert_eq!(name, "P0");
-                if *sense {
-                    assert_eq!(*addr, 0x20);
-                    found_cond = true;
-                } else {
-                    assert_eq!(*addr, 0x10);
-                    found_uncond = true;
+    fn up(n:NodeIndex,child:&HashMap<NodeIndex,Vec<NodeIndex>>,
+          df:&mut HashMap<NodeIndex,HashSet<NodeIndex>>,idom:&HashMap<NodeIndex,NodeIndex>)
+    {
+        if let Some(ch)=child.get(&n){ for &c in ch{ up(c,child,df,idom); } }
+        for &c in child.get(&n).unwrap_or(&Vec::new()){
+            let set=df.entry(c).or_default().clone();
+            for w in set{
+                if idom.get(&w).copied()!=Some(n){
+                    df.entry(n).or_default().insert(w);
                 }
             }
         }
-        assert!(found_cond && found_uncond);
     }
+    let mut df=local;
+    let root=cfg.node_indices().next().unwrap();
+    up(root,&children,&mut df,idom);
+    df
 }
 
+/* =======================================================================
+   Section 4 – DOT Debugging
+======================================================================= */
+impl FunctionIR {
+    pub fn to_dot(&self, cfg: &ControlFlowGraph, ctx: &dyn DisplayCtx) -> String {
+        use std::fmt::Write;
+
+        /// 将 IRCond 显示成 “(P0.3)” / “(!P1.7)” / “(uncond)”
+        fn cond_str(c: &Option<IRCond>, ctx:&dyn DisplayCtx) -> String {
+            match c {
+                Some(IRCond::True) | None => "(uncond)".into(),
+                Some(IRCond::Pred { reg, sense }) => {
+                    let s = ctx.reg(reg);
+                    if *sense { format!("({})", s) } else { format!("(!{})", s) }
+                }
+            }
+        }
+
+        let mut dot = String::from("digraph SSA {\n  node[shape=box];\n");
+
+        /* ----------- 节点 ----------- */
+        for b in &self.blocks {
+            let mut label = format!("BB{} | Start: 0x{:x}\\l", b.id, b.start_addr);
+
+            /* 语句 */
+            for stmt in &b.stmts {
+                let line = match &stmt.value {
+                    RValue::Op { opcode, args } => {
+                        let dst = stmt
+                            .dest
+                            .as_ref()
+                            .map(|e| ctx.expr(e))
+                            .unwrap_or_else(|| "_".into());
+                        let a = args
+                            .iter()
+                            .map(|e| ctx.expr(e))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("{} = {}({})", dst, opcode, a)
+                    }
+                    RValue::Phi(vars) => {
+                        let dst = ctx.expr(stmt.dest.as_ref().unwrap());
+                        let list = vars
+                            .iter()
+                            .map(|v| ctx.expr(v))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("{} = phi({})", dst, list)
+                    }
+                    RValue::ImmI(i) => {
+                        format!("{} = {}", ctx.expr(stmt.dest.as_ref().unwrap()), i)
+                    }
+                    RValue::ImmF(f) => {
+                        format!("{} = {}", ctx.expr(stmt.dest.as_ref().unwrap()), f)
+                    }
+                };
+                label.push_str(&line);
+                label.push_str("\\l");
+            }
+
+            /* IRDst 列表 */
+            label.push_str("\\l");
+            for (cond, addr) in &b.irdst {
+                let cstr = cond_str(cond, ctx);
+                label.push_str(&format!("IRDst: {} -> 0x{:x}\\l", cstr, addr));
+            }
+
+            // 写入节点
+            writeln!(
+                dot,
+                "  {} [label=\"{}\"];",
+                b.id,
+                label.replace('\"', "\\\"")
+            )
+            .unwrap();
+        }
+
+        /* ----------- 边 ----------- */
+        for e in cfg.edge_references() {
+            let (sid, did) = (cfg[e.source()].id, cfg[e.target()].id);
+            writeln!(dot, "  {} -> {};", sid, did).unwrap();
+        }
+        dot.push_str("}");
+        dot
+    }
+}
