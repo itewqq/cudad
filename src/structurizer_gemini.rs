@@ -88,7 +88,6 @@ impl fmt::Display for StructuredStatement {
 pub struct Structurizer<'a> {
     cfg: &'a ControlFlowGraph, // DiGraph<CfgBasicBlock, EdgeKind>
     function_ir: &'a FunctionIR,
-    region_graph: DiGraph<StructuredStatement, EdgeKind>,
     dom: Dominators<NodeIndex>,
     pdom_algo_result: Dominators<NodeIndex>,
     immediate_pdom_map: HashMap<NodeIndex, NodeIndex>,
@@ -129,21 +128,9 @@ impl<'a> Structurizer<'a> {
         let (pdom_algo_result, immediate_pdom_map) =
             Self::calculate_post_dominators(cfg, function_ir);
 
-        // initially, each node from the CFG graph is a region, and the edges are the edges from the CFG graph
-        let mut region_graph = DiGraph::<StructuredStatement, EdgeKind>::new();
-        for node_idx in cfg.node_indices() {
-            // the statements are the ones in the IR block
-            let ir_block = function_ir.blocks.iter().find(|b| b.id == node_idx.index()).expect("IR block should exist");
-            region_graph.add_node(StructuredStatement::BasicBlock { block_id: node_idx.index(), stmts: ir_block.stmts.clone() });
-        }
-        for edge_ref in cfg.edge_references() {
-            region_graph.add_edge(edge_ref.source(), edge_ref.target(), *edge_ref.weight());
-        }
-
         Structurizer {
             cfg,
             function_ir,
-            region_graph,
             dom,
             pdom_algo_result,
             immediate_pdom_map,
@@ -240,32 +227,14 @@ impl<'a> Structurizer<'a> {
     pub fn structure_function(&mut self) -> Option<StructuredStatement> {
         self.processed_cfg_nodes.clear(); // Ensure clean state for new function
         let entry_cfg_node = self.block_id_to_node_index.get(&0).copied().unwrap_or_else(|| NodeIndex::new(0));
-        self.structure_region_recursive(entry_cfg_node)
+        self.structure_region_recursive(entry_cfg_node, None)
     }
 
     fn structure_region_recursive(
         &mut self,
         current_cfg_node: NodeIndex,
+        desired_exit_node: Option<NodeIndex>,
     ) -> Option<StructuredStatement> {
-        // recursively visit each node of the region graph in DFS post-order and structure it
-        // the post-order is to visit the children first, then the current node
-        // this is to ensure that all the children are structured before the current node is structured
-        // this is important for nested loops and conditionals
-        // the children are structured first
-        // the current node is structured last
-        if self.processed_cfg_nodes.contains(&current_cfg_node) {
-            return Some(StructuredStatement::Empty);
-        }
-        // visit the children first
-        for child in self.region_graph.neighbors_directed(current_cfg_node, Direction::Outgoing) {
-            self.structure_region_recursive(child);
-        }
-        // structure the current node
-        self.structure_current_node(current_cfg_node);
-    }
-    
-    fn structure_current_node(&mut self, current_cfg_node: NodeIndex) -> Option<StructuredStatement> {
-        // structure the current node
         if self.processed_cfg_nodes.contains(&current_cfg_node) {
             return Some(StructuredStatement::Empty);
         }

@@ -1,4 +1,5 @@
 use cudad::*;
+use crate::{cfg::build_cfg, ir::build_ssa, cfg_analysis::CFGAnalysis, structurizer::*};
 use clap::Parser;
 use std::fs;
 
@@ -208,7 +209,7 @@ struct Args {
     ssa_dot: bool,
     /// Dump structured block tree as text
     #[clap(long)]
-    struct_dot: bool,
+    struct_code: bool,
 }
 
 
@@ -234,15 +235,27 @@ fn main() {
             println!("{}", dot);
         }
     }
-    if args.struct_dot {
-        let fir = build_ssa(&cfg);
-        let sb = cudad::structurizer::structurize(&cfg, &fir);
-        let txt = structured_block_to_text(&sb, 0);
-        if let Some(ref path) = args.output {
-            fs::write(path, txt).expect("Failed to write struct file");
+    if args.struct_code {
+        let fir = build_ssa(&cfg); // build_ssa returns FunctionIR
+        // Create the structurizer instance
+        let mut structurizer_instance = structurizer::Structurizer::new(&cfg, &fir);
+            
+        println!("// --- Structured Output ---");
+        if let Some(structured_func_body) = structurizer_instance.structure_function() {
+            let display_ctx = DefaultDisplay; // Use the same DisplayCtx
+            let code_output = structurizer_instance.pretty_print(&structured_func_body, &display_ctx, 0);
+            
+            if let Some(ref path) = args.output {
+                 // Potentially overwrite if also doing other dots to same file
+                fs::write(path, code_output).expect("Failed to write structured code file");
+                println!("Structured code written to {}", path);
+            } else {
+                println!("{}", code_output);
+            }
         } else {
-            println!("{}", txt);
+            println!("// Failed to structure function or function is empty.");
         }
+        println!("// --- End Structured Output ---");
     }
     // for idx in cfg.node_indices() {
     //     println!("{:?}", &cfg[idx]);

@@ -1,101 +1,138 @@
-//! CFG分析辅助模块：支配树、后支配树、回边、循环体、出口分析
-use crate::cfg::ControlFlowGraph;
-use crate::debug_log;
-use petgraph::graph::{NodeIndex, EdgeReference};
-use petgraph::Direction;
-use petgraph::visit::EdgeRef;
-use std::collections::{HashMap, HashSet};
+//! cfg_analysis.rs  –– 静态 CFG 分析工具集
+//! 1. 直接/后支配树
+//! 2. 回边 + 自然循环 + 出口
 
-/// 计算支配树（每个节点的直接支配者）
-pub fn compute_dominators(cfg: &ControlFlowGraph, entry: NodeIndex) -> HashMap<NodeIndex, NodeIndex> {
-    let doms = petgraph::algo::dominators::simple_fast(cfg, entry);
-    let mut result = HashMap::new();
-    for n in cfg.node_indices() {
-        if let Some(idom) = doms.immediate_dominator(n) {
-            result.insert(n, idom);
-        }
-    }
-    result
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::cfg::ControlFlowGraph;
+use petgraph::{algo::dominators::simple_fast, graph::NodeIndex, Direction};
+
+/// 单个自然循环
+#[derive(Debug, Clone)]
+pub struct NaturalLoop {
+    pub head: NodeIndex,              // 回边的 head(入口)
+    pub tail: NodeIndex,              // 回边的 tail
+    pub body: BTreeSet<NodeIndex>,    // 包含 head+tail 的所有节点
+    pub exits: BTreeSet<NodeIndex>,   // body→外部 的出口节点(目标)
 }
 
-/// 计算后支配树（每个节点的直接后支配者）
-pub fn compute_post_dominators(cfg: &ControlFlowGraph, exit: NodeIndex) -> HashMap<NodeIndex, NodeIndex> {
-    let mut rev = cfg.clone();
-    rev.reverse();
-    let doms = petgraph::algo::dominators::simple_fast(&rev, exit);
-    let mut result = HashMap::new();
-    for n in rev.node_indices() {
-        if let Some(idom) = doms.immediate_dominator(n) {
-            if idom != n {
-                result.insert(n, idom);
+/// 综合分析结果
+#[derive(Debug, Clone)]
+pub struct CFGAnalysis {
+    pub idom: BTreeMap<NodeIndex, NodeIndex>,
+    pub ipdom: BTreeMap<NodeIndex, NodeIndex>,
+    pub loops: Vec<NaturalLoop>,
+}
+
+impl CFGAnalysis {
+    pub fn new(cfg: &ControlFlowGraph) -> Self {
+        let idom = Self::compute_idom(cfg);
+        let ipdom = Self::compute_postdom(cfg);
+        let loops = Self::compute_loops(cfg, &idom);
+
+        Self { idom, ipdom, loops }
+    }
+
+    /* ---------- 基本算法 ---------- */
+
+    fn compute_idom(cfg: &ControlFlowGraph) -> BTreeMap<NodeIndex, NodeIndex> {
+        let entry = NodeIndex::new(0);
+        let doms = simple_fast(cfg, entry);
+        let mut out = BTreeMap::new();
+        for n in cfg.node_indices() {
+            if let Some(i) = doms.immediate_dominator(n) {
+                out.insert(n, i);
             }
         }
+        out
     }
-    result
-}
 
-/// 检测所有回边（back-edges），返回 (from, to) 块id对
-pub fn find_back_edges(cfg: &ControlFlowGraph, doms: &HashMap<NodeIndex, NodeIndex>) -> Vec<(usize, usize)> {
-    let mut res = Vec::new();
-    for e in cfg.edge_references() {
-        let from = e.source();
-        let to = e.target();
-        // 回边定义：目标支配源
-        let mut cur = from;
-        // 先特判自环
-        if from == to {
-            res.push((cfg[from].id, cfg[to].id));
-            continue;
+    /// 后支配树：对 **反向图** 计算支配即可
+    fn compute_postdom(cfg: &ControlFlowGraph) -> BTreeMap<NodeIndex, NodeIndex> {
+        let exit = cfg
+            .node_indices()
+            .find(|&n| cfg.neighbors_directed(n, Direction::Outgoing).next().is_none())
+            .unwrap_or(NodeIndex::new(0));
+        let rev = petgraph::visit::Reversed(cfg);
+        let doms = simple_fast(&rev, exit);
+        let mut out = BTreeMap::new();
+        for n in cfg.node_indices() {
+            if let Some(i) = doms.immediate_dominator(n) {
+                out.insert(n, i);
+            }
         }
-        // 从from开始沿着支配链向上找，直到找到to
-        while let Some(idom) = doms.get(&cur) {
-            if *idom == to {
-                res.push((cfg[from].id, cfg[to].id));
+        out
+    }
+
+    /// 查 dom 关系
+    fn dom(idom: &BTreeMap<NodeIndex, NodeIndex>, mut x: NodeIndex, y: NodeIndex) -> bool {
+        // y dom x ?
+        while let Some(&p) = idom.get(&x) {
+            if p == y {
+                return true;
+            }
+            if p == x {
                 break;
             }
-            cur = *idom;
+            x = p;
         }
+        false
     }
-    res
-}
 
-/// 给定循环头，返回自然循环体（所有能从回边源到头的块）
-pub fn collect_natural_loop(cfg: &ControlFlowGraph, head: usize, tail: usize) -> HashSet<usize> {
-    // 先特判一下自环
-    if head == tail {
-        return vec![head].into_iter().collect();
-    }
-    // 初始化：body只包括head和tail
-    let mut body = HashSet::new();
-    body.insert(tail);
-    body.insert(head);
-    let mut stack = vec![tail];
-    while let Some(cur) = stack.pop() {
-        // 对于cur的每个前驱 pred，如果pred不在body中，则将pred加入到body和stack中
-        for pred in cfg.neighbors_directed(
-            cfg.node_indices().find(|&i| cfg[i].id == cur).unwrap(),
-            Direction::Incoming) {
-            let pid = cfg[pred].id;
-            if pid != head {
-                body.insert(pid);
-                stack.push(pid);
+    /* ---------- 回边 & 循环 ---------- */
+
+    fn compute_loops(
+        cfg: &ControlFlowGraph,
+        idom: &BTreeMap<NodeIndex, NodeIndex>,
+    ) -> Vec<NaturalLoop> {
+        let mut loops = Vec::<NaturalLoop>::new();
+
+        for tail in cfg.node_indices() {
+            for head in cfg.neighbors_directed(tail, Direction::Outgoing) {
+                if Self::dom(idom, tail, head) {
+                    // (tail, head) is a back-edge
+                    let mut body: BTreeSet<NodeIndex> = BTreeSet::new();
+                    body.insert(head);
+                    body.insert(tail);
+
+                    // 经典算法：从 tail 逆 CFG 收集直到 head 支配
+                    let mut work = vec![tail];
+                    while let Some(n) = work.pop() {
+                        for pred in cfg.neighbors_directed(n, Direction::Incoming) {
+                            if !body.contains(&pred) {
+                                body.insert(pred);
+                                if !Self::dom(idom, pred, head) {
+                                    // pred 可能在循环支配之外，但仍算体内
+                                }
+                                work.push(pred);
+                            }
+                        }
+                    }
+
+                    // 出口：体内 → 体外
+                    let mut exits = BTreeSet::new();
+                    for &n in &body {
+                        for succ in cfg.neighbors_directed(n, Direction::Outgoing) {
+                            if !body.contains(&succ) {
+                                exits.insert(succ);
+                            }
+                        }
+                    }
+                    loops.push(NaturalLoop {
+                        head,
+                        tail,
+                        body,
+                        exits,
+                    });
+                }
             }
         }
+        loops
     }
-    body
-}
 
-/// 给定循环体，返回所有出口边 (from, to)（体内指向体外的边）
-pub fn find_loop_exits(cfg: &ControlFlowGraph, loop_body: &HashSet<usize>) -> Vec<(usize, usize)> {
-    let mut exits = Vec::new();
-    for &bid in loop_body {
-        let idx = cfg.node_indices().find(|&i| cfg[i].id == bid).unwrap();
-        for succ in cfg.neighbors(idx) {
-            let sid = cfg[succ].id;
-            if !loop_body.contains(&sid) {
-                exits.push((bid, sid));
-            }
-        }
+    /* ---------- 查询辅助 ---------- */
+
+    pub fn loop_of(&self, n: NodeIndex) -> Option<&NaturalLoop> {
+        self.loops.iter().find(|lp| lp.body.contains(&n))
     }
-    exits
-} 
+}

@@ -4,8 +4,11 @@ pub mod parser;
 pub mod cfg;
 pub mod ir;
 pub mod debug_util;
+pub mod ast;
+pub mod region;
 pub mod structurizer;
 pub mod cfg_analysis;
+pub mod high_il;
 
 #[cfg(test)]
 mod test;
@@ -14,3 +17,5 @@ pub use parser::*;
 pub use cfg::*;
 pub use ir::*;
 pub use structurizer::*;
+pub use cfg_analysis::*;
+pub use high_il::*;
