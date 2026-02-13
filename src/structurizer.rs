@@ -96,6 +96,14 @@ pub struct Structurizer<'a> {
 }
 
 impl<'a> Structurizer<'a> {
+    fn is_branch_only_opcode(opcode: &str) -> bool {
+        matches!(opcode, "BRA" | "JMP" | "JMPP")
+    }
+
+    fn is_return_opcode(opcode: &str) -> bool {
+        opcode == "RET" || opcode == "EXIT" || opcode.starts_with("RET")
+    }
+
     fn is_effectively_empty(stmt: &StructuredStatement) -> bool {
         match stmt {
             StructuredStatement::Empty => true,
@@ -725,6 +733,26 @@ impl<'a> Structurizer<'a> {
             StructuredStatement::BasicBlock { block_id, stmts } => {
                 s_out.push_str(&format!("{}BB{} {{\n", indent, block_id));
                 for ir_s in stmts {
+                    if let RValue::Op { opcode, .. } = &ir_s.value {
+                        if Self::is_branch_only_opcode(opcode) {
+                            // Branch instructions are represented by structured control flow
+                            // (if/loop/goto), so omit them from block bodies.
+                            continue;
+                        }
+                        if Self::is_return_opcode(opcode) {
+                            let pred_prefix = ir_s
+                                .pred
+                                .as_ref()
+                                .map_or(String::new(), |p| format!("if ({}) ", ctx.expr(p)));
+                            s_out.push_str(&format!(
+                                "{}{}return;\n",
+                                "  ".repeat(indent_level + 1),
+                                pred_prefix
+                            ));
+                            continue;
+                        }
+                    }
+
                     let dest_str = ir_s.dest.as_ref().map_or_else(|| "_".to_string(), |d| ctx.expr(d));
                     let value_str = match &ir_s.value {
                         RValue::Op { opcode, args } => {
@@ -829,6 +857,7 @@ fn negate_condition(expr: IRExpr) -> IRExpr {
 mod tests {
     use super::*;
     use crate::cfg::{BasicBlock as CfgBasicBlock, ControlFlowGraph, EdgeKind};
+    use crate::ir::DefaultDisplay;
     use petgraph::graph::DiGraph;
     use std::collections::{HashMap, HashSet};
 
@@ -837,6 +866,15 @@ mod tests {
             dest: None,
             value: RValue::Op { opcode: opcode.to_string(), args: vec![] },
             pred: None,
+            mem_addr_args: None,
+        }
+    }
+
+    fn predicated_stmt(opcode: &str, pred: IRExpr) -> IRStatement {
+        IRStatement {
+            dest: None,
+            value: RValue::Op { opcode: opcode.to_string(), args: vec![] },
+            pred: Some(pred),
             mem_addr_args: None,
         }
     }
@@ -1089,5 +1127,48 @@ mod tests {
             }],
         };
         assert!(!Structurizer::is_block_return(&block));
+    }
+
+    #[test]
+    fn pretty_print_omits_raw_branch_ops() {
+        let specs = vec![(0, 0x00, vec![], vec![stmt("IADD3"), stmt("BRA")])];
+        let edges = vec![];
+        let (cfg, fir, _) = build_case(&specs, &edges);
+        let structurizer = Structurizer::new(&cfg, &fir);
+        let rendered = structurizer.pretty_print(
+            &StructuredStatement::BasicBlock {
+                block_id: 0,
+                stmts: fir.blocks[0].stmts.clone(),
+            },
+            &DefaultDisplay,
+            0,
+        );
+        assert!(rendered.contains("IADD3("));
+        assert!(!rendered.contains("BRA("));
+    }
+
+    #[test]
+    fn pretty_print_predicated_exit_as_return() {
+        let specs = vec![
+            (
+                0,
+                0x00,
+                vec![],
+                vec![predicated_stmt("EXIT", IRExpr::Reg(RegId::new("P", 0, 1)))],
+            ),
+        ];
+        let edges = vec![];
+        let (cfg, fir, _) = build_case(&specs, &edges);
+        let structurizer = Structurizer::new(&cfg, &fir);
+        let rendered = structurizer.pretty_print(
+            &StructuredStatement::BasicBlock {
+                block_id: 0,
+                stmts: fir.blocks[0].stmts.clone(),
+            },
+            &DefaultDisplay,
+            0,
+        );
+        assert!(rendered.contains("if (P0) return;"));
+        assert!(!rendered.contains("EXIT("));
     }
 }

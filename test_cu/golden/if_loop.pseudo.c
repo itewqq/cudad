@@ -72,7 +72,6 @@ if (!(P0)) {
               P1.18 = FSETP.GT.AND(PT, R4.18, 0.5, PT);
               R9.3 = FSEL(R7.2, 0.8999999761581421, P1.18);
               R9.4 = FMUL(R4.18, R9.3);
-              if (P2.2) _ = BRA();
             }
             continue;
           }
@@ -144,7 +143,6 @@ if (!(P0)) {
                   P1.25 = FSETP.GT.AND(PT, R4.34, 0.5, PT);
                   R9.11 = FSEL(R7.7, 0.8999999761581421, P1.25);
                   R9.12 = FMUL(R4.34, R9.11);
-                  if (P0.22) _ = BRA();
                 }
                 continue;
               }
@@ -167,7 +165,6 @@ if (!(P0)) {
                     P0.26 = ISETP.NE.AND(PT, R2.3, RZ, PT);
                     R4.37 = FSEL(R5.29, 0.8999999761581421, P1.28);
                     R9.15 = FMUL(R4.37, R9.14);
-                    if (P0.26) _ = BRA();
                   }
                   continue;
                 }

@@ -2,7 +2,6 @@
 if (P0) {
   BB1 {
     R1.1 = IADD3(R1.0, 1, RZ);
-    _ = BRA();
   }
 } else {
   BB2 {
