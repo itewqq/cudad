@@ -732,7 +732,12 @@ impl<'a> Structurizer<'a> {
         match stmt {
             StructuredStatement::BasicBlock { block_id, stmts } => {
                 s_out.push_str(&format!("{}BB{} {{\n", indent, block_id));
+                let mut omitted_phi_count = 0usize;
                 for ir_s in stmts {
+                    if matches!(ir_s.value, RValue::Phi(_)) {
+                        omitted_phi_count += 1;
+                        continue;
+                    }
                     if let RValue::Op { opcode, .. } = &ir_s.value {
                         if Self::is_branch_only_opcode(opcode) {
                             // Branch instructions are represented by structured control flow
@@ -768,6 +773,13 @@ impl<'a> Structurizer<'a> {
                     };
                     let pred_str = ir_s.pred.as_ref().map_or("".to_string(), |p| format!("if ({}) ", ctx.expr(p)));
                     s_out.push_str(&format!("{}{}{} = {};\n", "  ".repeat(indent_level + 1), pred_str, dest_str, value_str));
+                }
+                if omitted_phi_count > 0 {
+                    s_out.push_str(&format!(
+                        "{}// {} phi node(s) omitted\n",
+                        "  ".repeat(indent_level + 1),
+                        omitted_phi_count
+                    ));
                 }
                 s_out.push_str(&format!("{}}}\n", indent));
             }
@@ -1170,5 +1182,40 @@ mod tests {
         );
         assert!(rendered.contains("if (P0) return;"));
         assert!(!rendered.contains("EXIT("));
+    }
+
+    #[test]
+    fn pretty_print_omits_phi_statements_with_summary_comment() {
+        let specs = vec![(
+            0,
+            0x00,
+            vec![],
+            vec![
+                IRStatement {
+                    dest: Some(IRExpr::Reg(RegId::new("R", 1, 1))),
+                    value: RValue::Phi(vec![
+                        IRExpr::Reg(RegId::new("R", 2, 1)),
+                        IRExpr::Reg(RegId::new("R", 3, 1)),
+                    ]),
+                    pred: None,
+                    mem_addr_args: None,
+                },
+                stmt("IADD3"),
+            ],
+        )];
+        let edges = vec![];
+        let (cfg, fir, _) = build_case(&specs, &edges);
+        let structurizer = Structurizer::new(&cfg, &fir);
+        let rendered = structurizer.pretty_print(
+            &StructuredStatement::BasicBlock {
+                block_id: 0,
+                stmts: fir.blocks[0].stmts.clone(),
+            },
+            &DefaultDisplay,
+            0,
+        );
+        assert!(!rendered.contains("phi("));
+        assert!(rendered.contains("phi node(s) omitted"));
+        assert!(rendered.contains("IADD3("));
     }
 }

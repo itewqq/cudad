@@ -14,13 +14,6 @@ if (!(P0)) {
           // Loop header BB6
           while (P2) {
             BB6 {
-              R9.2 = phi(R9.4, R9.1);
-              R7.1 = phi(R7.2, R7.0);
-              R6.3 = phi(R6.4, R6.2);
-              R5.1 = phi(R5.15, R5.0);
-              R4.2 = phi(R4.18, R4.1);
-              P2.1 = phi(P2.2, P2.0);
-              P1.2 = phi(P1.18, P1.1);
               R7.2 = IMAD.MOV.U32(RZ, RZ, 1066192077);
               P1.3 = FSETP.GT.AND(PT, R9.2, 0.5, PT);
               R6.4 = IADD3(R6.3, -16, RZ);
@@ -72,6 +65,7 @@ if (!(P0)) {
               P1.18 = FSETP.GT.AND(PT, R4.18, 0.5, PT);
               R9.3 = FSEL(R7.2, 0.8999999761581421, P1.18);
               R9.4 = FMUL(R4.18, R9.3);
+              // 7 phi node(s) omitted
             }
             continue;
           }
@@ -110,25 +104,12 @@ if (!(P0)) {
             // Condition from BB9
             if (P0) {
               BB10 {
-                R9.9 = phi(R9.8, R9.1);
-                R7.6 = phi(R7.5, R7.0);
-                R6.8 = phi(R6.7, R6.2);
-                R5.24 = phi(R5.23, R5.0);
-                R4.29 = phi(R4.28, R4.1);
-                P2.4 = phi(P2.3, P2.0);
-                P1.23 = phi(P1.22, P1.0);
-                P0.17 = phi(P0.16, P0.3);
                 R7.7 = IMAD.MOV.U32(RZ, RZ, 1066192077);
+                // 8 phi node(s) omitted
               }
               // Loop header BB11
               while (P0) {
                 BB11 {
-                  R9.10 = phi(R9.12, R9.9);
-                  R6.9 = phi(R6.10, R6.8);
-                  R5.25 = phi(R5.27, R5.24);
-                  R4.30 = phi(R4.34, R4.29);
-                  P1.24 = phi(P1.25, P1.23);
-                  P0.18 = phi(P0.22, P0.17);
                   P0.19 = FSETP.GT.AND(PT, R9.10, 0.5, PT);
                   R6.10 = IADD3(R6.9, -4, RZ);
                   R4.31 = FSEL(R7.7, 0.8999999761581421, P0.19);
@@ -143,6 +124,7 @@ if (!(P0)) {
                   P1.25 = FSETP.GT.AND(PT, R4.34, 0.5, PT);
                   R9.11 = FSEL(R7.7, 0.8999999761581421, P1.25);
                   R9.12 = FMUL(R4.34, R9.11);
+                  // 6 phi node(s) omitted
                 }
                 continue;
               }
@@ -155,16 +137,12 @@ if (!(P0)) {
                 // Loop header BB14
                 while (P0) {
                   BB14 {
-                    R9.14 = phi(R9.15, R9.13);
-                    R4.36 = phi(R4.37, R4.35);
-                    R2.2 = phi(R2.3, R2.1);
-                    P1.27 = phi(P1.28, P1.26);
-                    P0.25 = phi(P0.26, P0.24);
                     R2.3 = IADD3(R2.2, -1, RZ);
                     P1.28 = FSETP.GT.AND(PT, R9.14, 0.5, PT);
                     P0.26 = ISETP.NE.AND(PT, R2.3, RZ, PT);
                     R4.37 = FSEL(R5.29, 0.8999999761581421, P1.28);
                     R9.15 = FMUL(R4.37, R9.14);
+                    // 5 phi node(s) omitted
                   }
                   continue;
                 }
