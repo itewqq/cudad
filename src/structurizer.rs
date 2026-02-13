@@ -96,6 +96,14 @@ pub struct Structurizer<'a> {
 }
 
 impl<'a> Structurizer<'a> {
+    fn is_effectively_empty(stmt: &StructuredStatement) -> bool {
+        match stmt {
+            StructuredStatement::Empty => true,
+            StructuredStatement::Sequence(stmts) => stmts.iter().all(Self::is_effectively_empty),
+            _ => false,
+        }
+    }
+
     fn node_is_dominated_by(&self, dom_results: &Dominators<NodeIndex>, node_to_check: NodeIndex, potential_dominator: NodeIndex) -> bool {
         if node_to_check == potential_dominator {
             return true;
@@ -743,14 +751,30 @@ impl<'a> Structurizer<'a> {
                 }
             }
             StructuredStatement::If { condition_block_id, condition_expr, then_branch, else_branch } => {
-                s_out.push_str(&format!("{}// Condition from BB{}\n", indent, condition_block_id));
-                s_out.push_str(&format!("{}if ({}) {{\n", indent, ctx.expr(condition_expr)));
-                s_out.push_str(&self.pretty_print(then_branch, ctx, indent_level + 1));
-                if let Some(eb) = else_branch {
-                    s_out.push_str(&format!("{}}} else {{\n", indent));
-                    s_out.push_str(&self.pretty_print(eb, ctx, indent_level + 1));
+                let then_empty = Self::is_effectively_empty(then_branch);
+                let else_ref = else_branch.as_deref();
+                let else_empty = else_ref.map(Self::is_effectively_empty).unwrap_or(true);
+
+                if then_empty && else_empty {
+                    // No-op condition: suppress noisy empty if blocks in output.
+                } else if then_empty && !else_empty {
+                    // Canonicalize "if (cond) {} else { X }" -> "if (!cond) { X }".
+                    s_out.push_str(&format!("{}// Condition from BB{}\n", indent, condition_block_id));
+                    s_out.push_str(&format!("{}if ({}) {{\n", indent, ctx.expr(&negate_condition(condition_expr.clone()))));
+                    s_out.push_str(&self.pretty_print(else_ref.unwrap(), ctx, indent_level + 1));
+                    s_out.push_str(&format!("{}}}\n", indent));
+                } else {
+                    s_out.push_str(&format!("{}// Condition from BB{}\n", indent, condition_block_id));
+                    s_out.push_str(&format!("{}if ({}) {{\n", indent, ctx.expr(condition_expr)));
+                    s_out.push_str(&self.pretty_print(then_branch, ctx, indent_level + 1));
+                    if let Some(eb) = else_ref {
+                        if !Self::is_effectively_empty(eb) {
+                            s_out.push_str(&format!("{}}} else {{\n", indent));
+                            s_out.push_str(&self.pretty_print(eb, ctx, indent_level + 1));
+                        }
+                    }
+                    s_out.push_str(&format!("{}}}\n", indent));
                 }
-                s_out.push_str(&format!("{}}}\n", indent));
             }
             StructuredStatement::Loop { loop_type, header_block_id, condition_expr, body } => {
                 s_out.push_str(&format!("{}// Loop header BB{:?}\n", indent, header_block_id.unwrap_or(usize::MAX)));

@@ -5,8 +5,7 @@ BB0 {
   if (P0.0) _ = EXIT();
 }
 // Condition from BB1
-if (P1) {
-} else {
+if (!(P1)) {
   // Loop header BB2
   while (!(P1)) {
     BB2 {
