@@ -220,6 +220,24 @@ fn test_structured_output_with_abi_display_symbols_constmem() {
 }
 
 #[test]
+fn test_abi_inferred_aliases_show_in_output() {
+    let sample = r#"
+        /*0000*/ IMAD.WIDE R4, R0, R7, c[0x0][0x160] ;
+        /*0010*/ IADD3.X R5, R5, c[0x0][0x164], RZ ;
+        /*0020*/ EXIT ;
+    "#;
+    let cfg = build_cfg(parse_sass(sample));
+    let fir = build_ssa(&cfg);
+    let profile = AbiProfile::modern_param_160();
+    let anns = annotate_function_ir_constmem(&fir, profile);
+    let aliases = infer_arg_aliases(&fir, &anns);
+    let display = AbiDisplay::with_aliases(profile, aliases);
+    let out = fir.to_dot(&cfg, &display);
+    assert!(out.contains("arg0_ptr.lo32"));
+    assert!(out.contains("arg0_ptr.hi32"));
+}
+
+#[test]
 fn smoke_struct_output_if_sass() {
     let sass = include_str!("../test_cu/if.sass");
     let expected = include_str!("../test_cu/golden/if.pseudo.c");

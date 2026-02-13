@@ -76,6 +76,43 @@ pub struct AbiAnnotations {
     pub constmem_by_stmt: BTreeMap<StatementRef, Vec<ConstMemAnnotation>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AliasConfidence {
+    Low,
+    Medium,
+    High,
+}
+
+impl AliasConfidence {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AliasConfidence::Low => "low",
+            AliasConfidence::Medium => "medium",
+            AliasConfidence::High => "high",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArgAliasKind {
+    Word32,
+    U64,
+    Ptr64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArgAlias {
+    pub param_idx: u32,
+    pub kind: ArgAliasKind,
+    pub confidence: AliasConfidence,
+    pub observed_words: BTreeSet<u32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AbiArgAliases {
+    pub by_param: BTreeMap<u32, ArgAlias>,
+}
+
 impl AbiAnnotations {
     pub fn is_empty(&self) -> bool {
         self.constmem_by_stmt.is_empty()
@@ -101,6 +138,50 @@ impl AbiAnnotations {
                         ann.symbol()
                     )
                 })
+            })
+            .take(max_lines)
+            .collect()
+    }
+}
+
+impl AbiArgAliases {
+    pub fn is_empty(&self) -> bool {
+        self.by_param.is_empty()
+    }
+
+    pub fn render_param_word(&self, param_idx: u32, word_idx: u32) -> Option<String> {
+        let alias = self.by_param.get(&param_idx)?;
+        let rendered = match alias.kind {
+            ArgAliasKind::Ptr64 => {
+                let lane = if word_idx == 0 { "lo32" } else { "hi32" };
+                format!("arg{}_ptr.{}", param_idx, lane)
+            }
+            ArgAliasKind::U64 => {
+                let lane = if word_idx == 0 { "lo32" } else { "hi32" };
+                format!("arg{}_u64.{}", param_idx, lane)
+            }
+            ArgAliasKind::Word32 => format!("arg{}_word{}", param_idx, word_idx),
+        };
+        Some(rendered)
+    }
+
+    pub fn summarize_lines(&self, max_lines: usize) -> Vec<String> {
+        self.by_param
+            .values()
+            .map(|alias| {
+                let kind = match alias.kind {
+                    ArgAliasKind::Ptr64 => "ptr64",
+                    ArgAliasKind::U64 => "u64",
+                    ArgAliasKind::Word32 => "word32",
+                };
+                format!(
+                    "param_{} -> arg{} ({}, confidence: {}, words: {:?})",
+                    alias.param_idx,
+                    alias.param_idx,
+                    kind,
+                    alias.confidence.as_str(),
+                    alias.observed_words
+                )
             })
             .take(max_lines)
             .collect()
@@ -244,11 +325,19 @@ impl AbiProfile {
 
 pub struct AbiDisplay {
     profile: AbiProfile,
+    aliases: Option<AbiArgAliases>,
 }
 
 impl AbiDisplay {
     pub fn new(profile: AbiProfile) -> Self {
-        Self { profile }
+        Self { profile, aliases: None }
+    }
+
+    pub fn with_aliases(profile: AbiProfile, aliases: AbiArgAliases) -> Self {
+        Self {
+            profile,
+            aliases: Some(aliases),
+        }
     }
 
     pub fn profile(&self) -> AbiProfile {
@@ -262,6 +351,15 @@ impl AbiDisplay {
         let bank = imm_as_u32(&args[0])?;
         let offset = imm_as_u32(&args[1])?;
         let resolved = self.profile.resolve_constmem(bank, offset)?;
+        if let ConstMemKind::ParamWord { param_idx, word_idx } = resolved.kind {
+            if let Some(sym) = self
+                .aliases
+                .as_ref()
+                .and_then(|a| a.render_param_word(param_idx, word_idx))
+            {
+                return Some(sym);
+            }
+        }
         Some(resolved.symbol)
     }
 }
@@ -373,6 +471,76 @@ pub fn annotate_function_ir_constmem(function_ir: &FunctionIR, profile: AbiProfi
     out
 }
 
+pub fn infer_arg_aliases(function_ir: &FunctionIR, annotations: &AbiAnnotations) -> AbiArgAliases {
+    #[derive(Default)]
+    struct ParamUsage {
+        words: BTreeSet<u32>,
+        pointer_like_hits: usize,
+        total_hits: usize,
+    }
+
+    let mut opcode_by_stmt: BTreeMap<StatementRef, String> = BTreeMap::new();
+    for block in &function_ir.blocks {
+        for (stmt_idx, stmt) in block.stmts.iter().enumerate() {
+            let opcode = match &stmt.value {
+                RValue::Op { opcode, .. } => opcode.clone(),
+                RValue::Phi(_) => "phi".to_string(),
+                RValue::ImmI(_) | RValue::ImmF(_) => "imm".to_string(),
+            };
+            opcode_by_stmt.insert(
+                StatementRef {
+                    block_id: block.id,
+                    stmt_idx,
+                },
+                opcode,
+            );
+        }
+    }
+
+    let mut by_param: BTreeMap<u32, ParamUsage> = BTreeMap::new();
+    for (stmt_ref, anns) in annotations.iter() {
+        let opcode = opcode_by_stmt
+            .get(stmt_ref)
+            .map(String::as_str)
+            .unwrap_or("");
+        for ann in anns {
+            if let ConstMemSemantic::ParamWord { param_idx, word_idx } = ann.semantic {
+                let usage = by_param.entry(param_idx).or_default();
+                usage.words.insert(word_idx);
+                usage.total_hits += 1;
+                if is_pointer_context_opcode(opcode) {
+                    usage.pointer_like_hits += 1;
+                }
+            }
+        }
+    }
+
+    let mut out = AbiArgAliases::default();
+    for (param_idx, usage) in by_param {
+        let has_lo = usage.words.contains(&0);
+        let has_hi = usage.words.contains(&1);
+        let (kind, confidence) = if has_lo && has_hi {
+            if usage.pointer_like_hits > 0 {
+                (ArgAliasKind::Ptr64, AliasConfidence::High)
+            } else {
+                (ArgAliasKind::U64, AliasConfidence::Medium)
+            }
+        } else {
+            (ArgAliasKind::Word32, AliasConfidence::Low)
+        };
+        out.by_param.insert(
+            param_idx,
+            ArgAlias {
+                param_idx,
+                kind,
+                confidence,
+                observed_words: usage.words,
+            },
+        );
+    }
+    out
+}
+
 fn collect_constmem_from_expr(expr: &IRExpr, out: &mut Vec<(u32, u32)>) {
     match expr {
         IRExpr::Op { op, args } => {
@@ -393,6 +561,13 @@ fn collect_constmem_from_expr(expr: &IRExpr, out: &mut Vec<(u32, u32)>) {
         }
         IRExpr::Reg(_) | IRExpr::ImmI(_) | IRExpr::ImmF(_) => {}
     }
+}
+
+fn is_pointer_context_opcode(opcode: &str) -> bool {
+    opcode.contains("WIDE")
+        || opcode.starts_with("LD")
+        || opcode.starts_with("ST")
+        || opcode.contains("LEA")
 }
 
 #[cfg(test)]
@@ -477,6 +652,44 @@ mod tests {
             args: vec![IRExpr::ImmI(0), IRExpr::ImmI(0x148)],
         };
         assert_eq!(display.expr(&expr), "param_1[0]");
+    }
+
+    #[test]
+    fn infers_pointer_alias_for_u64_param_used_in_wide_ops() {
+        let sass = r#"
+            /*0000*/ IMAD.WIDE R4, R0, R7, c[0x0][0x160] ;
+            /*0010*/ IADD3.X R5, R5, c[0x0][0x164], RZ ;
+            /*0020*/ EXIT ;
+        "#;
+        let cfg = build_cfg(parse_sass(sass));
+        let fir = build_ssa(&cfg);
+        let anns = annotate_function_ir_constmem(&fir, AbiProfile::modern_param_160());
+        let aliases = infer_arg_aliases(&fir, &anns);
+        let alias = aliases.by_param.get(&0).expect("missing alias for param 0");
+        assert_eq!(alias.kind, ArgAliasKind::Ptr64);
+        assert_eq!(alias.confidence, AliasConfidence::High);
+        assert_eq!(aliases.render_param_word(0, 0).unwrap(), "arg0_ptr.lo32");
+        assert_eq!(aliases.render_param_word(0, 1).unwrap(), "arg0_ptr.hi32");
+    }
+
+    #[test]
+    fn abi_display_prefers_inferred_arg_aliases_for_param_words() {
+        let mut aliases = AbiArgAliases::default();
+        aliases.by_param.insert(
+            1,
+            ArgAlias {
+                param_idx: 1,
+                kind: ArgAliasKind::U64,
+                confidence: AliasConfidence::Medium,
+                observed_words: [0, 1].into_iter().collect(),
+            },
+        );
+        let display = AbiDisplay::with_aliases(AbiProfile::legacy_param_140(), aliases);
+        let expr = IRExpr::Op {
+            op: "ConstMem".to_string(),
+            args: vec![IRExpr::ImmI(0), IRExpr::ImmI(0x148)],
+        };
+        assert_eq!(display.expr(&expr), "arg1_u64.lo32");
     }
 
     #[test]

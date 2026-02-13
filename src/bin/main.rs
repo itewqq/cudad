@@ -254,7 +254,11 @@ fn main() {
     if args.ssa_dot {
         let fir = build_ssa(&cfg);
         let default_display = DefaultDisplay;
-        let abi_display = abi_profile.map(AbiDisplay::new);
+        let abi_display = abi_profile.map(|profile| {
+            let anns = annotate_function_ir_constmem(&fir, profile);
+            let aliases = infer_arg_aliases(&fir, &anns);
+            AbiDisplay::with_aliases(profile, aliases)
+        });
         let display_ctx: &dyn DisplayCtx = abi_display
             .as_ref()
             .map(|d| d as &dyn DisplayCtx)
@@ -269,6 +273,10 @@ fn main() {
     if args.struct_code {
         let fir = build_ssa(&cfg); // build_ssa returns FunctionIR
         let abi_annotations = abi_profile.map(|p| annotate_function_ir_constmem(&fir, p));
+        let abi_aliases = match (abi_profile, abi_annotations.as_ref()) {
+            (Some(_), Some(anns)) => Some(infer_arg_aliases(&fir, anns)),
+            _ => None,
+        };
         // Create the structurizer instance
         let mut structurizer_instance = structurizer::Structurizer::new(&cfg, &fir);
             
@@ -281,9 +289,21 @@ fn main() {
                 }
             }
         }
+        if let Some(aliases) = &abi_aliases {
+            if !aliases.is_empty() {
+                println!("// ABI arg aliases (heuristic):");
+                for line in aliases.summarize_lines(12) {
+                    println!("// {}", line);
+                }
+            }
+        }
         if let Some(structured_func_body) = structurizer_instance.structure_function() {
             let default_display = DefaultDisplay;
-            let abi_display = abi_profile.map(AbiDisplay::new);
+            let abi_display = match (abi_profile, abi_aliases.clone()) {
+                (Some(profile), Some(aliases)) => Some(AbiDisplay::with_aliases(profile, aliases)),
+                (Some(profile), None) => Some(AbiDisplay::new(profile)),
+                (None, _) => None,
+            };
             let display_ctx: &dyn DisplayCtx = abi_display
                 .as_ref()
                 .map(|d| d as &dyn DisplayCtx)
