@@ -14,7 +14,6 @@ if (!(P1)) {
       P1.2 = ISETP.GE.AND(PT, R2.2, 256, PT);
       // 2 phi node(s) omitted
     }
-    continue;
   }
 }
 BB3 {

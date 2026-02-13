@@ -67,7 +67,6 @@ if (!(P0)) {
               R9.4 = FMUL(R4.18, R9.3);
               // 7 phi node(s) omitted
             }
-            continue;
           }
         } else {
           // Condition from BB7
@@ -126,7 +125,6 @@ if (!(P0)) {
                   R9.12 = FMUL(R4.34, R9.11);
                   // 6 phi node(s) omitted
                 }
-                continue;
               }
             } else {
               // Condition from BB12
@@ -144,7 +142,6 @@ if (!(P0)) {
                     R9.15 = FMUL(R4.37, R9.14);
                     // 5 phi node(s) omitted
                   }
-                  continue;
                 }
               } else {
                 return;

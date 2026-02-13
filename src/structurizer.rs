@@ -112,6 +112,27 @@ impl<'a> Structurizer<'a> {
         }
     }
 
+    fn without_redundant_loop_tail_continue(stmt: &StructuredStatement) -> StructuredStatement {
+        match stmt {
+            StructuredStatement::Continue(_) => StructuredStatement::Empty,
+            StructuredStatement::Sequence(stmts) => {
+                if matches!(stmts.last(), Some(StructuredStatement::Continue(_))) {
+                    let trimmed = &stmts[..stmts.len() - 1];
+                    if trimmed.is_empty() {
+                        StructuredStatement::Empty
+                    } else if trimmed.len() == 1 {
+                        trimmed[0].clone()
+                    } else {
+                        StructuredStatement::Sequence(trimmed.to_vec())
+                    }
+                } else {
+                    stmt.clone()
+                }
+            }
+            _ => stmt.clone(),
+        }
+    }
+
     fn node_is_dominated_by(&self, dom_results: &Dominators<NodeIndex>, node_to_check: NodeIndex, potential_dominator: NodeIndex) -> bool {
         if node_to_check == potential_dominator {
             return true;
@@ -829,7 +850,8 @@ impl<'a> Structurizer<'a> {
                         s_out.push_str(&format!("{}do {{\n", indent));
                     }
                 }
-                s_out.push_str(&self.pretty_print(body, ctx, indent_level + 1));
+                let printable_body = Self::without_redundant_loop_tail_continue(body);
+                s_out.push_str(&self.pretty_print(&printable_body, ctx, indent_level + 1));
                 if *loop_type == LoopType::DoWhile {
                      s_out.push_str(&format!("{}}} while({});\n", indent, condition_expr.as_ref().map_or("true".to_string(), |e| ctx.expr(e))));
                 } else {
@@ -1217,5 +1239,29 @@ mod tests {
         assert!(!rendered.contains("phi("));
         assert!(rendered.contains("phi node(s) omitted"));
         assert!(rendered.contains("IADD3("));
+    }
+
+    #[test]
+    fn pretty_print_omits_redundant_loop_tail_continue() {
+        let specs = vec![(0, 0x00, vec![], vec![stmt("BODY")])];
+        let edges = vec![];
+        let (cfg, fir, _) = build_case(&specs, &edges);
+        let structurizer = Structurizer::new(&cfg, &fir);
+        let loop_stmt = StructuredStatement::Loop {
+            loop_type: LoopType::While,
+            header_block_id: Some(0),
+            condition_expr: Some(IRExpr::Reg(RegId::new("P", 0, 1))),
+            body: Box::new(StructuredStatement::Sequence(vec![
+                StructuredStatement::BasicBlock {
+                    block_id: 0,
+                    stmts: fir.blocks[0].stmts.clone(),
+                },
+                StructuredStatement::Continue(None),
+            ])),
+        };
+        let rendered = structurizer.pretty_print(&loop_stmt, &DefaultDisplay, 0);
+        assert!(rendered.contains("while (P0)"));
+        assert!(rendered.contains("BODY("));
+        assert!(!rendered.contains("continue;"));
     }
 }
