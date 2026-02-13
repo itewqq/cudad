@@ -192,6 +192,13 @@ const SAMPLE_SASS: &str = r#"
         /*0ad0*/                   IMAD.MOV.U32 R8, RZ, RZ, R4 ;
 "#;
 
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum AbiProfileMode {
+    Auto,
+    Legacy140,
+    Modern160,
+}
+
 #[derive(Parser, Debug)]
 /// CLI for CUDA SASS SSA/CFG tool
 struct Args {
@@ -213,6 +220,9 @@ struct Args {
     /// Resolve known ABI constant-memory slots (block/grid dims, params)
     #[clap(long)]
     abi_map: bool,
+    /// Force ABI profile used by `--abi-map` (`auto|legacy140|modern160`)
+    #[clap(long, value_enum, default_value = "auto")]
+    abi_profile: AbiProfileMode,
 }
 
 
@@ -225,8 +235,15 @@ fn main() {
         SAMPLE_SASS.to_string()
     };
     let instrs = parse_sass(&sass);
-    let abi_profile = if args.abi_map {
-        Some(AbiProfile::detect(&instrs))
+    let sm_version = parse_sm_version(&sass);
+    let abi_profile = if args.abi_map || !matches!(args.abi_profile, AbiProfileMode::Auto) {
+        let auto_profile = AbiProfile::detect_with_sm(&instrs, sm_version);
+        let selected = match args.abi_profile {
+            AbiProfileMode::Auto => auto_profile,
+            AbiProfileMode::Legacy140 => AbiProfile::legacy_param_140(),
+            AbiProfileMode::Modern160 => AbiProfile::modern_param_160(),
+        };
+        Some(selected)
     } else {
         None
     };

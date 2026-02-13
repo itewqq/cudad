@@ -134,6 +134,24 @@ fn test_parser_normalizes_register_modifiers_and_memref() {
 }
 
 #[test]
+fn test_parse_sm_version_from_headerflags() {
+    let sample = r#"
+        .headerflags @"EF_CUDA_TEXMODE_UNIFIED EF_CUDA_64BIT_ADDRESS EF_CUDA_SM89"
+        /*0000*/ IMAD.MOV.U32 R1, RZ, RZ, c[0x0][0x28] ;
+    "#;
+    assert_eq!(parse_sm_version(sample), Some(89));
+}
+
+#[test]
+fn test_parse_sm_version_from_target_fallback() {
+    let sample = r#"
+        .target sm_75
+        /*0000*/ IMAD.MOV.U32 R1, RZ, RZ, c[0x0][0x28] ;
+    "#;
+    assert_eq!(parse_sm_version(sample), Some(75));
+}
+
+#[test]
 fn test_ssa_keeps_immutable_special_registers_unversioned() {
     let sample = r#"
         /*0000*/ ISETP.GE.AND P0, PT, R0, 0x1, PT ;
@@ -169,6 +187,19 @@ fn test_abi_profile_detects_legacy_window_from_sample() {
     "#;
     let instrs = parse_sass(sample);
     let profile = AbiProfile::detect(&instrs);
+    assert_eq!(profile, AbiProfile::legacy_param_140());
+}
+
+#[test]
+fn test_abi_profile_sm_fallback_without_param_offsets() {
+    let sample = r#"
+        .headerflags @"EF_CUDA_SM70"
+        /*0000*/ S2R R0, SR_CTAID.X ;
+        /*0010*/ S2R R1, SR_TID.X ;
+    "#;
+    let instrs = parse_sass(sample);
+    let sm = parse_sm_version(sample);
+    let profile = AbiProfile::detect_with_sm(&instrs, sm);
     assert_eq!(profile, AbiProfile::legacy_param_140());
 }
 

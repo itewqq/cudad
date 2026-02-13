@@ -63,6 +63,8 @@ lazy_static! {
     static ref RE_HEX_I : Regex = Regex::new(r"^-?0x[0-9A-Fa-f]+$").unwrap();
     static ref RE_DEC_I : Regex = Regex::new(r"^-?\d+$").unwrap();
     static ref RE_FLOAT : Regex = Regex::new(r"^-?\d+\.\d+(e[+-]?\d+)?$").unwrap();
+    static ref RE_HEADER_SM: Regex = Regex::new(r"EF_CUDA_SM(?P<sm>\d+)").unwrap();
+    static ref RE_TARGET_SM: Regex = Regex::new(r"\bsm_(?P<sm>\d+)\b").unwrap();
 }
 
 /* --------------------------------- 基础解析器 -------------------------------- */
@@ -259,4 +261,28 @@ pub fn parse_instruction_line(line: &str) -> Option<Instruction> {
 /* ---------- 解析整段 ---------- */
 pub fn parse_sass(text: &str) -> Vec<Instruction> {
     text.lines().filter_map(parse_instruction_line).collect()
+}
+
+/// Parse SM generation from SASS metadata lines when available.
+/// Priority:
+/// 1) `.headerflags` entries containing `EF_CUDA_SMxx`
+/// 2) `.target sm_xx` fallback
+pub fn parse_sm_version(text: &str) -> Option<u32> {
+    for line in text.lines() {
+        if !line.contains("headerflags") {
+            continue;
+        }
+        if let Some(cap) = RE_HEADER_SM.captures(line) {
+            if let Ok(sm) = cap["sm"].parse::<u32>() {
+                return Some(sm);
+            }
+        }
+    }
+
+    if let Some(cap) = RE_TARGET_SM.captures(text) {
+        if let Ok(sm) = cap["sm"].parse::<u32>() {
+            return Some(sm);
+        }
+    }
+    None
 }

@@ -51,10 +51,33 @@ impl AbiProfile {
     }
 
     /// Detect the best-effort ABI profile from observed constant-memory offsets.
-    /// Heuristic:
-    /// - Prefer layouts with denser hits in the first parameter window.
-    /// - Fall back to modern profile, which matches current fixtures.
+    /// This keeps current behavior for callers without metadata.
     pub fn detect(instructions: &[Instruction]) -> Self {
+        Self::detect_with_sm(instructions, None)
+    }
+
+    /// Detect profile using offsets first, then optional SM metadata fallback.
+    ///
+    /// Fallback rule (when no offset evidence exists):
+    /// - `sm >= 80` -> modern parameter base (`0x160`)
+    /// - otherwise -> legacy parameter base (`0x140`)
+    pub fn detect_with_sm(instructions: &[Instruction], sm: Option<u32>) -> Self {
+        if let Some(by_offset) = Self::detect_from_offsets(instructions) {
+            return by_offset;
+        }
+
+        if let Some(sm_val) = sm {
+            if sm_val >= 80 {
+                return Self::modern_param_160();
+            }
+            return Self::legacy_param_140();
+        }
+
+        // Default keeps existing behavior and current fixtures stable.
+        Self::modern_param_160()
+    }
+
+    fn detect_from_offsets(instructions: &[Instruction]) -> Option<Self> {
         let mut near_140_hits = 0usize;
         let mut near_160_hits = 0usize;
 
@@ -75,12 +98,12 @@ impl AbiProfile {
         }
 
         if near_160_hits > 0 && near_160_hits >= near_140_hits {
-            return Self::modern_param_160();
+            return Some(Self::modern_param_160());
         }
         if near_140_hits > 0 {
-            return Self::legacy_param_140();
+            return Some(Self::legacy_param_140());
         }
-        Self::modern_param_160()
+        None
     }
 
     /// Resolve `c[bank][offset]` into a symbolic ABI meaning when possible.
@@ -226,6 +249,23 @@ mod tests {
         let instrs = parse_sass(sass);
         let p = AbiProfile::detect(&instrs);
         assert_eq!(p, AbiProfile::modern_param_160());
+    }
+
+    #[test]
+    fn detects_profile_from_sm_fallback_when_offsets_absent() {
+        let sass = r#"
+            /*0000*/ S2R R0, SR_CTAID.X ;
+            /*0010*/ S2R R1, SR_TID.X ;
+        "#;
+        let instrs = parse_sass(sass);
+        assert_eq!(
+            AbiProfile::detect_with_sm(&instrs, Some(89)),
+            AbiProfile::modern_param_160()
+        );
+        assert_eq!(
+            AbiProfile::detect_with_sm(&instrs, Some(70)),
+            AbiProfile::legacy_param_140()
+        );
     }
 
     #[test]
