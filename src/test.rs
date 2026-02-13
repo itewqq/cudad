@@ -161,6 +161,34 @@ fn run_structured_output(sass: &str) -> String {
 }
 
 #[test]
+fn test_abi_profile_detects_legacy_window_from_sample() {
+    let sample = r#"
+        /*0000*/ IMAD.MOV.U32 R1, RZ, RZ, c[0x0][0x140] ;
+        /*0010*/ IMAD.MOV.U32 R2, RZ, RZ, c[0x0][0x148] ;
+        /*0020*/ IMAD.MOV.U32 R3, RZ, RZ, c[0x0][0x154] ;
+    "#;
+    let instrs = parse_sass(sample);
+    let profile = AbiProfile::detect(&instrs);
+    assert_eq!(profile, AbiProfile::legacy_param_140());
+}
+
+#[test]
+fn test_structured_output_with_abi_display_symbols_constmem() {
+    let sample = r#"
+        /*0000*/ IMAD.MOV.U32 R1, RZ, RZ, c[0x0][0x140] ;
+        /*0010*/ IMAD.MOV.U32 R2, RZ, RZ, c[0x0][0x8] ;
+        /*0020*/ EXIT ;
+    "#;
+    let cfg = build_cfg(parse_sass(sample));
+    let fir = build_ssa(&cfg);
+    let display = AbiDisplay::new(AbiProfile::legacy_param_140());
+    let out = fir.to_dot(&cfg, &display);
+
+    assert!(out.contains("param_0[0]"));
+    assert!(out.contains("blockDimX"));
+}
+
+#[test]
 fn smoke_struct_output_if_sass() {
     let sass = include_str!("../test_cu/if.sass");
     let expected = include_str!("../test_cu/golden/if.pseudo.c");

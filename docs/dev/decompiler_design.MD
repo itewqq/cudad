@@ -12,6 +12,17 @@ The canonical path for this project is:
 
 Experimental modules are intentionally not part of this critical path.
 
+## ABI Profile Layer
+
+`src/abi.rs` adds an architecture-aware mapping layer for `c[bank][offset]`:
+
+1. `AbiProfile::detect` infers a profile from observed parameter windows (e.g. `0x140` vs `0x160` bases).
+2. `AbiProfile::resolve_constmem` maps known built-ins (`blockDim*`, `gridDim*`) and parameter words (`param_i[j]`).
+3. `AbiDisplay` is an optional `DisplayCtx` that renders symbolic ABI names in DOT/pseudocode output.
+
+This layer is display-oriented and does not change SSA construction semantics.
+Unknown offsets remain explicit raw `ConstMem(...)` values or `abi_internal_0x..` slots.
+
 ## IR Invariants Required by Structurizer
 
 1. `IRBlock::id` must match the CFG basic-block `id`.

@@ -210,6 +210,9 @@ struct Args {
     /// Dump structured block tree as text
     #[clap(long)]
     struct_code: bool,
+    /// Resolve known ABI constant-memory slots (block/grid dims, params)
+    #[clap(long)]
+    abi_map: bool,
 }
 
 
@@ -222,13 +225,24 @@ fn main() {
         SAMPLE_SASS.to_string()
     };
     let instrs = parse_sass(&sass);
+    let abi_profile = if args.abi_map {
+        Some(AbiProfile::detect(&instrs))
+    } else {
+        None
+    };
     let cfg = build_cfg(instrs);
     if args.cfg_dot {
         println!("{}", graph_to_dot(&cfg));
     }
     if args.ssa_dot {
         let fir = build_ssa(&cfg);
-        let dot = fir.to_dot(&cfg, &DefaultDisplay);
+        let default_display = DefaultDisplay;
+        let abi_display = abi_profile.map(AbiDisplay::new);
+        let display_ctx: &dyn DisplayCtx = abi_display
+            .as_ref()
+            .map(|d| d as &dyn DisplayCtx)
+            .unwrap_or(&default_display);
+        let dot = fir.to_dot(&cfg, display_ctx);
         if let Some(ref path) = args.output {
             fs::write(path, dot).expect("Failed to write DOT file");
         } else {
@@ -242,8 +256,13 @@ fn main() {
             
         println!("// --- Structured Output ---");
         if let Some(structured_func_body) = structurizer_instance.structure_function() {
-            let display_ctx = DefaultDisplay; // Use the same DisplayCtx
-            let code_output = structurizer_instance.pretty_print(&structured_func_body, &display_ctx, 0);
+            let default_display = DefaultDisplay;
+            let abi_display = abi_profile.map(AbiDisplay::new);
+            let display_ctx: &dyn DisplayCtx = abi_display
+                .as_ref()
+                .map(|d| d as &dyn DisplayCtx)
+                .unwrap_or(&default_display);
+            let code_output = structurizer_instance.pretty_print(&structured_func_body, display_ctx, 0);
             
             if let Some(ref path) = args.output {
                  // Potentially overwrite if also doing other dots to same file
