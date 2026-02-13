@@ -1,5 +1,5 @@
 use cudad::*;
-use crate::{cfg::build_cfg, ir::build_ssa, cfg_analysis::CFGAnalysis, structurizer::*};
+use crate::{cfg::build_cfg, ir::build_ssa, structurizer::*};
 use clap::Parser;
 use std::fs;
 

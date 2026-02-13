@@ -37,6 +37,12 @@ pub enum Operand {
     ImmediateI(i64),                            // 整数立即数
     ImmediateF(f64),                            // 浮点立即数
     ConstMem { bank: u32, offset: u32 },        // c[bank][off]
+    MemRef {                                     // [R4.64+0x20]
+        base: Box<Operand>,
+        offset: Option<i64>,
+        width: Option<u32>,
+        raw: String,
+    },
     Raw(String),
 }
 
@@ -52,7 +58,7 @@ pub struct Instruction {
 /* --------------------------------- 正则预编译 -------------------------------- */
 
 lazy_static! {
-    static ref RE_REG   : Regex = Regex::new(r"^(?P<cls>UR|R|P)(?P<idx>\d+|Z|T)$").unwrap();
+    static ref RE_REG_NUM: Regex = Regex::new(r"^(?P<cls>UP|UR|R|P)(?P<idx>\d+)$").unwrap();
     static ref RE_CONST : Regex = Regex::new(r"^c\[(?P<bank>0x[0-9A-Fa-f]+)\]\[(?P<off>0x[0-9A-Fa-f]+)\]$").unwrap();
     static ref RE_HEX_I : Regex = Regex::new(r"^-?0x[0-9A-Fa-f]+$").unwrap();
     static ref RE_DEC_I : Regex = Regex::new(r"^-?\d+$").unwrap();
@@ -99,55 +105,115 @@ fn parse_pred(input: &str) -> IResult<&str, PredicateUse> {
 fn is_opcode_char(c: char) -> bool { !(c.is_whitespace() || c == ';') }
 fn parse_opcode(input: &str) -> IResult<&str, &str> { take_while(is_opcode_char)(input) }
 
+fn parse_int_literal(s: &str) -> Option<i64> {
+    if RE_HEX_I.is_match(s) {
+        return parse_hex(s);
+    }
+    if RE_DEC_I.is_match(s) {
+        return s.parse::<i64>().ok();
+    }
+    None
+}
+
+fn parse_register_operand(tok: &str) -> Option<Operand> {
+    let mut sign = 1;
+    let mut core = tok.trim();
+    if let Some(rest) = core.strip_prefix('-') {
+        sign = -1;
+        core = rest;
+    }
+
+    // Treat predicate negation token like "!UPT" as raw expression.
+    if core.starts_with('!') {
+        return None;
+    }
+
+    let mut ty = None;
+    let mut parts = core.split('.');
+    let base = parts.next()?.to_ascii_uppercase();
+    for suffix in parts {
+        let s = suffix.to_ascii_lowercase();
+        if let Ok(bits) = s.parse::<u32>() {
+            ty = Some(RegType::BitWidth(bits));
+        }
+        // ".reuse", ".x8" and other suffixes are syntax decorations for now.
+    }
+
+    let (class, idx) = match base.as_str() {
+        "RZ" => ("RZ".to_string(), 0),
+        "PT" => ("PT".to_string(), 0),
+        "URZ" => ("URZ".to_string(), 0),
+        "UPT" => ("UPT".to_string(), 0),
+        _ => {
+            if let Some(cap) = RE_REG_NUM.captures(base.as_str()) {
+                let class = cap["cls"].to_string();
+                let idx = cap["idx"].parse::<i32>().ok()?;
+                (class, idx)
+            } else {
+                return None;
+            }
+        }
+    };
+
+    Some(Operand::Register { class, idx, sign, ty })
+}
+
+fn parse_mem_ref_operand(tok: &str) -> Option<Operand> {
+    let t = tok.trim();
+    if !(t.starts_with('[') && t.ends_with(']')) {
+        return None;
+    }
+    let inner = &t[1..t.len() - 1];
+    let (base_str, offset) = if let Some((lhs, rhs)) = inner.split_once('+') {
+        (lhs.trim(), parse_int_literal(rhs.trim()))
+    } else {
+        (inner.trim(), None)
+    };
+
+    let base = classify_operand(base_str);
+    let width = match &base {
+        Operand::Register { ty: Some(RegType::BitWidth(bits)), .. } => Some(*bits),
+        _ => None,
+    };
+
+    Some(Operand::MemRef {
+        base: Box::new(base),
+        offset,
+        width,
+        raw: t.to_string(),
+    })
+}
+
 /* ---------- Operand 解析 ---------- */
 fn classify_operand(tok: &str) -> Operand {
     let t = tok.trim();
-    // 1. [expr] 递归解析内存表达式，parser层直接Raw
-    if t.starts_with('[') && t.ends_with(']') {
-        return Operand::Raw(t.to_string());
+    // 1) [base+off] memory reference
+    if let Some(mem) = parse_mem_ref_operand(t) {
+        return mem;
     }
-    // 2. 浮点数优先
+    // 2) floating literal
     if RE_FLOAT.is_match(t) {
         let v: f64 = t.parse().unwrap();
         return Operand::ImmediateF(v);
     }
-    // 3. 整数
+    // 3) integer literal
     if RE_HEX_I.is_match(t) {
-        let neg = t.starts_with("-");
-        let v = parse_hex(t).unwrap();
-        return Operand::ImmediateI(if neg { -v } else { v });
+        return Operand::ImmediateI(parse_hex(t).unwrap());
     }
-    if RE_DEC_I.is_match(t) { return Operand::ImmediateI(t.parse::<i64>().unwrap()); }
-    // 4. Register/Uniform/PT/P0-P6/RZ
-    if let Some(cap) = RE_REG.captures(t) {
-        let class = cap["cls"].to_string();
-        let idx_raw = &cap["idx"];
-        // 新增：解析如R4.64后缀
-        let (t, ty) = if let Some((base, bits)) = t.rsplit_once('.') {
-            if let Ok(bits) = bits.parse::<u32>() {
-                (base, Some(RegType::BitWidth(bits)))
-            } else {
-                (t, None)
-            }
-        } else {
-            (t, None)
-        };
-        let idx = match (class.as_str(), idx_raw.to_ascii_uppercase().as_str()) {
-            ("R", "Z") => 0,
-            ("P", "T") => 0,
-            ("P", n) | ("R", n) | ("UR", n) => n.parse::<i32>().unwrap_or(-1),
-            _ => -1,
-        };
-        let sign = if t.starts_with('-') { -1 } else { 1 };
-        return Operand::Register { class, idx, sign, ty };
+    if RE_DEC_I.is_match(t) {
+        return Operand::ImmediateI(t.parse::<i64>().unwrap());
     }
-    // 5. Const mem c[bank][off]
+    // 4) register-like operand (R*/P*/UR*/UP* plus RZ/PT/URZ/UPT)
+    if let Some(r) = parse_register_operand(t) {
+        return r;
+    }
+    // 5) constant memory c[bank][off]
     if let Some(cap) = RE_CONST.captures(t) {
         let bank = u32::from_str_radix(&cap["bank"][2..], 16).unwrap();
         let off  = u32::from_str_radix(&cap["off"][2..], 16).unwrap();
         return Operand::ConstMem { bank, offset: off };
     }
-    // 6. 其它情况
+    // 6) fallback raw token
     Operand::Raw(t.to_string())
 }
 

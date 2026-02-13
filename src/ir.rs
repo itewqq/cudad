@@ -3,17 +3,14 @@
 //! no string cached inside nodes; all printing via DisplayCtx
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use crate::parser::{Instruction, Operand};
+use crate::parser::Operand;
 use crate::cfg::{ControlFlowGraph, EdgeKind};
 use petgraph::{
     algo::dominators::simple_fast,
     graph::NodeIndex,
-    visit::DfsPostOrder,
     Direction,
 };
 use petgraph::visit::EdgeRef;
-
-use crate::debug_log;
 
 /* =======================================================================
    Section 0 – Printing context
@@ -63,7 +60,11 @@ impl RegId {
         let mut r=self.clone(); r.ssa=Some(v); r
     }
     pub fn display(&self)->String{
-        let base=format!("{}{}",self.class,self.idx);
+        let base = match self.class.as_str() {
+            // Immutable pseudo-registers print without numeric suffix.
+            "RZ" | "PT" | "URZ" | "UPT" => self.class.clone(),
+            _ => format!("{}{}", self.class, self.idx),
+        };
         let ssa=self.ssa.map(|v|format!(".{}",v)).unwrap_or_default();
         let sign=if self.sign<0{"-"}else{""};
         format!("{}{}{}",sign,base,ssa)
@@ -124,9 +125,11 @@ pub struct FunctionIR{
 fn phys_reg_of(op:&Operand)->Option<RegId>{
     match op{
         Operand::Register{class,idx,sign,..} => {
-            if class=="PT"||class=="RZ" {Some(RegId::new(class,0,*sign))}
-            else if class.starts_with('P'){Some(RegId::new("P",*idx,*sign))}
-            else {Some(RegId::new(class, *idx,*sign))}
+            match class.as_str() {
+                "RZ" | "PT" | "URZ" | "UPT" => Some(RegId::new(class, 0, *sign)),
+                "UP" | "P" => Some(RegId::new(class, *idx, *sign)),
+                _ => Some(RegId::new(class, *idx, *sign)),
+            }
         }
         Operand::Uniform{idx} => Some(RegId::new("UR",*idx,1)),
         _=>None
@@ -141,6 +144,15 @@ fn lower_operand(op:&Operand)->IRExpr{
         Operand::ImmediateF(f)=>IRExpr::ImmF(*f),
         Operand::ConstMem{bank,offset}=>{
             IRExpr::Op{op:"ConstMem".into(),args:vec![IRExpr::ImmI(*bank as i64),IRExpr::ImmI(*offset as i64)]}
+        }
+        Operand::MemRef { base, offset, width, .. } => {
+            let base_expr = Box::new(lower_operand(base.as_ref()));
+            let off_expr = offset.as_ref().map(|v| Box::new(IRExpr::ImmI(*v)));
+            IRExpr::Mem {
+                base: base_expr,
+                offset: off_expr,
+                width: *width,
+            }
         }
         Operand::Raw(s)=>{
             if let Ok(i)=s.parse::<i64>() { IRExpr::ImmI(i)}
@@ -167,6 +179,9 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
     /* ---------- helpers ---------- */
     fn base_reg(r: &RegId) -> RegId {
         RegId { ssa: None, ..r.clone() }
+    }
+    fn is_immutable_reg(r: &RegId) -> bool {
+        matches!(r.class.as_str(), "RZ" | "PT" | "URZ" | "UPT")
     }
     fn new_ssa(r: &RegId, cnt: &mut HashMap<RegId, usize>) -> RegId {
         let key = base_reg(r);
@@ -195,6 +210,9 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
     ) {
         match e {
             IRExpr::Reg(r) => {
+                if is_immutable_reg(r) {
+                    return;
+                }
                 let top = top_or_new(&base_reg(r), stack, cnt).clone();
                 *r = top;
             }
@@ -229,7 +247,9 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
             if is_mem_load(&ins.opcode) {
                 if let Some(r) = ins.operands.first().and_then(phys_reg_of) {
                     dest = Some(IRExpr::Reg(r.clone()));
-                    defsites.entry(base_reg(&r)).or_default().insert(n);
+                    if !is_immutable_reg(&r) {
+                        defsites.entry(base_reg(&r)).or_default().insert(n);
+                    }
                 }
                 let mut a = Vec::new();
                 for op in ins.operands.iter().skip(1) {
@@ -255,7 +275,9 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
                     if idx == 0 {
                         if let Some(r) = phys_reg_of(op) {
                             dest = Some(IRExpr::Reg(r.clone()));
-                            defsites.entry(base_reg(&r)).or_default().insert(n);
+                            if !is_immutable_reg(&r) {
+                                defsites.entry(base_reg(&r)).or_default().insert(n);
+                            }
                         }
                     } else {
                         args.push(lo);
@@ -439,7 +461,11 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
 
                 if !matches!(stmt.value, RValue::Phi(_)) {
                     if let Some(dest) = &mut stmt.dest {
-                        let k = base_reg(dest.get_reg().unwrap());
+                        let cur = dest.get_reg().unwrap().clone();
+                        if is_immutable_reg(&cur) {
+                            continue;
+                        }
+                        let k = base_reg(&cur);
                         let new = IRExpr::Reg(new_ssa(&k, counter));
                         stack
                             .entry(k.clone())
@@ -495,7 +521,11 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
             let blk = ir_blocks.get(&bid).unwrap();
             for stmt in &blk.stmts {
                 if let Some(dest) = &stmt.dest {
-                    let k = base_reg(dest.get_reg().unwrap());
+                    let d = dest.get_reg().unwrap();
+                    if is_immutable_reg(d) {
+                        continue;
+                    }
+                    let k = base_reg(d);
                     if let Some(v) = stack.get_mut(&k) {
                         v.pop();
                     }

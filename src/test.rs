@@ -102,3 +102,104 @@ fn rpo_loop(){
     let fir=build_ssa(&cfg);
     assert!(fir.blocks.len()>=2);
 }
+
+#[test]
+fn test_parser_normalizes_register_modifiers_and_memref() {
+    let sample = r#"
+        /*0000*/ IADD3 R4, R2.reuse, -0x1, RZ ;
+        /*0010*/ LDG.E.U8 R16, [R2.64+0x1] ;
+        /*0020*/ ULOP3.LUT UR5, UR5, 0xffffff00, URZ, 0xc0, !UPT ;
+    "#;
+    let instrs = parse_sass(sample);
+    assert_eq!(instrs.len(), 3);
+
+    match &instrs[0].operands[1] {
+        Operand::Register { class, idx, .. } => {
+            assert_eq!(class, "R");
+            assert_eq!(*idx, 2);
+        }
+        _ => panic!("expected normalized register"),
+    }
+    match &instrs[1].operands[1] {
+        Operand::MemRef { offset, width, .. } => {
+            assert_eq!(*offset, Some(1));
+            assert_eq!(*width, Some(64));
+        }
+        _ => panic!("expected parsed mem ref"),
+    }
+    match &instrs[2].operands[3] {
+        Operand::Register { class, .. } => assert_eq!(class, "URZ"),
+        _ => panic!("expected special register URZ"),
+    }
+}
+
+#[test]
+fn test_ssa_keeps_immutable_special_registers_unversioned() {
+    let sample = r#"
+        /*0000*/ ISETP.GE.AND P0, PT, R0, 0x1, PT ;
+        /*0010*/ IADD3 R1, RZ, 0x1, RZ ;
+        /*0020*/ EXIT ;
+    "#;
+    let cfg = build_cfg(parse_sass(sample));
+    let fir = build_ssa(&cfg);
+    let dot = fir.to_dot(&cfg, &DefaultDisplay);
+
+    assert!(dot.contains("RZ"));
+    assert!(dot.contains("PT"));
+    assert!(!dot.contains("RZ."));
+    assert!(!dot.contains("PT."));
+}
+
+fn run_structured_output(sass: &str) -> String {
+    let cfg = build_cfg(parse_sass(sass));
+    let fir = build_ssa(&cfg);
+    let mut structurizer = Structurizer::new(&cfg, &fir);
+    match structurizer.structure_function() {
+        Some(tree) => structurizer.pretty_print(&tree, &DefaultDisplay, 0),
+        None => String::new(),
+    }
+}
+
+#[test]
+fn smoke_struct_output_if_sass() {
+    let sass = include_str!("../test_cu/if.sass");
+    let expected = include_str!("../test_cu/golden/if.pseudo.c");
+    let out1 = run_structured_output(sass);
+    let out2 = run_structured_output(sass);
+    assert!(!out1.trim().is_empty());
+    assert_eq!(out1, out2);
+    assert_eq!(out1, expected);
+}
+
+#[test]
+fn smoke_struct_output_loop_constant_sass() {
+    let sass = include_str!("../test_cu/loop_constant.sass");
+    let expected = include_str!("../test_cu/golden/loop_constant.pseudo.c");
+    let out1 = run_structured_output(sass);
+    let out2 = run_structured_output(sass);
+    assert!(!out1.trim().is_empty());
+    assert_eq!(out1, out2);
+    assert_eq!(out1, expected);
+}
+
+#[test]
+fn smoke_struct_output_if_loop_sass() {
+    let sass = include_str!("../test_cu/if_loop.sass");
+    let expected = include_str!("../test_cu/golden/if_loop.pseudo.c");
+    let out1 = run_structured_output(sass);
+    let out2 = run_structured_output(sass);
+    assert!(!out1.trim().is_empty());
+    assert_eq!(out1, out2);
+    assert_eq!(out1, expected);
+}
+
+#[test]
+fn smoke_struct_output_test_div_sass() {
+    let sass = include_str!("../test_cu/test_div.sass");
+    let expected = include_str!("../test_cu/golden/test_div.pseudo.c");
+    let out1 = run_structured_output(sass);
+    let out2 = run_structured_output(sass);
+    assert!(!out1.trim().is_empty());
+    assert_eq!(out1, out2);
+    assert_eq!(out1, expected);
+}

@@ -1,0 +1,54 @@
+# Decompiler Design Notes (Stabilization Pass)
+
+## Pipeline
+
+The canonical path for this project is:
+
+1. `parse_sass` (`src/parser.rs`)
+2. `build_cfg` (`src/cfg.rs`)
+3. `build_ssa` (`src/ir.rs`)
+4. `Structurizer::structure_function` (`src/structurizer.rs`)
+5. `Structurizer::pretty_print` (C-like pseudocode)
+
+Experimental modules are intentionally not part of this critical path.
+
+## IR Invariants Required by Structurizer
+
+1. `IRBlock::id` must match the CFG basic-block `id`.
+2. `IRBlock::start_addr` must match CFG block `start` for address->node mapping.
+3. `IRBlock::irdst` must represent outgoing control edges with conditions:
+   - `IRCond::True` for unconditional edges.
+   - `IRCond::Pred` for predicate-conditioned edges.
+4. Predicate conditions should be explicit and stable after SSA renaming.
+5. Immutable pseudo-registers (`RZ`, `PT`, `URZ`, `UPT`) are not SSA definition targets.
+
+## Structurizer Pattern Order
+
+`structure_region_recursive` processes patterns in this order:
+
+1. Loop recovery (`try_structure_loop`)
+2. If / if-else recovery (`try_structure_if`)
+3. Sequence extension (single successor)
+4. Fallback to `UnstructuredJump` (`goto`) for unsupported branch shapes
+
+This order intentionally prefers high-level constructs first and preserves output totality
+by falling back to goto when recognition is uncertain.
+
+## Known Unsupported / Partial Cases
+
+1. Complex nested branch reconstruction inside loop bodies is partial.
+2. Multi-way branch normalization to `switch` is not implemented.
+3. Some loop exits still degrade to goto fallback depending on CFG shape.
+
+These cases should not panic; they should emit explicit goto-based pseudocode.
+
+## Debug Checkpoints
+
+Suggested instrumentation points when debugging structurization:
+
+1. Start of `structure_region_recursive` loop for active node transitions.
+2. Entry/exit of `try_structure_if` with detected merge node.
+3. Entry/exit of `try_structure_loop` with computed loop body and exits.
+4. `structure_loop_body_recursive` successor classification (`break`, `continue`, fallback goto).
+
+Use these checkpoints to correlate CFG nodes, `irdst`, and final pseudocode shape.
