@@ -51,7 +51,7 @@ pub struct RegionForest<'a> {
     /// Borrowed reference to the immutable original CFG.  Used only for
     /// debugging and for anchoring back to block addresses when emitting
     /// pseudocode comments.
-    cfg: &'a ControlFlowGraph,
+    _cfg: &'a ControlFlowGraph,
 }
 
 impl<'a> RegionForest<'a> {
@@ -72,7 +72,7 @@ impl<'a> RegionForest<'a> {
             rg.add_edge(s, d, ());
         }
         let root = blk_map[&cfg.node_indices().next().expect("empty CFG?")];
-        Self { rg, root, blk_map, cfg }
+        Self { rg, root, blk_map, _cfg: cfg }
     }
 
     /// Collapse an *internal, connected* set of region nodes into a new
@@ -133,12 +133,4 @@ impl<'a> RegionForest<'a> {
             self.blk_map.insert(b, new_r);
         }
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use petgraph::graph::Graph;
-
-    
 }

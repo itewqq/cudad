@@ -6,7 +6,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use crate::parser::Operand;
 use crate::cfg::{ControlFlowGraph, EdgeKind};
 use petgraph::{
-    algo::dominators::simple_fast,
     graph::NodeIndex,
     Direction,
 };

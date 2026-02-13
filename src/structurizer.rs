@@ -3,7 +3,9 @@
 //! converted into structured control flow, it falls back to explicit goto.
 
 use crate::ir::{FunctionIR, IRBlock, IRExpr, IRCond, RegId, DisplayCtx, IRStatement, RValue};
+use crate::abi::StatementRef;
 use crate::cfg::{ControlFlowGraph, BasicBlock as CfgBasicBlock, EdgeKind}; 
+use crate::semantic_lift::SemanticLiftResult;
 
 use petgraph::graph::{NodeIndex, DiGraph};
 use petgraph::visit::EdgeRef;
@@ -578,7 +580,7 @@ impl<'a> Structurizer<'a> {
             }
         }
         
-        let mut backup_processed = self.processed_cfg_nodes.clone();
+        let backup_processed = self.processed_cfg_nodes.clone();
         for node in &loop_body_cfg_nodes { if *node != potential_header_cfg_node { self.processed_cfg_nodes.remove(node); } }
         // Header itself is part of Loop construct, not to be re-processed as a loose block by body structuring.
         self.processed_cfg_nodes.insert(potential_header_cfg_node); 
@@ -603,14 +605,16 @@ impl<'a> Structurizer<'a> {
                 body_entry_for_structuring, 
                 &loop_body_cfg_nodes, 
                 potential_header_cfg_node, 
-                loop_natural_successor_node
+                loop_natural_successor_node,
+                None,
             ).unwrap_or(StructuredStatement::Empty)
         } else {
              self.structure_loop_body_recursive(
                 body_entry_for_structuring, 
                 &loop_body_cfg_nodes, 
                 potential_header_cfg_node, 
-                loop_natural_successor_node
+                loop_natural_successor_node,
+                None,
             ).unwrap_or(StructuredStatement::Empty)
         };
 
@@ -633,6 +637,7 @@ impl<'a> Structurizer<'a> {
         nodes_in_this_loop: &HashSet<NodeIndex>,
         loop_header_for_continue: NodeIndex,
         loop_exit_for_break: Option<NodeIndex>,
+        stop_at: Option<NodeIndex>,
     ) -> Option<StructuredStatement> {
         // Single-header loop fallback: keep the header body visible and model
         // the latch as an explicit continue.
@@ -669,6 +674,9 @@ impl<'a> Structurizer<'a> {
         let mut active_node_in_body = current_body_cfg_node;
         
         'body_sequence: loop {
+            if Some(active_node_in_body) == stop_at {
+                break 'body_sequence;
+            }
             if !nodes_in_this_loop.contains(&active_node_in_body) ||
                self.processed_cfg_nodes.contains(&active_node_in_body) ||
                active_node_in_body == loop_header_for_continue { // Don't re-enter header from body sequence
@@ -694,17 +702,83 @@ impl<'a> Structurizer<'a> {
             }
 
 
-            // For now, treat blocks in loop body sequentially if not direct break/continue
-            // TODO: Integrate `try_structure_if` here for branches *within* the loop body.
+            let successors: Vec<NodeIndex> = self.cfg.neighbors_directed(active_node_in_body, Direction::Outgoing).collect();
+            if successors.len() > 1 {
+                if let Some((cond_expr, true_target, false_target_opt)) =
+                    self.extract_if_targets_and_condition(ir_block)
+                {
+                    let false_target = false_target_opt.or_else(|| {
+                        successors
+                            .iter()
+                            .copied()
+                            .find(|succ| *succ != true_target)
+                    });
+
+                    if let Some(false_target) = false_target {
+                        let merge_node_opt = self.immediate_pdom_map.get(&active_node_in_body).copied();
+                        let then_stmt_opt = self.structure_loop_branch_target(
+                            true_target,
+                            nodes_in_this_loop,
+                            loop_header_for_continue,
+                            loop_exit_for_break,
+                            merge_node_opt,
+                        );
+                        let else_stmt_opt = self.structure_loop_branch_target(
+                            false_target,
+                            nodes_in_this_loop,
+                            loop_header_for_continue,
+                            loop_exit_for_break,
+                            merge_node_opt,
+                        );
+
+                        if let (Some(then_stmt), Some(else_stmt)) = (then_stmt_opt, else_stmt_opt) {
+                            self.processed_cfg_nodes.insert(active_node_in_body);
+                            body_statements.push(StructuredStatement::If {
+                                condition_block_id: ir_block.id,
+                                condition_expr: cond_expr,
+                                then_branch: Box::new(then_stmt),
+                                else_branch: if matches!(else_stmt, StructuredStatement::Empty) {
+                                    None
+                                } else {
+                                    Some(Box::new(else_stmt))
+                                },
+                            });
+
+                            if let Some(merge_node) = merge_node_opt {
+                                if Some(merge_node) == stop_at {
+                                    break 'body_sequence;
+                                }
+                                if merge_node == loop_header_for_continue {
+                                    body_statements.push(StructuredStatement::Continue(None));
+                                    break 'body_sequence;
+                                }
+                                if Some(merge_node) == loop_exit_for_break {
+                                    body_statements.push(StructuredStatement::Break(None));
+                                    break 'body_sequence;
+                                }
+                                if nodes_in_this_loop.contains(&merge_node) {
+                                    active_node_in_body = merge_node;
+                                    continue 'body_sequence;
+                                }
+                            }
+                            break 'body_sequence;
+                        }
+                    }
+                }
+            }
+
+            // Default sequential/fallback handling for non-if shapes.
             self.processed_cfg_nodes.insert(active_node_in_body);
             body_statements.push(StructuredStatement::BasicBlock {
                 block_id: ir_block.id,
                 stmts: ir_block.stmts.clone(),
             });
 
-            let successors: Vec<NodeIndex> = self.cfg.neighbors_directed(active_node_in_body, Direction::Outgoing).collect();
             if successors.len() == 1 {
                 let succ_node = successors[0];
+                if Some(succ_node) == stop_at {
+                    break 'body_sequence;
+                }
                 if succ_node == loop_header_for_continue {
                     body_statements.push(StructuredStatement::Continue(None));
                     break 'body_sequence; // Sequence ends with a continue
@@ -724,7 +798,7 @@ impl<'a> Structurizer<'a> {
                 break 'body_sequence;
             } else { // Branch within loop body
                  body_statements.push(StructuredStatement::UnstructuredJump{ from_block_id: ir_block.id, to_block_id: self.cfg[successors[0]].id, condition: None });
-                break 'body_sequence; // TODO: Handle with try_structure_if
+                break 'body_sequence;
             }
         }
 
@@ -732,6 +806,35 @@ impl<'a> Structurizer<'a> {
         if body_statements.is_empty() { Some(StructuredStatement::Empty) }
         else if body_statements.len() == 1 { Some(body_statements.remove(0)) }
         else { Some(StructuredStatement::Sequence(body_statements)) }
+    }
+
+    fn structure_loop_branch_target(
+        &mut self,
+        target: NodeIndex,
+        nodes_in_this_loop: &HashSet<NodeIndex>,
+        loop_header_for_continue: NodeIndex,
+        loop_exit_for_break: Option<NodeIndex>,
+        stop_at: Option<NodeIndex>,
+    ) -> Option<StructuredStatement> {
+        if Some(target) == stop_at {
+            return Some(StructuredStatement::Empty);
+        }
+        if target == loop_header_for_continue {
+            return Some(StructuredStatement::Continue(None));
+        }
+        if Some(target) == loop_exit_for_break {
+            return Some(StructuredStatement::Break(None));
+        }
+        if nodes_in_this_loop.contains(&target) {
+            return self.structure_loop_body_recursive(
+                target,
+                nodes_in_this_loop,
+                loop_header_for_continue,
+                loop_exit_for_break,
+                stop_at,
+            );
+        }
+        None
     }
 
     fn get_loop_successor(&self, loop_stmt: &StructuredStatement) -> Option<NodeIndex> {
@@ -747,6 +850,16 @@ impl<'a> Structurizer<'a> {
     }
 
     pub fn pretty_print(&self, stmt: &StructuredStatement, ctx: &dyn DisplayCtx, indent_level: usize) -> String {
+        self.pretty_print_with_lift(stmt, ctx, indent_level, None)
+    }
+
+    pub fn pretty_print_with_lift(
+        &self,
+        stmt: &StructuredStatement,
+        ctx: &dyn DisplayCtx,
+        indent_level: usize,
+        lifted: Option<&SemanticLiftResult>,
+    ) -> String {
         let indent = "  ".repeat(indent_level);
         let mut s_out = String::new();
 
@@ -754,7 +867,7 @@ impl<'a> Structurizer<'a> {
             StructuredStatement::BasicBlock { block_id, stmts } => {
                 s_out.push_str(&format!("{}BB{} {{\n", indent, block_id));
                 let mut omitted_phi_count = 0usize;
-                for ir_s in stmts {
+                for (stmt_idx, ir_s) in stmts.iter().enumerate() {
                     if matches!(ir_s.value, RValue::Phi(_)) {
                         omitted_phi_count += 1;
                         continue;
@@ -777,6 +890,26 @@ impl<'a> Structurizer<'a> {
                             ));
                             continue;
                         }
+                    }
+
+                    if let Some(lifted_stmt) = lifted.and_then(|res| {
+                        res.by_stmt.get(&StatementRef {
+                            block_id: *block_id,
+                            stmt_idx,
+                        })
+                    }) {
+                        let pred_str = lifted_stmt
+                            .pred
+                            .as_ref()
+                            .map_or_else(String::new, |p| format!("if ({}) ", p.render()));
+                        s_out.push_str(&format!(
+                            "{}{}{} = {};\n",
+                            "  ".repeat(indent_level + 1),
+                            pred_str,
+                            lifted_stmt.dest,
+                            lifted_stmt.rhs.render()
+                        ));
+                        continue;
                     }
 
                     let dest_str = ir_s.dest.as_ref().map_or_else(|| "_".to_string(), |d| ctx.expr(d));
@@ -807,7 +940,7 @@ impl<'a> Structurizer<'a> {
             StructuredStatement::Sequence(stmts) => {
                 for s_child in stmts {
                     if !matches!(s_child, StructuredStatement::Empty) { // Don't print empty
-                        s_out.push_str(&self.pretty_print(s_child, ctx, indent_level));
+                        s_out.push_str(&self.pretty_print_with_lift(s_child, ctx, indent_level, lifted));
                     }
                 }
             }
@@ -822,16 +955,16 @@ impl<'a> Structurizer<'a> {
                     // Canonicalize "if (cond) {} else { X }" -> "if (!cond) { X }".
                     s_out.push_str(&format!("{}// Condition from BB{}\n", indent, condition_block_id));
                     s_out.push_str(&format!("{}if ({}) {{\n", indent, ctx.expr(&negate_condition(condition_expr.clone()))));
-                    s_out.push_str(&self.pretty_print(else_ref.unwrap(), ctx, indent_level + 1));
+                    s_out.push_str(&self.pretty_print_with_lift(else_ref.unwrap(), ctx, indent_level + 1, lifted));
                     s_out.push_str(&format!("{}}}\n", indent));
                 } else {
                     s_out.push_str(&format!("{}// Condition from BB{}\n", indent, condition_block_id));
                     s_out.push_str(&format!("{}if ({}) {{\n", indent, ctx.expr(condition_expr)));
-                    s_out.push_str(&self.pretty_print(then_branch, ctx, indent_level + 1));
+                    s_out.push_str(&self.pretty_print_with_lift(then_branch, ctx, indent_level + 1, lifted));
                     if let Some(eb) = else_ref {
                         if !Self::is_effectively_empty(eb) {
                             s_out.push_str(&format!("{}}} else {{\n", indent));
-                            s_out.push_str(&self.pretty_print(eb, ctx, indent_level + 1));
+                            s_out.push_str(&self.pretty_print_with_lift(eb, ctx, indent_level + 1, lifted));
                         }
                     }
                     s_out.push_str(&format!("{}}}\n", indent));
@@ -851,7 +984,7 @@ impl<'a> Structurizer<'a> {
                     }
                 }
                 let printable_body = Self::without_redundant_loop_tail_continue(body);
-                s_out.push_str(&self.pretty_print(&printable_body, ctx, indent_level + 1));
+                s_out.push_str(&self.pretty_print_with_lift(&printable_body, ctx, indent_level + 1, lifted));
                 if *loop_type == LoopType::DoWhile {
                      s_out.push_str(&format!("{}}} while({});\n", indent, condition_expr.as_ref().map_or("true".to_string(), |e| ctx.expr(e))));
                 } else {
@@ -1100,7 +1233,7 @@ mod tests {
         let loop_nodes: HashSet<NodeIndex> = [id_to_idx[&0], id_to_idx[&1]].into_iter().collect();
 
         let out = structurizer
-            .structure_loop_body_recursive(id_to_idx[&1], &loop_nodes, id_to_idx[&0], Some(id_to_idx[&3]))
+            .structure_loop_body_recursive(id_to_idx[&1], &loop_nodes, id_to_idx[&0], Some(id_to_idx[&3]), None)
             .unwrap();
         assert!(contains_break(&out));
     }
@@ -1117,7 +1250,7 @@ mod tests {
         let loop_nodes: HashSet<NodeIndex> = [id_to_idx[&0], id_to_idx[&1]].into_iter().collect();
 
         let out = structurizer
-            .structure_loop_body_recursive(id_to_idx[&1], &loop_nodes, id_to_idx[&0], None)
+            .structure_loop_body_recursive(id_to_idx[&1], &loop_nodes, id_to_idx[&0], None, None)
             .unwrap();
         assert!(contains_continue(&out));
     }
@@ -1139,9 +1272,53 @@ mod tests {
         let loop_nodes: HashSet<NodeIndex> = [id_to_idx[&0], id_to_idx[&1]].into_iter().collect();
 
         let out = structurizer
-            .structure_loop_body_recursive(id_to_idx[&1], &loop_nodes, id_to_idx[&0], Some(id_to_idx[&3]))
+            .structure_loop_body_recursive(id_to_idx[&1], &loop_nodes, id_to_idx[&0], Some(id_to_idx[&3]), None)
             .unwrap();
         assert!(contains_goto(&out));
+    }
+
+    #[test]
+    fn loop_body_recovers_if_inside_loop() {
+        let p0 = RegId::new("P", 0, 1);
+        let specs = vec![
+            (0, 0x00, vec![], vec![stmt("HDR")]),
+            (
+                1,
+                0x10,
+                vec![
+                    (Some(IRCond::Pred { reg: p0.clone(), sense: true }), 0x20),
+                    (Some(IRCond::Pred { reg: p0, sense: false }), 0x30),
+                ],
+                vec![stmt("CMP")],
+            ),
+            (2, 0x20, vec![(Some(IRCond::True), 0x40)], vec![stmt("THEN")]),
+            (3, 0x30, vec![(Some(IRCond::True), 0x40)], vec![stmt("ELSE")]),
+            (4, 0x40, vec![(Some(IRCond::True), 0x00)], vec![stmt("LATCH")]),
+        ];
+        let edges = vec![
+            (1, 2, EdgeKind::CondBranch),
+            (1, 3, EdgeKind::FallThrough),
+            (2, 4, EdgeKind::UncondBranch),
+            (3, 4, EdgeKind::UncondBranch),
+            (4, 0, EdgeKind::UncondBranch),
+        ];
+        let (cfg, fir, id_to_idx) = build_case(&specs, &edges);
+        let mut structurizer = Structurizer::new(&cfg, &fir);
+        let loop_nodes: HashSet<NodeIndex> = [
+            id_to_idx[&0],
+            id_to_idx[&1],
+            id_to_idx[&2],
+            id_to_idx[&3],
+            id_to_idx[&4],
+        ]
+        .into_iter()
+        .collect();
+
+        let out = structurizer
+            .structure_loop_body_recursive(id_to_idx[&1], &loop_nodes, id_to_idx[&0], None, None)
+            .unwrap();
+        assert!(contains_if(&out));
+        assert!(!contains_goto(&out));
     }
 
     #[test]

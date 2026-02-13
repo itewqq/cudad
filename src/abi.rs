@@ -186,6 +186,67 @@ impl AbiArgAliases {
             .take(max_lines)
             .collect()
     }
+
+    pub fn render_typed_arg_declarations(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for alias in self.by_param.values() {
+            match alias.kind {
+                ArgAliasKind::Ptr64 => {
+                    out.push(format!(
+                        "uint64_t arg{}_ptr; // confidence: {}",
+                        alias.param_idx,
+                        alias.confidence.as_str()
+                    ));
+                }
+                ArgAliasKind::U64 => {
+                    out.push(format!(
+                        "uint64_t arg{}_u64; // confidence: {}",
+                        alias.param_idx,
+                        alias.confidence.as_str()
+                    ));
+                }
+                ArgAliasKind::Word32 => {
+                    for w in &alias.observed_words {
+                        out.push(format!(
+                            "uint32_t arg{}_word{}; // confidence: {}",
+                            alias.param_idx,
+                            w,
+                            alias.confidence.as_str()
+                        ));
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+pub fn infer_local_typed_declarations(function_ir: &FunctionIR) -> Vec<String> {
+    let mut regs: BTreeSet<(String, i32)> = BTreeSet::new();
+    for block in &function_ir.blocks {
+        for stmt in &block.stmts {
+            if let Some(IRExpr::Reg(r)) = &stmt.dest {
+                if is_immutable_reg(r) {
+                    continue;
+                }
+                regs.insert((r.class.clone(), r.idx));
+            }
+        }
+    }
+
+    regs.into_iter()
+        .map(|(class, idx)| {
+            if class == "P" || class == "UP" {
+                format!("bool {}{};", class, idx)
+            } else {
+                format!("uint32_t {}{};", class, idx)
+            }
+        })
+        .collect()
+}
+
+fn is_immutable_reg(r: &RegId) -> bool {
+    matches!(r.class.as_str(), "RZ" | "PT" | "URZ" | "UPT")
 }
 
 impl From<ConstMemKind> for ConstMemSemantic {
@@ -690,6 +751,47 @@ mod tests {
             args: vec![IRExpr::ImmI(0), IRExpr::ImmI(0x148)],
         };
         assert_eq!(display.expr(&expr), "arg1_u64.lo32");
+    }
+
+    #[test]
+    fn renders_typed_arg_declarations_from_aliases() {
+        let mut aliases = AbiArgAliases::default();
+        aliases.by_param.insert(
+            0,
+            ArgAlias {
+                param_idx: 0,
+                kind: ArgAliasKind::Ptr64,
+                confidence: AliasConfidence::High,
+                observed_words: [0, 1].into_iter().collect(),
+            },
+        );
+        aliases.by_param.insert(
+            3,
+            ArgAlias {
+                param_idx: 3,
+                kind: ArgAliasKind::Word32,
+                confidence: AliasConfidence::Low,
+                observed_words: [1].into_iter().collect(),
+            },
+        );
+
+        let decls = aliases.render_typed_arg_declarations();
+        assert!(decls.iter().any(|d| d.contains("uint64_t arg0_ptr;")));
+        assert!(decls.iter().any(|d| d.contains("uint32_t arg3_word1;")));
+    }
+
+    #[test]
+    fn infers_local_typed_declarations_from_ssa_dests() {
+        let sass = r#"
+            /*0000*/ ISETP.GE.AND P0, PT, R0, 0x1, PT ;
+            /*0010*/ IADD3 R1, R1, 0x1, RZ ;
+            /*0020*/ EXIT ;
+        "#;
+        let cfg = build_cfg(parse_sass(sass));
+        let fir = build_ssa(&cfg);
+        let decls = infer_local_typed_declarations(&fir);
+        assert!(decls.iter().any(|d| d == "bool P0;"));
+        assert!(decls.iter().any(|d| d == "uint32_t R1;"));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::fmt::{self, Write};
+use std::fmt::Write;
 
 #[derive(Clone, Debug)]
 pub enum HExpr {

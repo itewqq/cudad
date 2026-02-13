@@ -178,6 +178,18 @@ fn run_structured_output(sass: &str) -> String {
     }
 }
 
+fn run_structured_output_lifted(sass: &str) -> String {
+    let cfg = build_cfg(parse_sass(sass));
+    let fir = build_ssa(&cfg);
+    let mut structurizer = Structurizer::new(&cfg, &fir);
+    let lift_cfg = SemanticLiftConfig::default();
+    let lifted = lift_function_ir(&fir, &lift_cfg);
+    match structurizer.structure_function() {
+        Some(tree) => structurizer.pretty_print_with_lift(&tree, &DefaultDisplay, 0, Some(&lifted)),
+        None => String::new(),
+    }
+}
+
 #[test]
 fn test_abi_profile_detects_legacy_window_from_sample() {
     let sample = r#"
@@ -279,4 +291,115 @@ fn smoke_struct_output_test_div_sass() {
     assert!(!out1.trim().is_empty());
     assert_eq!(out1, out2);
     assert_eq!(out1.trim_end(), expected.trim_end());
+}
+
+#[test]
+fn smoke_struct_output_lifted_if_sass() {
+    let sass = include_str!("../test_cu/if.sass");
+    let expected = include_str!("../test_cu/golden_lifted/if.pseudo.c");
+    let out1 = run_structured_output_lifted(sass);
+    let out2 = run_structured_output_lifted(sass);
+    assert!(!out1.trim().is_empty());
+    assert_eq!(out1, out2);
+    assert_eq!(out1.trim_end(), expected.trim_end());
+}
+
+#[test]
+fn smoke_struct_output_lifted_loop_constant_sass() {
+    let sass = include_str!("../test_cu/loop_constant.sass");
+    let expected = include_str!("../test_cu/golden_lifted/loop_constant.pseudo.c");
+    let out1 = run_structured_output_lifted(sass);
+    let out2 = run_structured_output_lifted(sass);
+    assert!(!out1.trim().is_empty());
+    assert_eq!(out1, out2);
+    assert_eq!(out1.trim_end(), expected.trim_end());
+}
+
+#[test]
+fn smoke_struct_output_lifted_if_loop_sass() {
+    let sass = include_str!("../test_cu/if_loop.sass");
+    let expected = include_str!("../test_cu/golden_lifted/if_loop.pseudo.c");
+    let out1 = run_structured_output_lifted(sass);
+    let out2 = run_structured_output_lifted(sass);
+    assert!(!out1.trim().is_empty());
+    assert_eq!(out1, out2);
+    assert_eq!(out1.trim_end(), expected.trim_end());
+}
+
+#[test]
+fn smoke_struct_output_lifted_test_div_sass() {
+    let sass = include_str!("../test_cu/test_div.sass");
+    let expected = include_str!("../test_cu/golden_lifted/test_div.pseudo.c");
+    let out1 = run_structured_output_lifted(sass);
+    let out2 = run_structured_output_lifted(sass);
+    assert!(!out1.trim().is_empty());
+    assert_eq!(out1, out2);
+    assert_eq!(out1.trim_end(), expected.trim_end());
+}
+
+#[test]
+fn smoke_struct_output_lifted_rc4_sass() {
+    let sass = include_str!("../test_cu/rc4.sass");
+    let expected = include_str!("../test_cu/golden_lifted/rc4.pseudo.c");
+    let out1 = run_structured_output_lifted(sass);
+    let out2 = run_structured_output_lifted(sass);
+    assert!(!out1.trim().is_empty());
+    assert_eq!(out1, out2);
+    assert_eq!(out1.trim_end(), expected.trim_end());
+}
+
+#[test]
+fn lifted_output_uses_infix_for_supported_patterns() {
+    let sass = include_str!("../test_cu/if.sass");
+    let out = run_structured_output_lifted(sass);
+    assert!(out.contains("R1.1 = R1.0 + 1;"));
+    assert!(!out.contains("IADD3("));
+}
+
+#[test]
+fn lifted_output_falls_back_to_raw_for_unmatched_opcodes() {
+    let sass = include_str!("../test_cu/loop_constant.sass");
+    let out = run_structured_output_lifted(sass);
+    assert!(out.contains("S2R("));
+}
+
+#[test]
+fn semantic_lift_has_mixed_coverage_on_if_loop_fixture() {
+    let sass = include_str!("../test_cu/if_loop.sass");
+    let cfg = build_cfg(parse_sass(sass));
+    let fir = build_ssa(&cfg);
+    let lifted = lift_function_ir(&fir, &SemanticLiftConfig::default());
+    assert!(lifted.stats.lifted > 0);
+    assert!(lifted.stats.fallback > 0);
+}
+
+#[test]
+fn semantic_lift_percentage_gate_if_loop_fixture() {
+    let sass = include_str!("../test_cu/if_loop.sass");
+    let cfg = build_cfg(parse_sass(sass));
+    let fir = build_ssa(&cfg);
+    let lifted = lift_function_ir(&fir, &SemanticLiftConfig::default());
+
+    assert!(lifted.stats.attempted > 0);
+    let lifted_pct = lifted.stats.lifted as f64 / lifted.stats.attempted as f64;
+    let fallback_pct = lifted.stats.fallback as f64 / lifted.stats.attempted as f64;
+
+    // Guardrails for regression detection while preserving conservative fallback.
+    assert!(lifted_pct >= 0.30);
+    assert!(fallback_pct <= 0.70);
+}
+
+#[test]
+fn structured_output_goto_gate_lifted_fixtures() {
+    let if_loop = run_structured_output_lifted(include_str!("../test_cu/if_loop.sass"));
+    let rc4 = run_structured_output_lifted(include_str!("../test_cu/rc4.sass"));
+    let test_div = run_structured_output_lifted(include_str!("../test_cu/test_div.sass"));
+
+    let if_loop_goto = if_loop.matches("goto BB").count();
+    let rc4_goto = rc4.matches("goto BB").count();
+    let test_div_goto = test_div.matches("goto BB").count();
+
+    assert_eq!(if_loop_goto, 0);
+    assert_eq!(rc4_goto, 0);
+    assert_eq!(test_div_goto, 0);
 }

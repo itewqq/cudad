@@ -8,7 +8,23 @@ The canonical path for this project is:
 2. `build_cfg` (`src/cfg.rs`)
 3. `build_ssa` (`src/ir.rs`)
 4. `Structurizer::structure_function` (`src/structurizer.rs`)
-5. `Structurizer::pretty_print` (C-like pseudocode)
+5. `Structurizer::pretty_print` (C-like pseudocode, default path)
+
+Optional (opt-in) structured rendering stage:
+
+1. `lift_function_ir` (`src/semantic_lift.rs`) computes conservative
+   expression rewrites keyed by `StatementRef`.
+2. `Structurizer::pretty_print_with_lift` renders lifted expressions when
+   available, and falls back to current opcode-style rendering otherwise.
+3. CLI control: `--semantic-lift` (effective with `--struct-code`).
+
+Optional declaration stage (opt-in):
+
+1. `AbiArgAliases::render_typed_arg_declarations` (`src/abi.rs`) emits
+   heuristic typed argument declarations from ABI alias inference.
+2. `infer_local_typed_declarations` (`src/abi.rs`) emits heuristic local
+   declarations from SSA destinations.
+3. CLI control: `--typed-decls` (effective with `--struct-code`).
 
 Experimental modules are intentionally not part of this critical path.
 
@@ -55,7 +71,9 @@ by falling back to goto when recognition is uncertain.
 
 ## Known Unsupported / Partial Cases
 
-1. Complex nested branch reconstruction inside loop bodies is partial.
+1. Complex nested branch reconstruction inside loop bodies is still partial,
+   but simple branch diamonds inside loop bodies are now recovered as `if`
+   instead of unconditional goto fallback when merge structure is clear.
 2. Multi-way branch normalization to `switch` is not implemented.
 3. Some loop exits still degrade to goto fallback depending on CFG shape.
 

@@ -1,5 +1,4 @@
 use cudad::*;
-use crate::{cfg::build_cfg, ir::build_ssa, structurizer::*};
 use clap::Parser;
 use std::fs;
 
@@ -220,6 +219,12 @@ struct Args {
     /// Resolve known ABI constant-memory slots (block/grid dims, params)
     #[clap(long)]
     abi_map: bool,
+    /// Enable conservative semantic expression lifting in structured output
+    #[clap(long)]
+    semantic_lift: bool,
+    /// Emit heuristic typed argument/local declarations in structured output
+    #[clap(long)]
+    typed_decls: bool,
     /// Force ABI profile used by `--abi-map` (`auto|legacy140|modern160`)
     #[clap(long, value_enum, default_value = "auto")]
     abi_profile: AbiProfileMode,
@@ -297,6 +302,23 @@ fn main() {
                 }
             }
         }
+        if args.typed_decls {
+            let arg_decls = abi_aliases
+                .as_ref()
+                .map(|a| a.render_typed_arg_declarations())
+                .unwrap_or_default();
+            let local_decls = infer_local_typed_declarations(&fir);
+
+            if !arg_decls.is_empty() || !local_decls.is_empty() {
+                println!("// Heuristic typed declarations:");
+                for d in arg_decls {
+                    println!("{}", d);
+                }
+                for d in local_decls {
+                    println!("{}", d);
+                }
+            }
+        }
         if let Some(structured_func_body) = structurizer_instance.structure_function() {
             let default_display = DefaultDisplay;
             let abi_display = match (abi_profile, abi_aliases.clone()) {
@@ -308,7 +330,22 @@ fn main() {
                 .as_ref()
                 .map(|d| d as &dyn DisplayCtx)
                 .unwrap_or(&default_display);
-            let code_output = structurizer_instance.pretty_print(&structured_func_body, display_ctx, 0);
+            let lift_result = if args.semantic_lift {
+                let lift_cfg = SemanticLiftConfig {
+                    abi_annotations: abi_annotations.as_ref(),
+                    abi_aliases: abi_aliases.as_ref(),
+                    strict: true,
+                };
+                Some(lift_function_ir(&fir, &lift_cfg))
+            } else {
+                None
+            };
+            let code_output = structurizer_instance.pretty_print_with_lift(
+                &structured_func_body,
+                display_ctx,
+                0,
+                lift_result.as_ref(),
+            );
             
             if let Some(ref path) = args.output {
                  // Potentially overwrite if also doing other dots to same file
