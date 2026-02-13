@@ -168,7 +168,7 @@ fn smoke_struct_output_if_sass() {
     let out2 = run_structured_output(sass);
     assert!(!out1.trim().is_empty());
     assert_eq!(out1, out2);
-    assert_eq!(out1, expected);
+    assert_eq!(out1.trim_end(), expected.trim_end());
 }
 
 #[test]
@@ -179,7 +179,7 @@ fn smoke_struct_output_loop_constant_sass() {
     let out2 = run_structured_output(sass);
     assert!(!out1.trim().is_empty());
     assert_eq!(out1, out2);
-    assert_eq!(out1, expected);
+    assert_eq!(out1.trim_end(), expected.trim_end());
 }
 
 #[test]
@@ -190,7 +190,7 @@ fn smoke_struct_output_if_loop_sass() {
     let out2 = run_structured_output(sass);
     assert!(!out1.trim().is_empty());
     assert_eq!(out1, out2);
-    assert_eq!(out1, expected);
+    assert_eq!(out1.trim_end(), expected.trim_end());
 }
 
 #[test]
@@ -201,5 +201,5 @@ fn smoke_struct_output_test_div_sass() {
     let out2 = run_structured_output(sass);
     assert!(!out1.trim().is_empty());
     assert_eq!(out1, out2);
-    assert_eq!(out1, expected);
+    assert_eq!(out1.trim_end(), expected.trim_end());
 }

@@ -142,7 +142,10 @@ impl<'a> Structurizer<'a> {
     fn is_block_return(ir_block: &IRBlock) -> bool {
         if let Some(last_stmt) = ir_block.stmts.last() {
             if let RValue::Op { opcode, .. } = &last_stmt.value {
-                return opcode == "RET" || opcode == "EXIT" || opcode.starts_with("RET");
+                // Only treat unconditional terminators as function returns.
+                // Predicated EXIT/RET are conditional control-flow instructions.
+                return last_stmt.pred.is_none()
+                    && (opcode == "RET" || opcode == "EXIT" || opcode.starts_with("RET"));
             }
         }
         false
@@ -453,9 +456,9 @@ impl<'a> Structurizer<'a> {
         for edge_ref in self.cfg.edges_directed(potential_header_cfg_node, Direction::Incoming) {
             let pred_node_idx = edge_ref.source();
             if self.node_is_dominated_by(&self.dom, pred_node_idx, potential_header_cfg_node) {
-                if pred_node_idx != potential_header_cfg_node { 
-                    back_edges_to_header.push(pred_node_idx);
-                }
+                // Keep self-latches: many SASS loops are represented as
+                // a single header block with a back edge to itself.
+                back_edges_to_header.push(pred_node_idx);
             }
         }
         if back_edges_to_header.is_empty() { return None; }
@@ -525,8 +528,8 @@ impl<'a> Structurizer<'a> {
             let s2 = header_successors[1];
             let s1_is_exit = Some(s1) == loop_natural_successor_node || !loop_body_cfg_nodes.contains(&s1);
             let s2_is_exit = Some(s2) == loop_natural_successor_node || !loop_body_cfg_nodes.contains(&s2);
-            let s1_is_body_entry = loop_body_cfg_nodes.contains(&s1) && s1 != potential_header_cfg_node;
-            let s2_is_body_entry = loop_body_cfg_nodes.contains(&s2) && s2 != potential_header_cfg_node;
+            let s1_is_body_entry = loop_body_cfg_nodes.contains(&s1);
+            let s2_is_body_entry = loop_body_cfg_nodes.contains(&s2);
 
             if (s1_is_exit && s2_is_body_entry) || (s2_is_exit && s1_is_body_entry) {
                 if let Some((cond, true_target, _)) = self.extract_if_targets_and_condition(header_ir_block) {
@@ -594,6 +597,20 @@ impl<'a> Structurizer<'a> {
         loop_header_for_continue: NodeIndex,
         loop_exit_for_break: Option<NodeIndex>,
     ) -> Option<StructuredStatement> {
+        // Single-header loop fallback: keep the header body visible and model
+        // the latch as an explicit continue.
+        if current_body_cfg_node == loop_header_for_continue && nodes_in_this_loop.len() == 1 {
+            if let Some(ir_block) = self.get_ir_block_by_cfg_node(current_body_cfg_node) {
+                return Some(StructuredStatement::Sequence(vec![
+                    StructuredStatement::BasicBlock {
+                        block_id: ir_block.id,
+                        stmts: ir_block.stmts.clone(),
+                    },
+                    StructuredStatement::Continue(None),
+                ]));
+            }
+            return Some(StructuredStatement::Empty);
+        }
         if current_body_cfg_node == loop_header_for_continue { return Some(StructuredStatement::Empty); } // Body starts *after* header for While/Do, or includes it for Endless
         if !nodes_in_this_loop.contains(&current_body_cfg_node) || self.processed_cfg_nodes.contains(&current_body_cfg_node) {
             return Some(StructuredStatement::Empty);
@@ -1029,5 +1046,24 @@ mod tests {
             .structure_loop_body_recursive(id_to_idx[&1], &loop_nodes, id_to_idx[&0], Some(id_to_idx[&3]))
             .unwrap();
         assert!(contains_goto(&out));
+    }
+
+    #[test]
+    fn predicated_exit_is_not_unconditional_return() {
+        let block = IRBlock {
+            id: 0,
+            start_addr: 0,
+            irdst: vec![],
+            stmts: vec![IRStatement {
+                dest: None,
+                value: RValue::Op {
+                    opcode: "EXIT".to_string(),
+                    args: vec![],
+                },
+                pred: Some(IRExpr::Reg(RegId::new("P", 0, 1))),
+                mem_addr_args: None,
+            }],
+        };
+        assert!(!Structurizer::is_block_return(&block));
     }
 }
