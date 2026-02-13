@@ -268,10 +268,19 @@ fn main() {
     }
     if args.struct_code {
         let fir = build_ssa(&cfg); // build_ssa returns FunctionIR
+        let abi_annotations = abi_profile.map(|p| annotate_function_ir_constmem(&fir, p));
         // Create the structurizer instance
         let mut structurizer_instance = structurizer::Structurizer::new(&cfg, &fir);
             
         println!("// --- Structured Output ---");
+        if let Some(anns) = &abi_annotations {
+            if !anns.is_empty() {
+                println!("// ABI const-memory mapping (sample):");
+                for line in anns.summarize_lines(16) {
+                    println!("// {}", line);
+                }
+            }
+        }
         if let Some(structured_func_body) = structurizer_instance.structure_function() {
             let default_display = DefaultDisplay;
             let abi_display = abi_profile.map(AbiDisplay::new);

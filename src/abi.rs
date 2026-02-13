@@ -2,7 +2,9 @@
 //! This module is intentionally conservative: it maps well-known offsets to
 //! symbolic names and falls back to raw `ConstMem(bank, off)` semantics.
 
-use crate::ir::{DisplayCtx, IRExpr, RegId};
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::ir::{DisplayCtx, FunctionIR, IRExpr, RegId, RValue};
 use crate::parser::{Instruction, Operand};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +33,90 @@ pub enum ConstMemKind {
 pub struct ResolvedConstMem {
     pub symbol: String,
     pub kind: ConstMemKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConstMemSemantic {
+    Builtin(&'static str),
+    ParamWord { param_idx: u32, word_idx: u32 },
+    AbiInternal(u32),
+    Unknown { bank: u32, offset: u32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StatementRef {
+    pub block_id: usize,
+    pub stmt_idx: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstMemAnnotation {
+    pub bank: u32,
+    pub offset: u32,
+    pub semantic: ConstMemSemantic,
+}
+
+impl ConstMemAnnotation {
+    pub fn symbol(&self) -> String {
+        match &self.semantic {
+            ConstMemSemantic::Builtin(name) => (*name).to_string(),
+            ConstMemSemantic::ParamWord { param_idx, word_idx } => {
+                format!("param_{}[{}]", param_idx, word_idx)
+            }
+            ConstMemSemantic::AbiInternal(offset) => format!("abi_internal_0x{:x}", offset),
+            ConstMemSemantic::Unknown { bank, offset } => {
+                format!("c[0x{:x}][0x{:x}]", bank, offset)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AbiAnnotations {
+    pub constmem_by_stmt: BTreeMap<StatementRef, Vec<ConstMemAnnotation>>,
+}
+
+impl AbiAnnotations {
+    pub fn is_empty(&self) -> bool {
+        self.constmem_by_stmt.is_empty()
+    }
+
+    pub fn iter(
+        &self,
+    ) -> impl Iterator<Item = (&StatementRef, &Vec<ConstMemAnnotation>)> + '_ {
+        self.constmem_by_stmt.iter()
+    }
+
+    pub fn summarize_lines(&self, max_lines: usize) -> Vec<String> {
+        self.constmem_by_stmt
+            .iter()
+            .flat_map(|(stmt_ref, anns)| {
+                anns.iter().map(|ann| {
+                    format!(
+                        "BB{}.S{}: c[0x{:x}][0x{:x}] -> {}",
+                        stmt_ref.block_id,
+                        stmt_ref.stmt_idx,
+                        ann.bank,
+                        ann.offset,
+                        ann.symbol()
+                    )
+                })
+            })
+            .take(max_lines)
+            .collect()
+    }
+}
+
+impl From<ConstMemKind> for ConstMemSemantic {
+    fn from(value: ConstMemKind) -> Self {
+        match value {
+            ConstMemKind::Builtin(name) => ConstMemSemantic::Builtin(name),
+            ConstMemKind::ParamWord { param_idx, word_idx } => {
+                ConstMemSemantic::ParamWord { param_idx, word_idx }
+            }
+            ConstMemKind::AbiInternal(offset) => ConstMemSemantic::AbiInternal(offset),
+        }
+    }
 }
 
 impl AbiProfile {
@@ -147,6 +233,13 @@ impl AbiProfile {
 
         None
     }
+
+    pub fn classify_constmem(&self, bank: u32, offset: u32) -> ConstMemSemantic {
+        if let Some(resolved) = self.resolve_constmem(bank, offset) {
+            return resolved.kind.into();
+        }
+        ConstMemSemantic::Unknown { bank, offset }
+    }
 }
 
 pub struct AbiDisplay {
@@ -222,10 +315,90 @@ where
     }
 }
 
+pub fn annotate_function_ir_constmem(function_ir: &FunctionIR, profile: AbiProfile) -> AbiAnnotations {
+    let mut out = AbiAnnotations::default();
+    for block in &function_ir.blocks {
+        for (stmt_idx, stmt) in block.stmts.iter().enumerate() {
+            let mut raw_pairs = Vec::new();
+            if let Some(dest) = &stmt.dest {
+                collect_constmem_from_expr(dest, &mut raw_pairs);
+            }
+            if let Some(pred) = &stmt.pred {
+                collect_constmem_from_expr(pred, &mut raw_pairs);
+            }
+            match &stmt.value {
+                RValue::Op { args, .. } => {
+                    for arg in args {
+                        collect_constmem_from_expr(arg, &mut raw_pairs);
+                    }
+                }
+                RValue::Phi(args) => {
+                    for arg in args {
+                        collect_constmem_from_expr(arg, &mut raw_pairs);
+                    }
+                }
+                RValue::ImmI(_) | RValue::ImmF(_) => {}
+            }
+            if let Some(mem_args) = &stmt.mem_addr_args {
+                for arg in mem_args {
+                    collect_constmem_from_expr(arg, &mut raw_pairs);
+                }
+            }
+
+            if raw_pairs.is_empty() {
+                continue;
+            }
+
+            let mut unique = BTreeSet::new();
+            let mut anns = Vec::new();
+            for (bank, offset) in raw_pairs {
+                if !unique.insert((bank, offset)) {
+                    continue;
+                }
+                anns.push(ConstMemAnnotation {
+                    bank,
+                    offset,
+                    semantic: profile.classify_constmem(bank, offset),
+                });
+            }
+            out.constmem_by_stmt.insert(
+                StatementRef {
+                    block_id: block.id,
+                    stmt_idx,
+                },
+                anns,
+            );
+        }
+    }
+    out
+}
+
+fn collect_constmem_from_expr(expr: &IRExpr, out: &mut Vec<(u32, u32)>) {
+    match expr {
+        IRExpr::Op { op, args } => {
+            if op == "ConstMem" && args.len() == 2 {
+                if let (Some(bank), Some(offset)) = (imm_as_u32(&args[0]), imm_as_u32(&args[1])) {
+                    out.push((bank, offset));
+                }
+            }
+            for arg in args {
+                collect_constmem_from_expr(arg, out);
+            }
+        }
+        IRExpr::Mem { base, offset, .. } => {
+            collect_constmem_from_expr(base, out);
+            if let Some(off) = offset {
+                collect_constmem_from_expr(off, out);
+            }
+        }
+        IRExpr::Reg(_) | IRExpr::ImmI(_) | IRExpr::ImmF(_) => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::parse_sass;
+    use crate::{build_cfg, build_ssa, parser::parse_sass};
 
     #[test]
     fn detects_legacy_profile_from_param_window() {
@@ -269,6 +442,20 @@ mod tests {
     }
 
     #[test]
+    fn profile_selection_changes_param_indexing() {
+        let legacy = AbiProfile::legacy_param_140();
+        let modern = AbiProfile::modern_param_160();
+        assert!(matches!(
+            legacy.classify_constmem(0, 0x160),
+            ConstMemSemantic::ParamWord { param_idx: 4, word_idx: 0 }
+        ));
+        assert!(matches!(
+            modern.classify_constmem(0, 0x160),
+            ConstMemSemantic::ParamWord { param_idx: 0, word_idx: 0 }
+        ));
+    }
+
+    #[test]
     fn resolves_user_asked_offsets_in_legacy_profile() {
         let p = AbiProfile::legacy_param_140();
         assert_eq!(p.resolve_constmem(0, 0x8).unwrap().symbol, "blockDimX");
@@ -290,5 +477,36 @@ mod tests {
             args: vec![IRExpr::ImmI(0), IRExpr::ImmI(0x148)],
         };
         assert_eq!(display.expr(&expr), "param_1[0]");
+    }
+
+    #[test]
+    fn annotates_ir_with_typed_constmem_semantics() {
+        let sass = r#"
+            /*0000*/ IMAD.MOV.U32 R1, RZ, RZ, c[0x0][0x140] ;
+            /*0010*/ IMAD.MOV.U32 R2, RZ, RZ, c[0x0][0x8] ;
+            /*0020*/ IMAD.MOV.U32 R3, RZ, RZ, c[0x0][0x44] ;
+            /*0030*/ EXIT ;
+        "#;
+        let cfg = build_cfg(parse_sass(sass));
+        let fir = build_ssa(&cfg);
+        let anns = annotate_function_ir_constmem(&fir, AbiProfile::legacy_param_140());
+        assert!(!anns.is_empty());
+
+        let mut saw_param = false;
+        let mut saw_builtin = false;
+        let mut saw_internal = false;
+        for (_stmt, entries) in anns.iter() {
+            for e in entries {
+                match e.semantic {
+                    ConstMemSemantic::ParamWord { param_idx: 0, word_idx: 0 } => saw_param = true,
+                    ConstMemSemantic::Builtin("blockDimX") => saw_builtin = true,
+                    ConstMemSemantic::AbiInternal(0x44) => saw_internal = true,
+                    _ => {}
+                }
+            }
+        }
+        assert!(saw_param);
+        assert!(saw_builtin);
+        assert!(saw_internal);
     }
 }

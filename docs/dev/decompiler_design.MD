@@ -21,6 +21,9 @@ Experimental modules are intentionally not part of this critical path.
 2. `AbiProfile::resolve_constmem` maps known built-ins (`blockDim*`, `gridDim*`) and parameter words (`param_i[j]`).
 3. `AbiDisplay` is an optional `DisplayCtx` that renders symbolic ABI names in DOT/pseudocode output.
    - CLI controls: `--abi-map` and `--abi-profile auto|legacy140|modern160`.
+4. `annotate_function_ir_constmem` creates typed annotations (`ConstMemSemantic`) over SSA statements.
+   - This pass is non-invasive and keeps SSA algorithm/output semantics intact.
+   - It is intended as the bridge for future structurizer/HL passes that need ABI meaning, not raw offsets.
 
 This layer is display-oriented and does not change SSA construction semantics.
 Unknown offsets remain explicit raw `ConstMem(...)` values or `abi_internal_0x..` slots.
