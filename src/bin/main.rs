@@ -191,6 +191,40 @@ const SAMPLE_SASS: &str = r#"
         /*0ad0*/                   IMAD.MOV.U32 R8, RZ, RZ, R4 ;
 "#;
 
+fn render_typed_structured_output(
+    code_output: &str,
+    aliases: Option<&AbiArgAliases>,
+    local_decls: &[String],
+) -> String {
+    let params = aliases
+        .map(|a| a.render_typed_param_list())
+        .unwrap_or_default();
+    let sig = if params.is_empty() {
+        "void kernel(void)".to_string()
+    } else {
+        format!("void kernel({})", params.join(", "))
+    };
+
+    let mut out = String::new();
+    out.push_str(&sig);
+    out.push_str(" {\n");
+    for d in local_decls {
+        out.push_str("  ");
+        out.push_str(d);
+        out.push('\n');
+    }
+    if !local_decls.is_empty() {
+        out.push('\n');
+    }
+    for line in code_output.lines() {
+        out.push_str("  ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str("}\n");
+    out
+}
+
 #[derive(clap::ValueEnum, Clone, Debug)]
 enum AbiProfileMode {
     Auto,
@@ -241,10 +275,10 @@ fn main() {
     };
     let instrs = parse_sass(&sass);
     let sm_version = parse_sm_version(&sass);
+    let inferred_profile = AbiProfile::detect_with_sm(&instrs, sm_version);
     let abi_profile = if args.abi_map || !matches!(args.abi_profile, AbiProfileMode::Auto) {
-        let auto_profile = AbiProfile::detect_with_sm(&instrs, sm_version);
         let selected = match args.abi_profile {
-            AbiProfileMode::Auto => auto_profile,
+            AbiProfileMode::Auto => inferred_profile,
             AbiProfileMode::Legacy140 => AbiProfile::legacy_param_140(),
             AbiProfileMode::Modern160 => AbiProfile::modern_param_160(),
         };
@@ -277,8 +311,13 @@ fn main() {
     }
     if args.struct_code {
         let fir = build_ssa(&cfg); // build_ssa returns FunctionIR
-        let abi_annotations = abi_profile.map(|p| annotate_function_ir_constmem(&fir, p));
-        let abi_aliases = match (abi_profile, abi_annotations.as_ref()) {
+        let analysis_abi_profile = if abi_profile.is_some() || args.typed_decls {
+            abi_profile.or(Some(inferred_profile))
+        } else {
+            None
+        };
+        let abi_annotations = analysis_abi_profile.map(|p| annotate_function_ir_constmem(&fir, p));
+        let abi_aliases = match (analysis_abi_profile, abi_annotations.as_ref()) {
             (Some(_), Some(anns)) => Some(infer_arg_aliases(&fir, anns)),
             _ => None,
         };
@@ -286,36 +325,36 @@ fn main() {
         let mut structurizer_instance = structurizer::Structurizer::new(&cfg, &fir);
             
         println!("// --- Structured Output ---");
-        if let Some(anns) = &abi_annotations {
-            if !anns.is_empty() {
-                println!("// ABI const-memory mapping (sample):");
-                for line in anns.summarize_lines(16) {
-                    println!("// {}", line);
+        if args.abi_map {
+            if let Some(anns) = &abi_annotations {
+                if !anns.is_empty() {
+                    println!("// ABI const-memory mapping (sample):");
+                    for line in anns.summarize_lines(16) {
+                        println!("// {}", line);
+                    }
+                }
+            }
+            if let Some(aliases) = &abi_aliases {
+                if !aliases.is_empty() {
+                    println!("// ABI arg aliases (heuristic):");
+                    for line in aliases.summarize_lines(12) {
+                        println!("// {}", line);
+                    }
                 }
             }
         }
-        if let Some(aliases) = &abi_aliases {
-            if !aliases.is_empty() {
-                println!("// ABI arg aliases (heuristic):");
-                for line in aliases.summarize_lines(12) {
-                    println!("// {}", line);
-                }
-            }
-        }
+        let local_decls = if args.typed_decls {
+            infer_local_typed_declarations(&fir)
+        } else {
+            Vec::new()
+        };
         if args.typed_decls {
-            let arg_decls = abi_aliases
-                .as_ref()
-                .map(|a| a.render_typed_arg_declarations())
-                .unwrap_or_default();
-            let local_decls = infer_local_typed_declarations(&fir);
-
-            if !arg_decls.is_empty() || !local_decls.is_empty() {
-                println!("// Heuristic typed declarations:");
-                for d in arg_decls {
-                    println!("{}", d);
-                }
-                for d in local_decls {
-                    println!("{}", d);
+            if let Some(aliases) = &abi_aliases {
+                if !aliases.is_empty() {
+                    println!("// Typed signature inferred from ABI aliases:");
+                    for line in aliases.summarize_lines(12) {
+                        println!("// {}", line);
+                    }
                 }
             }
         }
@@ -346,13 +385,18 @@ fn main() {
                 0,
                 lift_result.as_ref(),
             );
+            let final_output = if args.typed_decls {
+                render_typed_structured_output(&code_output, abi_aliases.as_ref(), &local_decls)
+            } else {
+                code_output
+            };
             
             if let Some(ref path) = args.output {
                  // Potentially overwrite if also doing other dots to same file
-                fs::write(path, code_output).expect("Failed to write structured code file");
+                fs::write(path, final_output).expect("Failed to write structured code file");
                 println!("Structured code written to {}", path);
             } else {
-                println!("{}", code_output);
+                println!("{}", final_output);
             }
         } else {
             println!("// Failed to structure function or function is empty.");

@@ -867,7 +867,24 @@ impl<'a> Structurizer<'a> {
             StructuredStatement::BasicBlock { block_id, stmts } => {
                 s_out.push_str(&format!("{}BB{} {{\n", indent, block_id));
                 let mut omitted_phi_count = 0usize;
+                let fir_block = self.function_ir.blocks.iter().find(|b| b.id == *block_id);
+                let mut fir_search_from = 0usize;
                 for (stmt_idx, ir_s) in stmts.iter().enumerate() {
+                    let mut lookup_stmt_idx = stmt_idx;
+                    if let Some(orig_block) = fir_block {
+                        if let Some((found_idx, _)) = orig_block
+                            .stmts
+                            .iter()
+                            .enumerate()
+                            .skip(fir_search_from)
+                            .find(|(_, s)| {
+                                s.dest == ir_s.dest && s.value == ir_s.value && s.pred == ir_s.pred
+                            })
+                        {
+                            lookup_stmt_idx = found_idx;
+                            fir_search_from = found_idx + 1;
+                        }
+                    }
                     if matches!(ir_s.value, RValue::Phi(_)) {
                         omitted_phi_count += 1;
                         continue;
@@ -895,7 +912,7 @@ impl<'a> Structurizer<'a> {
                     if let Some(lifted_stmt) = lifted.and_then(|res| {
                         res.by_stmt.get(&StatementRef {
                             block_id: *block_id,
-                            stmt_idx,
+                            stmt_idx: lookup_stmt_idx,
                         })
                     }) {
                         let pred_str = lifted_stmt

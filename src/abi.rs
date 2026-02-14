@@ -193,7 +193,7 @@ impl AbiArgAliases {
             match alias.kind {
                 ArgAliasKind::Ptr64 => {
                     out.push(format!(
-                        "uint64_t arg{}_ptr; // confidence: {}",
+                        "uintptr_t arg{}_ptr; // confidence: {}",
                         alias.param_idx,
                         alias.confidence.as_str()
                     ));
@@ -219,18 +219,55 @@ impl AbiArgAliases {
         }
         out
     }
+
+    pub fn render_typed_param_list(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for alias in self.by_param.values() {
+            match alias.kind {
+                ArgAliasKind::Ptr64 => {
+                    out.push(format!("uintptr_t arg{}_ptr", alias.param_idx));
+                }
+                ArgAliasKind::U64 => {
+                    out.push(format!("uint64_t arg{}_u64", alias.param_idx));
+                }
+                ArgAliasKind::Word32 => {
+                    for w in &alias.observed_words {
+                        out.push(format!("uint32_t arg{}_word{}", alias.param_idx, w));
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum LocalTypeHint {
+    PtrStrong,
+    PtrWeak,
+    F32,
+    U32,
+    U16,
+    U8,
 }
 
 pub fn infer_local_typed_declarations(function_ir: &FunctionIR) -> Vec<String> {
     let mut regs: BTreeSet<(String, i32)> = BTreeSet::new();
+    let mut hints: BTreeMap<(String, i32), BTreeSet<LocalTypeHint>> = BTreeMap::new();
+
     for block in &function_ir.blocks {
         for stmt in &block.stmts {
             if let Some(IRExpr::Reg(r)) = &stmt.dest {
                 if is_immutable_reg(r) {
                     continue;
                 }
-                regs.insert((r.class.clone(), r.idx));
+                let key = (r.class.clone(), r.idx);
+                regs.insert(key.clone());
+                if let Some(h) = hint_from_dest_stmt(stmt) {
+                    hints.entry(key).or_default().insert(h);
+                }
             }
+            collect_pointer_hints_from_stmt(stmt, &mut hints);
         }
     }
 
@@ -239,10 +276,149 @@ pub fn infer_local_typed_declarations(function_ir: &FunctionIR) -> Vec<String> {
             if class == "P" || class == "UP" {
                 format!("bool {}{};", class, idx)
             } else {
-                format!("uint32_t {}{};", class, idx)
+                let ty = select_local_decl_type(hints.get(&(class.clone(), idx)));
+                format!("{} {}{};", ty, class, idx)
             }
         })
         .collect()
+}
+
+fn hint_from_dest_stmt(stmt: &crate::ir::IRStatement) -> Option<LocalTypeHint> {
+    let RValue::Op { opcode, .. } = &stmt.value else {
+        return None;
+    };
+    let Some(IRExpr::Reg(dest)) = &stmt.dest else {
+        return None;
+    };
+    if dest.class == "P" || dest.class == "UP" {
+        return None;
+    }
+    hint_from_dest_opcode(opcode)
+}
+
+fn hint_from_dest_opcode(opcode: &str) -> Option<LocalTypeHint> {
+    if opcode.starts_with("IMAD.WIDE") || opcode == "LEA" {
+        return Some(LocalTypeHint::PtrStrong);
+    }
+    if opcode.starts_with("I2F")
+        || opcode.starts_with("FADD")
+        || opcode.starts_with("FMUL")
+        || opcode.starts_with("FFMA")
+        || opcode.starts_with("FSEL")
+        || opcode.starts_with("MUFU")
+    {
+        return Some(LocalTypeHint::F32);
+    }
+    hint_from_opcode_data_suffix(opcode)
+}
+
+fn hint_from_opcode_data_suffix(opcode: &str) -> Option<LocalTypeHint> {
+    for tok in opcode.split('.') {
+        match tok {
+            "U8" | "S8" => return Some(LocalTypeHint::U8),
+            "U16" | "S16" => return Some(LocalTypeHint::U16),
+            "U32" | "S32" => return Some(LocalTypeHint::U32),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn collect_pointer_hints_from_stmt(
+    stmt: &crate::ir::IRStatement,
+    hints: &mut BTreeMap<(String, i32), BTreeSet<LocalTypeHint>>,
+) {
+    if let Some(dest) = &stmt.dest {
+        collect_pointer_hints_from_expr(dest, hints);
+    }
+    if let Some(pred) = &stmt.pred {
+        collect_pointer_hints_from_expr(pred, hints);
+    }
+    match &stmt.value {
+        RValue::Op { args, .. } => {
+            for arg in args {
+                collect_pointer_hints_from_expr(arg, hints);
+            }
+        }
+        RValue::Phi(args) => {
+            for arg in args {
+                collect_pointer_hints_from_expr(arg, hints);
+            }
+        }
+        RValue::ImmI(_) | RValue::ImmF(_) => {}
+    }
+    if let Some(mem_args) = &stmt.mem_addr_args {
+        for arg in mem_args {
+            collect_pointer_hints_from_expr(arg, hints);
+        }
+    }
+}
+
+fn collect_pointer_hints_from_expr(
+    expr: &IRExpr,
+    hints: &mut BTreeMap<(String, i32), BTreeSet<LocalTypeHint>>,
+) {
+    match expr {
+        IRExpr::Mem { base, offset, width } => {
+            if matches!(width, Some(64)) {
+                mark_pointer_base_reg(base, hints);
+            }
+            collect_pointer_hints_from_expr(base, hints);
+            if let Some(off) = offset {
+                collect_pointer_hints_from_expr(off, hints);
+            }
+        }
+        IRExpr::Op { args, .. } => {
+            for arg in args {
+                collect_pointer_hints_from_expr(arg, hints);
+            }
+        }
+        IRExpr::Reg(_) | IRExpr::ImmI(_) | IRExpr::ImmF(_) => {}
+    }
+}
+
+fn mark_pointer_base_reg(
+    base: &IRExpr,
+    hints: &mut BTreeMap<(String, i32), BTreeSet<LocalTypeHint>>,
+) {
+    let IRExpr::Reg(r) = base else {
+        return;
+    };
+    if is_immutable_reg(r) || matches!(r.class.as_str(), "P" | "UP" | "PT" | "UPT") {
+        return;
+    }
+    hints
+        .entry((r.class.clone(), r.idx))
+        .or_default()
+        .insert(LocalTypeHint::PtrWeak);
+}
+
+fn select_local_decl_type(hints: Option<&BTreeSet<LocalTypeHint>>) -> &'static str {
+    let Some(hints) = hints else {
+        return "uint32_t";
+    };
+    let has_float = hints.contains(&LocalTypeHint::F32);
+    let has_int = hints.contains(&LocalTypeHint::U32)
+        || hints.contains(&LocalTypeHint::U16)
+        || hints.contains(&LocalTypeHint::U8);
+    if hints.contains(&LocalTypeHint::PtrStrong)
+        || (hints.contains(&LocalTypeHint::PtrWeak) && !has_float && !has_int)
+    {
+        return "uintptr_t";
+    }
+    if has_float && !has_int {
+        return "float";
+    }
+    if hints.contains(&LocalTypeHint::U32) || (has_float && has_int) {
+        return "uint32_t";
+    }
+    if hints.contains(&LocalTypeHint::U16) {
+        return "uint16_t";
+    }
+    if hints.contains(&LocalTypeHint::U8) {
+        return "uint8_t";
+    }
+    "uint32_t"
 }
 
 fn is_immutable_reg(r: &RegId) -> bool {
@@ -776,8 +952,34 @@ mod tests {
         );
 
         let decls = aliases.render_typed_arg_declarations();
-        assert!(decls.iter().any(|d| d.contains("uint64_t arg0_ptr;")));
+        assert!(decls.iter().any(|d| d.contains("uintptr_t arg0_ptr;")));
         assert!(decls.iter().any(|d| d.contains("uint32_t arg3_word1;")));
+    }
+
+    #[test]
+    fn renders_typed_param_list_from_aliases() {
+        let mut aliases = AbiArgAliases::default();
+        aliases.by_param.insert(
+            0,
+            ArgAlias {
+                param_idx: 0,
+                kind: ArgAliasKind::Ptr64,
+                confidence: AliasConfidence::High,
+                observed_words: [0, 1].into_iter().collect(),
+            },
+        );
+        aliases.by_param.insert(
+            2,
+            ArgAlias {
+                param_idx: 2,
+                kind: ArgAliasKind::Word32,
+                confidence: AliasConfidence::Low,
+                observed_words: [1].into_iter().collect(),
+            },
+        );
+        let params = aliases.render_typed_param_list();
+        assert_eq!(params[0], "uintptr_t arg0_ptr");
+        assert_eq!(params[1], "uint32_t arg2_word1");
     }
 
     #[test]
@@ -792,6 +994,24 @@ mod tests {
         let decls = infer_local_typed_declarations(&fir);
         assert!(decls.iter().any(|d| d == "bool P0;"));
         assert!(decls.iter().any(|d| d == "uint32_t R1;"));
+    }
+
+    #[test]
+    fn infers_richer_local_types_from_opcode_hints() {
+        let sass = r#"
+            /*0000*/ I2F.RP R2, R1 ;
+            /*0010*/ FMUL R3, R2, R2 ;
+            /*0020*/ LDS.U8 R4, [UR0] ;
+            /*0030*/ IMAD.WIDE R8, R0, 0x4, RZ ;
+            /*0040*/ EXIT ;
+        "#;
+        let cfg = build_cfg(parse_sass(sass));
+        let fir = build_ssa(&cfg);
+        let decls = infer_local_typed_declarations(&fir);
+        assert!(decls.iter().any(|d| d == "float R2;"));
+        assert!(decls.iter().any(|d| d == "float R3;"));
+        assert!(decls.iter().any(|d| d == "uint8_t R4;"));
+        assert!(decls.iter().any(|d| d == "uintptr_t R8;"));
     }
 
     #[test]

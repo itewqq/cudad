@@ -23,8 +23,13 @@ Optional declaration stage (opt-in):
 1. `AbiArgAliases::render_typed_arg_declarations` (`src/abi.rs`) emits
    heuristic typed argument declarations from ABI alias inference.
 2. `infer_local_typed_declarations` (`src/abi.rs`) emits heuristic local
-   declarations from SSA destinations.
+   declarations from SSA destinations and opcode usage hints
+   (`float`, `uint8_t`, `uintptr_t`, etc.).
 3. CLI control: `--typed-decls` (effective with `--struct-code`).
+   - `--typed-decls` can infer ABI aliases for declarations even when
+     `--abi-map` display mapping is not enabled.
+   - With `--typed-decls`, structured output is wrapped as
+     `void kernel(<typed args>) { ... }` and locals are emitted inside.
 
 Experimental modules are intentionally not part of this critical path.
 

@@ -403,3 +403,20 @@ fn structured_output_goto_gate_lifted_fixtures() {
     assert_eq!(rc4_goto, 0);
     assert_eq!(test_div_goto, 0);
 }
+
+#[test]
+fn lifted_rc4_uses_shared_array_style_for_shared_mem_ops() {
+    let out = run_structured_output_lifted(include_str!("../test_cu/rc4.sass"));
+    assert!(out.contains("shmem_u8["));
+    assert!(!out.contains("_ = STS."));
+}
+
+#[test]
+fn lifted_rc4_reduces_add_with_carry_and_lea_hi_opcode_noise() {
+    let out = run_structured_output_lifted(include_str!("../test_cu/rc4.sass"));
+    assert!(out.contains("? 1 : 0"));
+    assert!(out.contains("hi32("));
+    assert!(!out.contains("IADD3.X("));
+    assert!(!out.contains("LEA.HI("));
+    assert!(!out.contains("LOP3.LUT("));
+}

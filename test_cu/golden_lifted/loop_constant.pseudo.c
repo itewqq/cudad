@@ -9,7 +9,7 @@ if (!(P1)) {
   // Loop header BB2
   while (!(P1)) {
     BB2 {
-      _ = STS.U8(*R2.1, R2.1);
+      shmem_u8[R2.1] = R2.1;
       R2.2 = R2.1 + ConstMem(0, 0);
       P1.2 = R2.2 >= 256;
       // 2 phi node(s) omitted
@@ -20,3 +20,4 @@ BB3 {
   _ = BSYNC();
   // 2 phi node(s) omitted
 }
+
