@@ -612,16 +612,29 @@ impl DisplayCtx for AbiDisplay {
             IRExpr::ImmI(i) => format!("{}", i),
             IRExpr::ImmF(f) => format!("{}", f),
             IRExpr::Mem { base, offset, width } => {
-                let mut s = format!("*{}", self.expr(base));
-                if let Some(off) = offset {
-                    s.push_str(&format!("+{}", self.expr(off)));
-                }
+                let mut s = if let Some(off) = offset {
+                    format!("*({} + {})", self.expr(base), self.expr(off))
+                } else {
+                    format!("*{}", self.expr(base))
+                };
                 if let Some(w) = width {
                     s.push_str(&format!("@{}", w));
                 }
                 s
             }
             IRExpr::Op { op, args } => {
+                if op == "-" && args.len() == 1 {
+                    let inner = self.expr(&args[0]);
+                    let simple = match &args[0] {
+                        IRExpr::Reg(_) | IRExpr::ImmI(_) | IRExpr::ImmF(_) => true,
+                        IRExpr::Op { op, .. } if op == "ConstMem" => true,
+                        _ => false,
+                    };
+                    if simple {
+                        return format!("-{}", inner);
+                    }
+                    return format!("-({})", inner);
+                }
                 if let Some(sym) = self.try_constmem_symbol(op, args) {
                     return sym;
                 }

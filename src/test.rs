@@ -1,4 +1,5 @@
 use pretty_assertions::assert_eq;
+use regex::Regex;
 use crate::*;
 
 const SAMPLE_SASS: &str = r#"
@@ -168,6 +169,62 @@ fn test_ssa_keeps_immutable_special_registers_unversioned() {
     assert!(!dot.contains("PT."));
 }
 
+#[test]
+fn test_ssa_signed_register_use_tracks_latest_positive_version() {
+    let sample = r#"
+        /*0000*/ IMAD.MOV.U32 R1, RZ, RZ, 0x1 ;
+        /*0010*/ IADD3 R1, R1, 0x1, RZ ;
+        /*0020*/ IMAD.IADD R1, R1, 0x1, -R1 ;
+        /*0030*/ EXIT ;
+    "#;
+    let cfg = build_cfg(parse_sass(sample));
+    let fir = build_ssa(&cfg);
+
+    let mut seen = false;
+    for block in &fir.blocks {
+        for stmt in &block.stmts {
+            let RValue::Op { opcode, args } = &stmt.value else {
+                continue;
+            };
+            if opcode != "IMAD.IADD" {
+                continue;
+            }
+            seen = true;
+            assert!(args.len() >= 3);
+            let IRExpr::Reg(lhs_use) = &args[0] else {
+                panic!("expected register use in IMAD.IADD arg0");
+            };
+            let IRExpr::Reg(neg_use) = &args[2] else {
+                panic!("expected register use in IMAD.IADD arg2");
+            };
+            assert_eq!(lhs_use.class, "R");
+            assert_eq!(lhs_use.idx, 1);
+            assert_eq!(lhs_use.ssa, Some(1));
+            assert_eq!(neg_use.class, "R");
+            assert_eq!(neg_use.idx, 1);
+            assert_eq!(neg_use.sign, -1);
+            assert_eq!(neg_use.ssa, Some(1));
+        }
+    }
+    assert!(seen, "expected IMAD.IADD statement in SSA");
+}
+
+#[test]
+fn test_predicated_instruction_preserves_negated_sense() {
+    let sample = r#"
+        /*0000*/ ISETP.NE.AND P0, PT, R1, RZ, PT ;
+        /*0010*/ @!P0 IADD3 R2, R2, 0x1, RZ ;
+        /*0020*/ EXIT ;
+    "#;
+    let out = run_structured_output(sample);
+    assert!(
+        out.contains("if (!(P0.0))"),
+        "expected negated predicate to be preserved, got:\n{}",
+        out
+    );
+    assert!(out.contains("IADD3("));
+}
+
 fn run_structured_output(sass: &str) -> String {
     let cfg = build_cfg(parse_sass(sass));
     let fir = build_ssa(&cfg);
@@ -188,6 +245,50 @@ fn run_structured_output_lifted(sass: &str) -> String {
         Some(tree) => structurizer.pretty_print_with_lift(&tree, &DefaultDisplay, 0, Some(&lifted)),
         None => String::new(),
     }
+}
+
+fn run_structured_output_lifted_named(sass: &str) -> String {
+    let cfg = build_cfg(parse_sass(sass));
+    let fir = build_ssa(&cfg);
+    let mut structurizer = Structurizer::new(&cfg, &fir);
+    let lift_cfg = SemanticLiftConfig::default();
+    let lifted = lift_function_ir(&fir, &lift_cfg);
+    let rendered = match structurizer.structure_function() {
+        Some(tree) => structurizer.pretty_print_with_lift(&tree, &DefaultDisplay, 0, Some(&lifted)),
+        None => String::new(),
+    };
+    recover_structured_output_names(
+        &fir,
+        &rendered,
+        &NameRecoveryConfig {
+            style: NameStyle::Temp,
+            rewrite_control_predicates: true,
+            emit_phi_merge_comments: false,
+        },
+    )
+    .output
+}
+
+fn run_structured_output_lifted_named_with_phi_comments(sass: &str) -> String {
+    let cfg = build_cfg(parse_sass(sass));
+    let fir = build_ssa(&cfg);
+    let mut structurizer = Structurizer::new(&cfg, &fir);
+    let lift_cfg = SemanticLiftConfig::default();
+    let lifted = lift_function_ir(&fir, &lift_cfg);
+    let rendered = match structurizer.structure_function() {
+        Some(tree) => structurizer.pretty_print_with_lift(&tree, &DefaultDisplay, 0, Some(&lifted)),
+        None => String::new(),
+    };
+    recover_structured_output_names(
+        &fir,
+        &rendered,
+        &NameRecoveryConfig {
+            style: NameStyle::Temp,
+            rewrite_control_predicates: true,
+            emit_phi_merge_comments: true,
+        },
+    )
+    .output
 }
 
 #[test]
@@ -360,7 +461,7 @@ fn lifted_output_uses_infix_for_supported_patterns() {
 fn lifted_output_falls_back_to_raw_for_unmatched_opcodes() {
     let sass = include_str!("../test_cu/loop_constant.sass");
     let out = run_structured_output_lifted(sass);
-    assert!(out.contains("S2R("));
+    assert!(out.contains("BSYNC("));
 }
 
 #[test]
@@ -419,4 +520,116 @@ fn lifted_rc4_reduces_add_with_carry_and_lea_hi_opcode_noise() {
     assert!(!out.contains("IADD3.X("));
     assert!(!out.contains("LEA.HI("));
     assert!(!out.contains("LOP3.LUT("));
+}
+
+#[test]
+fn smoke_struct_output_lifted_named_if_sass() {
+    let sass = include_str!("../test_cu/if.sass");
+    let expected = include_str!("../test_cu/golden_lifted_named/if.pseudo.c");
+    let out1 = run_structured_output_lifted_named(sass);
+    let out2 = run_structured_output_lifted_named(sass);
+    assert!(!out1.trim().is_empty());
+    assert_eq!(out1, out2);
+    assert_eq!(out1.trim_end(), expected.trim_end());
+}
+
+#[test]
+fn smoke_struct_output_lifted_named_loop_constant_sass() {
+    let sass = include_str!("../test_cu/loop_constant.sass");
+    let expected = include_str!("../test_cu/golden_lifted_named/loop_constant.pseudo.c");
+    let out1 = run_structured_output_lifted_named(sass);
+    let out2 = run_structured_output_lifted_named(sass);
+    assert!(!out1.trim().is_empty());
+    assert_eq!(out1, out2);
+    assert_eq!(out1.trim_end(), expected.trim_end());
+}
+
+#[test]
+fn smoke_struct_output_lifted_named_if_loop_sass() {
+    let sass = include_str!("../test_cu/if_loop.sass");
+    let expected = include_str!("../test_cu/golden_lifted_named/if_loop.pseudo.c");
+    let out1 = run_structured_output_lifted_named(sass);
+    let out2 = run_structured_output_lifted_named(sass);
+    assert!(!out1.trim().is_empty());
+    assert_eq!(out1, out2);
+    assert_eq!(out1.trim_end(), expected.trim_end());
+}
+
+#[test]
+fn smoke_struct_output_lifted_named_test_div_sass() {
+    let sass = include_str!("../test_cu/test_div.sass");
+    let expected = include_str!("../test_cu/golden_lifted_named/test_div.pseudo.c");
+    let out1 = run_structured_output_lifted_named(sass);
+    let out2 = run_structured_output_lifted_named(sass);
+    assert!(!out1.trim().is_empty());
+    assert_eq!(out1, out2);
+    assert_eq!(out1.trim_end(), expected.trim_end());
+}
+
+#[test]
+fn smoke_struct_output_lifted_named_rc4_sass() {
+    let sass = include_str!("../test_cu/rc4.sass");
+    let expected = include_str!("../test_cu/golden_lifted_named/rc4.pseudo.c");
+    let out1 = run_structured_output_lifted_named(sass);
+    let out2 = run_structured_output_lifted_named(sass);
+    assert!(!out1.trim().is_empty());
+    assert_eq!(out1, out2);
+    assert_eq!(out1.trim_end(), expected.trim_end());
+}
+
+#[test]
+fn named_output_has_no_ssa_suffix_tokens_rc4() {
+    let out = run_structured_output_lifted_named(include_str!("../test_cu/rc4.sass"));
+    let re = Regex::new(r"\b(?:UR|UP|R|P)\d+\.\d+\b").expect("valid regex");
+    assert!(!re.is_match(&out));
+}
+
+#[test]
+fn named_output_deterministic_rc4() {
+    let o1 = run_structured_output_lifted_named(include_str!("../test_cu/rc4.sass"));
+    let o2 = run_structured_output_lifted_named(include_str!("../test_cu/rc4.sass"));
+    assert_eq!(o1, o2);
+}
+
+#[test]
+fn named_output_preserves_no_goto_gate() {
+    let if_loop = run_structured_output_lifted_named(include_str!("../test_cu/if_loop.sass"));
+    let rc4 = run_structured_output_lifted_named(include_str!("../test_cu/rc4.sass"));
+    let test_div = run_structured_output_lifted_named(include_str!("../test_cu/test_div.sass"));
+
+    assert_eq!(if_loop.matches("goto BB").count(), 0);
+    assert_eq!(rc4.matches("goto BB").count(), 0);
+    assert_eq!(test_div.matches("goto BB").count(), 0);
+}
+
+#[test]
+fn named_output_with_semantic_lift_still_removes_opcode_noise() {
+    let out = run_structured_output_lifted_named(include_str!("../test_cu/rc4.sass"));
+    assert!(out.contains("hi32("));
+    assert!(out.contains("? 1 : 0"));
+    assert!(!out.contains("IADD3.X("));
+    assert!(!out.contains("LEA.HI("));
+    assert!(!out.contains("LOP3.LUT("));
+}
+
+#[test]
+fn named_rc4_uses_parenthesized_pointer_offset_syntax() {
+    let out = run_structured_output_lifted_named(include_str!("../test_cu/rc4.sass"));
+    assert!(!out.contains("*v9+1@64"));
+    assert!(!out.contains("*v164+1@64"));
+    assert!(out.contains("*(v9 + 1)@64") || out.contains("*(v164 + 1)@64"));
+}
+
+#[test]
+fn lifted_rc4_no_raw_constmem_call_syntax() {
+    let out = run_structured_output_lifted(include_str!("../test_cu/rc4.sass"));
+    assert!(!out.contains("c[0x0][0x180]()"));
+}
+
+#[test]
+fn named_phi_merge_comments_are_opt_in() {
+    let off = run_structured_output_lifted_named(include_str!("../test_cu/if_loop.sass"));
+    let on = run_structured_output_lifted_named_with_phi_comments(include_str!("../test_cu/if_loop.sass"));
+    assert!(!off.contains("phi merge:"));
+    assert!(on.contains("phi merge:"));
 }

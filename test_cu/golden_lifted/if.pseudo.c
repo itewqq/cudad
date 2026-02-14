@@ -1,5 +1,8 @@
+BB0 {
+  R26.0 = threadIdx.x;
+}
 // Condition from BB0
-if (P0) {
+if (P0.0) {
   BB1 {
     R1.1 = R1.0 + 1;
   }

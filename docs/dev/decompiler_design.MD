@@ -18,6 +18,17 @@ Optional (opt-in) structured rendering stage:
    available, and falls back to current opcode-style rendering otherwise.
 3. CLI control: `--semantic-lift` (effective with `--struct-code`).
 
+Optional (opt-in) name recovery stage:
+
+1. `recover_structured_output_names` (`src/name_recovery.rs`) rewrites SSA-style
+   register tokens in rendered structured output into stable C-like names.
+2. Merging is conservative: only phi/copy-congruent SSA versions are merged;
+   reused register families can split into multiple recovered names.
+3. CLI controls (effective with `--struct-code`):
+   - `--recover-names`
+   - `--name-style temp|reg` (default `temp`)
+   - `--phi-merge-comments` (comment-only merge/live-in annotations)
+
 Optional declaration stage (opt-in):
 
 1. `AbiArgAliases::render_typed_arg_declarations` (`src/abi.rs`) emits

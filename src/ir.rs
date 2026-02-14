@@ -23,12 +23,27 @@ pub trait DisplayCtx {
             IRExpr::ImmI(i)=>format!("{}",i),
             IRExpr::ImmF(f)=>format!("{}",f),
             IRExpr::Mem{base,offset,width}=>{
-                let mut s=format!("*{}",self.expr(base));
-                if let Some(off)=offset{ s.push_str(&format!("+{}",self.expr(off))); }
+                let mut s=if let Some(off)=offset{
+                    format!("*({} + {})",self.expr(base),self.expr(off))
+                } else {
+                    format!("*{}",self.expr(base))
+                };
                 if let Some(w)=width { s.push_str(&format!("@{}",w)); }
                 s
             }
             IRExpr::Op{op,args}=>{
+                if op=="-" && args.len()==1 {
+                    let inner = self.expr(&args[0]);
+                    let simple = match &args[0] {
+                        IRExpr::Reg(_) | IRExpr::ImmI(_) | IRExpr::ImmF(_) => true,
+                        IRExpr::Op { op, .. } if op == "ConstMem" => true,
+                        _ => false,
+                    };
+                    if simple {
+                        return format!("-{}", inner);
+                    }
+                    return format!("-({})", inner);
+                }
                 let list=args.iter().map(|a|self.expr(a)).collect::<Vec<_>>().join(", ");
                 format!("{}({})",op,list)
             }
@@ -154,11 +169,52 @@ fn lower_operand(op:&Operand)->IRExpr{
             }
         }
         Operand::Raw(s)=>{
+            if let Some((neg, bank, off)) = parse_raw_constmem_token(s) {
+                let cm = IRExpr::Op {
+                    op: "ConstMem".into(),
+                    args: vec![IRExpr::ImmI(bank as i64), IRExpr::ImmI(off as i64)],
+                };
+                if neg {
+                    return IRExpr::Op {
+                        op: "-".into(),
+                        args: vec![cm],
+                    };
+                }
+                return cm;
+            }
             if let Ok(i)=s.parse::<i64>() { IRExpr::ImmI(i)}
             else if let Ok(f)=s.parse::<f64>(){ IRExpr::ImmF(f)}
             else{ IRExpr::Op{op:s.clone(),args:vec![]}}
         }
     }
+}
+
+fn parse_raw_constmem_token(s: &str) -> Option<(bool, u32, u32)> {
+    let t = s.trim();
+    let (neg, core) = if let Some(rest) = t.strip_prefix('-') {
+        (true, rest)
+    } else {
+        (false, t)
+    };
+    if !(core.starts_with("c[") && core.ends_with(']')) {
+        return None;
+    }
+    let mut parts = core.split('[');
+    let head = parts.next()?;
+    if head != "c" {
+        return None;
+    }
+    let bank_part = parts.next()?.strip_suffix(']')?;
+    let off_part = parts.next()?.strip_suffix(']')?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if !bank_part.starts_with("0x") || !off_part.starts_with("0x") {
+        return None;
+    }
+    let bank = u32::from_str_radix(&bank_part[2..], 16).ok()?;
+    let off = u32::from_str_radix(&off_part[2..], 16).ok()?;
+    Some((neg, bank, off))
 }
 /* mem load/store heuristics */
 fn is_mem_load(op:&str)->bool{op.starts_with("LD")}
@@ -177,7 +233,12 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
 
     /* ---------- helpers ---------- */
     fn base_reg(r: &RegId) -> RegId {
-        RegId { ssa: None, ..r.clone() }
+        // SSA identity is register family + index only.
+        // Unary sign is an expression-level property and must not fork SSA chains.
+        let mut out = r.clone();
+        out.ssa = None;
+        out.sign = 1;
+        out
     }
     fn is_immutable_reg(r: &RegId) -> bool {
         matches!(r.class.as_str(), "RZ" | "PT" | "URZ" | "UPT")
@@ -212,7 +273,9 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
                 if is_immutable_reg(r) {
                     return;
                 }
-                let top = top_or_new(&base_reg(r), stack, cnt).clone();
+                let use_sign = r.sign;
+                let mut top = top_or_new(&base_reg(r), stack, cnt).clone();
+                top.sign = use_sign;
                 *r = top;
             }
             IRExpr::Mem { base, offset, .. } => {
@@ -287,7 +350,15 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
             let pred_expr = ins.pred.as_ref().and_then(|p| {
                 if p.reg.starts_with('P') {
                     let idx = p.reg[1..].parse().ok()?;
-                    Some(IRExpr::Reg(RegId::new("P", idx, 1)))
+                    let base = IRExpr::Reg(RegId::new("P", idx, 1));
+                    if p.sense {
+                        Some(base)
+                    } else {
+                        Some(IRExpr::Op {
+                            op: "!".into(),
+                            args: vec![base],
+                        })
+                    }
                 } else {
                     None
                 }

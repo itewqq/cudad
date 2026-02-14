@@ -1,18 +1,22 @@
+BB0 {
+  R0.0 = S2R(SR_CTAID.X());
+  R3.0 = S2R(SR_TID.X());
+}
 // Condition from BB0
-if (!(P0)) {
+if (!(P0.0)) {
   // Condition from BB1
-  if (P1) {
+  if (P1.0) {
     // Condition from BB2
-    if (P0) {
+    if (P0.2) {
       // Condition from BB3
-      if (P0) {
+      if (P0.3) {
         // Condition from BB4
-        if (P1) {
+        if (P1.1) {
           BB5 {
             P0.5 = PLOP3.LUT(PT, PT, PT, PT, 8, 0);
           }
           // Loop header BB6
-          while (P2) {
+          while (P2.2) {
             BB6 {
               R7.2 = IMAD.MOV.U32(RZ, RZ, 1066192077);
               P1.3 = FSETP.GT.AND(PT, R9.2, 0.5, PT);
@@ -68,86 +72,89 @@ if (!(P0)) {
               // 7 phi node(s) omitted
             }
           }
-        } else {
-          // Condition from BB7
-          if (P1) {
-            BB8 {
-              R7.4 = IMAD.MOV.U32(RZ, RZ, 1066192077);
-              P0.7 = FSETP.GT.AND(PT, R9.5, 0.5, PT);
-              R6.6 = IADD3(R6.5, -8, RZ);
-              R4.20 = FSEL(R7.4, 0.8999999761581421, P0.7);
-              R4.21 = FMUL(R9.5, R4.20);
-              P0.8 = FSETP.GT.AND(PT, R4.21, 0.5, PT);
-              R5.17 = FSEL(R7.4, 0.8999999761581421, P0.8);
-              R5.18 = FMUL(R4.21, R5.17);
-              P0.9 = FSETP.GT.AND(PT, R5.18, 0.5, PT);
-              R4.22 = FSEL(R7.4, 0.8999999761581421, P0.9);
-              R4.23 = FMUL(R5.18, R4.22);
-              P0.10 = FSETP.GT.AND(PT, R4.23, 0.5, PT);
-              R5.19 = FSEL(R7.4, 0.8999999761581421, P0.10);
-              R5.20 = FMUL(R4.23, R5.19);
-              P0.11 = FSETP.GT.AND(PT, R5.20, 0.5, PT);
-              R4.24 = FSEL(R7.4, 0.8999999761581421, P0.11);
-              R4.25 = FMUL(R5.20, R4.24);
-              P0.12 = FSETP.GT.AND(PT, R4.25, 0.5, PT);
-              R5.21 = FSEL(R7.4, 0.8999999761581421, P0.12);
-              R5.22 = FMUL(R4.25, R5.21);
-              P0.13 = FSETP.GT.AND(PT, R5.22, 0.5, PT);
-              R4.26 = FSEL(R7.4, 0.8999999761581421, P0.13);
-              P0.14 = PLOP3.LUT(PT, PT, PT, PT, 8, 0);
-              R4.27 = FMUL(R5.22, R4.26);
-              P1.21 = FSETP.GT.AND(PT, R4.27, 0.5, PT);
-              R9.6 = FSEL(R7.4, 0.8999999761581421, P1.21);
-              R9.7 = FMUL(R4.27, R9.6);
-            }
-            // Condition from BB9
-            if (P0) {
-              BB10 {
-                R7.7 = IMAD.MOV.U32(RZ, RZ, 1066192077);
-                // 8 phi node(s) omitted
-              }
-              // Loop header BB11
-              while (P0) {
-                BB11 {
-                  P0.19 = FSETP.GT.AND(PT, R9.10, 0.5, PT);
-                  R6.10 = IADD3(R6.9, -4, RZ);
-                  R4.31 = FSEL(R7.7, 0.8999999761581421, P0.19);
-                  R4.32 = FMUL(R4.31, R9.10);
-                  P0.20 = FSETP.GT.AND(PT, R4.32, 0.5, PT);
-                  R5.26 = FSEL(R7.7, 0.8999999761581421, P0.20);
-                  R5.27 = FMUL(R4.32, R5.26);
-                  P0.21 = FSETP.GT.AND(PT, R5.27, 0.5, PT);
-                  R4.33 = FSEL(R7.7, 0.8999999761581421, P0.21);
-                  P0.22 = ISETP.NE.AND(PT, R6.10, RZ, PT);
-                  R4.34 = FMUL(R5.27, R4.33);
-                  P1.25 = FSETP.GT.AND(PT, R4.34, 0.5, PT);
-                  R9.11 = FSEL(R7.7, 0.8999999761581421, P1.25);
-                  R9.12 = FMUL(R4.34, R9.11);
-                  // 6 phi node(s) omitted
-                }
-              }
-            } else {
-              // Condition from BB12
-              if (P0) {
-                BB13 {
-                  R5.29 = IMAD.MOV.U32(RZ, RZ, 1066192077);
-                }
-                // Loop header BB14
-                while (P0) {
-                  BB14 {
-                    R2.3 = IADD3(R2.2, -1, RZ);
-                    P1.28 = FSETP.GT.AND(PT, R9.14, 0.5, PT);
-                    P0.26 = ISETP.NE.AND(PT, R2.3, RZ, PT);
-                    R4.37 = FSEL(R5.29, 0.8999999761581421, P1.28);
-                    R9.15 = FMUL(R4.37, R9.14);
-                    // 5 phi node(s) omitted
-                  }
-                }
-              } else {
-                return;
-              }
+        }
+        // Condition from BB7
+        if (P1.20) {
+          BB8 {
+            R7.4 = IMAD.MOV.U32(RZ, RZ, 1066192077);
+            P0.7 = FSETP.GT.AND(PT, R9.5, 0.5, PT);
+            R6.6 = IADD3(R6.5, -8, RZ);
+            R4.20 = FSEL(R7.4, 0.8999999761581421, P0.7);
+            R4.21 = FMUL(R9.5, R4.20);
+            P0.8 = FSETP.GT.AND(PT, R4.21, 0.5, PT);
+            R5.17 = FSEL(R7.4, 0.8999999761581421, P0.8);
+            R5.18 = FMUL(R4.21, R5.17);
+            P0.9 = FSETP.GT.AND(PT, R5.18, 0.5, PT);
+            R4.22 = FSEL(R7.4, 0.8999999761581421, P0.9);
+            R4.23 = FMUL(R5.18, R4.22);
+            P0.10 = FSETP.GT.AND(PT, R4.23, 0.5, PT);
+            R5.19 = FSEL(R7.4, 0.8999999761581421, P0.10);
+            R5.20 = FMUL(R4.23, R5.19);
+            P0.11 = FSETP.GT.AND(PT, R5.20, 0.5, PT);
+            R4.24 = FSEL(R7.4, 0.8999999761581421, P0.11);
+            R4.25 = FMUL(R5.20, R4.24);
+            P0.12 = FSETP.GT.AND(PT, R4.25, 0.5, PT);
+            R5.21 = FSEL(R7.4, 0.8999999761581421, P0.12);
+            R5.22 = FMUL(R4.25, R5.21);
+            P0.13 = FSETP.GT.AND(PT, R5.22, 0.5, PT);
+            R4.26 = FSEL(R7.4, 0.8999999761581421, P0.13);
+            P0.14 = PLOP3.LUT(PT, PT, PT, PT, 8, 0);
+            R4.27 = FMUL(R5.22, R4.26);
+            P1.21 = FSETP.GT.AND(PT, R4.27, 0.5, PT);
+            R9.6 = FSEL(R7.4, 0.8999999761581421, P1.21);
+            R9.7 = FMUL(R4.27, R9.6);
+          }
+        }
+        // Condition from BB9
+        if (P0.16) {
+          BB10 {
+            R7.7 = IMAD.MOV.U32(RZ, RZ, 1066192077);
+            // 8 phi node(s) omitted
+          }
+          // Loop header BB11
+          while (P0.22) {
+            BB11 {
+              P0.19 = FSETP.GT.AND(PT, R9.10, 0.5, PT);
+              R6.10 = IADD3(R6.9, -4, RZ);
+              R4.31 = FSEL(R7.7, 0.8999999761581421, P0.19);
+              R4.32 = FMUL(R4.31, R9.10);
+              P0.20 = FSETP.GT.AND(PT, R4.32, 0.5, PT);
+              R5.26 = FSEL(R7.7, 0.8999999761581421, P0.20);
+              R5.27 = FMUL(R4.32, R5.26);
+              P0.21 = FSETP.GT.AND(PT, R5.27, 0.5, PT);
+              R4.33 = FSEL(R7.7, 0.8999999761581421, P0.21);
+              P0.22 = ISETP.NE.AND(PT, R6.10, RZ, PT);
+              R4.34 = FMUL(R5.27, R4.33);
+              P1.25 = FSETP.GT.AND(PT, R4.34, 0.5, PT);
+              R9.11 = FSEL(R7.7, 0.8999999761581421, P1.25);
+              R9.12 = FMUL(R4.34, R9.11);
+              // 6 phi node(s) omitted
             }
           }
+        }
+        // Condition from BB12
+        if (P0.24) {
+          BB13 {
+            R5.29 = IMAD.MOV.U32(RZ, RZ, 1066192077);
+          }
+          // Loop header BB14
+          while (P0.26) {
+            BB14 {
+              R2.3 = IADD3(R2.2, -1, RZ);
+              P1.28 = FSETP.GT.AND(PT, R9.14, 0.5, PT);
+              P0.26 = ISETP.NE.AND(PT, R2.3, RZ, PT);
+              R4.37 = FSEL(R5.29, 0.8999999761581421, P1.28);
+              R9.15 = FMUL(R4.37, R9.14);
+              // 5 phi node(s) omitted
+            }
+          }
+        }
+        BB15 {
+          R2.5 = LEA(P0.27, R0.1, ConstMem(0, 368), 2);
+          R3.2 = LEA.HI.X(R0.1, ConstMem(0, 372), R3.1, 2, P0.27);
+          _ = STG.E(*R2.5@64, R9.16);
+          return;
+          // 9 phi node(s) omitted
         }
       }
     }

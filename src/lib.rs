@@ -11,6 +11,7 @@ pub mod structurizer;
 pub mod cfg_analysis;
 pub mod high_il;
 pub mod semantic_lift;
+pub mod name_recovery;
 
 #[cfg(test)]
 mod test;
@@ -23,3 +24,4 @@ pub use structurizer::*;
 pub use cfg_analysis::*;
 pub use high_il::*;
 pub use semantic_lift::*;
+pub use name_recovery::*;

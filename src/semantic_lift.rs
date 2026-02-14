@@ -183,6 +183,9 @@ fn lift_opcode_expr(
     stmt_ref: StatementRef,
     config: &SemanticLiftConfig<'_>,
 ) -> Option<LiftedExpr> {
+    if opcode.starts_with("S2R") {
+        return lift_s2r(args);
+    }
     if opcode.starts_with("IMAD.MOV") {
         return lift_imad_mov(args, stmt_ref, config);
     }
@@ -229,6 +232,31 @@ fn lift_opcode_expr(
         return lift_lea(opcode, args, stmt_ref, config);
     }
     None
+}
+
+fn lift_s2r(args: &[IRExpr]) -> Option<LiftedExpr> {
+    if args.len() != 1 {
+        return None;
+    }
+    let IRExpr::Op { op, args } = &args[0] else {
+        return None;
+    };
+    if !args.is_empty() {
+        return None;
+    }
+    let sym = match op.as_str() {
+        "SR_CTAID.X" => "blockIdx.x",
+        "SR_CTAID.Y" => "blockIdx.y",
+        "SR_CTAID.Z" => "blockIdx.z",
+        "SR_TID.X" => "threadIdx.x",
+        "SR_TID.Y" => "threadIdx.y",
+        "SR_TID.Z" => "threadIdx.z",
+        "SR_NTID.X" => "blockDim.x",
+        "SR_NTID.Y" => "blockDim.y",
+        "SR_NTID.Z" => "blockDim.z",
+        _ => return None,
+    };
+    Some(LiftedExpr::Raw(sym.to_string()))
 }
 
 fn lift_store_stmt(
@@ -1060,16 +1088,33 @@ fn render_expr_raw(expr: &IRExpr, stmt_ref: StatementRef, config: &SemanticLiftC
             offset,
             width,
         } => {
-            let mut s = format!("*{}", render_expr_raw(base, stmt_ref, config));
-            if let Some(off) = offset {
-                s.push_str(&format!("+{}", render_expr_raw(off, stmt_ref, config)));
-            }
+            let mut s = if let Some(off) = offset {
+                format!(
+                    "*({} + {})",
+                    render_expr_raw(base, stmt_ref, config),
+                    render_expr_raw(off, stmt_ref, config)
+                )
+            } else {
+                format!("*{}", render_expr_raw(base, stmt_ref, config))
+            };
             if let Some(w) = width {
                 s.push_str(&format!("@{}", w));
             }
             s
         }
         IRExpr::Op { op, args } => {
+            if op == "-" && args.len() == 1 {
+                let inner = render_expr_raw(&args[0], stmt_ref, config);
+                let simple = match &args[0] {
+                    IRExpr::Reg(_) | IRExpr::ImmI(_) | IRExpr::ImmF(_) => true,
+                    IRExpr::Op { op, .. } if op == "ConstMem" => true,
+                    _ => false,
+                };
+                if simple {
+                    return format!("-{}", inner);
+                }
+                return format!("-({})", inner);
+            }
             if args.is_empty() {
                 match op.as_str() {
                     "PT" | "UPT" => return "true".to_string(),
@@ -1236,6 +1281,23 @@ mod tests {
             })
             .expect("expected lifted ISETP");
         assert_eq!(lifted.rhs.render(), "R0.0 >= 1");
+    }
+
+    #[test]
+    fn lifts_s2r_ctaid_x_to_blockidx_x() {
+        let sass = r#"
+            /*0000*/ S2R R0, SR_CTAID.X ;
+            /*0010*/ EXIT ;
+        "#;
+        let out = run_lift(sass);
+        let lifted = out
+            .by_stmt
+            .get(&StatementRef {
+                block_id: 0,
+                stmt_idx: 0,
+            })
+            .expect("expected lifted S2R");
+        assert_eq!(lifted.rhs.render(), "blockIdx.x");
     }
 
     #[test]

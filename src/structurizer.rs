@@ -106,6 +106,44 @@ impl<'a> Structurizer<'a> {
         opcode == "RET" || opcode == "EXIT" || opcode.starts_with("RET")
     }
 
+    fn is_setp_opcode(opcode: &str) -> bool {
+        opcode.starts_with("ISETP") || opcode.starts_with("FSETP")
+    }
+
+    fn should_omit_control_predicate_def(
+        stmt: &IRStatement,
+        stmt_idx: usize,
+        block: &IRBlock,
+        control_pred_regs: &[RegId],
+    ) -> bool {
+        let (dest_reg, opcode) = match (&stmt.dest, &stmt.value) {
+            (
+                Some(IRExpr::Reg(r)),
+                RValue::Op { opcode, .. },
+            ) if matches!(r.class.as_str(), "P" | "UP") => (r, opcode.as_str()),
+            _ => return false,
+        };
+        if !Self::is_setp_opcode(opcode) {
+            return false;
+        }
+        let matches_control_pred = control_pred_regs.iter().any(|r| {
+            r.class == dest_reg.class && r.idx == dest_reg.idx && r.ssa == dest_reg.ssa
+        });
+        if !matches_control_pred {
+            return false;
+        }
+        block
+            .stmts
+            .iter()
+            .skip(stmt_idx + 1)
+            .all(|s| match &s.value {
+                RValue::Op { opcode, .. } => {
+                    Self::is_branch_only_opcode(opcode) || Self::is_return_opcode(opcode)
+                }
+                _ => false,
+            })
+    }
+
     fn is_effectively_empty(stmt: &StructuredStatement) -> bool {
         match stmt {
             StructuredStatement::Empty => true,
@@ -149,6 +187,50 @@ impl<'a> Structurizer<'a> {
             if current == NodeIndex::end() { break; } 
         }
         false
+    }
+
+    fn has_cfg_path(&self, start: NodeIndex, goal: NodeIndex) -> bool {
+        if start == goal {
+            return true;
+        }
+        let mut seen = HashSet::new();
+        let mut work = VecDeque::new();
+        seen.insert(start);
+        work.push_back(start);
+        while let Some(n) = work.pop_front() {
+            for succ in self.cfg.neighbors_directed(n, Direction::Outgoing) {
+                if succ == goal {
+                    return true;
+                }
+                if seen.insert(succ) {
+                    work.push_back(succ);
+                }
+            }
+        }
+        false
+    }
+
+    fn select_if_merge_node(
+        &self,
+        condition_cfg_node: NodeIndex,
+        true_target_cfg_node: NodeIndex,
+        false_target_cfg_node_opt: Option<NodeIndex>,
+    ) -> Option<NodeIndex> {
+        let mut if_merge_cfg_node = self.immediate_pdom_map.get(&condition_cfg_node).copied();
+        if let Some(false_target_cfg_node) = false_target_cfg_node_opt {
+            let true_reaches_false = self.has_cfg_path(true_target_cfg_node, false_target_cfg_node);
+            let false_reaches_true = self.has_cfg_path(false_target_cfg_node, true_target_cfg_node);
+            if true_reaches_false ^ false_reaches_true {
+                // One branch target reaches the other: treat the reached target
+                // as the local join to avoid pulling post-merge regions into a branch.
+                if_merge_cfg_node = Some(if false_reaches_true {
+                    true_target_cfg_node
+                } else {
+                    false_target_cfg_node
+                });
+            }
+        }
+        if_merge_cfg_node
     }
 
     pub fn new(cfg: &'a ControlFlowGraph, function_ir: &'a FunctionIR) -> Self {
@@ -306,6 +388,31 @@ impl<'a> Structurizer<'a> {
                     }
                     None
                 });
+                let mut pre_return_stmts = ir_block.stmts.clone();
+                if let Some(IRStatement { value: RValue::Op { opcode, .. }, pred, .. }) =
+                    pre_return_stmts.last()
+                {
+                    if pred.is_none() && Self::is_return_opcode(opcode) {
+                        pre_return_stmts.pop();
+                    }
+                }
+                let has_renderable_pre_return_stmt = pre_return_stmts.iter().any(|s| {
+                    if matches!(s.value, RValue::Phi(_)) {
+                        return false;
+                    }
+                    match &s.value {
+                        RValue::Op { opcode, .. } => {
+                            !Self::is_branch_only_opcode(opcode) && !Self::is_return_opcode(opcode)
+                        }
+                        _ => true,
+                    }
+                });
+                if has_renderable_pre_return_stmt {
+                    region_statements.push(StructuredStatement::BasicBlock {
+                        block_id: ir_block.id,
+                        stmts: pre_return_stmts,
+                    });
+                }
                 region_statements.push(StructuredStatement::Return(ret_val));
                 break 'structure_sequence;
             }
@@ -388,16 +495,16 @@ impl<'a> Structurizer<'a> {
             match (cond1_opt, cond2_opt) {
                 (Some(IRCond::Pred { reg: r1, sense: s1 }), Some(IRCond::Pred { reg: r2, sense: s2 })) => {
                     if r1.class == r2.class && r1.idx == r2.idx && *s1 != *s2 {
-                        let cond_expr = IRExpr::Reg(RegId::new(&r1.class, r1.idx, r1.sign));
+                        let cond_expr = IRExpr::Reg(r1.clone());
                         return if *s1 { Some((cond_expr, node1, Some(node2))) } else { Some((cond_expr, node2, Some(node1))) };
                     }
                 }
                  (Some(IRCond::Pred { reg, sense }), Some(IRCond::True)) => {
-                    let cond_expr_val = IRExpr::Reg(RegId::new(&reg.class, reg.idx, reg.sign));
+                    let cond_expr_val = IRExpr::Reg(reg.clone());
                     return if *sense { Some((cond_expr_val, node1, Some(node2))) } else { Some((negate_condition(cond_expr_val), node1, Some(node2))) };
                 }
                 (Some(IRCond::True), Some(IRCond::Pred { reg, sense })) => {
-                    let cond_expr_val = IRExpr::Reg(RegId::new(&reg.class, reg.idx, reg.sign));
+                    let cond_expr_val = IRExpr::Reg(reg.clone());
                     return if *sense { Some((cond_expr_val, node2, Some(node1))) } else { Some((negate_condition(cond_expr_val), node2, Some(node1))) };
                 }
                 _ => {}
@@ -406,7 +513,7 @@ impl<'a> Structurizer<'a> {
             let (cond_opt, addr) = &ir_block.irdst[0];
             if let Some(IRCond::Pred { reg, sense }) = cond_opt {
                 let target_node = self.addr_to_node_index.get(addr).copied()?;
-                let base_reg_expr = IRExpr::Reg(RegId::new(&reg.class, reg.idx, reg.sign));
+                let base_reg_expr = IRExpr::Reg(reg.clone());
                 let cond_expr = if *sense { base_reg_expr } else { negate_condition(base_reg_expr) };
                 return Some((cond_expr, target_node, None)); 
             }
@@ -425,13 +532,19 @@ impl<'a> Structurizer<'a> {
         let (if_condition_expr, true_target_cfg_node, false_target_cfg_node_opt) =
             self.extract_if_targets_and_condition(ir_cond_block)?;
 
-        let if_merge_cfg_node = self.immediate_pdom_map.get(&condition_cfg_node).copied();
+        let if_merge_cfg_node = self.select_if_merge_node(
+            condition_cfg_node,
+            true_target_cfg_node,
+            false_target_cfg_node_opt,
+        );
 
-        let actual_branch_exit_target = match (if_merge_cfg_node, overall_desired_exit) {
-            (Some(imn), Some(ode)) => if self.node_is_dominated_by(&self.pdom_algo_result, imn, ode) || imn == ode { Some(ode) } else { Some(imn) },
-            (Some(imn), None) => Some(imn),
-            (None, Some(ode)) => Some(ode),
-            (None, None) => None,
+        // Prefer the local immediate post-dominator as the IF merge target.
+        // Extending to an outer desired-exit can incorrectly pull post-merge
+        // code into one branch and distort control flow.
+        let actual_branch_exit_target = if if_merge_cfg_node.is_some() {
+            if_merge_cfg_node
+        } else {
+            overall_desired_exit
         };
         
         let is_true_target_exit = Some(true_target_cfg_node) == actual_branch_exit_target;
@@ -479,7 +592,14 @@ impl<'a> Structurizer<'a> {
     fn get_if_merge_or_successor(&self, if_stmt: &StructuredStatement) -> Option<NodeIndex> {
         if let StructuredStatement::If { condition_block_id, .. } = if_stmt {
             let cond_cfg_node = self.block_id_to_node_index.get(condition_block_id)?;
-            return self.immediate_pdom_map.get(cond_cfg_node).copied();
+            let ir_cond_block = self.get_ir_block_by_cfg_node(*cond_cfg_node)?;
+            let (_, true_target_cfg_node, false_target_cfg_node_opt) =
+                self.extract_if_targets_and_condition(ir_cond_block)?;
+            return self.select_if_merge_node(
+                *cond_cfg_node,
+                true_target_cfg_node,
+                false_target_cfg_node_opt,
+            );
         }
         None
     }
@@ -849,6 +969,175 @@ impl<'a> Structurizer<'a> {
         None
     }
 
+    fn render_condition_prelude_for_block(
+        &self,
+        block_id: usize,
+        ctx: &dyn DisplayCtx,
+        indent_level: usize,
+        lifted: Option<&SemanticLiftResult>,
+    ) -> String {
+        let Some(block) = self.function_ir.blocks.iter().find(|b| b.id == block_id) else {
+            return String::new();
+        };
+
+        let mut lines = String::new();
+        for (stmt_idx, ir_s) in block.stmts.iter().enumerate() {
+            if matches!(ir_s.value, RValue::Phi(_)) {
+                continue;
+            }
+            let is_s2r = matches!(
+                &ir_s.value,
+                RValue::Op { opcode, .. } if opcode == "S2R" || opcode == "CS2R"
+            );
+            if !is_s2r {
+                continue;
+            }
+
+            if let Some(lifted_stmt) = lifted.and_then(|res| {
+                res.by_stmt.get(&StatementRef {
+                    block_id,
+                    stmt_idx,
+                })
+            }) {
+                let pred_str = lifted_stmt
+                    .pred
+                    .as_ref()
+                    .map_or_else(String::new, |p| format!("if ({}) ", p.render()));
+                lines.push_str(&format!(
+                    "{}{}{} = {};\n",
+                    "  ".repeat(indent_level + 1),
+                    pred_str,
+                    lifted_stmt.dest,
+                    lifted_stmt.rhs.render()
+                ));
+                continue;
+            }
+
+            let dest_str = ir_s
+                .dest
+                .as_ref()
+                .map_or_else(|| "_".to_string(), |d| ctx.expr(d));
+            let value_str = match &ir_s.value {
+                RValue::Op { opcode, args } => {
+                    let args_s = args.iter().map(|a| ctx.expr(a)).collect::<Vec<_>>().join(", ");
+                    format!("{}({})", opcode, args_s)
+                }
+                RValue::Phi(args) => {
+                    let args_s = args.iter().map(|a| ctx.expr(a)).collect::<Vec<_>>().join(", ");
+                    format!("phi({})", args_s)
+                }
+                RValue::ImmI(i) => format!("{}", i),
+                RValue::ImmF(f) => format!("{}", f),
+            };
+            let pred_str = ir_s
+                .pred
+                .as_ref()
+                .map_or("".to_string(), |p| format!("if ({}) ", ctx.expr(p)));
+            lines.push_str(&format!(
+                "{}{}{} = {};\n",
+                "  ".repeat(indent_level + 1),
+                pred_str,
+                dest_str,
+                value_str
+            ));
+        }
+
+        if lines.is_empty() {
+            return String::new();
+        }
+
+        let indent = "  ".repeat(indent_level);
+        let mut out = String::new();
+        out.push_str(&format!("{}BB{} {{\n", indent, block_id));
+        out.push_str(&lines);
+        out.push_str(&format!("{}}}\n", indent));
+        out
+    }
+
+    fn render_condition_expr(
+        &self,
+        condition_block_id: usize,
+        condition_expr: &IRExpr,
+        ctx: &dyn DisplayCtx,
+        lifted: Option<&SemanticLiftResult>,
+    ) -> String {
+        match condition_expr {
+            IRExpr::Op { op, args } if op == "!" && args.len() == 1 => {
+                let inner = self.render_condition_expr(
+                    condition_block_id,
+                    &args[0],
+                    ctx,
+                    lifted,
+                );
+                format!("!({})", inner)
+            }
+            IRExpr::Reg(pred) => {
+                if let Some(expr) = self.resolve_predicate_condition_rhs(
+                    condition_block_id,
+                    pred,
+                    lifted,
+                ) {
+                    expr
+                } else {
+                    ctx.expr(condition_expr)
+                }
+            }
+            _ => ctx.expr(condition_expr),
+        }
+    }
+
+    fn resolve_predicate_condition_rhs(
+        &self,
+        block_id: usize,
+        pred: &RegId,
+        lifted: Option<&SemanticLiftResult>,
+    ) -> Option<String> {
+        let lifted = lifted?;
+
+        // Prefer a local def in the condition block, then fall back to exact SSA def globally.
+        let mut search_blocks = Vec::new();
+        if let Some(local) = self.function_ir.blocks.iter().find(|b| b.id == block_id) {
+            search_blocks.push(local);
+        }
+        for b in &self.function_ir.blocks {
+            if b.id != block_id {
+                search_blocks.push(b);
+            }
+        }
+
+        for block in search_blocks {
+            for (stmt_idx, stmt) in block.stmts.iter().enumerate().rev() {
+                let Some(IRExpr::Reg(dst)) = &stmt.dest else {
+                    continue;
+                };
+                if dst.class != pred.class || dst.idx != pred.idx {
+                    continue;
+                }
+                if let Some(want_ssa) = pred.ssa {
+                    if dst.ssa != Some(want_ssa) {
+                        continue;
+                    }
+                }
+                let is_setp = matches!(
+                    &stmt.value,
+                    RValue::Op { opcode, .. } if opcode.starts_with("ISETP") || opcode.starts_with("FSETP")
+                );
+                if !is_setp {
+                    continue;
+                }
+                let stmt_ref = StatementRef {
+                    block_id: block.id,
+                    stmt_idx,
+                };
+                if let Some(ls) = lifted.by_stmt.get(&stmt_ref) {
+                    return Some(ls.rhs.render());
+                }
+            }
+        }
+
+        None
+    }
+
     pub fn pretty_print(&self, stmt: &StructuredStatement, ctx: &dyn DisplayCtx, indent_level: usize) -> String {
         self.pretty_print_with_lift(stmt, ctx, indent_level, None)
     }
@@ -869,6 +1158,17 @@ impl<'a> Structurizer<'a> {
                 let mut omitted_phi_count = 0usize;
                 let fir_block = self.function_ir.blocks.iter().find(|b| b.id == *block_id);
                 let mut fir_search_from = 0usize;
+                let control_pred_regs: Vec<RegId> = fir_block
+                    .map(|b| {
+                        b.irdst
+                            .iter()
+                            .filter_map(|(cond, _)| match cond {
+                                Some(IRCond::Pred { reg, .. }) => Some(reg.clone()),
+                                _ => None,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 for (stmt_idx, ir_s) in stmts.iter().enumerate() {
                     let mut lookup_stmt_idx = stmt_idx;
                     if let Some(orig_block) = fir_block {
@@ -888,6 +1188,16 @@ impl<'a> Structurizer<'a> {
                     if matches!(ir_s.value, RValue::Phi(_)) {
                         omitted_phi_count += 1;
                         continue;
+                    }
+                    if let Some(orig_block) = fir_block {
+                        if Self::should_omit_control_predicate_def(
+                            ir_s,
+                            lookup_stmt_idx,
+                            orig_block,
+                            &control_pred_regs,
+                        ) {
+                            continue;
+                        }
                     }
                     if let RValue::Op { opcode, .. } = &ir_s.value {
                         if Self::is_branch_only_opcode(opcode) {
@@ -970,13 +1280,37 @@ impl<'a> Structurizer<'a> {
                     // No-op condition: suppress noisy empty if blocks in output.
                 } else if then_empty && !else_empty {
                     // Canonicalize "if (cond) {} else { X }" -> "if (!cond) { X }".
+                    s_out.push_str(&self.render_condition_prelude_for_block(
+                        *condition_block_id,
+                        ctx,
+                        indent_level,
+                        lifted,
+                    ));
                     s_out.push_str(&format!("{}// Condition from BB{}\n", indent, condition_block_id));
-                    s_out.push_str(&format!("{}if ({}) {{\n", indent, ctx.expr(&negate_condition(condition_expr.clone()))));
+                    let cond_str = self.render_condition_expr(
+                        *condition_block_id,
+                        &negate_condition(condition_expr.clone()),
+                        ctx,
+                        lifted,
+                    );
+                    s_out.push_str(&format!("{}if ({}) {{\n", indent, cond_str));
                     s_out.push_str(&self.pretty_print_with_lift(else_ref.unwrap(), ctx, indent_level + 1, lifted));
                     s_out.push_str(&format!("{}}}\n", indent));
                 } else {
+                    s_out.push_str(&self.render_condition_prelude_for_block(
+                        *condition_block_id,
+                        ctx,
+                        indent_level,
+                        lifted,
+                    ));
                     s_out.push_str(&format!("{}// Condition from BB{}\n", indent, condition_block_id));
-                    s_out.push_str(&format!("{}if ({}) {{\n", indent, ctx.expr(condition_expr)));
+                    let cond_str = self.render_condition_expr(
+                        *condition_block_id,
+                        condition_expr,
+                        ctx,
+                        lifted,
+                    );
+                    s_out.push_str(&format!("{}if ({}) {{\n", indent, cond_str));
                     s_out.push_str(&self.pretty_print_with_lift(then_branch, ctx, indent_level + 1, lifted));
                     if let Some(eb) = else_ref {
                         if !Self::is_effectively_empty(eb) {
@@ -988,10 +1322,27 @@ impl<'a> Structurizer<'a> {
                 }
             }
             StructuredStatement::Loop { loop_type, header_block_id, condition_expr, body } => {
+                if let Some(hid) = header_block_id {
+                    s_out.push_str(&self.render_condition_prelude_for_block(
+                        *hid,
+                        ctx,
+                        indent_level,
+                        lifted,
+                    ));
+                }
                 s_out.push_str(&format!("{}// Loop header BB{:?}\n", indent, header_block_id.unwrap_or(usize::MAX)));
                 match loop_type {
                     LoopType::While => {
-                        s_out.push_str(&format!("{}while ({}) {{\n", indent, condition_expr.as_ref().map_or("true".to_string(), |e| ctx.expr(e))));
+                        let cond_str = condition_expr
+                            .as_ref()
+                            .map_or("true".to_string(), |e| {
+                                if let Some(hid) = header_block_id {
+                                    self.render_condition_expr(*hid, e, ctx, lifted)
+                                } else {
+                                    ctx.expr(e)
+                                }
+                            });
+                        s_out.push_str(&format!("{}while ({}) {{\n", indent, cond_str));
                     }
                     LoopType::Endless => {
                          s_out.push_str(&format!("{}while (true) {{\n", indent));

@@ -232,6 +232,12 @@ enum AbiProfileMode {
     Modern160,
 }
 
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum NameStyleMode {
+    Temp,
+    Reg,
+}
+
 #[derive(Parser, Debug)]
 /// CLI for CUDA SASS SSA/CFG tool
 struct Args {
@@ -259,6 +265,15 @@ struct Args {
     /// Emit heuristic typed argument/local declarations in structured output
     #[clap(long)]
     typed_decls: bool,
+    /// Recover SSA-style names into C-like temporary names in structured output
+    #[clap(long)]
+    recover_names: bool,
+    /// Name style used by --recover-names (`temp|reg`)
+    #[clap(long, value_enum, default_value = "temp")]
+    name_style: NameStyleMode,
+    /// Emit comment-only phi/live-in merge annotations in recovered-name mode
+    #[clap(long)]
+    phi_merge_comments: bool,
     /// Force ABI profile used by `--abi-map` (`auto|legacy140|modern160`)
     #[clap(long, value_enum, default_value = "auto")]
     abi_profile: AbiProfileMode,
@@ -385,10 +400,24 @@ fn main() {
                 0,
                 lift_result.as_ref(),
             );
-            let final_output = if args.typed_decls {
-                render_typed_structured_output(&code_output, abi_aliases.as_ref(), &local_decls)
+            let recovered_output = if args.recover_names {
+                let style = match args.name_style {
+                    NameStyleMode::Temp => NameStyle::Temp,
+                    NameStyleMode::Reg => NameStyle::RegisterFamily,
+                };
+                let recover_cfg = NameRecoveryConfig {
+                    style,
+                    rewrite_control_predicates: true,
+                    emit_phi_merge_comments: args.phi_merge_comments,
+                };
+                recover_structured_output_names(&fir, &code_output, &recover_cfg).output
             } else {
                 code_output
+            };
+            let final_output = if args.typed_decls {
+                render_typed_structured_output(&recovered_output, abi_aliases.as_ref(), &local_decls)
+            } else {
+                recovered_output
             };
             
             if let Some(ref path) = args.output {
