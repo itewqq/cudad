@@ -28,7 +28,7 @@ BB0 {
   R3.5 = MOV(ConstMem(0, 364));
   if (!(P1.0)) R5.2 = IADD3(-R5.1, RZ, RZ);
   if (!(P2.1)) R5.3 = LOP3.LUT(RZ, ConstMem(0, 356), RZ, 51, !PT());
-  _ = STG.E(*R2.2@64, R5.3);
+  _ = STG.E(*addr64(R2.2, R3.5), R5.3);
 }
 return;
 

@@ -274,6 +274,9 @@ struct Args {
     /// Emit comment-only phi/live-in merge annotations in recovered-name mode
     #[clap(long)]
     phi_merge_comments: bool,
+    /// Rewrite recovered temp vars using semantic seed names when possible
+    #[clap(long)]
+    semantic_symbolize: bool,
     /// Force ABI profile used by `--abi-map` (`auto|legacy140|modern160`)
     #[clap(long, value_enum, default_value = "auto")]
     abi_profile: AbiProfileMode,
@@ -289,6 +292,7 @@ fn main() {
         SAMPLE_SASS.to_string()
     };
     let instrs = parse_sass(&sass);
+    let no_parseable_instrs = instrs.is_empty();
     let sm_version = parse_sm_version(&sass);
     let inferred_profile = AbiProfile::detect_with_sm(&instrs, sm_version);
     let abi_profile = if args.abi_map || !matches!(args.abi_profile, AbiProfileMode::Auto) {
@@ -325,6 +329,22 @@ fn main() {
         }
     }
     if args.struct_code {
+        if no_parseable_instrs {
+            let mut fallback = String::new();
+            fallback.push_str("// Warning: no parseable SASS instruction lines were found.\n");
+            fallback.push_str("// Returning an empty stub to keep the pipeline non-fatal.\n");
+            fallback.push_str("void kernel(void) {\n");
+            fallback.push_str("}\n");
+            println!("// --- Structured Output ---");
+            if let Some(ref path) = args.output {
+                fs::write(path, &fallback).expect("Failed to write structured code file");
+                println!("Structured code written to {}", path);
+            } else {
+                println!("{}", fallback);
+            }
+            println!("// --- End Structured Output ---");
+            return;
+        }
         let fir = build_ssa(&cfg); // build_ssa returns FunctionIR
         let analysis_abi_profile = if abi_profile.is_some() || args.typed_decls {
             abi_profile.or(Some(inferred_profile))
@@ -359,7 +379,11 @@ fn main() {
             }
         }
         let local_decls = if args.typed_decls {
-            infer_local_typed_declarations(&fir)
+            infer_local_typed_declarations_with_abi(
+                &fir,
+                abi_annotations.as_ref(),
+                abi_aliases.as_ref(),
+            )
         } else {
             Vec::new()
         };
@@ -409,6 +433,7 @@ fn main() {
                     style,
                     rewrite_control_predicates: true,
                     emit_phi_merge_comments: args.phi_merge_comments,
+                    semantic_symbolization: args.semantic_symbolize,
                 };
                 recover_structured_output_names(&fir, &code_output, &recover_cfg).output
             } else {

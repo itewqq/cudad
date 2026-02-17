@@ -7,6 +7,10 @@ use std::collections::BTreeMap;
 use crate::abi::{AbiAnnotations, AbiArgAliases, ConstMemSemantic, StatementRef};
 use crate::ir::{FunctionIR, IRExpr, RValue};
 
+mod op_sig;
+mod registry;
+mod rules;
+
 #[derive(Clone, Debug)]
 pub struct SemanticLiftConfig<'a> {
     pub abi_annotations: Option<&'a AbiAnnotations>,
@@ -183,55 +187,7 @@ fn lift_opcode_expr(
     stmt_ref: StatementRef,
     config: &SemanticLiftConfig<'_>,
 ) -> Option<LiftedExpr> {
-    if opcode.starts_with("S2R") {
-        return lift_s2r(args);
-    }
-    if opcode.starts_with("IMAD.MOV") {
-        return lift_imad_mov(args, stmt_ref, config);
-    }
-    if opcode.starts_with("IMAD.WIDE") {
-        return lift_imad_wide(args, stmt_ref, config);
-    }
-    if opcode.starts_with("IMAD.IADD") {
-        return lift_imad_iadd(args, stmt_ref, config);
-    }
-    if opcode == "IADD3.X" || opcode == "UIADD3.X" {
-        return lift_iadd3_x(args, stmt_ref, config);
-    }
-    if opcode == "IADD3" || opcode == "UIADD3" {
-        return lift_iadd3(args, stmt_ref, config);
-    }
-    if opcode.starts_with("FMUL") {
-        return lift_binary_infix("*", args, stmt_ref, config);
-    }
-    if opcode.starts_with("FADD") {
-        return lift_binary_add_like(args, stmt_ref, config);
-    }
-    if opcode.starts_with("LDS") && opcode.contains(".U8") {
-        return lift_lds_expr(args, stmt_ref, config);
-    }
-    if opcode.starts_with("LDG") {
-        return lift_ldg_expr(args, stmt_ref, config);
-    }
-    if opcode.starts_with("FSEL") {
-        return lift_fsel(args, stmt_ref, config);
-    }
-    if opcode.starts_with("ISETP") || opcode.starts_with("FSETP") {
-        return lift_setp_compare(opcode, args, stmt_ref, config);
-    }
-    if opcode.starts_with("LOP3.LUT") || opcode.starts_with("ULOP3.LUT") {
-        return lift_lop3_lut(args, stmt_ref, config);
-    }
-    if opcode.starts_with("SEL") {
-        return lift_sel(args, stmt_ref, config);
-    }
-    if opcode.starts_with("SHF") || opcode.starts_with("USHF") {
-        return lift_shf(opcode, args, stmt_ref, config);
-    }
-    if opcode.starts_with("LEA") || opcode.starts_with("ULEA") {
-        return lift_lea(opcode, args, stmt_ref, config);
-    }
-    None
+    registry::dispatch_opcode(opcode, args, stmt_ref, config)
 }
 
 fn lift_s2r(args: &[IRExpr]) -> Option<LiftedExpr> {
@@ -277,7 +233,8 @@ fn lift_store_stmt(
         return Some((dest, rhs));
     }
     if opcode.starts_with("STG") {
-        let dest = render_expr_raw(&args[0], stmt_ref, config);
+        let dest = render_global_store_ref(&args[0], opcode, stmt_ref, config)
+            .unwrap_or_else(|| render_expr_raw(&args[0], stmt_ref, config));
         let rhs = lift_ir_expr(&args[1], stmt_ref, config);
         return Some((dest, rhs));
     }
@@ -308,10 +265,6 @@ fn lift_iadd3(
     let a1z = is_zero_expr(a1);
     let a2z = is_zero_expr(a2);
 
-    if config.strict && !(a0z || a1z || a2z) {
-        return None;
-    }
-
     let expr = if a0z && !a1z && !a2z {
         add_like_expr(
             lift_ir_expr(a1, stmt_ref, config),
@@ -327,8 +280,6 @@ fn lift_iadd3(
             lift_ir_expr(a0, stmt_ref, config),
             lift_ir_expr(a1, stmt_ref, config),
         )
-    } else if config.strict {
-        return None;
     } else {
         let left = add_like_expr(
             lift_ir_expr(a0, stmt_ref, config),
@@ -338,6 +289,22 @@ fn lift_iadd3(
     };
 
     Some(expr)
+}
+
+fn lift_iadd3_carry(
+    helper: &str,
+    args: &[IRExpr],
+    stmt_ref: StatementRef,
+    config: &SemanticLiftConfig<'_>,
+) -> Option<LiftedExpr> {
+    let (a0, a1, a2) = extract_triplet_operands(args)?;
+    Some(LiftedExpr::Raw(format!(
+        "{}({}, {}, {})",
+        helper,
+        lift_ir_expr(a0, stmt_ref, config).render(),
+        lift_ir_expr(a1, stmt_ref, config).render(),
+        lift_ir_expr(a2, stmt_ref, config).render()
+    )))
 }
 
 fn lift_iadd3_x(
@@ -403,6 +370,103 @@ fn lift_imad_wide(
     Some(add_like_expr(mul, lift_ir_expr(&args[2], stmt_ref, config)))
 }
 
+fn lift_imad(
+    args: &[IRExpr],
+    stmt_ref: StatementRef,
+    config: &SemanticLiftConfig<'_>,
+) -> Option<LiftedExpr> {
+    let (a0, a1, a2) = extract_triplet_operands(args)?;
+    let mul = LiftedExpr::Binary {
+        op: "*".to_string(),
+        lhs: Box::new(lift_ir_expr(a0, stmt_ref, config)),
+        rhs: Box::new(lift_ir_expr(a1, stmt_ref, config)),
+    };
+    Some(add_like_expr(mul, lift_ir_expr(a2, stmt_ref, config)))
+}
+
+fn lift_imad_hi_u32(
+    args: &[IRExpr],
+    stmt_ref: StatementRef,
+    config: &SemanticLiftConfig<'_>,
+) -> Option<LiftedExpr> {
+    let (a0, a1, a2) = extract_triplet_operands(args)?;
+    let hi = LiftedExpr::Raw(format!(
+        "mul_hi_u32({}, {})",
+        lift_ir_expr(a0, stmt_ref, config).render(),
+        lift_ir_expr(a1, stmt_ref, config).render()
+    ));
+    if is_zero_expr(a2) {
+        return Some(hi);
+    }
+    Some(add_like_expr(hi, lift_ir_expr(a2, stmt_ref, config)))
+}
+
+fn lift_imad_x(
+    args: &[IRExpr],
+    stmt_ref: StatementRef,
+    config: &SemanticLiftConfig<'_>,
+) -> Option<LiftedExpr> {
+    if args.len() != 4 {
+        return None;
+    }
+    let a0z = is_zero_expr(&args[0]);
+    let a1z = is_zero_expr(&args[1]);
+    if !(a0z && a1z) {
+        return None;
+    }
+    let base = lift_ir_expr(&args[2], stmt_ref, config);
+    let carry = carry_inc_expr(&args[3], stmt_ref, config)?;
+    Some(add_like_expr(base, carry))
+}
+
+fn lift_iabs(
+    args: &[IRExpr],
+    stmt_ref: StatementRef,
+    config: &SemanticLiftConfig<'_>,
+) -> Option<LiftedExpr> {
+    lift_unary_intrinsic("abs", args, stmt_ref, config)
+}
+
+fn lift_i2f_rp(
+    args: &[IRExpr],
+    stmt_ref: StatementRef,
+    config: &SemanticLiftConfig<'_>,
+) -> Option<LiftedExpr> {
+    lift_unary_intrinsic("i2f_rp", args, stmt_ref, config)
+}
+
+fn lift_mufu_rcp(
+    args: &[IRExpr],
+    stmt_ref: StatementRef,
+    config: &SemanticLiftConfig<'_>,
+) -> Option<LiftedExpr> {
+    lift_unary_intrinsic("rcp_approx", args, stmt_ref, config)
+}
+
+fn lift_uldc64(
+    args: &[IRExpr],
+    stmt_ref: StatementRef,
+    config: &SemanticLiftConfig<'_>,
+) -> Option<LiftedExpr> {
+    lift_unary_intrinsic("uldc64", args, stmt_ref, config)
+}
+
+fn lift_unary_intrinsic(
+    name: &str,
+    args: &[IRExpr],
+    stmt_ref: StatementRef,
+    config: &SemanticLiftConfig<'_>,
+) -> Option<LiftedExpr> {
+    if args.len() != 1 {
+        return None;
+    }
+    Some(LiftedExpr::Raw(format!(
+        "{}({})",
+        name,
+        lift_ir_expr(&args[0], stmt_ref, config).render()
+    )))
+}
+
 fn lift_binary_infix(
     op: &str,
     args: &[IRExpr],
@@ -446,6 +510,7 @@ fn lift_lds_expr(
 }
 
 fn lift_ldg_expr(
+    opcode: &str,
     args: &[IRExpr],
     stmt_ref: StatementRef,
     config: &SemanticLiftConfig<'_>,
@@ -453,7 +518,71 @@ fn lift_ldg_expr(
     if args.len() != 1 || !is_mem_expr(&args[0]) {
         return None;
     }
+    if let Some(rendered) = render_global_load_ref(&args[0], opcode, stmt_ref, config) {
+        return Some(LiftedExpr::Raw(rendered));
+    }
     Some(LiftedExpr::Raw(render_expr_raw(&args[0], stmt_ref, config)))
+}
+
+fn scalar_type_from_opcode(opcode: &str) -> Option<&'static str> {
+    for tok in opcode.split('.') {
+        match tok {
+            "U8" => return Some("uint8_t"),
+            "S8" => return Some("int8_t"),
+            "U16" => return Some("uint16_t"),
+            "S16" => return Some("int16_t"),
+            "U32" => return Some("uint32_t"),
+            "S32" => return Some("int32_t"),
+            "U64" => return Some("uint64_t"),
+            "S64" => return Some("int64_t"),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn render_addr_expr(mem_expr: &IRExpr, stmt_ref: StatementRef, config: &SemanticLiftConfig<'_>) -> Option<String> {
+    let IRExpr::Mem { base, offset, width } = mem_expr else {
+        return None;
+    };
+    let mut addr = if matches!(width, Some(64)) {
+        match base.as_ref() {
+            IRExpr::Op { op, args } if op == "addr64" && args.len() == 2 => {
+                let lo = render_expr_raw(&args[0], stmt_ref, config);
+                let hi = render_expr_raw(&args[1], stmt_ref, config);
+                format!("addr64({}, {})", lo, hi)
+            }
+            _ => render_expr_raw(base, stmt_ref, config),
+        }
+    } else {
+        render_expr_raw(base, stmt_ref, config)
+    };
+    if let Some(off) = offset {
+        addr = format!("({} + {})", addr, render_expr_raw(off, stmt_ref, config));
+    }
+    Some(addr)
+}
+
+fn render_global_load_ref(
+    mem_expr: &IRExpr,
+    opcode: &str,
+    stmt_ref: StatementRef,
+    config: &SemanticLiftConfig<'_>,
+) -> Option<String> {
+    let ty = scalar_type_from_opcode(opcode)?;
+    let addr = render_addr_expr(mem_expr, stmt_ref, config)?;
+    Some(format!("*(({}*){})", ty, addr))
+}
+
+fn render_global_store_ref(
+    mem_expr: &IRExpr,
+    opcode: &str,
+    stmt_ref: StatementRef,
+    config: &SemanticLiftConfig<'_>,
+) -> Option<String> {
+    let ty = scalar_type_from_opcode(opcode)?;
+    let addr = render_addr_expr(mem_expr, stmt_ref, config)?;
+    Some(format!("*(({}*){})", ty, addr))
 }
 
 fn lift_fsel(
@@ -710,7 +839,7 @@ fn lift_lea(
     config: &SemanticLiftConfig<'_>,
 ) -> Option<LiftedExpr> {
     if opcode.starts_with("LEA.HI") || opcode.starts_with("ULEA.HI") {
-        return lift_lea_hi(args, stmt_ref, config);
+        return lift_lea_hi(opcode, args, stmt_ref, config);
     }
     if opcode != "LEA" {
         return None;
@@ -738,6 +867,7 @@ fn lift_lea(
 }
 
 fn lift_lea_hi(
+    opcode: &str,
     args: &[IRExpr],
     stmt_ref: StatementRef,
     config: &SemanticLiftConfig<'_>,
@@ -768,15 +898,21 @@ fn lift_lea_hi(
     //   LEA.HI.X.* dst, base, off, sh, Pcarry
     // IR keeps 4 args (base, off, sh, Pcarry).
     if matches!(args[2], IRExpr::ImmI(_)) && is_pred_reg_expr(&args[3]) {
-        let shifted = LiftedExpr::Binary {
-            op: "<<".to_string(),
-            lhs: Box::new(lift_ir_expr(&args[1], stmt_ref, config)),
-            rhs: Box::new(lift_ir_expr(&args[2], stmt_ref, config)),
+        // LEA.HI.X semantics vary by signedness/scale/addressing mode; avoid
+        // over-claiming with a potentially wrong algebraic expansion.
+        let helper = if opcode.contains(".SX32") {
+            "lea_hi_x_sx32"
+        } else {
+            "lea_hi_x"
         };
-        let inner = add_like_expr(lift_ir_expr(&args[0], stmt_ref, config), shifted);
-        let hi = hi32_expr(inner);
-        let carry = carry_inc_expr(&args[3], stmt_ref, config)?;
-        return Some(add_like_expr(hi, carry));
+        let base = lift_ir_expr(&args[0], stmt_ref, config).render();
+        let off = lift_ir_expr(&args[1], stmt_ref, config).render();
+        let sh = lift_ir_expr(&args[2], stmt_ref, config).render();
+        let carry = lift_ir_expr(&args[3], stmt_ref, config).render();
+        return Some(LiftedExpr::Raw(format!(
+            "{}({}, {}, {}, {})",
+            helper, base, off, sh, carry
+        )));
     }
     None
 }
@@ -1088,7 +1224,7 @@ fn render_expr_raw(expr: &IRExpr, stmt_ref: StatementRef, config: &SemanticLiftC
             offset,
             width,
         } => {
-            let mut s = if let Some(off) = offset {
+            let s = if let Some(off) = offset {
                 format!(
                     "*({} + {})",
                     render_expr_raw(base, stmt_ref, config),
@@ -1097,9 +1233,7 @@ fn render_expr_raw(expr: &IRExpr, stmt_ref: StatementRef, config: &SemanticLiftC
             } else {
                 format!("*{}", render_expr_raw(base, stmt_ref, config))
             };
-            if let Some(w) = width {
-                s.push_str(&format!("@{}", w));
-            }
+            let _ = width;
             s
         }
         IRExpr::Op { op, args } => {
@@ -1332,7 +1466,7 @@ mod tests {
                 stmt_idx: 0,
             })
             .expect("expected lifted SEL");
-        assert_eq!(lifted.rhs.render(), "!P1 ? R5.0 : R6.0");
+        assert_eq!(lifted.rhs.render(), "!P1.0 ? R5.0 : R6.0");
     }
 
     #[test]
@@ -1436,7 +1570,7 @@ mod tests {
             .expect("expected lifted LEA.HI.X");
         assert_eq!(
             lifted.rhs.render(),
-            "hi32(R6.0 + (ConstMem(0, 356) << 1)) + (P2.0 ? 1 : 0)"
+            "lea_hi_x_sx32(R6.0, ConstMem(0, 356), 1, P2.0)"
         );
     }
 
@@ -1541,6 +1675,159 @@ mod tests {
             .expect("expected lifted STS");
         assert_eq!(lifted.dest, "shmem_u8[UR4.0]");
         assert_eq!(lifted.rhs.render(), "R11.0");
+    }
+
+    #[test]
+    fn lifts_imad_generic_to_mul_add() {
+        let sass = r#"
+            /*0000*/ IMAD R5, R1, R2, R3 ;
+            /*0010*/ EXIT ;
+        "#;
+        let out = run_lift(sass);
+        let lifted = out
+            .by_stmt
+            .get(&StatementRef {
+                block_id: 0,
+                stmt_idx: 0,
+            })
+            .expect("expected lifted IMAD");
+        assert_eq!(lifted.rhs.render(), "R1.0 * R2.0 + R3.0");
+    }
+
+    #[test]
+    fn lifts_imad_hi_u32_to_helper_intrinsic() {
+        let sass = r#"
+            /*0000*/ IMAD.HI.U32 R12, R8, R11, R9 ;
+            /*0010*/ EXIT ;
+        "#;
+        let out = run_lift(sass);
+        let lifted = out
+            .by_stmt
+            .get(&StatementRef {
+                block_id: 0,
+                stmt_idx: 0,
+            })
+            .expect("expected lifted IMAD.HI.U32");
+        assert_eq!(lifted.rhs.render(), "mul_hi_u32(R8.0, R11.0) + R9.0");
+    }
+
+    #[test]
+    fn lifts_imad_x_zero_mul_form_to_add_carry() {
+        let sass = r#"
+            /*0000*/ IMAD.X R5, RZ, RZ, R3, P0 ;
+            /*0010*/ EXIT ;
+        "#;
+        let out = run_lift(sass);
+        let lifted = out
+            .by_stmt
+            .get(&StatementRef {
+                block_id: 0,
+                stmt_idx: 0,
+            })
+            .expect("expected lifted IMAD.X");
+        assert_eq!(lifted.rhs.render(), "R3.0 + (P0.0 ? 1 : 0)");
+    }
+
+    #[test]
+    fn lifts_iabs_to_abs_intrinsic() {
+        let sass = r#"
+            /*0000*/ IABS R5, R2 ;
+            /*0010*/ EXIT ;
+        "#;
+        let out = run_lift(sass);
+        let lifted = out
+            .by_stmt
+            .get(&StatementRef {
+                block_id: 0,
+                stmt_idx: 0,
+            })
+            .expect("expected lifted IABS");
+        assert_eq!(lifted.rhs.render(), "abs(R2.0)");
+    }
+
+    #[test]
+    fn lifts_i2f_rp_to_helper_intrinsic() {
+        let sass = r#"
+            /*0000*/ I2F.RP R7, R3 ;
+            /*0010*/ EXIT ;
+        "#;
+        let out = run_lift(sass);
+        let lifted = out
+            .by_stmt
+            .get(&StatementRef {
+                block_id: 0,
+                stmt_idx: 0,
+            })
+            .expect("expected lifted I2F.RP");
+        assert_eq!(lifted.rhs.render(), "i2f_rp(R3.0)");
+    }
+
+    #[test]
+    fn lifts_f2i_ftz_trunc_ntz_to_helper_intrinsic() {
+        let sass = r#"
+            /*0000*/ F2I.FTZ.U32.TRUNC.NTZ R8, R7 ;
+            /*0010*/ EXIT ;
+        "#;
+        let out = run_lift(sass);
+        let lifted = out
+            .by_stmt
+            .get(&StatementRef {
+                block_id: 0,
+                stmt_idx: 0,
+            })
+            .expect("expected lifted F2I.FTZ.U32.TRUNC.NTZ");
+        assert_eq!(lifted.rhs.render(), "f2i_trunc_u32_ftz_ntz(R7.0)");
+    }
+
+    #[test]
+    fn lifts_mufu_rcp_to_helper_intrinsic() {
+        let sass = r#"
+            /*0000*/ MUFU.RCP R6, R5 ;
+            /*0010*/ EXIT ;
+        "#;
+        let out = run_lift(sass);
+        let lifted = out
+            .by_stmt
+            .get(&StatementRef {
+                block_id: 0,
+                stmt_idx: 0,
+            })
+            .expect("expected lifted MUFU.RCP");
+        assert_eq!(lifted.rhs.render(), "rcp_approx(R5.0)");
+    }
+
+    #[test]
+    fn lifts_uldc_64_to_intrinsic_form() {
+        let sass = r#"
+            /*0000*/ ULDC.64 UR8, c[0x0][0x118] ;
+            /*0010*/ EXIT ;
+        "#;
+        let out = run_lift(sass);
+        let lifted = out
+            .by_stmt
+            .get(&StatementRef {
+                block_id: 0,
+                stmt_idx: 0,
+            })
+            .expect("expected lifted ULDC.64");
+        assert_eq!(lifted.rhs.render(), "uldc64(ConstMem(0, 280))");
+    }
+
+    #[test]
+    fn strict_iadd3_allows_exact_three_term_addition() {
+        let sass = r#"
+            /*0000*/ IADD3 R1, R2, R3, R4 ;
+            /*0010*/ EXIT ;
+        "#;
+        let out = run_lift(sass);
+        let lifted = out
+            .by_stmt
+            .get(&StatementRef {
+                block_id: 0,
+                stmt_idx: 0,
+            })
+            .expect("expected lifted IADD3 in strict mode");
+        assert_eq!(lifted.rhs.render(), "R2.0 + R3.0 + R4.0");
     }
 
     #[test]

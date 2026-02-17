@@ -23,12 +23,12 @@ pub trait DisplayCtx {
             IRExpr::ImmI(i)=>format!("{}",i),
             IRExpr::ImmF(f)=>format!("{}",f),
             IRExpr::Mem{base,offset,width}=>{
-                let mut s=if let Some(off)=offset{
+                let s=if let Some(off)=offset{
                     format!("*({} + {})",self.expr(base),self.expr(off))
                 } else {
                     format!("*{}",self.expr(base))
                 };
-                if let Some(w)=width { s.push_str(&format!("@{}",w)); }
+                let _ = width;
                 s
             }
             IRExpr::Op{op,args}=>{
@@ -160,15 +160,26 @@ fn lower_operand(op:&Operand)->IRExpr{
             IRExpr::Op{op:"ConstMem".into(),args:vec![IRExpr::ImmI(*bank as i64),IRExpr::ImmI(*offset as i64)]}
         }
         Operand::MemRef { base, offset, width, .. } => {
-            let base_expr = Box::new(lower_operand(base.as_ref()));
+            let mut base_expr = lower_operand(base.as_ref());
+            if matches!(width, Some(64)) {
+                if let Some(hi_expr) = infer_64bit_pair_hi_expr(base.as_ref()) {
+                    base_expr = IRExpr::Op {
+                        op: "addr64".into(),
+                        args: vec![base_expr, hi_expr],
+                    };
+                }
+            }
             let off_expr = offset.as_ref().map(|v| Box::new(IRExpr::ImmI(*v)));
             IRExpr::Mem {
-                base: base_expr,
+                base: Box::new(base_expr),
                 offset: off_expr,
                 width: *width,
             }
         }
         Operand::Raw(s)=>{
+            if let Some(pred) = parse_raw_predicate_token(s) {
+                return pred;
+            }
             if let Some((neg, bank, off)) = parse_raw_constmem_token(s) {
                 let cm = IRExpr::Op {
                     op: "ConstMem".into(),
@@ -186,6 +197,16 @@ fn lower_operand(op:&Operand)->IRExpr{
             else if let Ok(f)=s.parse::<f64>(){ IRExpr::ImmF(f)}
             else{ IRExpr::Op{op:s.clone(),args:vec![]}}
         }
+    }
+}
+
+fn infer_64bit_pair_hi_expr(base: &Operand) -> Option<IRExpr> {
+    match base {
+        Operand::Register { class, idx, .. } if class == "R" || class == "UR" => {
+            Some(IRExpr::Reg(RegId::new(class, idx + 1, 1)))
+        }
+        Operand::Uniform { idx } => Some(IRExpr::Reg(RegId::new("UR", idx + 1, 1))),
+        _ => None,
     }
 }
 
@@ -216,6 +237,65 @@ fn parse_raw_constmem_token(s: &str) -> Option<(bool, u32, u32)> {
     let off = u32::from_str_radix(&off_part[2..], 16).ok()?;
     Some((neg, bank, off))
 }
+
+fn parse_raw_predicate_token(s: &str) -> Option<IRExpr> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let (neg, core) = if let Some(rest) = t.strip_prefix('!') {
+        (true, rest)
+    } else {
+        (false, t)
+    };
+
+    let base = if let Some(num) = core.strip_prefix('P') {
+        let idx = num.parse::<i32>().ok()?;
+        IRExpr::Reg(RegId::new("P", idx, 1))
+    } else if let Some(num) = core.strip_prefix("UP") {
+        let idx = num.parse::<i32>().ok()?;
+        IRExpr::Reg(RegId::new("UP", idx, 1))
+    } else {
+        return None;
+    };
+
+    if neg {
+        Some(IRExpr::Op {
+            op: "!".into(),
+            args: vec![base],
+        })
+    } else {
+        Some(base)
+    }
+}
+
+fn opcode_mnemonic(opcode: &str) -> &str {
+    opcode.split('.').next().unwrap_or(opcode)
+}
+
+fn opcode_has_mod(opcode: &str, needle: &str) -> bool {
+    opcode.split('.').skip(1).any(|m| m == needle)
+}
+
+fn collect_predicate_outputs(opcode: &str, operands: &[Operand]) -> Vec<RegId> {
+    let mnem = opcode_mnemonic(opcode);
+    // Integer ADD3 forms can emit one or more predicate outputs right after dst.
+    // Model them explicitly so downstream LEA.HI.X consumes the fresh carry def.
+    if !matches!(mnem, "IADD3" | "UIADD3") || opcode_has_mod(opcode, "X") {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for op in operands.iter().skip(1) {
+        let Some(r) = phys_reg_of(op) else {
+            break;
+        };
+        if !matches!(r.class.as_str(), "P" | "UP") {
+            break;
+        }
+        out.push(r);
+    }
+    out
+}
 /* mem load/store heuristics */
 fn is_mem_load(op:&str)->bool{op.starts_with("LD")}
 fn is_mem_store(op:&str)->bool{op.starts_with("ST")}
@@ -230,6 +310,10 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
     use petgraph::graph::NodeIndex;
     use petgraph::Direction;
     use std::collections::{HashMap, HashSet};
+
+    if cfg.node_count() == 0 {
+        return FunctionIR { blocks: Vec::new() };
+    }
 
     /* ---------- helpers ---------- */
     fn base_reg(r: &RegId) -> RegId {
@@ -305,6 +389,7 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
             let mut dest = None::<IRExpr>;
             let mut args = Vec::<IRExpr>::new();
             let mut mem_addr_args = None::<Vec<IRExpr>>;
+            let pred_outputs = collect_predicate_outputs(&ins.opcode, &ins.operands);
 
             if is_mem_load(&ins.opcode) {
                 if let Some(r) = ins.operands.first().and_then(phys_reg_of) {
@@ -341,6 +426,9 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
                                 defsites.entry(base_reg(&r)).or_default().insert(n);
                             }
                         }
+                    } else if !pred_outputs.is_empty() && idx <= pred_outputs.len() {
+                        // Skip predicate output operands (carry-out defs).
+                        continue;
                     } else {
                         args.push(lo);
                     }
@@ -373,6 +461,50 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
                 pred: pred_expr,
                 mem_addr_args,
             });
+
+            if !pred_outputs.is_empty() {
+                let carry_args: Vec<IRExpr> = ins
+                    .operands
+                    .iter()
+                    .skip(1 + pred_outputs.len())
+                    .map(lower_operand)
+                    .collect();
+                let mnem = opcode_mnemonic(&ins.opcode);
+                for (idx, pr) in pred_outputs.iter().enumerate() {
+                    if !is_immutable_reg(pr) {
+                        defsites.entry(base_reg(pr)).or_default().insert(n);
+                    }
+                    let carry_opcode = if idx == 0 {
+                        format!("{}.CARRY", mnem)
+                    } else {
+                        format!("{}.CARRY{}", mnem, idx + 1)
+                    };
+                    stmts.push(IRStatement {
+                        dest: Some(IRExpr::Reg(pr.clone())),
+                        value: RValue::Op {
+                            opcode: carry_opcode,
+                            args: carry_args.clone(),
+                        },
+                        pred: ins.pred.as_ref().and_then(|p| {
+                            if p.reg.starts_with('P') {
+                                let idx = p.reg[1..].parse().ok()?;
+                                let base = IRExpr::Reg(RegId::new("P", idx, 1));
+                                if p.sense {
+                                    Some(base)
+                                } else {
+                                    Some(IRExpr::Op {
+                                        op: "!".into(),
+                                        args: vec![base],
+                                    })
+                                }
+                            } else {
+                                None
+                            }
+                        }),
+                        mem_addr_args: None,
+                    });
+                }
+            }
         }
 
         /* IRDst */

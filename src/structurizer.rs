@@ -110,6 +110,10 @@ impl<'a> Structurizer<'a> {
         opcode.starts_with("ISETP") || opcode.starts_with("FSETP")
     }
 
+    fn is_barrier_opcode(opcode: &str) -> bool {
+        opcode.starts_with("BAR.SYNC")
+    }
+
     fn should_omit_control_predicate_def(
         stmt: &IRStatement,
         stmt_idx: usize,
@@ -985,11 +989,27 @@ impl<'a> Structurizer<'a> {
             if matches!(ir_s.value, RValue::Phi(_)) {
                 continue;
             }
-            let is_s2r = matches!(
-                &ir_s.value,
-                RValue::Op { opcode, .. } if opcode == "S2R" || opcode == "CS2R"
-            );
-            if !is_s2r {
+            let (is_s2r, is_barrier) = match &ir_s.value {
+                RValue::Op { opcode, .. } => (
+                    opcode == "S2R" || opcode == "CS2R",
+                    Self::is_barrier_opcode(opcode),
+                ),
+                _ => (false, false),
+            };
+            if !is_s2r && !is_barrier {
+                continue;
+            }
+
+            if is_barrier {
+                let pred_str = ir_s
+                    .pred
+                    .as_ref()
+                    .map_or_else(String::new, |p| format!("if ({}) ", ctx.expr(p)));
+                lines.push_str(&format!(
+                    "{}{}__syncthreads();\n",
+                    "  ".repeat(indent_level + 1),
+                    pred_str
+                ));
                 continue;
             }
 
@@ -1094,44 +1114,35 @@ impl<'a> Structurizer<'a> {
     ) -> Option<String> {
         let lifted = lifted?;
 
-        // Prefer a local def in the condition block, then fall back to exact SSA def globally.
-        let mut search_blocks = Vec::new();
-        if let Some(local) = self.function_ir.blocks.iter().find(|b| b.id == block_id) {
-            search_blocks.push(local);
-        }
-        for b in &self.function_ir.blocks {
-            if b.id != block_id {
-                search_blocks.push(b);
+        // Only inline predicate conditions when the defining compare is in the same
+        // condition block. Cross-block expansion can be stale once SSA names are
+        // recovered into mutable temporaries.
+        let block = self.function_ir.blocks.iter().find(|b| b.id == block_id)?;
+        for (stmt_idx, stmt) in block.stmts.iter().enumerate().rev() {
+            let Some(IRExpr::Reg(dst)) = &stmt.dest else {
+                continue;
+            };
+            if dst.class != pred.class || dst.idx != pred.idx {
+                continue;
             }
-        }
-
-        for block in search_blocks {
-            for (stmt_idx, stmt) in block.stmts.iter().enumerate().rev() {
-                let Some(IRExpr::Reg(dst)) = &stmt.dest else {
-                    continue;
-                };
-                if dst.class != pred.class || dst.idx != pred.idx {
+            if let Some(want_ssa) = pred.ssa {
+                if dst.ssa != Some(want_ssa) {
                     continue;
                 }
-                if let Some(want_ssa) = pred.ssa {
-                    if dst.ssa != Some(want_ssa) {
-                        continue;
-                    }
-                }
-                let is_setp = matches!(
-                    &stmt.value,
-                    RValue::Op { opcode, .. } if opcode.starts_with("ISETP") || opcode.starts_with("FSETP")
-                );
-                if !is_setp {
-                    continue;
-                }
-                let stmt_ref = StatementRef {
-                    block_id: block.id,
-                    stmt_idx,
-                };
-                if let Some(ls) = lifted.by_stmt.get(&stmt_ref) {
-                    return Some(ls.rhs.render());
-                }
+            }
+            let is_setp = matches!(
+                &stmt.value,
+                RValue::Op { opcode, .. } if opcode.starts_with("ISETP") || opcode.starts_with("FSETP")
+            );
+            if !is_setp {
+                continue;
+            }
+            let stmt_ref = StatementRef {
+                block_id: block.id,
+                stmt_idx,
+            };
+            if let Some(ls) = lifted.by_stmt.get(&stmt_ref) {
+                return Some(ls.rhs.render());
             }
         }
 
@@ -1203,6 +1214,18 @@ impl<'a> Structurizer<'a> {
                         if Self::is_branch_only_opcode(opcode) {
                             // Branch instructions are represented by structured control flow
                             // (if/loop/goto), so omit them from block bodies.
+                            continue;
+                        }
+                        if Self::is_barrier_opcode(opcode) {
+                            let pred_str = ir_s
+                                .pred
+                                .as_ref()
+                                .map_or_else(String::new, |p| format!("if ({}) ", ctx.expr(p)));
+                            s_out.push_str(&format!(
+                                "{}{}__syncthreads();\n",
+                                "  ".repeat(indent_level + 1),
+                                pred_str
+                            ));
                             continue;
                         }
                         if Self::is_return_opcode(opcode) {

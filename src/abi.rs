@@ -106,6 +106,8 @@ pub struct ArgAlias {
     pub kind: ArgAliasKind,
     pub confidence: AliasConfidence,
     pub observed_words: BTreeSet<u32>,
+    pub signed_words: BTreeSet<u32>,
+    pub pointee_ty: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -192,11 +194,20 @@ impl AbiArgAliases {
         for alias in self.by_param.values() {
             match alias.kind {
                 ArgAliasKind::Ptr64 => {
-                    out.push(format!(
-                        "uintptr_t arg{}_ptr; // confidence: {}",
-                        alias.param_idx,
-                        alias.confidence.as_str()
-                    ));
+                    if let Some(elem) = alias.pointee_ty {
+                        out.push(format!(
+                            "{}* arg{}_ptr; // confidence: {}",
+                            elem,
+                            alias.param_idx,
+                            alias.confidence.as_str()
+                        ));
+                    } else {
+                        out.push(format!(
+                            "uintptr_t arg{}_ptr; // confidence: {}",
+                            alias.param_idx,
+                            alias.confidence.as_str()
+                        ));
+                    }
                 }
                 ArgAliasKind::U64 => {
                     out.push(format!(
@@ -207,8 +218,14 @@ impl AbiArgAliases {
                 }
                 ArgAliasKind::Word32 => {
                     for w in &alias.observed_words {
+                        let scalar_ty = if alias.signed_words.contains(w) {
+                            "int32_t"
+                        } else {
+                            "uint32_t"
+                        };
                         out.push(format!(
-                            "uint32_t arg{}_word{}; // confidence: {}",
+                            "{} arg{}_word{}; // confidence: {}",
+                            scalar_ty,
                             alias.param_idx,
                             w,
                             alias.confidence.as_str()
@@ -225,14 +242,23 @@ impl AbiArgAliases {
         for alias in self.by_param.values() {
             match alias.kind {
                 ArgAliasKind::Ptr64 => {
-                    out.push(format!("uintptr_t arg{}_ptr", alias.param_idx));
+                    if let Some(elem) = alias.pointee_ty {
+                        out.push(format!("{}* arg{}_ptr", elem, alias.param_idx));
+                    } else {
+                        out.push(format!("uintptr_t arg{}_ptr", alias.param_idx));
+                    }
                 }
                 ArgAliasKind::U64 => {
                     out.push(format!("uint64_t arg{}_u64", alias.param_idx));
                 }
                 ArgAliasKind::Word32 => {
                     for w in &alias.observed_words {
-                        out.push(format!("uint32_t arg{}_word{}", alias.param_idx, w));
+                        let scalar_ty = if alias.signed_words.contains(w) {
+                            "int32_t"
+                        } else {
+                            "uint32_t"
+                        };
+                        out.push(format!("{} arg{}_word{}", scalar_ty, alias.param_idx, w));
                     }
                 }
             }
@@ -252,11 +278,23 @@ enum LocalTypeHint {
 }
 
 pub fn infer_local_typed_declarations(function_ir: &FunctionIR) -> Vec<String> {
+    infer_local_typed_declarations_with_abi(function_ir, None, None)
+}
+
+pub fn infer_local_typed_declarations_with_abi(
+    function_ir: &FunctionIR,
+    annotations: Option<&AbiAnnotations>,
+    aliases: Option<&AbiArgAliases>,
+) -> Vec<String> {
     let mut regs: BTreeSet<(String, i32)> = BTreeSet::new();
     let mut hints: BTreeMap<(String, i32), BTreeSet<LocalTypeHint>> = BTreeMap::new();
 
     for block in &function_ir.blocks {
-        for stmt in &block.stmts {
+        for (stmt_idx, stmt) in block.stmts.iter().enumerate() {
+            let stmt_ref = StatementRef {
+                block_id: block.id,
+                stmt_idx,
+            };
             if let Some(IRExpr::Reg(r)) = &stmt.dest {
                 if is_immutable_reg(r) {
                     continue;
@@ -264,6 +302,9 @@ pub fn infer_local_typed_declarations(function_ir: &FunctionIR) -> Vec<String> {
                 let key = (r.class.clone(), r.idx);
                 regs.insert(key.clone());
                 if let Some(h) = hint_from_dest_stmt(stmt) {
+                    hints.entry(key.clone()).or_default().insert(h);
+                }
+                if let Some(h) = abi_pointer_hint_from_dest_stmt(stmt_ref, stmt, annotations, aliases) {
                     hints.entry(key).or_default().insert(h);
                 }
             }
@@ -281,6 +322,37 @@ pub fn infer_local_typed_declarations(function_ir: &FunctionIR) -> Vec<String> {
             }
         })
         .collect()
+}
+
+fn abi_pointer_hint_from_dest_stmt(
+    stmt_ref: StatementRef,
+    stmt: &crate::ir::IRStatement,
+    annotations: Option<&AbiAnnotations>,
+    aliases: Option<&AbiArgAliases>,
+) -> Option<LocalTypeHint> {
+    let anns = annotations?;
+    let aliases = aliases?;
+    let RValue::Op { opcode, .. } = &stmt.value else {
+        return None;
+    };
+    if !is_pointer_arith_opcode(opcode) {
+        return None;
+    }
+    let stmt_anns = anns.constmem_by_stmt.get(&stmt_ref)?;
+    let has_ptr_param = stmt_anns.iter().any(|ann| {
+        let ConstMemSemantic::ParamWord { param_idx, .. } = ann.semantic else {
+            return false;
+        };
+        matches!(
+            aliases.by_param.get(&param_idx).map(|a| a.kind),
+            Some(ArgAliasKind::Ptr64)
+        )
+    });
+    if has_ptr_param {
+        Some(LocalTypeHint::PtrStrong)
+    } else {
+        None
+    }
 }
 
 fn hint_from_dest_stmt(stmt: &crate::ir::IRStatement) -> Option<LocalTypeHint> {
@@ -310,6 +382,13 @@ fn hint_from_dest_opcode(opcode: &str) -> Option<LocalTypeHint> {
         return Some(LocalTypeHint::F32);
     }
     hint_from_opcode_data_suffix(opcode)
+}
+
+fn is_pointer_arith_opcode(opcode: &str) -> bool {
+    opcode.starts_with("IMAD")
+        || opcode.starts_with("LEA")
+        || opcode.starts_with("IADD3")
+        || opcode.starts_with("UIADD3")
 }
 
 fn hint_from_opcode_data_suffix(opcode: &str) -> Option<LocalTypeHint> {
@@ -381,16 +460,23 @@ fn mark_pointer_base_reg(
     base: &IRExpr,
     hints: &mut BTreeMap<(String, i32), BTreeSet<LocalTypeHint>>,
 ) {
-    let IRExpr::Reg(r) = base else {
-        return;
-    };
-    if is_immutable_reg(r) || matches!(r.class.as_str(), "P" | "UP" | "PT" | "UPT") {
-        return;
+    if let IRExpr::Op { op, args } = base {
+        if op == "addr64" {
+            if let Some(lo) = args.first() {
+                mark_pointer_base_reg(lo, hints);
+            }
+            return;
+        }
     }
-    hints
-        .entry((r.class.clone(), r.idx))
-        .or_default()
-        .insert(LocalTypeHint::PtrWeak);
+    if let IRExpr::Reg(r) = base {
+        if is_immutable_reg(r) || matches!(r.class.as_str(), "P" | "UP" | "PT" | "UPT") {
+            return;
+        }
+        hints
+            .entry((r.class.clone(), r.idx))
+            .or_default()
+            .insert(LocalTypeHint::PtrWeak);
+    }
 }
 
 fn select_local_decl_type(hints: Option<&BTreeSet<LocalTypeHint>>) -> &'static str {
@@ -612,14 +698,12 @@ impl DisplayCtx for AbiDisplay {
             IRExpr::ImmI(i) => format!("{}", i),
             IRExpr::ImmF(f) => format!("{}", f),
             IRExpr::Mem { base, offset, width } => {
-                let mut s = if let Some(off) = offset {
+                let s = if let Some(off) = offset {
                     format!("*({} + {})", self.expr(base), self.expr(off))
                 } else {
                     format!("*{}", self.expr(base))
                 };
-                if let Some(w) = width {
-                    s.push_str(&format!("@{}", w));
-                }
+                let _ = width;
                 s
             }
             IRExpr::Op { op, args } => {
@@ -727,6 +811,9 @@ pub fn infer_arg_aliases(function_ir: &FunctionIR, annotations: &AbiAnnotations)
         words: BTreeSet<u32>,
         pointer_like_hits: usize,
         total_hits: usize,
+        pointer_data_widths: BTreeSet<u32>,
+        word_pointer_like_hits: BTreeMap<u32, usize>,
+        word_signed_hits: BTreeMap<u32, usize>,
     }
 
     let mut opcode_by_stmt: BTreeMap<StatementRef, String> = BTreeMap::new();
@@ -747,6 +834,13 @@ pub fn infer_arg_aliases(function_ir: &FunctionIR, annotations: &AbiAnnotations)
         }
     }
 
+    let mut function_pointer_widths = BTreeSet::<u32>::new();
+    for opcode in opcode_by_stmt.values() {
+        if let Some(width) = pointer_data_width_opcode(opcode) {
+            function_pointer_widths.insert(width);
+        }
+    }
+
     let mut by_param: BTreeMap<u32, ParamUsage> = BTreeMap::new();
     for (stmt_ref, anns) in annotations.iter() {
         let opcode = opcode_by_stmt
@@ -760,6 +854,13 @@ pub fn infer_arg_aliases(function_ir: &FunctionIR, annotations: &AbiAnnotations)
                 usage.total_hits += 1;
                 if is_pointer_context_opcode(opcode) {
                     usage.pointer_like_hits += 1;
+                    *usage.word_pointer_like_hits.entry(word_idx).or_insert(0) += 1;
+                }
+                if is_signed_word_context_opcode(opcode) {
+                    *usage.word_signed_hits.entry(word_idx).or_insert(0) += 1;
+                }
+                if let Some(width) = pointer_data_width_opcode(opcode) {
+                    usage.pointer_data_widths.insert(width);
                 }
             }
         }
@@ -769,15 +870,38 @@ pub fn infer_arg_aliases(function_ir: &FunctionIR, annotations: &AbiAnnotations)
     for (param_idx, usage) in by_param {
         let has_lo = usage.words.contains(&0);
         let has_hi = usage.words.contains(&1);
+        let lo_pointer_hits = usage.word_pointer_like_hits.get(&0).copied().unwrap_or(0);
+        let hi_pointer_hits = usage.word_pointer_like_hits.get(&1).copied().unwrap_or(0);
+        let lo_is_pointer_like = lo_pointer_hits > 0;
+        let hi_is_pointer_like = hi_pointer_hits > 0;
         let (kind, confidence) = if has_lo && has_hi {
-            if usage.pointer_like_hits > 0 {
+            if lo_is_pointer_like && hi_is_pointer_like {
                 (ArgAliasKind::Ptr64, AliasConfidence::High)
-            } else {
+            } else if usage.pointer_like_hits == 0 {
                 (ArgAliasKind::U64, AliasConfidence::Medium)
+            } else {
+                // Mixed usage across lo/hi words (e.g., one word in pointer math,
+                // other word in scalar compares) is common for packed 32-bit args.
+                // Keep this conservative and avoid forcing ptr64 aliases.
+                (ArgAliasKind::Word32, AliasConfidence::Low)
             }
         } else {
             (ArgAliasKind::Word32, AliasConfidence::Low)
         };
+        let pointee_ty = if kind == ArgAliasKind::Ptr64 {
+            if usage.pointer_data_widths.is_empty() {
+                infer_pointer_pointee_ty(&function_pointer_widths)
+            } else {
+                infer_pointer_pointee_ty(&usage.pointer_data_widths)
+            }
+        } else {
+            None
+        };
+        let signed_words = usage
+            .word_signed_hits
+            .iter()
+            .filter_map(|(word, hits)| if *hits > 0 { Some(*word) } else { None })
+            .collect();
         out.by_param.insert(
             param_idx,
             ArgAlias {
@@ -785,6 +909,8 @@ pub fn infer_arg_aliases(function_ir: &FunctionIR, annotations: &AbiAnnotations)
                 kind,
                 confidence,
                 observed_words: usage.words,
+                signed_words,
+                pointee_ty,
             },
         );
     }
@@ -814,10 +940,45 @@ fn collect_constmem_from_expr(expr: &IRExpr, out: &mut Vec<(u32, u32)>) {
 }
 
 fn is_pointer_context_opcode(opcode: &str) -> bool {
-    opcode.contains("WIDE")
+    opcode.starts_with("IMAD.WIDE")
+        || opcode.starts_with("IADD3")
+        || opcode.starts_with("UIADD3")
         || opcode.starts_with("LD")
         || opcode.starts_with("ST")
         || opcode.contains("LEA")
+}
+
+fn is_signed_word_context_opcode(opcode: &str) -> bool {
+    opcode.starts_with("IABS")
+}
+
+fn pointer_data_width_opcode(opcode: &str) -> Option<u32> {
+    if !(opcode.starts_with("LD") || opcode.starts_with("ST")) {
+        return None;
+    }
+    for tok in opcode.split('.') {
+        match tok {
+            "U8" | "S8" => return Some(8),
+            "U16" | "S16" => return Some(16),
+            "U32" | "S32" => return Some(32),
+            "U64" | "S64" => return Some(64),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn infer_pointer_pointee_ty(widths: &BTreeSet<u32>) -> Option<&'static str> {
+    if widths.len() != 1 {
+        return None;
+    }
+    match widths.iter().next().copied() {
+        Some(8) => Some("uint8_t"),
+        Some(16) => Some("uint16_t"),
+        Some(32) => Some("uint32_t"),
+        Some(64) => Some("uint64_t"),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -923,6 +1084,37 @@ mod tests {
     }
 
     #[test]
+    fn infers_pointer_alias_for_iadd3_plus_lea_hi_pair() {
+        let sass = r#"
+            /*0000*/ IADD3 R10, P2, R6, c[0x0][0x160], RZ ;
+            /*0010*/ LEA.HI.X.SX32 R11, R6, c[0x0][0x164], 0x1, P2 ;
+            /*0020*/ EXIT ;
+        "#;
+        let cfg = build_cfg(parse_sass(sass));
+        let fir = build_ssa(&cfg);
+        let anns = annotate_function_ir_constmem(&fir, AbiProfile::modern_param_160());
+        let aliases = infer_arg_aliases(&fir, &anns);
+        let alias = aliases.by_param.get(&0).expect("missing alias for param 0");
+        assert_eq!(alias.kind, ArgAliasKind::Ptr64);
+    }
+
+    #[test]
+    fn mixed_lo_hi_usage_does_not_force_ptr64_alias() {
+        let sass = r#"
+            /*0000*/ IMAD.WIDE R4, R0, R7, c[0x0][0x180] ;
+            /*0010*/ ISETP.GE.AND P0, PT, R1, c[0x0][0x184], PT ;
+            /*0020*/ EXIT ;
+        "#;
+        let cfg = build_cfg(parse_sass(sass));
+        let fir = build_ssa(&cfg);
+        let anns = annotate_function_ir_constmem(&fir, AbiProfile::modern_param_160());
+        let aliases = infer_arg_aliases(&fir, &anns);
+        let alias = aliases.by_param.get(&4).expect("missing alias for param 4");
+        assert_eq!(alias.kind, ArgAliasKind::Word32);
+        assert_eq!(aliases.render_param_word(4, 1).unwrap(), "arg4_word1");
+    }
+
+    #[test]
     fn abi_display_prefers_inferred_arg_aliases_for_param_words() {
         let mut aliases = AbiArgAliases::default();
         aliases.by_param.insert(
@@ -932,6 +1124,8 @@ mod tests {
                 kind: ArgAliasKind::U64,
                 confidence: AliasConfidence::Medium,
                 observed_words: [0, 1].into_iter().collect(),
+                signed_words: BTreeSet::new(),
+                pointee_ty: None,
             },
         );
         let display = AbiDisplay::with_aliases(AbiProfile::legacy_param_140(), aliases);
@@ -952,6 +1146,8 @@ mod tests {
                 kind: ArgAliasKind::Ptr64,
                 confidence: AliasConfidence::High,
                 observed_words: [0, 1].into_iter().collect(),
+                signed_words: BTreeSet::new(),
+                pointee_ty: None,
             },
         );
         aliases.by_param.insert(
@@ -961,6 +1157,8 @@ mod tests {
                 kind: ArgAliasKind::Word32,
                 confidence: AliasConfidence::Low,
                 observed_words: [1].into_iter().collect(),
+                signed_words: BTreeSet::new(),
+                pointee_ty: None,
             },
         );
 
@@ -979,6 +1177,8 @@ mod tests {
                 kind: ArgAliasKind::Ptr64,
                 confidence: AliasConfidence::High,
                 observed_words: [0, 1].into_iter().collect(),
+                signed_words: BTreeSet::new(),
+                pointee_ty: None,
             },
         );
         aliases.by_param.insert(
@@ -988,11 +1188,44 @@ mod tests {
                 kind: ArgAliasKind::Word32,
                 confidence: AliasConfidence::Low,
                 observed_words: [1].into_iter().collect(),
+                signed_words: BTreeSet::new(),
+                pointee_ty: None,
             },
         );
         let params = aliases.render_typed_param_list();
         assert_eq!(params[0], "uintptr_t arg0_ptr");
         assert_eq!(params[1], "uint32_t arg2_word1");
+    }
+
+    #[test]
+    fn infers_pointer_pointee_type_from_memory_width_usage() {
+        let sass = r#"
+            /*0000*/ IMAD.WIDE R4, R0, R7, c[0x0][0x160] ;
+            /*0010*/ IADD3.X R5, R5, c[0x0][0x164], RZ ;
+            /*0020*/ LDG.E.U8 R8, [R4.64] ;
+            /*0030*/ EXIT ;
+        "#;
+        let cfg = build_cfg(parse_sass(sass));
+        let fir = build_ssa(&cfg);
+        let anns = annotate_function_ir_constmem(&fir, AbiProfile::modern_param_160());
+        let aliases = infer_arg_aliases(&fir, &anns);
+        let params = aliases.render_typed_param_list();
+        assert!(params.iter().any(|p| p == "uint8_t* arg0_ptr"));
+    }
+
+    #[test]
+    fn abi_aware_local_decl_inference_marks_pointer_arith_dest() {
+        let sass = r#"
+            /*0000*/ IMAD.WIDE R8, R0, c[0x0][0x160], R1 ;
+            /*0010*/ IADD3.X R9, R9, c[0x0][0x164], RZ ;
+            /*0020*/ EXIT ;
+        "#;
+        let cfg = build_cfg(parse_sass(sass));
+        let fir = build_ssa(&cfg);
+        let anns = annotate_function_ir_constmem(&fir, AbiProfile::modern_param_160());
+        let aliases = infer_arg_aliases(&fir, &anns);
+        let decls = infer_local_typed_declarations_with_abi(&fir, Some(&anns), Some(&aliases));
+        assert!(decls.iter().any(|d| d == "uintptr_t R8;"));
     }
 
     #[test]

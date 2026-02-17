@@ -19,6 +19,7 @@ pub struct NameRecoveryConfig {
     pub style: NameStyle,
     pub rewrite_control_predicates: bool,
     pub emit_phi_merge_comments: bool,
+    pub semantic_symbolization: bool,
 }
 
 impl Default for NameRecoveryConfig {
@@ -27,6 +28,7 @@ impl Default for NameRecoveryConfig {
             style: NameStyle::Temp,
             rewrite_control_predicates: true,
             emit_phi_merge_comments: false,
+            semantic_symbolization: false,
         }
     }
 }
@@ -288,6 +290,10 @@ pub fn recover_structured_output_names(
         output = rewrite_control_guard_predicates(&output, &pred_map);
     }
 
+    if config.semantic_symbolization {
+        output = rewrite_semantic_seed_names(&output);
+    }
+
     if config.emit_phi_merge_comments {
         output = append_phi_merge_comments(function_ir, &output, &token_map);
     }
@@ -308,6 +314,89 @@ pub fn recover_structured_output_names(
             split_components,
         },
     }
+}
+
+fn rewrite_semantic_seed_names(output: &str) -> String {
+    let assign_re = Regex::new(
+        r"^\s*(?P<lhs>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<rhs>[A-Za-z_][A-Za-z0-9_.]*)\s*;\s*$",
+    )
+    .expect("valid regex");
+    let ident_re = Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").expect("valid regex");
+    let mut used = BTreeSet::<String>::new();
+    for m in ident_re.find_iter(output) {
+        used.insert(m.as_str().to_string());
+    }
+
+    let mut rename = HashMap::<String, String>::new();
+    for line in output.lines() {
+        let Some(cap) = assign_re.captures(line) else {
+            continue;
+        };
+        let lhs = cap.name("lhs").expect("lhs").as_str().to_string();
+        let rhs = cap.name("rhs").expect("rhs").as_str();
+        let Some(seed) = semantic_name_seed(rhs) else {
+            continue;
+        };
+        if rename.contains_key(&lhs) {
+            continue;
+        }
+        let unique = alloc_unique_name(seed, &mut used);
+        rename.insert(lhs, unique);
+    }
+    if rename.is_empty() {
+        return output.to_string();
+    }
+
+    let mut out = output.to_string();
+    for (from, to) in rename {
+        let pat = Regex::new(&format!(r"\b{}\b", regex::escape(&from))).expect("valid regex");
+        out = pat.replace_all(&out, to.as_str()).into_owned();
+    }
+    out
+}
+
+fn alloc_unique_name(seed: String, used: &mut BTreeSet<String>) -> String {
+    if used.insert(seed.clone()) {
+        return seed;
+    }
+    let mut idx = 1usize;
+    loop {
+        let candidate = format!("{}_{}", seed, idx);
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+        idx += 1;
+    }
+}
+
+fn semantic_name_seed(rhs: &str) -> Option<String> {
+    let fixed = match rhs {
+        "threadIdx.x" => Some("tid_x"),
+        "threadIdx.y" => Some("tid_y"),
+        "threadIdx.z" => Some("tid_z"),
+        "blockIdx.x" => Some("ctaid_x"),
+        "blockIdx.y" => Some("ctaid_y"),
+        "blockIdx.z" => Some("ctaid_z"),
+        "blockDim.x" => Some("block_dim_x"),
+        "blockDim.y" => Some("block_dim_y"),
+        "blockDim.z" => Some("block_dim_z"),
+        "gridDim.x" => Some("grid_dim_x"),
+        "gridDim.y" => Some("grid_dim_y"),
+        "gridDim.z" => Some("grid_dim_z"),
+        _ => None,
+    };
+    if let Some(name) = fixed {
+        return Some(name.to_string());
+    }
+    let arg_ptr_lane_re = Regex::new(r"^arg(?P<idx>\d+)_ptr\.(?P<lane>lo32|hi32)$").expect("valid regex");
+    if let Some(cap) = arg_ptr_lane_re.captures(rhs) {
+        return Some(format!(
+            "arg{}_ptr_{}",
+            cap.name("idx").expect("idx").as_str(),
+            cap.name("lane").expect("lane").as_str()
+        ));
+    }
+    None
 }
 
 fn rewrite_control_guard_predicates(output: &str, pred_map: &HashMap<String, String>) -> String {
@@ -765,10 +854,33 @@ mod tests {
                 style: NameStyle::Temp,
                 rewrite_control_predicates: true,
                 emit_phi_merge_comments: true,
+                semantic_symbolization: false,
             },
         );
         assert!(out.output.contains("phi merge:"));
         // live-ins summary is emitted only when cross-name phi inputs exist.
         // Keep phi-merge comments as the strict opt-in contract here.
+    }
+
+    #[test]
+    fn semantic_symbolization_renames_seeded_dimensions() {
+        let sass = r#"
+            /*0000*/ S2R R2, SR_TID.X ;
+            /*0010*/ EXIT ;
+        "#;
+        let fir = build_fir(sass);
+        let rendered = "v0 = threadIdx.x;\nif (v0 > 1) {\n}\n";
+        let out = recover_structured_output_names(
+            &fir,
+            rendered,
+            &NameRecoveryConfig {
+                style: NameStyle::Temp,
+                rewrite_control_predicates: true,
+                emit_phi_merge_comments: false,
+                semantic_symbolization: true,
+            },
+        );
+        assert!(out.output.contains("tid_x = threadIdx.x;"));
+        assert!(out.output.contains("if (tid_x > 1)"));
     }
 }
