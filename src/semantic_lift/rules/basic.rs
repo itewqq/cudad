@@ -98,6 +98,23 @@ pub(super) fn register(registry: &mut RuleRegistry) {
     registry.register("SEL", "sel", |_, args, stmt_ref, config| {
         crate::semantic_lift::lift_sel(args, stmt_ref, config)
     });
+    // UMOV is a uniform register move: UMOV URd, URs → URd = URs.
+    // Just pass through the single source operand.
+    registry.register("UMOV", "umov", |_, args, stmt_ref, config| {
+        if args.len() == 1 {
+            Some(crate::semantic_lift::lift_ir_expr(&args[0], stmt_ref, config))
+        } else {
+            None
+        }
+    });
+    // MOV is a regular register move: MOV Rd, Rs → Rd = Rs.
+    registry.register("MOV", "mov", |_, args, stmt_ref, config| {
+        if args.len() == 1 {
+            Some(crate::semantic_lift::lift_ir_expr(&args[0], stmt_ref, config))
+        } else {
+            None
+        }
+    });
 }
 
 #[allow(dead_code)]

@@ -1,4 +1,5 @@
 BB0 {
+  R1.0 = ConstMem(0, 40);
   R26.0 = threadIdx.x;
 }
 // Condition from BB0
@@ -12,4 +13,3 @@ if (P0.0) {
   }
 }
 return;
-

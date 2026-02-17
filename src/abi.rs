@@ -60,8 +60,8 @@ impl ConstMemAnnotation {
     pub fn symbol(&self) -> String {
         match &self.semantic {
             ConstMemSemantic::Builtin(name) => (*name).to_string(),
-            ConstMemSemantic::ParamWord { param_idx, word_idx } => {
-                format!("param_{}[{}]", param_idx, word_idx)
+            ConstMemSemantic::ParamWord { param_idx, .. } => {
+                format!("param_{}", param_idx)
             }
             ConstMemSemantic::AbiInternal(offset) => format!("abi_internal_0x{:x}", offset),
             ConstMemSemantic::Unknown { bank, offset } => {
@@ -151,20 +151,55 @@ impl AbiArgAliases {
         self.by_param.is_empty()
     }
 
+    /// Returns true if `param_idx` is part of a Ptr64 alias — either as the
+    /// lo word (direct entry) or as the hi word (base = param_idx - 1).
+    pub fn is_ptr_param(&self, param_idx: u32) -> bool {
+        if let Some(alias) = self.by_param.get(&param_idx) {
+            if alias.kind == ArgAliasKind::Ptr64 {
+                return true;
+            }
+        }
+        if param_idx > 0 {
+            if let Some(alias) = self.by_param.get(&(param_idx - 1)) {
+                if alias.kind == ArgAliasKind::Ptr64 {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub fn render_param_word(&self, param_idx: u32, word_idx: u32) -> Option<String> {
-        let alias = self.by_param.get(&param_idx)?;
-        let rendered = match alias.kind {
-            ArgAliasKind::Ptr64 => {
-                let lane = if word_idx == 0 { "lo32" } else { "hi32" };
-                format!("arg{}_ptr.{}", param_idx, lane)
+        // Direct hit: the param_idx exists in our alias map.
+        if let Some(alias) = self.by_param.get(&param_idx) {
+            let rendered = match alias.kind {
+                ArgAliasKind::Ptr64 => {
+                    let lane = if word_idx == 0 { "lo32" } else { "hi32" };
+                    format!("arg{}_ptr.{}", param_idx, lane)
+                }
+                ArgAliasKind::U64 => {
+                    let lane = if word_idx == 0 { "lo32" } else { "hi32" };
+                    format!("arg{}_u64.{}", param_idx, lane)
+                }
+                ArgAliasKind::Word32 => {
+                    // With per-word param indexing the canonical word is always 0.
+                    // Render as plain "argN" instead of "argN_word0".
+                    format!("arg{}", param_idx)
+                }
+            };
+            return Some(rendered);
+        }
+        // The param_idx might be the hi half of a Ptr64 pair that was merged
+        // under the even word.  E.g. param_idx=5 merged into param_idx=4.
+        if param_idx > 0 {
+            let base = param_idx - 1;
+            if let Some(alias) = self.by_param.get(&base) {
+                if alias.kind == ArgAliasKind::Ptr64 {
+                    return Some(format!("arg{}_ptr.hi32", base));
+                }
             }
-            ArgAliasKind::U64 => {
-                let lane = if word_idx == 0 { "lo32" } else { "hi32" };
-                format!("arg{}_u64.{}", param_idx, lane)
-            }
-            ArgAliasKind::Word32 => format!("arg{}_word{}", param_idx, word_idx),
-        };
-        Some(rendered)
+        }
+        None
     }
 
     pub fn summarize_lines(&self, max_lines: usize) -> Vec<String> {
@@ -217,20 +252,14 @@ impl AbiArgAliases {
                     ));
                 }
                 ArgAliasKind::Word32 => {
-                    for w in &alias.observed_words {
-                        let scalar_ty = if alias.signed_words.contains(w) {
-                            "int32_t"
-                        } else {
-                            "uint32_t"
-                        };
-                        out.push(format!(
-                            "{} arg{}_word{}; // confidence: {}",
-                            scalar_ty,
-                            alias.param_idx,
-                            w,
-                            alias.confidence.as_str()
-                        ));
-                    }
+                    let is_signed = alias.signed_words.contains(&0);
+                    let scalar_ty = if is_signed { "int32_t" } else { "uint32_t" };
+                    out.push(format!(
+                        "{} arg{}; // confidence: {}",
+                        scalar_ty,
+                        alias.param_idx,
+                        alias.confidence.as_str()
+                    ));
                 }
             }
         }
@@ -252,14 +281,9 @@ impl AbiArgAliases {
                     out.push(format!("uint64_t arg{}_u64", alias.param_idx));
                 }
                 ArgAliasKind::Word32 => {
-                    for w in &alias.observed_words {
-                        let scalar_ty = if alias.signed_words.contains(w) {
-                            "int32_t"
-                        } else {
-                            "uint32_t"
-                        };
-                        out.push(format!("{} arg{}_word{}", scalar_ty, alias.param_idx, w));
-                    }
+                    let is_signed = alias.signed_words.contains(&0);
+                    let scalar_ty = if is_signed { "int32_t" } else { "uint32_t" };
+                    out.push(format!("{} arg{}", scalar_ty, alias.param_idx));
                 }
             }
         }
@@ -349,10 +373,7 @@ fn abi_pointer_hint_from_dest_stmt(
         let ConstMemSemantic::ParamWord { param_idx, .. } = ann.semantic else {
             return false;
         };
-        matches!(
-            aliases.by_param.get(&param_idx).map(|a| a.kind),
-            Some(ArgAliasKind::Ptr64)
-        )
+        aliases.is_ptr_param(param_idx)
     });
     if has_ptr_param {
         Some(LocalTypeHint::PtrStrong)
@@ -606,12 +627,12 @@ impl AbiProfile {
         }
 
         let builtin = match offset {
-            0x8 => Some("blockDimX"),
-            0xc => Some("blockDimY"),
-            0x10 => Some("blockDimZ"),
-            0x14 => Some("gridDimX"),
-            0x18 => Some("gridDimY"),
-            0x1c => Some("gridDimZ"),
+            0x0 => Some("blockDimX"),
+            0x4 => Some("blockDimY"),
+            0x8 => Some("blockDimZ"),
+            0xc => Some("gridDimX"),
+            0x10 => Some("gridDimY"),
+            0x14 => Some("gridDimZ"),
             _ => None,
         };
         if let Some(name) = builtin {
@@ -623,10 +644,13 @@ impl AbiProfile {
 
         if offset >= self.param_base && (offset - self.param_base) % 4 == 0 {
             let word = (offset - self.param_base) / 4;
-            let param_idx = word / 2;
-            let word_idx = word % 2;
+            // Each 4-byte word is its own param slot.  The merging of
+            // consecutive slots into Ptr64 / U64 happens later in
+            // infer_arg_aliases(), where we have actual usage evidence.
+            let param_idx = word;
+            let word_idx: u32 = 0;
             return Some(ResolvedConstMem {
-                symbol: format!("param_{}[{}]", param_idx, word_idx),
+                symbol: format!("param_{}", param_idx),
                 kind: ConstMemKind::ParamWord { param_idx, word_idx },
             });
         }
@@ -809,16 +833,16 @@ pub fn annotate_function_ir_constmem(function_ir: &FunctionIR, profile: AbiProfi
 }
 
 pub fn infer_arg_aliases(function_ir: &FunctionIR, annotations: &AbiAnnotations) -> AbiArgAliases {
+    /// Per-word-param usage statistics.
     #[derive(Default)]
-    struct ParamUsage {
-        words: BTreeSet<u32>,
+    struct WordUsage {
         pointer_like_hits: usize,
         total_hits: usize,
         pointer_data_widths: BTreeSet<u32>,
-        word_pointer_like_hits: BTreeMap<u32, usize>,
-        word_signed_hits: BTreeMap<u32, usize>,
+        signed_hits: usize,
     }
 
+    // ---- 1. Build opcode index ----
     let mut opcode_by_stmt: BTreeMap<StatementRef, String> = BTreeMap::new();
     for block in &function_ir.blocks {
         for (stmt_idx, stmt) in block.stmts.iter().enumerate() {
@@ -844,23 +868,24 @@ pub fn infer_arg_aliases(function_ir: &FunctionIR, annotations: &AbiAnnotations)
         }
     }
 
-    let mut by_param: BTreeMap<u32, ParamUsage> = BTreeMap::new();
+    // ---- 2. Gather per-word usage ----
+    // With per-word param indexing every param_idx is a single 4-byte word
+    // (word_idx is always 0).
+    let mut by_word: BTreeMap<u32, WordUsage> = BTreeMap::new();
     for (stmt_ref, anns) in annotations.iter() {
         let opcode = opcode_by_stmt
             .get(stmt_ref)
             .map(String::as_str)
             .unwrap_or("");
         for ann in anns {
-            if let ConstMemSemantic::ParamWord { param_idx, word_idx } = ann.semantic {
-                let usage = by_param.entry(param_idx).or_default();
-                usage.words.insert(word_idx);
+            if let ConstMemSemantic::ParamWord { param_idx, .. } = ann.semantic {
+                let usage = by_word.entry(param_idx).or_default();
                 usage.total_hits += 1;
                 if is_pointer_context_opcode(opcode) {
                     usage.pointer_like_hits += 1;
-                    *usage.word_pointer_like_hits.entry(word_idx).or_insert(0) += 1;
                 }
                 if is_signed_word_context_opcode(opcode) {
-                    *usage.word_signed_hits.entry(word_idx).or_insert(0) += 1;
+                    usage.signed_hits += 1;
                 }
                 if let Some(width) = pointer_data_width_opcode(opcode) {
                     usage.pointer_data_widths.insert(width);
@@ -869,51 +894,71 @@ pub fn infer_arg_aliases(function_ir: &FunctionIR, annotations: &AbiAnnotations)
         }
     }
 
+    // ---- 3. Merge consecutive even/odd pairs into Ptr64 when evidence supports it ----
+    let word_indices: Vec<u32> = by_word.keys().copied().collect();
+    let mut merged_as_hi: BTreeSet<u32> = BTreeSet::new(); // odd words consumed by a pair
+
     let mut out = AbiArgAliases::default();
-    for (param_idx, usage) in by_param {
-        let has_lo = usage.words.contains(&0);
-        let has_hi = usage.words.contains(&1);
-        let lo_pointer_hits = usage.word_pointer_like_hits.get(&0).copied().unwrap_or(0);
-        let hi_pointer_hits = usage.word_pointer_like_hits.get(&1).copied().unwrap_or(0);
-        let lo_is_pointer_like = lo_pointer_hits > 0;
-        let hi_is_pointer_like = hi_pointer_hits > 0;
-        let (kind, confidence) = if has_lo && has_hi {
-            if lo_is_pointer_like && hi_is_pointer_like {
-                (ArgAliasKind::Ptr64, AliasConfidence::High)
-            } else if usage.pointer_like_hits == 0 {
-                (ArgAliasKind::U64, AliasConfidence::Medium)
-            } else {
-                // Mixed usage across lo/hi words (e.g., one word in pointer math,
-                // other word in scalar compares) is common for packed 32-bit args.
-                // Keep this conservative and avoid forcing ptr64 aliases.
-                (ArgAliasKind::Word32, AliasConfidence::Low)
-            }
-        } else {
-            (ArgAliasKind::Word32, AliasConfidence::Low)
+
+    for &lo in &word_indices {
+        if lo % 2 != 0 {
+            continue; // only start pairs on even-numbered words
+        }
+        let hi = lo + 1;
+        let lo_usage = match by_word.get(&lo) {
+            Some(u) => u,
+            None => continue,
         };
-        let pointee_ty = if kind == ArgAliasKind::Ptr64 {
-            if usage.pointer_data_widths.is_empty() {
+        let hi_usage = match by_word.get(&hi) {
+            Some(u) => u,
+            None => continue,
+        };
+        // Both words of the natural pair exist — check if they form a pointer.
+        let lo_ptr = lo_usage.pointer_like_hits > 0;
+        let hi_ptr = hi_usage.pointer_like_hits > 0;
+        if lo_ptr && hi_ptr {
+            // Merge into Ptr64 keyed by the even (lo) word index.
+            let mut data_widths = lo_usage.pointer_data_widths.clone();
+            data_widths.extend(hi_usage.pointer_data_widths.iter().copied());
+            let pointee_ty = if data_widths.is_empty() {
                 infer_pointer_pointee_ty(&function_pointer_widths)
             } else {
-                infer_pointer_pointee_ty(&usage.pointer_data_widths)
-            }
-        } else {
-            None
-        };
-        let signed_words = usage
-            .word_signed_hits
-            .iter()
-            .filter_map(|(word, hits)| if *hits > 0 { Some(*word) } else { None })
-            .collect();
+                infer_pointer_pointee_ty(&data_widths)
+            };
+            out.by_param.insert(
+                lo,
+                ArgAlias {
+                    param_idx: lo,
+                    kind: ArgAliasKind::Ptr64,
+                    confidence: AliasConfidence::High,
+                    observed_words: [0u32, 1].iter().copied().collect(),
+                    signed_words: BTreeSet::new(),
+                    pointee_ty,
+                },
+            );
+            merged_as_hi.insert(hi);
+        }
+    }
+
+    // ---- 4. Remaining words become Word32 ----
+    for (&word_idx, usage) in &by_word {
+        if out.by_param.contains_key(&word_idx) || merged_as_hi.contains(&word_idx) {
+            continue; // already handled as part of a Ptr64 pair
+        }
+        let is_signed = usage.signed_hits > 0;
         out.by_param.insert(
-            param_idx,
+            word_idx,
             ArgAlias {
-                param_idx,
-                kind,
-                confidence,
-                observed_words: usage.words,
-                signed_words,
-                pointee_ty,
+                param_idx: word_idx,
+                kind: ArgAliasKind::Word32,
+                confidence: AliasConfidence::Low,
+                observed_words: [0u32].iter().copied().collect(),
+                signed_words: if is_signed {
+                    [0u32].iter().copied().collect()
+                } else {
+                    BTreeSet::new()
+                },
+                pointee_ty: None,
             },
         );
     }
@@ -1034,10 +1079,12 @@ mod tests {
     fn profile_selection_changes_param_indexing() {
         let legacy = AbiProfile::legacy_param_140();
         let modern = AbiProfile::modern_param_160();
+        // legacy param_base = 0x140, so offset 0x160 is word (0x160-0x140)/4 = 8
         assert!(matches!(
             legacy.classify_constmem(0, 0x160),
-            ConstMemSemantic::ParamWord { param_idx: 4, word_idx: 0 }
+            ConstMemSemantic::ParamWord { param_idx: 8, word_idx: 0 }
         ));
+        // modern param_base = 0x160, so offset 0x160 is word 0
         assert!(matches!(
             modern.classify_constmem(0, 0x160),
             ConstMemSemantic::ParamWord { param_idx: 0, word_idx: 0 }
@@ -1047,15 +1094,17 @@ mod tests {
     #[test]
     fn resolves_user_asked_offsets_in_legacy_profile() {
         let p = AbiProfile::legacy_param_140();
-        assert_eq!(p.resolve_constmem(0, 0x8).unwrap().symbol, "blockDimX");
+        assert_eq!(p.resolve_constmem(0, 0x0).unwrap().symbol, "blockDimX");
+        assert_eq!(p.resolve_constmem(0, 0x8).unwrap().symbol, "blockDimZ");
         assert_eq!(p.resolve_constmem(0, 0x28).unwrap().symbol, "abi_internal_0x28");
         assert_eq!(p.resolve_constmem(0, 0x44).unwrap().symbol, "abi_internal_0x44");
-        assert_eq!(p.resolve_constmem(0, 0x140).unwrap().symbol, "param_0[0]");
-        assert_eq!(p.resolve_constmem(0, 0x144).unwrap().symbol, "param_0[1]");
-        assert_eq!(p.resolve_constmem(0, 0x148).unwrap().symbol, "param_1[0]");
-        assert_eq!(p.resolve_constmem(0, 0x14c).unwrap().symbol, "param_1[1]");
-        assert_eq!(p.resolve_constmem(0, 0x150).unwrap().symbol, "param_2[0]");
-        assert_eq!(p.resolve_constmem(0, 0x154).unwrap().symbol, "param_2[1]");
+        // Per-word param indexing: each 4-byte word is its own param.
+        assert_eq!(p.resolve_constmem(0, 0x140).unwrap().symbol, "param_0");
+        assert_eq!(p.resolve_constmem(0, 0x144).unwrap().symbol, "param_1");
+        assert_eq!(p.resolve_constmem(0, 0x148).unwrap().symbol, "param_2");
+        assert_eq!(p.resolve_constmem(0, 0x14c).unwrap().symbol, "param_3");
+        assert_eq!(p.resolve_constmem(0, 0x150).unwrap().symbol, "param_4");
+        assert_eq!(p.resolve_constmem(0, 0x154).unwrap().symbol, "param_5");
     }
 
     #[test]
@@ -1065,7 +1114,7 @@ mod tests {
             op: "ConstMem".to_string(),
             args: vec![IRExpr::ImmI(0), IRExpr::ImmI(0x148)],
         };
-        assert_eq!(display.expr(&expr), "param_1[0]");
+        assert_eq!(display.expr(&expr), "param_2");
     }
 
     #[test]
@@ -1112,21 +1161,30 @@ mod tests {
         let fir = build_ssa(&cfg);
         let anns = annotate_function_ir_constmem(&fir, AbiProfile::modern_param_160());
         let aliases = infer_arg_aliases(&fir, &anns);
-        let alias = aliases.by_param.get(&4).expect("missing alias for param 4");
-        assert_eq!(alias.kind, ArgAliasKind::Word32);
-        assert_eq!(aliases.render_param_word(4, 1).unwrap(), "arg4_word1");
+        // With per-word indexing: c[0x180] is param 8, c[0x184] is param 9.
+        // They are in the same even/odd pair (8/9).  Word 8 has pointer-like
+        // context (IMAD.WIDE) but word 9 does not (ISETP).  Since only one
+        // of the pair is pointer-like, they must NOT be merged into Ptr64.
+        let alias8 = aliases.by_param.get(&8).expect("missing alias for param 8");
+        assert_eq!(alias8.kind, ArgAliasKind::Word32);
+        let alias9 = aliases.by_param.get(&9).expect("missing alias for param 9");
+        assert_eq!(alias9.kind, ArgAliasKind::Word32);
+        assert_eq!(aliases.render_param_word(8, 0).unwrap(), "arg8");
+        assert_eq!(aliases.render_param_word(9, 0).unwrap(), "arg9");
     }
 
     #[test]
     fn abi_display_prefers_inferred_arg_aliases_for_param_words() {
         let mut aliases = AbiArgAliases::default();
+        // Legacy param_base = 0x140. Offset 0x148 → word 2.
+        // Put a Word32 alias at param_idx=2 so the display picks it up.
         aliases.by_param.insert(
-            1,
+            2,
             ArgAlias {
-                param_idx: 1,
-                kind: ArgAliasKind::U64,
-                confidence: AliasConfidence::Medium,
-                observed_words: [0, 1].into_iter().collect(),
+                param_idx: 2,
+                kind: ArgAliasKind::Word32,
+                confidence: AliasConfidence::Low,
+                observed_words: [0].into_iter().collect(),
                 signed_words: BTreeSet::new(),
                 pointee_ty: None,
             },
@@ -1136,7 +1194,7 @@ mod tests {
             op: "ConstMem".to_string(),
             args: vec![IRExpr::ImmI(0), IRExpr::ImmI(0x148)],
         };
-        assert_eq!(display.expr(&expr), "arg1_u64.lo32");
+        assert_eq!(display.expr(&expr), "arg2");
     }
 
     #[test]
@@ -1159,7 +1217,7 @@ mod tests {
                 param_idx: 3,
                 kind: ArgAliasKind::Word32,
                 confidence: AliasConfidence::Low,
-                observed_words: [1].into_iter().collect(),
+                observed_words: [0].into_iter().collect(),
                 signed_words: BTreeSet::new(),
                 pointee_ty: None,
             },
@@ -1167,7 +1225,7 @@ mod tests {
 
         let decls = aliases.render_typed_arg_declarations();
         assert!(decls.iter().any(|d| d.contains("uintptr_t arg0_ptr;")));
-        assert!(decls.iter().any(|d| d.contains("uint32_t arg3_word1;")));
+        assert!(decls.iter().any(|d| d.contains("uint32_t arg3;")));
     }
 
     #[test]
@@ -1190,14 +1248,14 @@ mod tests {
                 param_idx: 2,
                 kind: ArgAliasKind::Word32,
                 confidence: AliasConfidence::Low,
-                observed_words: [1].into_iter().collect(),
+                observed_words: [0].into_iter().collect(),
                 signed_words: BTreeSet::new(),
                 pointee_ty: None,
             },
         );
         let params = aliases.render_typed_param_list();
         assert_eq!(params[0], "uintptr_t arg0_ptr");
-        assert_eq!(params[1], "uint32_t arg2_word1");
+        assert_eq!(params[1], "uint32_t arg2");
     }
 
     #[test]
@@ -1267,7 +1325,7 @@ mod tests {
     fn annotates_ir_with_typed_constmem_semantics() {
         let sass = r#"
             /*0000*/ IMAD.MOV.U32 R1, RZ, RZ, c[0x0][0x140] ;
-            /*0010*/ IMAD.MOV.U32 R2, RZ, RZ, c[0x0][0x8] ;
+            /*0010*/ IMAD.MOV.U32 R2, RZ, RZ, c[0x0][0x0] ;
             /*0020*/ IMAD.MOV.U32 R3, RZ, RZ, c[0x0][0x44] ;
             /*0030*/ EXIT ;
         "#;

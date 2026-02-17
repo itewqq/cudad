@@ -1005,6 +1005,11 @@ impl<'a> Structurizer<'a> {
         None
     }
 
+    /// Returns true if the opcode is a convergence barrier with no data effect.
+    fn is_convergence_barrier_opcode(opcode: &str) -> bool {
+        matches!(opcode, "BSSY" | "BSYNC" | "SSY" | "SYNC")
+    }
+
     fn render_condition_prelude_for_block(
         &self,
         block_id: usize,
@@ -1016,23 +1021,46 @@ impl<'a> Structurizer<'a> {
             return String::new();
         };
 
+        // Collect the predicates used by this block's own branch/exit so we can
+        // suppress the ISETP that feeds the branch (it is expressed as the
+        // structured if/while condition instead).
+        let control_pred_regs: Vec<RegId> = block
+            .irdst
+            .iter()
+            .filter_map(|(cond, _)| match cond {
+                Some(IRCond::Pred { reg, .. }) => Some(reg.clone()),
+                _ => None,
+            })
+            .collect();
+
         let mut lines = String::new();
         for (stmt_idx, ir_s) in block.stmts.iter().enumerate() {
+            // Skip phi nodes — they are handled separately.
             if matches!(ir_s.value, RValue::Phi(_)) {
                 continue;
             }
-            let (is_s2r, is_barrier) = match &ir_s.value {
-                RValue::Op { opcode, .. } => (
-                    opcode == "S2R" || opcode == "CS2R",
-                    Self::is_barrier_opcode(opcode),
-                ),
-                _ => (false, false),
+
+            let opcode = match &ir_s.value {
+                RValue::Op { opcode, .. } => opcode.as_str(),
+                _ => "",
             };
-            if !is_s2r && !is_barrier {
+
+            // Skip pure control-flow opcodes (branches, exits, convergence barriers).
+            if Self::is_branch_only_opcode(opcode)
+                || Self::is_return_opcode(opcode)
+                || Self::is_convergence_barrier_opcode(opcode)
+            {
                 continue;
             }
 
-            if is_barrier {
+            // Skip the SETP that defines *only* the block's own branch predicate
+            // (its semantics are captured by the structured if/while condition).
+            if Self::should_omit_control_predicate_def(ir_s, stmt_idx, block, &control_pred_regs) {
+                continue;
+            }
+
+            // Render barriers as __syncthreads().
+            if Self::is_barrier_opcode(opcode) {
                 let pred_str = ir_s
                     .pred
                     .as_ref()
@@ -1045,6 +1073,7 @@ impl<'a> Structurizer<'a> {
                 continue;
             }
 
+            // Try lifted (semantic) rendering first.
             if let Some(res) = lifted {
                 let mut emitted_any = false;
                 for def_idx in Self::lifted_def_emit_order(ir_s) {
@@ -1074,6 +1103,7 @@ impl<'a> Structurizer<'a> {
                 }
             }
 
+            // Fallback: raw SSA rendering.
             let dest_str = if ir_s.defs.is_empty() {
                 "_".to_string()
             } else if ir_s.defs.len() == 1 {

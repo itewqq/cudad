@@ -329,7 +329,7 @@ fn semantic_lift_carry_def_uses_pre_increment_low_operand() {
         .expect("expected carry def");
 
     assert_eq!(low.rhs.render(), "R1.0 + 1");
-    assert_eq!(carry.rhs.render(), "carry_u32_add3(R1.0, 1, RZ)");
+    assert_eq!(carry.rhs.render(), "carry_u32_add3(R1.0, 1, 0)");
     assert!(!carry.rhs.render().contains("R1.1"));
 }
 
@@ -494,7 +494,13 @@ fn render_typed_structured_output_for_test(
         out.push_str(d);
         out.push('\n');
     }
-    if !local_decls.is_empty() {
+    let extra_decls = infer_self_contained_locals_for_test(code_output, aliases, local_decls);
+    for d in &extra_decls {
+        out.push_str("  ");
+        out.push_str(d);
+        out.push('\n');
+    }
+    if !local_decls.is_empty() || !extra_decls.is_empty() {
         out.push('\n');
     }
     for line in code_output.lines() {
@@ -503,6 +509,97 @@ fn render_typed_structured_output_for_test(
         out.push('\n');
     }
     out.push_str("}\n");
+    out
+}
+
+fn infer_self_contained_locals_for_test(
+    code_output: &str,
+    aliases: Option<&AbiArgAliases>,
+    local_decls: &[String],
+) -> Vec<String> {
+    let ident_re = Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").expect("valid regex");
+    let temp_re = Regex::new(
+        r"\b(?:v\d+|u\d+|b\d+|abi_internal_0x[0-9A-Fa-f]+|arg\d+_ptr_(?:lo32|hi32)|arg\d+_word\d+)\b",
+    )
+    .expect("valid regex");
+    let assign_re = Regex::new(
+        r"^\s*(?:if\s*\([^)]*\)\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*=",
+    )
+    .expect("valid regex");
+    let mut declared = std::collections::BTreeSet::<String>::new();
+    for d in local_decls {
+        for m in ident_re.find_iter(d) {
+            declared.insert(m.as_str().to_string());
+        }
+    }
+    if let Some(a) = aliases {
+        for p in a.render_typed_param_list() {
+            for m in ident_re.find_iter(&p) {
+                declared.insert(m.as_str().to_string());
+            }
+        }
+    }
+
+    let mut seen = std::collections::BTreeSet::<String>::new();
+    let mut ordered = Vec::<String>::new();
+    let mut defined = std::collections::BTreeSet::<String>::new();
+    let mut live_ins = std::collections::BTreeSet::<String>::new();
+    for raw_line in code_output.lines() {
+        let line = raw_line.split("//").next().unwrap_or("");
+        let lhs_span = assign_re.captures(line).and_then(|c| {
+            let whole = c.get(0)?;
+            let after_eq = line.get(whole.end()..).unwrap_or("").trim_start();
+            if after_eq.starts_with('=') {
+                return None;
+            }
+            c.get(1)
+                .map(|m| (m.as_str().to_string(), m.start(), m.end()))
+        });
+        for m in temp_re.find_iter(line) {
+            let t = m.as_str();
+            let is_lhs = lhs_span
+                .as_ref()
+                .map(|(_, s, e)| m.start() == *s && m.end() == *e)
+                .unwrap_or(false);
+            if !is_lhs && !defined.contains(t) {
+                live_ins.insert(t.to_string());
+            }
+            if declared.contains(t) {
+                continue;
+            }
+            if seen.insert(t.to_string()) {
+                ordered.push(t.to_string());
+            }
+        }
+        if let Some((lhs, _, _)) = lhs_span {
+            if temp_re.is_match(&lhs) {
+                defined.insert(lhs);
+            }
+        }
+    }
+
+    let mut out = Vec::<String>::new();
+    if code_output.contains("shmem_u8[") && !declared.contains("shmem_u8") {
+        out.push("uint8_t shmem_u8[256];".to_string());
+    }
+    for name in ordered {
+        let is_bool = name.starts_with('b')
+            && name[1..].chars().all(|c| c.is_ascii_digit());
+        let is_live_in = live_ins.contains(&name);
+        if is_bool {
+            if is_live_in {
+                out.push(format!("bool {}; // live-in", name));
+            } else {
+                out.push(format!("bool {};", name));
+            }
+        } else {
+            if is_live_in {
+                out.push(format!("uint32_t {}; // live-in", name));
+            } else {
+                out.push(format!("uint32_t {};", name));
+            }
+        }
+    }
     out
 }
 
@@ -641,7 +738,7 @@ fn test_abi_profile_sm_fallback_without_param_offsets() {
 fn test_structured_output_with_abi_display_symbols_constmem() {
     let sample = r#"
         /*0000*/ IMAD.MOV.U32 R1, RZ, RZ, c[0x0][0x140] ;
-        /*0010*/ IMAD.MOV.U32 R2, RZ, RZ, c[0x0][0x8] ;
+        /*0010*/ IMAD.MOV.U32 R2, RZ, RZ, c[0x0][0x0] ;
         /*0020*/ EXIT ;
     "#;
     let cfg = build_cfg(parse_sass(sample));
@@ -649,7 +746,7 @@ fn test_structured_output_with_abi_display_symbols_constmem() {
     let display = AbiDisplay::new(AbiProfile::legacy_param_140());
     let out = fir.to_dot(&cfg, &display);
 
-    assert!(out.contains("param_0[0]"));
+    assert!(out.contains("param_0"));
     assert!(out.contains("blockDimX"));
 }
 

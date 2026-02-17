@@ -1,4 +1,5 @@
 BB0 {
+  R1.0 = IMAD.MOV.U32(RZ, RZ, ConstMem(0, 40));
   R26.0 = S2R(SR_TID.X());
 }
 // Condition from BB0
@@ -12,4 +13,3 @@ if (P0.0) {
   }
 }
 return;
-

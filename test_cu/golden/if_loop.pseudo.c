@@ -1,19 +1,99 @@
 BB0 {
+  R1.0 = IMAD.MOV.U32(RZ, RZ, ConstMem(0, 40));
   R0.0 = S2R(SR_CTAID.X());
   R3.0 = S2R(SR_TID.X());
+  R0.1 = IMAD(R0.0, ConstMem(0, 0), R3.0);
 }
 // Condition from BB0
 if (!(P0.0)) {
+  BB1 {
+    R7.0 = IMAD.MOV.U32(RZ, RZ, 4);
+    (UR4.0, UR5.0) = ULDC.64(ConstMem(0, 280));
+    R4.0 = IMAD.WIDE(R0.1, R7.0, ConstMem(0, 352));
+    R6.0 = IMAD.WIDE(R0.1, R7.0, ConstMem(0, 360));
+    R5.1 = LDG.E(*addr64(R4.0, R5.0));
+    R6.1 = LDG.E(*addr64(R6.0, R7.0));
+    R2.0 = IMAD.MOV.U32(RZ, RZ, ConstMem(0, 380));
+    R3.1 = SHF.R.S32.HI(RZ, 31, R0.1);
+    P1.0 = ISETP.GE.AND(PT, R2.0, 1, PT);
+    R9.0 = FADD(R6.1, R5.1);
+    P0.1 = FSETP.GT.AND(PT, R9.0, 1, PT);
+    if (!(P0.1)) R9.1 = FMUL(R6.1, R5.1);
+  }
   // Condition from BB1
   if (P1.0) {
+    BB2 {
+      R4.1 = IADD3(R2.0, -1, RZ);
+      R2.1 = LOP3.LUT(R2.0, 3, RZ, 192, !PT());
+    }
     // Condition from BB2
     if (P0.2) {
+      BB3 {
+        R6.2 = IADD3(-R2.1, ConstMem(0, 380), RZ);
+      }
       // Condition from BB3
       if (P0.3) {
+        BB4 {
+          P1.1 = ISETP.GT.AND(PT, R6.2, 12, PT);
+          P0.4 = PLOP3.LUT(PT, PT, PT, PT, 128, 0);
+        }
         // Condition from BB4
         if (P1.1) {
           BB5 {
             P0.5 = PLOP3.LUT(PT, PT, PT, PT, 8, 0);
+          }
+          BB6 {
+            R7.2 = IMAD.MOV.U32(RZ, RZ, 1066192077);
+            P1.3 = FSETP.GT.AND(PT, R9.2, 0.5, PT);
+            R6.4 = IADD3(R6.3, -16, RZ);
+            R4.3 = FSEL(R7.2, 0.8999999761581421, P1.3);
+            P2.2 = ISETP.GT.AND(PT, R6.4, 12, PT);
+            R4.4 = FMUL(R4.3, R9.2);
+            P1.4 = FSETP.GT.AND(PT, R4.4, 0.5, PT);
+            R5.3 = FSEL(R7.2, 0.8999999761581421, P1.4);
+            R5.4 = FMUL(R4.4, R5.3);
+            P1.5 = FSETP.GT.AND(PT, R5.4, 0.5, PT);
+            R4.5 = FSEL(R7.2, 0.8999999761581421, P1.5);
+            R4.6 = FMUL(R5.4, R4.5);
+            P1.6 = FSETP.GT.AND(PT, R4.6, 0.5, PT);
+            R5.5 = FSEL(R7.2, 0.8999999761581421, P1.6);
+            R5.6 = FMUL(R4.6, R5.5);
+            P1.7 = FSETP.GT.AND(PT, R5.6, 0.5, PT);
+            R4.7 = FSEL(R7.2, 0.8999999761581421, P1.7);
+            R4.8 = FMUL(R5.6, R4.7);
+            P1.8 = FSETP.GT.AND(PT, R4.8, 0.5, PT);
+            R5.7 = FSEL(R7.2, 0.8999999761581421, P1.8);
+            R5.8 = FMUL(R4.8, R5.7);
+            P1.9 = FSETP.GT.AND(PT, R5.8, 0.5, PT);
+            R4.9 = FSEL(R7.2, 0.8999999761581421, P1.9);
+            R4.10 = FMUL(R5.8, R4.9);
+            P1.10 = FSETP.GT.AND(PT, R4.10, 0.5, PT);
+            R5.9 = FSEL(R7.2, 0.8999999761581421, P1.10);
+            R5.10 = FMUL(R4.10, R5.9);
+            P1.11 = FSETP.GT.AND(PT, R5.10, 0.5, PT);
+            R4.11 = FSEL(R7.2, 0.8999999761581421, P1.11);
+            R4.12 = FMUL(R5.10, R4.11);
+            P1.12 = FSETP.GT.AND(PT, R4.12, 0.5, PT);
+            R5.11 = FSEL(R7.2, 0.8999999761581421, P1.12);
+            R5.12 = FMUL(R4.12, R5.11);
+            P1.13 = FSETP.GT.AND(PT, R5.12, 0.5, PT);
+            R4.13 = FSEL(R7.2, 0.8999999761581421, P1.13);
+            R4.14 = FMUL(R5.12, R4.13);
+            P1.14 = FSETP.GT.AND(PT, R4.14, 0.5, PT);
+            R5.13 = FSEL(R7.2, 0.8999999761581421, P1.14);
+            R5.14 = FMUL(R4.14, R5.13);
+            P1.15 = FSETP.GT.AND(PT, R5.14, 0.5, PT);
+            R4.15 = FSEL(R7.2, 0.8999999761581421, P1.15);
+            R4.16 = FMUL(R5.14, R4.15);
+            P1.16 = FSETP.GT.AND(PT, R4.16, 0.5, PT);
+            R5.15 = FSEL(R7.2, 0.8999999761581421, P1.16);
+            R5.16 = FMUL(R4.16, R5.15);
+            P1.17 = FSETP.GT.AND(PT, R5.16, 0.5, PT);
+            R4.17 = FSEL(R7.2, 0.8999999761581421, P1.17);
+            R4.18 = FMUL(R5.16, R4.17);
+            P1.18 = FSETP.GT.AND(PT, R4.18, 0.5, PT);
+            R9.3 = FSEL(R7.2, 0.8999999761581421, P1.18);
+            R9.4 = FMUL(R4.18, R9.3);
           }
           // Loop header BB6
           while (P2.2) {
@@ -111,6 +191,22 @@ if (!(P0.0)) {
             R7.7 = IMAD.MOV.U32(RZ, RZ, 1066192077);
             // 8 phi node(s) omitted
           }
+          BB11 {
+            P0.19 = FSETP.GT.AND(PT, R9.10, 0.5, PT);
+            R6.10 = IADD3(R6.9, -4, RZ);
+            R4.31 = FSEL(R7.7, 0.8999999761581421, P0.19);
+            R4.32 = FMUL(R4.31, R9.10);
+            P0.20 = FSETP.GT.AND(PT, R4.32, 0.5, PT);
+            R5.27 = FSEL(R7.7, 0.8999999761581421, P0.20);
+            R5.28 = FMUL(R4.32, R5.27);
+            P0.21 = FSETP.GT.AND(PT, R5.28, 0.5, PT);
+            R4.33 = FSEL(R7.7, 0.8999999761581421, P0.21);
+            P0.22 = ISETP.NE.AND(PT, R6.10, RZ, PT);
+            R4.34 = FMUL(R5.28, R4.33);
+            P1.25 = FSETP.GT.AND(PT, R4.34, 0.5, PT);
+            R9.11 = FSEL(R7.7, 0.8999999761581421, P1.25);
+            R9.12 = FMUL(R4.34, R9.11);
+          }
           // Loop header BB11
           while (P0.22) {
             BB11 {
@@ -137,6 +233,13 @@ if (!(P0.0)) {
           BB13 {
             R5.30 = IMAD.MOV.U32(RZ, RZ, 1066192077);
           }
+          BB14 {
+            R2.3 = IADD3(R2.2, -1, RZ);
+            P1.28 = FSETP.GT.AND(PT, R9.14, 0.5, PT);
+            P0.26 = ISETP.NE.AND(PT, R2.3, RZ, PT);
+            R4.37 = FSEL(R5.30, 0.8999999761581421, P1.28);
+            R9.15 = FMUL(R4.37, R9.14);
+          }
           // Loop header BB14
           while (P0.26) {
             BB14 {
@@ -160,4 +263,3 @@ if (!(P0.0)) {
     }
   }
 }
-

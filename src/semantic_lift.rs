@@ -284,14 +284,18 @@ fn lift_uldc64_hi_from_lo(
     let ann = matches_stmt
         .iter()
         .find(|ann| ann.bank == bank && ann.offset == offset)?;
-    if let ConstMemSemantic::ParamWord { param_idx, word_idx } = ann.semantic {
-        let hi_word = word_idx.checked_add(1)?;
+    if let ConstMemSemantic::ParamWord { param_idx, .. } = ann.semantic {
+        // With per-word param indexing the hi half of a 64-bit load lives at
+        // param_idx + 1, not at a different word_idx within the same param.
+        let hi_param = param_idx.checked_add(1)?;
         if let Some(aliases) = config.abi_aliases {
-            if let Some(alias) = aliases.render_param_word(param_idx, hi_word) {
+            // Try rendering via the alias map — this handles Ptr64 pairs that
+            // were merged under the even param_idx.
+            if let Some(alias) = aliases.render_param_word(hi_param, 0) {
                 return Some(LiftedExpr::Raw(alias));
             }
         }
-        return Some(LiftedExpr::Raw(format!("param_{}[{}]", param_idx, hi_word)));
+        return Some(LiftedExpr::Raw(format!("param_{}", hi_param)));
     }
     None
 }
@@ -1242,7 +1246,19 @@ fn render_shared_u8_ref(
 
 fn lift_ir_expr(expr: &IRExpr, stmt_ref: StatementRef, config: &SemanticLiftConfig<'_>) -> LiftedExpr {
     match expr {
-        IRExpr::Reg(r) => LiftedExpr::Reg(r.display()),
+        IRExpr::Reg(r) => {
+            // Render RZ/URZ as literal 0 instead of a register name.
+            // These are hardware-zero registers and showing them as "RZ"
+            // confuses downstream name-recovery into inventing live-in vars.
+            if matches!(r.class.as_str(), "RZ" | "URZ") {
+                return LiftedExpr::Imm("0".to_string());
+            }
+            // PT/UPT are always-true predicates.
+            if matches!(r.class.as_str(), "PT" | "UPT") {
+                return LiftedExpr::Imm("true".to_string());
+            }
+            LiftedExpr::Reg(r.display())
+        }
         IRExpr::ImmI(i) => LiftedExpr::Imm(i.to_string()),
         IRExpr::ImmF(f) => LiftedExpr::Imm(f.to_string()),
         IRExpr::Mem { .. } => LiftedExpr::Raw(render_expr_raw(expr, stmt_ref, config)),
@@ -1330,7 +1346,15 @@ fn simplify_not(expr: LiftedExpr) -> LiftedExpr {
 
 fn render_expr_raw(expr: &IRExpr, stmt_ref: StatementRef, config: &SemanticLiftConfig<'_>) -> String {
     match expr {
-        IRExpr::Reg(r) => r.display(),
+        IRExpr::Reg(r) => {
+            if matches!(r.class.as_str(), "RZ" | "URZ") {
+                return "0".to_string();
+            }
+            if matches!(r.class.as_str(), "PT" | "UPT") {
+                return "true".to_string();
+            }
+            r.display()
+        }
         IRExpr::ImmI(i) => i.to_string(),
         IRExpr::ImmF(f) => f.to_string(),
         IRExpr::Mem {

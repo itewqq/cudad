@@ -31,4 +31,3 @@ BB0 {
   _ = STG.E(*addr64(R2.2, R3.5), R5.3);
 }
 return;
-
