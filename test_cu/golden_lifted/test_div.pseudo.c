@@ -1,11 +1,13 @@
 BB0 {
   R1.0 = ConstMem(0, 40);
   R5.0 = abs(ConstMem(0, 356));
-  UR4.0 = uldc64(ConstMem(0, 352));
+  UR4.0 = ConstMem(0, 352);
+  UR5.0 = ConstMem(0, 356);
   UR4.1 = UR4.0 ^ UR5.0;
   R0.0 = i2f_rp(R5.0);
   P1.0 = RZ <= UR4.1;
-  UR4.2 = uldc64(ConstMem(0, 280));
+  UR4.2 = ConstMem(0, 280);
+  UR5.1 = ConstMem(0, 284);
   R0.1 = rcp_approx(R0.0);
   R2.0 = R0.1 + 268435454;
   R3.0 = f2i_trunc_u32_ftz_ntz(R2.0);

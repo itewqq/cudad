@@ -12,6 +12,7 @@ pub mod cfg_analysis;
 pub mod high_il;
 pub mod semantic_lift;
 pub mod name_recovery;
+pub mod op_semantics;
 
 #[cfg(test)]
 mod test;
@@ -25,3 +26,4 @@ pub use cfg_analysis::*;
 pub use high_il::*;
 pub use semantic_lift::*;
 pub use name_recovery::*;
+pub use op_semantics::*;

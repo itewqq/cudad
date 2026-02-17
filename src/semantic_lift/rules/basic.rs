@@ -4,7 +4,7 @@ use crate::ir::IRExpr;
 use crate::semantic_lift::op_sig::OpSig;
 use crate::semantic_lift::registry::RuleRegistry;
 use crate::semantic_lift::{
-    lift_fsel, lift_i2f_rp, lift_iabs, lift_iadd3, lift_iadd3_carry, lift_iadd3_x, lift_imad,
+    lift_fsel, lift_i2f_rp, lift_iabs, lift_iadd3, lift_iadd3_x, lift_imad,
     lift_imad_hi_u32, lift_imad_iadd, lift_imad_mov, lift_imad_wide, lift_imad_x, lift_mufu_rcp,
     lift_unary_intrinsic, LiftedExpr, SemanticLiftConfig,
 };
@@ -47,29 +47,11 @@ pub(super) fn register(registry: &mut RuleRegistry) {
         }
         None
     });
-    registry.register("IADD3", "iadd3_carry", |sig, args, stmt_ref, config| {
-        if sig.raw_opcode == "IADD3.CARRY" {
-            return lift_iadd3_carry("carry_u32_add3", args, stmt_ref, config);
-        }
-        if sig.raw_opcode == "IADD3.CARRY2" {
-            return lift_iadd3_carry("carry_u32_add3_2", args, stmt_ref, config);
-        }
-        None
-    });
     registry.register("IADD3", "iadd3", |_, args, stmt_ref, config| {
         lift_iadd3(args, stmt_ref, config)
     });
     registry.register("UIADD3", "uiadd3", |_, args, stmt_ref, config| {
         lift_iadd3(args, stmt_ref, config)
-    });
-    registry.register("UIADD3", "uiadd3_carry", |sig, args, stmt_ref, config| {
-        if sig.raw_opcode == "UIADD3.CARRY" {
-            return lift_iadd3_carry("carry_u32_add3", args, stmt_ref, config);
-        }
-        if sig.raw_opcode == "UIADD3.CARRY2" {
-            return lift_iadd3_carry("carry_u32_add3_2", args, stmt_ref, config);
-        }
-        None
     });
     registry.register("IADD3", "iadd3_x", |sig, args, stmt_ref, config| {
         if sig.raw_opcode == "IADD3.X" {

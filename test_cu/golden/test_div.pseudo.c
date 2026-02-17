@@ -1,11 +1,11 @@
 BB0 {
   R1.0 = IMAD.MOV.U32(RZ, RZ, ConstMem(0, 40));
   R5.0 = IABS(ConstMem(0, 356));
-  UR4.0 = ULDC.64(ConstMem(0, 352));
+  (UR4.0, UR5.0) = ULDC.64(ConstMem(0, 352));
   UR4.1 = ULOP3.LUT(UR4.0, UR5.0, URZ, 60, !UPT());
   R0.0 = I2F.RP(R5.0);
   P1.0 = ISETP.LE.AND(PT, RZ, UR4.1, PT);
-  UR4.2 = ULDC.64(ConstMem(0, 280));
+  (UR4.2, UR5.1) = ULDC.64(ConstMem(0, 280));
   R0.1 = MUFU.RCP(R0.0);
   R2.0 = IADD3(R0.1, 268435454, RZ);
   R3.0 = F2I.FTZ.U32.TRUNC.NTZ(R2.0);

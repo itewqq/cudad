@@ -5,6 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use crate::parser::Operand;
 use crate::cfg::{ControlFlowGraph, EdgeKind};
+use crate::op_semantics::derive_op_semantics;
 use petgraph::{
     graph::NodeIndex,
     Direction,
@@ -114,7 +115,7 @@ pub enum RValue{
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct IRStatement{
-    pub dest:Option<IRExpr>,
+    pub defs:Vec<IRExpr>,
     pub value:RValue,
     pub pred:Option<IRExpr>,
     pub mem_addr_args:Option<Vec<IRExpr>>,
@@ -268,34 +269,6 @@ fn parse_raw_predicate_token(s: &str) -> Option<IRExpr> {
         Some(base)
     }
 }
-
-fn opcode_mnemonic(opcode: &str) -> &str {
-    opcode.split('.').next().unwrap_or(opcode)
-}
-
-fn opcode_has_mod(opcode: &str, needle: &str) -> bool {
-    opcode.split('.').skip(1).any(|m| m == needle)
-}
-
-fn collect_predicate_outputs(opcode: &str, operands: &[Operand]) -> Vec<RegId> {
-    let mnem = opcode_mnemonic(opcode);
-    // Integer ADD3 forms can emit one or more predicate outputs right after dst.
-    // Model them explicitly so downstream LEA.HI.X consumes the fresh carry def.
-    if !matches!(mnem, "IADD3" | "UIADD3") || opcode_has_mod(opcode, "X") {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    for op in operands.iter().skip(1) {
-        let Some(r) = phys_reg_of(op) else {
-            break;
-        };
-        if !matches!(r.class.as_str(), "P" | "UP") {
-            break;
-        }
-        out.push(r);
-    }
-    out
-}
 /* mem load/store heuristics */
 fn is_mem_load(op:&str)->bool{op.starts_with("LD")}
 fn is_mem_store(op:&str)->bool{op.starts_with("ST")}
@@ -386,53 +359,56 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
         let mut stmts = Vec::<IRStatement>::new();
 
         for ins in &bb.instrs {
-            let mut dest = None::<IRExpr>;
+            let mut defs = Vec::<IRExpr>::new();
             let mut args = Vec::<IRExpr>::new();
             let mut mem_addr_args = None::<Vec<IRExpr>>;
-            let pred_outputs = collect_predicate_outputs(&ins.opcode, &ins.operands);
+            let sem = derive_op_semantics(
+                &ins.opcode,
+                &ins.operands,
+                is_mem_load(&ins.opcode),
+                is_mem_store(&ins.opcode),
+            );
 
-            if is_mem_load(&ins.opcode) {
-                if let Some(r) = ins.operands.first().and_then(phys_reg_of) {
-                    dest = Some(IRExpr::Reg(r.clone()));
+            for idx in &sem.def_operand_indices {
+                if let Some(r) = ins.operands.get(*idx).and_then(phys_reg_of) {
+                    defs.push(IRExpr::Reg(r.clone()));
                     if !is_immutable_reg(&r) {
                         defsites.entry(base_reg(&r)).or_default().insert(n);
                     }
                 }
+            }
+            // ULDC/LDC .64 define a register pair (lo in dst, hi in dst+1).
+            // Model the second def explicitly so high halves are not treated as live-ins.
+            let mnem = ins.opcode.split('.').next().unwrap_or(ins.opcode.as_str());
+            let is_64 = ins.opcode.split('.').skip(1).any(|t| t == "64");
+            if is_64 && matches!(mnem, "ULDC" | "LDC") {
+                if let Some(mut hi) = ins.operands.first().and_then(phys_reg_of) {
+                    hi.idx += 1;
+                    hi.sign = 1;
+                    defs.push(IRExpr::Reg(hi.clone()));
+                    if !is_immutable_reg(&hi) {
+                        defsites.entry(base_reg(&hi)).or_default().insert(n);
+                    }
+                }
+            }
+            for idx in &sem.use_operand_indices {
+                if let Some(op) = ins.operands.get(*idx) {
+                    args.push(lower_operand(op));
+                }
+            }
+
+            if is_mem_load(&ins.opcode) {
                 let mut a = Vec::new();
                 for op in ins.operands.iter().skip(1) {
-                    let lo = lower_operand(op);
-                    a.push(lo.clone());
-                    args.push(lo);
+                    a.push(lower_operand(op));
                 }
                 mem_addr_args = Some(a);
             } else if is_mem_store(&ins.opcode) {
                 let mut a = Vec::new();
                 if let Some(op0) = ins.operands.first() {
-                    let lo = lower_operand(op0);
-                    a.push(lo.clone());
-                    args.push(lo);
-                }
-                for op in ins.operands.iter().skip(1) {
-                    args.push(lower_operand(op));
+                    a.push(lower_operand(op0));
                 }
                 mem_addr_args = Some(a);
-            } else {
-                for (idx, op) in ins.operands.iter().enumerate() {
-                    let lo = lower_operand(op);
-                    if idx == 0 {
-                        if let Some(r) = phys_reg_of(op) {
-                            dest = Some(IRExpr::Reg(r.clone()));
-                            if !is_immutable_reg(&r) {
-                                defsites.entry(base_reg(&r)).or_default().insert(n);
-                            }
-                        }
-                    } else if !pred_outputs.is_empty() && idx <= pred_outputs.len() {
-                        // Skip predicate output operands (carry-out defs).
-                        continue;
-                    } else {
-                        args.push(lo);
-                    }
-                }
             }
 
             let pred_expr = ins.pred.as_ref().and_then(|p| {
@@ -453,7 +429,7 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
             });
 
             stmts.push(IRStatement {
-                dest,
+                defs,
                 value: RValue::Op {
                     opcode: ins.opcode.clone(),
                     args,
@@ -461,50 +437,6 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
                 pred: pred_expr,
                 mem_addr_args,
             });
-
-            if !pred_outputs.is_empty() {
-                let carry_args: Vec<IRExpr> = ins
-                    .operands
-                    .iter()
-                    .skip(1 + pred_outputs.len())
-                    .map(lower_operand)
-                    .collect();
-                let mnem = opcode_mnemonic(&ins.opcode);
-                for (idx, pr) in pred_outputs.iter().enumerate() {
-                    if !is_immutable_reg(pr) {
-                        defsites.entry(base_reg(pr)).or_default().insert(n);
-                    }
-                    let carry_opcode = if idx == 0 {
-                        format!("{}.CARRY", mnem)
-                    } else {
-                        format!("{}.CARRY{}", mnem, idx + 1)
-                    };
-                    stmts.push(IRStatement {
-                        dest: Some(IRExpr::Reg(pr.clone())),
-                        value: RValue::Op {
-                            opcode: carry_opcode,
-                            args: carry_args.clone(),
-                        },
-                        pred: ins.pred.as_ref().and_then(|p| {
-                            if p.reg.starts_with('P') {
-                                let idx = p.reg[1..].parse().ok()?;
-                                let base = IRExpr::Reg(RegId::new("P", idx, 1));
-                                if p.sense {
-                                    Some(base)
-                                } else {
-                                    Some(IRExpr::Op {
-                                        op: "!".into(),
-                                        args: vec![base],
-                                    })
-                                }
-                            } else {
-                                None
-                            }
-                        }),
-                        mem_addr_args: None,
-                    });
-                }
-            }
         }
 
         /* IRDst */
@@ -596,7 +528,7 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
             .insert(
                 0,
                 IRStatement {
-                    dest: Some(IRExpr::Reg(reg.clone())),
+                    defs: vec![IRExpr::Reg(reg.clone())],
                     value: RValue::Phi(placeholder),
                     pred: None,
                     mem_addr_args: None,
@@ -634,10 +566,10 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
                 .iter_mut()
                 .filter(|s| matches!(s.value, RValue::Phi(_)))
             {
-                let key = base_reg(stmt.dest.as_ref().unwrap().get_reg().unwrap());
+                let key = base_reg(stmt.defs.first().unwrap().get_reg().unwrap());
                 let new = IRExpr::Reg(new_ssa(&key, counter));
                 stack.entry(key.clone()).or_default().push(new.get_reg().unwrap().clone());
-                stmt.dest = Some(new);
+                stmt.defs = vec![new];
             }
 
             /* 普通语句 */
@@ -662,8 +594,8 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
                 }
 
                 if !matches!(stmt.value, RValue::Phi(_)) {
-                    if let Some(dest) = &mut stmt.dest {
-                        let cur = dest.get_reg().unwrap().clone();
+                    for def in &mut stmt.defs {
+                        let cur = def.get_reg().unwrap().clone();
                         if is_immutable_reg(&cur) {
                             continue;
                         }
@@ -673,7 +605,7 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
                             .entry(k.clone())
                             .or_default()
                             .push(new.get_reg().unwrap().clone());
-                        *dest = new;
+                        *def = new;
                     }
                 }
             }
@@ -703,7 +635,7 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
                 .iter_mut()
                 .filter(|s| matches!(s.value, RValue::Phi(_)))
             {
-                let key = base_reg(stmt.dest.as_ref().unwrap().get_reg().unwrap());
+                let key = base_reg(stmt.defs.first().unwrap().get_reg().unwrap());
                 let src = top_or_new(&key, stack, counter).clone();
                 if let RValue::Phi(ref mut vec) = stmt.value {
                     vec[idx_in_succ] = IRExpr::Reg(src);
@@ -722,8 +654,8 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
         {
             let blk = ir_blocks.get(&bid).unwrap();
             for stmt in &blk.stmts {
-                if let Some(dest) = &stmt.dest {
-                    let d = dest.get_reg().unwrap();
+                for def in &stmt.defs {
+                    let d = def.get_reg().unwrap();
                     if is_immutable_reg(d) {
                         continue;
                     }
@@ -814,11 +746,19 @@ impl FunctionIR {
             for stmt in &b.stmts {
                 let line = match &stmt.value {
                     RValue::Op { opcode, args } => {
-                        let dst = stmt
-                            .dest
-                            .as_ref()
-                            .map(|e| ctx.expr(e))
-                            .unwrap_or_else(|| "_".into());
+                        let dst = if stmt.defs.is_empty() {
+                            "_".to_string()
+                        } else if stmt.defs.len() == 1 {
+                            ctx.expr(&stmt.defs[0])
+                        } else {
+                            let list = stmt
+                                .defs
+                                .iter()
+                                .map(|d| ctx.expr(d))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            format!("({})", list)
+                        };
                         let a = args
                             .iter()
                             .map(|e| ctx.expr(e))
@@ -827,7 +767,7 @@ impl FunctionIR {
                         format!("{} = {}({})", dst, opcode, a)
                     }
                     RValue::Phi(vars) => {
-                        let dst = ctx.expr(stmt.dest.as_ref().unwrap());
+                        let dst = ctx.expr(stmt.defs.first().unwrap());
                         let list = vars
                             .iter()
                             .map(|v| ctx.expr(v))
@@ -836,10 +776,10 @@ impl FunctionIR {
                         format!("{} = phi({})", dst, list)
                     }
                     RValue::ImmI(i) => {
-                        format!("{} = {}", ctx.expr(stmt.dest.as_ref().unwrap()), i)
+                        format!("{} = {}", ctx.expr(stmt.defs.first().unwrap()), i)
                     }
                     RValue::ImmF(f) => {
-                        format!("{} = {}", ctx.expr(stmt.dest.as_ref().unwrap()), f)
+                        format!("{} = {}", ctx.expr(stmt.defs.first().unwrap()), f)
                     }
                 };
                 label.push_str(&line);

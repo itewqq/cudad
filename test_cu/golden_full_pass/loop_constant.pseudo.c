@@ -15,6 +15,7 @@ void kernel(uint32_t arg4_word1) {
   uint32_t R1;
   uint32_t R2;
   uint32_t UR6;
+  uint32_t UR7;
 
   BB0 {
     v0 = abi_internal_0x28;

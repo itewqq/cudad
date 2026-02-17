@@ -34,6 +34,7 @@ void kernel(uint32_t arg0_word0, uint32_t arg1_word0, uintptr_t arg2_ptr, uint32
   uint32_t R7;
   float R9;
   uint32_t UR4;
+  uint32_t UR5;
 
   BB0 {
     ctaid_x = blockIdx.x;

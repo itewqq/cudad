@@ -3,9 +3,8 @@
 //! converted into structured control flow, it falls back to explicit goto.
 
 use crate::ir::{FunctionIR, IRBlock, IRExpr, IRCond, RegId, DisplayCtx, IRStatement, RValue};
-use crate::abi::StatementRef;
 use crate::cfg::{ControlFlowGraph, BasicBlock as CfgBasicBlock, EdgeKind}; 
-use crate::semantic_lift::SemanticLiftResult;
+use crate::semantic_lift::{DefRef, SemanticLiftResult};
 
 use petgraph::graph::{NodeIndex, DiGraph};
 use petgraph::visit::EdgeRef;
@@ -98,6 +97,26 @@ pub struct Structurizer<'a> {
 }
 
 impl<'a> Structurizer<'a> {
+    fn lifted_def_emit_order(stmt: &IRStatement) -> Vec<usize> {
+        if stmt.defs.is_empty() {
+            return vec![0];
+        }
+        let RValue::Op { opcode, .. } = &stmt.value else {
+            return (0..stmt.defs.len()).collect();
+        };
+        let mnem = opcode.split('.').next().unwrap_or(opcode);
+        let is_iadd3_non_x =
+            matches!(mnem, "IADD3" | "UIADD3") && !opcode.split('.').any(|t| t == "X");
+        if is_iadd3_non_x && stmt.defs.len() > 1 {
+            // Carry predicate defs conceptually depend on pre-update low operands.
+            // Emit them before low-result defs to preserve semantics in mutable-name views.
+            let mut out = (1..stmt.defs.len()).collect::<Vec<_>>();
+            out.push(0);
+            return out;
+        }
+        (0..stmt.defs.len()).collect()
+    }
+
     fn is_branch_only_opcode(opcode: &str) -> bool {
         matches!(opcode, "BRA" | "JMP" | "JMPP")
     }
@@ -120,20 +139,33 @@ impl<'a> Structurizer<'a> {
         block: &IRBlock,
         control_pred_regs: &[RegId],
     ) -> bool {
-        let (dest_reg, opcode) = match (&stmt.dest, &stmt.value) {
-            (
-                Some(IRExpr::Reg(r)),
-                RValue::Op { opcode, .. },
-            ) if matches!(r.class.as_str(), "P" | "UP") => (r, opcode.as_str()),
+        let opcode = match &stmt.value {
+            RValue::Op { opcode, .. } => opcode.as_str(),
             _ => return false,
         };
         if !Self::is_setp_opcode(opcode) {
             return false;
         }
-        let matches_control_pred = control_pred_regs.iter().any(|r| {
-            r.class == dest_reg.class && r.idx == dest_reg.idx && r.ssa == dest_reg.ssa
+        if stmt.defs.is_empty() {
+            return false;
+        }
+        let pred_defs = stmt
+            .defs
+            .iter()
+            .filter_map(|d| match d {
+                IRExpr::Reg(r) if matches!(r.class.as_str(), "P" | "UP") => Some(r),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if pred_defs.is_empty() || pred_defs.len() != stmt.defs.len() {
+            return false;
+        }
+        let all_control_preds = pred_defs.iter().all(|dest_reg| {
+            control_pred_regs.iter().any(|r| {
+                r.class == dest_reg.class && r.idx == dest_reg.idx && r.ssa == dest_reg.ssa
+            })
         });
-        if !matches_control_pred {
+        if !all_control_preds {
             return false;
         }
         block
@@ -1013,30 +1045,48 @@ impl<'a> Structurizer<'a> {
                 continue;
             }
 
-            if let Some(lifted_stmt) = lifted.and_then(|res| {
-                res.by_stmt.get(&StatementRef {
-                    block_id,
-                    stmt_idx,
-                })
-            }) {
-                let pred_str = lifted_stmt
-                    .pred
-                    .as_ref()
-                    .map_or_else(String::new, |p| format!("if ({}) ", p.render()));
-                lines.push_str(&format!(
-                    "{}{}{} = {};\n",
-                    "  ".repeat(indent_level + 1),
-                    pred_str,
-                    lifted_stmt.dest,
-                    lifted_stmt.rhs.render()
-                ));
-                continue;
+            if let Some(res) = lifted {
+                let mut emitted_any = false;
+                for def_idx in Self::lifted_def_emit_order(ir_s) {
+                    let def_ref = DefRef {
+                        block_id,
+                        stmt_idx,
+                        def_idx,
+                    };
+                    let Some(lifted_stmt) = res.by_def.get(&def_ref) else {
+                        continue;
+                    };
+                    let pred_str = lifted_stmt
+                        .pred
+                        .as_ref()
+                        .map_or_else(String::new, |p| format!("if ({}) ", p.render()));
+                    lines.push_str(&format!(
+                        "{}{}{} = {};\n",
+                        "  ".repeat(indent_level + 1),
+                        pred_str,
+                        lifted_stmt.dest,
+                        lifted_stmt.rhs.render()
+                    ));
+                    emitted_any = true;
+                }
+                if emitted_any {
+                    continue;
+                }
             }
 
-            let dest_str = ir_s
-                .dest
-                .as_ref()
-                .map_or_else(|| "_".to_string(), |d| ctx.expr(d));
+            let dest_str = if ir_s.defs.is_empty() {
+                "_".to_string()
+            } else if ir_s.defs.len() == 1 {
+                ctx.expr(&ir_s.defs[0])
+            } else {
+                let defs = ir_s
+                    .defs
+                    .iter()
+                    .map(|d| ctx.expr(d))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("({})", defs)
+            };
             let value_str = match &ir_s.value {
                 RValue::Op { opcode, args } => {
                     let args_s = args.iter().map(|a| ctx.expr(a)).collect::<Vec<_>>().join(", ");
@@ -1119,17 +1169,6 @@ impl<'a> Structurizer<'a> {
         // recovered into mutable temporaries.
         let block = self.function_ir.blocks.iter().find(|b| b.id == block_id)?;
         for (stmt_idx, stmt) in block.stmts.iter().enumerate().rev() {
-            let Some(IRExpr::Reg(dst)) = &stmt.dest else {
-                continue;
-            };
-            if dst.class != pred.class || dst.idx != pred.idx {
-                continue;
-            }
-            if let Some(want_ssa) = pred.ssa {
-                if dst.ssa != Some(want_ssa) {
-                    continue;
-                }
-            }
             let is_setp = matches!(
                 &stmt.value,
                 RValue::Op { opcode, .. } if opcode.starts_with("ISETP") || opcode.starts_with("FSETP")
@@ -1137,12 +1176,26 @@ impl<'a> Structurizer<'a> {
             if !is_setp {
                 continue;
             }
-            let stmt_ref = StatementRef {
-                block_id: block.id,
-                stmt_idx,
-            };
-            if let Some(ls) = lifted.by_stmt.get(&stmt_ref) {
-                return Some(ls.rhs.render());
+            for (def_idx, def) in stmt.defs.iter().enumerate() {
+                let IRExpr::Reg(dst) = def else {
+                    continue;
+                };
+                if dst.class != pred.class || dst.idx != pred.idx {
+                    continue;
+                }
+                if let Some(want_ssa) = pred.ssa {
+                    if dst.ssa != Some(want_ssa) {
+                        continue;
+                    }
+                }
+                let def_ref = DefRef {
+                    block_id: block.id,
+                    stmt_idx,
+                    def_idx,
+                };
+                if let Some(ls) = lifted.by_def.get(&def_ref) {
+                    return Some(ls.rhs.render());
+                }
             }
         }
 
@@ -1189,7 +1242,7 @@ impl<'a> Structurizer<'a> {
                             .enumerate()
                             .skip(fir_search_from)
                             .find(|(_, s)| {
-                                s.dest == ir_s.dest && s.value == ir_s.value && s.pred == ir_s.pred
+                                s.defs == ir_s.defs && s.value == ir_s.value && s.pred == ir_s.pred
                             })
                         {
                             lookup_stmt_idx = found_idx;
@@ -1242,27 +1295,48 @@ impl<'a> Structurizer<'a> {
                         }
                     }
 
-                    if let Some(lifted_stmt) = lifted.and_then(|res| {
-                        res.by_stmt.get(&StatementRef {
-                            block_id: *block_id,
-                            stmt_idx: lookup_stmt_idx,
-                        })
-                    }) {
-                        let pred_str = lifted_stmt
-                            .pred
-                            .as_ref()
-                            .map_or_else(String::new, |p| format!("if ({}) ", p.render()));
-                        s_out.push_str(&format!(
-                            "{}{}{} = {};\n",
-                            "  ".repeat(indent_level + 1),
-                            pred_str,
-                            lifted_stmt.dest,
-                            lifted_stmt.rhs.render()
-                        ));
-                        continue;
+                    if let Some(res) = lifted {
+                        let mut emitted_any = false;
+                        for def_idx in Self::lifted_def_emit_order(ir_s) {
+                            let def_ref = DefRef {
+                                block_id: *block_id,
+                                stmt_idx: lookup_stmt_idx,
+                                def_idx,
+                            };
+                            let Some(lifted_stmt) = res.by_def.get(&def_ref) else {
+                                continue;
+                            };
+                            let pred_str = lifted_stmt
+                                .pred
+                                .as_ref()
+                                .map_or_else(String::new, |p| format!("if ({}) ", p.render()));
+                            s_out.push_str(&format!(
+                                "{}{}{} = {};\n",
+                                "  ".repeat(indent_level + 1),
+                                pred_str,
+                                lifted_stmt.dest,
+                                lifted_stmt.rhs.render()
+                            ));
+                            emitted_any = true;
+                        }
+                        if emitted_any {
+                            continue;
+                        }
                     }
 
-                    let dest_str = ir_s.dest.as_ref().map_or_else(|| "_".to_string(), |d| ctx.expr(d));
+                    let dest_str = if ir_s.defs.is_empty() {
+                        "_".to_string()
+                    } else if ir_s.defs.len() == 1 {
+                        ctx.expr(&ir_s.defs[0])
+                    } else {
+                        let defs = ir_s
+                            .defs
+                            .iter()
+                            .map(|d| ctx.expr(d))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("({})", defs)
+                    };
                     let value_str = match &ir_s.value {
                         RValue::Op { opcode, args } => {
                             let args_s = args.iter().map(|a| ctx.expr(a)).collect::<Vec<_>>().join(", ");
@@ -1421,7 +1495,7 @@ mod tests {
 
     fn stmt(opcode: &str) -> IRStatement {
         IRStatement {
-            dest: None,
+            defs: vec![],
             value: RValue::Op { opcode: opcode.to_string(), args: vec![] },
             pred: None,
             mem_addr_args: None,
@@ -1430,7 +1504,7 @@ mod tests {
 
     fn predicated_stmt(opcode: &str, pred: IRExpr) -> IRStatement {
         IRStatement {
-            dest: None,
+            defs: vec![],
             value: RValue::Op { opcode: opcode.to_string(), args: vec![] },
             pred: Some(pred),
             mem_addr_args: None,
@@ -1719,7 +1793,7 @@ mod tests {
             start_addr: 0,
             irdst: vec![],
             stmts: vec![IRStatement {
-                dest: None,
+                defs: vec![],
                 value: RValue::Op {
                     opcode: "EXIT".to_string(),
                     args: vec![],
@@ -1782,7 +1856,7 @@ mod tests {
             vec![],
             vec![
                 IRStatement {
-                    dest: Some(IRExpr::Reg(RegId::new("R", 1, 1))),
+                    defs: vec![IRExpr::Reg(RegId::new("R", 1, 1))],
                     value: RValue::Phi(vec![
                         IRExpr::Reg(RegId::new("R", 2, 1)),
                         IRExpr::Reg(RegId::new("R", 3, 1)),

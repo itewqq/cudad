@@ -124,31 +124,33 @@ pub fn recover_structured_output_names(
     // Build conservative congruence edges.
     for block in &function_ir.blocks {
         for stmt in &block.stmts {
-            let Some(IRExpr::Reg(dest)) = &stmt.dest else {
-                continue;
-            };
-            let Some(dest_key) = reg_ssa(dest) else {
-                continue;
-            };
-            let Some(dest_idx) = idx_of.get(&dest_key).copied() else {
-                continue;
-            };
+            for def in &stmt.defs {
+                let IRExpr::Reg(dest) = def else {
+                    continue;
+                };
+                let Some(dest_key) = reg_ssa(dest) else {
+                    continue;
+                };
+                let Some(dest_idx) = idx_of.get(&dest_key).copied() else {
+                    continue;
+                };
 
-            if let RValue::Phi(args) = &stmt.value {
-                for arg in args {
-                    if let Some(arg_key) = reg_ssa_from_expr(arg) {
-                        if arg_key.base == dest_key.base {
-                            if let Some(arg_idx) = idx_of.get(&arg_key).copied() {
-                                uf.union(dest_idx, arg_idx);
+                if let RValue::Phi(args) = &stmt.value {
+                    for arg in args {
+                        if let Some(arg_key) = reg_ssa_from_expr(arg) {
+                            if arg_key.base == dest_key.base {
+                                if let Some(arg_idx) = idx_of.get(&arg_key).copied() {
+                                    uf.union(dest_idx, arg_idx);
+                                }
                             }
                         }
                     }
-                }
-            } else if let RValue::Op { opcode, args } = &stmt.value {
-                if let Some(src_key) = conservative_copy_source(opcode, args) {
-                    if src_key.base == dest_key.base {
-                        if let Some(src_idx) = idx_of.get(&src_key).copied() {
-                            uf.union(dest_idx, src_idx);
+                } else if let RValue::Op { opcode, args } = &stmt.value {
+                    if let Some(src_key) = conservative_copy_source(opcode, args) {
+                        if src_key.base == dest_key.base {
+                            if let Some(src_idx) = idx_of.get(&src_key).copied() {
+                                uf.union(dest_idx, src_idx);
+                            }
                         }
                     }
                 }
@@ -429,7 +431,7 @@ fn append_phi_merge_comments(
     for block in &function_ir.blocks {
         let mut merges = Vec::new();
         for stmt in &block.stmts {
-            let (Some(IRExpr::Reg(dst)), RValue::Phi(args)) = (&stmt.dest, &stmt.value) else {
+            let (Some(IRExpr::Reg(dst)), RValue::Phi(args)) = (stmt.defs.first(), &stmt.value) else {
                 continue;
             };
             let Some(dst_ssa) = reg_ssa(dst) else {
@@ -523,9 +525,9 @@ fn collect_tokens(
 
     for block in &function_ir.blocks {
         for (stmt_idx, stmt) in block.stmts.iter().enumerate() {
-            if let Some(dest) = &stmt.dest {
+            for def in &stmt.defs {
                 collect_expr_tokens(
-                    dest,
+                    def,
                     block.id,
                     stmt_idx,
                     0,

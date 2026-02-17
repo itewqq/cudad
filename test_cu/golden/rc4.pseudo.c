@@ -1,0 +1,430 @@
+BB0 {
+  R0.0 = S2R(SR_CTAID.X());
+}
+// Condition from BB0
+if (!(P0.0)) {
+  BB1 {
+    R2.0 = S2R(SR_TID.X());
+  }
+  // Condition from BB1
+  if (!(P1.0)) {
+    // Loop header BB2
+    while (!(P1.2)) {
+      BB2 {
+        _ = STS.U8(*R2.1, R2.1);
+        R2.2 = IADD3(R2.1, ConstMem(0, 0), RZ);
+        // 2 phi node(s) omitted
+      }
+    }
+  }
+  BB3 {
+    __syncthreads();
+  }
+  // Condition from BB3
+  if (!(P0.1)) {
+    BB4 {
+      R3.1 = IABS(ConstMem(0, 360));
+      R7.1 = IMAD.MOV.U32(RZ, RZ, RZ);
+      R8.1 = I2F.RP(R3.1);
+      R8.2 = MUFU.RCP(R8.1);
+      R4.1 = IADD3(R8.2, 268435454, RZ);
+      R5.1 = F2I.FTZ.U32.TRUNC.NTZ(R4.1);
+      R4.2 = IMAD.MOV.U32(RZ, RZ, RZ);
+      R2.4 = IMAD.MOV(RZ, RZ, -R5.1);
+      R9.1 = IMAD(R2.4, R3.1, RZ);
+      R2.5 = IMAD.MOV.U32(RZ, RZ, RZ);
+      R6.1 = IMAD.HI.U32(R5.1, R9.1, R4.2);
+    }
+    // Loop header BB5
+    while (P1.9) {
+      BB5 {
+        R5.3 = IABS(R2.6);
+        R16.2 = LDS.U8(*R2.6);
+        R4.4 = IABS(ConstMem(0, 360));
+        P2.2 = ISETP.GE.AND(PT, R2.6, RZ, PT);
+        R6.3 = IMAD.HI.U32(R6.2, R5.3, RZ);
+        R12.2 = I2F.RP(R4.4);
+        R6.4 = IMAD.MOV(RZ, RZ, -R6.3);
+        R5.4 = IMAD(R4.4, R6.4, R5.3);
+        P1.5 = ISETP.GT.U32.AND(PT, R3.2, R5.4, PT);
+        R12.3 = MUFU.RCP(R12.2);
+        if (!(P1.5)) R5.5 = IMAD.IADD(R5.4, 1, -R4.4);
+        P1.6 = ISETP.GT.U32.AND(PT, R3.2, R5.5, PT);
+        R8.4 = IADD3(R12.3, 268435454, RZ);
+        R9.3 = F2I.FTZ.U32.TRUNC.NTZ(R8.4);
+        if (!(P1.6)) R5.6 = IMAD.IADD(R5.5, 1, -R4.4);
+        P1.7 = ISETP.NE.AND(PT, RZ, ConstMem(0, 360), PT);
+        R6.5 = IMAD.MOV.U32(RZ, RZ, R5.6);
+        R5.7 = LOP3.LUT(RZ, ConstMem(0, 360), RZ, 51, !PT());
+        if (!(P2.2)) R6.6 = IMAD.MOV(RZ, RZ, -R6.5);
+        R6.7 = SEL(R5.7, R6.6, !(P1.7));
+        (R10.2, P2.3) = IADD3(R6.7, ConstMem(0, 352), RZ);
+        R11.2 = LEA.HI.X.SX32(R6.7, ConstMem(0, 356), 1, P2.3);
+        R10.3 = LDG.E.U8(*addr64(R10.2, R11.2));
+        R3.3 = IMAD.MOV(RZ, RZ, -R9.3);
+        R12.4 = IADD3(R2.6, 1, RZ);
+        R8.5 = IMAD.MOV.U32(RZ, RZ, RZ);
+        R3.4 = IMAD(R3.3, R4.4, RZ);
+        R13.2 = IABS(R12.4);
+        P3.2 = ISETP.GE.AND(PT, R12.4, RZ, PT);
+        R6.8 = IMAD.HI.U32(R9.3, R3.4, R8.5);
+        R9.4 = IMAD.MOV.U32(RZ, RZ, R13.2);
+        R3.5 = IMAD.HI.U32(R6.8, R9.4, RZ);
+        R3.6 = IMAD.MOV(RZ, RZ, -R3.5);
+        R8.6 = IMAD(R4.4, R3.6, R9.4);
+        R3.7 = IMAD.MOV.U32(RZ, RZ, R4.4);
+        P2.4 = ISETP.GT.U32.AND(PT, R3.7, R8.6, PT);
+        if (!(P2.4)) R8.7 = IMAD.IADD(R8.6, 1, -R4.4);
+        P2.5 = ISETP.GT.U32.AND(PT, R3.7, R8.7, PT);
+        if (!(P2.5)) R8.8 = IMAD.IADD(R8.7, 1, -R4.4);
+        if (!(P3.2)) R8.9 = IMAD.MOV(RZ, RZ, -R8.8);
+        R9.5 = SEL(R5.7, R8.9, !(P1.7));
+        (R8.10, P2.6) = IADD3(R9.5, ConstMem(0, 352), RZ);
+        R9.6 = LEA.HI.X.SX32(R9.5, ConstMem(0, 356), 1, P2.6);
+        R9.7 = LDG.E.U8(*addr64(R8.10, R9.6));
+        R11.3 = IADD3(R2.6, 2, RZ);
+        R13.3 = IABS(R11.3);
+        P3.3 = ISETP.GE.AND(PT, R11.3, RZ, PT);
+        R12.5 = IMAD.HI.U32(R6.8, R13.3, RZ);
+        R12.6 = IMAD.MOV(RZ, RZ, -R12.5);
+        R12.7 = IMAD(R4.4, R12.6, R13.3);
+        P2.7 = ISETP.GT.U32.AND(PT, R3.7, R12.7, PT);
+        if (!(P2.7)) R12.8 = IMAD.IADD(R12.7, 1, -R4.4);
+        P2.8 = ISETP.GT.U32.AND(PT, R3.7, R12.8, PT);
+        if (!(P2.8)) R12.9 = IMAD.IADD(R12.8, 1, -R4.4);
+        if (!(P3.3)) R12.10 = IMAD.MOV(RZ, RZ, -R12.9);
+        R8.11 = SEL(R5.7, R12.10, !(P1.7));
+        (R12.11, P2.9) = IADD3(R8.11, ConstMem(0, 352), RZ);
+        R13.4 = LEA.HI.X.SX32(R8.11, ConstMem(0, 356), 1, P2.9);
+        R8.12 = LDG.E.U8(*addr64(R12.11, R13.4));
+        R11.4 = IADD3(R2.6, 3, RZ);
+        R15.2 = IABS(R11.4);
+        P3.4 = ISETP.GE.AND(PT, R11.4, RZ, PT);
+        R14.2 = IMAD.HI.U32(R6.8, R15.2, RZ);
+        R14.3 = IMAD.MOV(RZ, RZ, -R14.2);
+        R14.4 = IMAD(R4.4, R14.3, R15.2);
+        P2.10 = ISETP.GT.U32.AND(PT, R3.7, R14.4, PT);
+        if (!(P2.10)) R14.5 = IMAD.IADD(R14.4, 1, -R4.4);
+        P2.11 = ISETP.GT.U32.AND(PT, R3.7, R14.5, PT);
+        if (!(P2.11)) R14.6 = IMAD.IADD(R14.5, 1, -R4.4);
+        if (!(P3.4)) R14.7 = IMAD.MOV(RZ, RZ, -R14.6);
+        R14.8 = SEL(R5.7, R14.7, !(P1.7));
+        R12.12 = IADD3(R10.3, R7.2, R16.2);
+        (R10.4, P2.12) = IADD3(R14.8, ConstMem(0, 352), RZ);
+        R7.3 = SHF.R.S32.HI(RZ, 31, R12.12);
+        R11.5 = LEA.HI.X.SX32(R14.8, ConstMem(0, 356), 1, P2.12);
+        R13.5 = LEA.HI(R7.3, R12.12, RZ, 8);
+        R7.4 = LDG.E.U8(*addr64(R10.4, R11.5));
+        R13.6 = LOP3.LUT(R13.5, 4294967040, RZ, 192, !PT());
+        R17.2 = IMAD.IADD(R12.12, 1, -R13.6);
+        R12.13 = IADD3(R2.6, 4, RZ);
+        R13.7 = LDS.U8(*R17.2);
+        R15.3 = IABS(R12.13);
+        P3.5 = ISETP.GE.AND(PT, R12.13, RZ, PT);
+        R14.9 = IMAD.HI.U32(R6.8, R15.3, RZ);
+        R14.10 = IMAD.MOV(RZ, RZ, -R14.9);
+        R14.11 = IMAD(R4.4, R14.10, R15.3);
+        P2.13 = ISETP.GT.U32.AND(PT, R3.7, R14.11, PT);
+        if (!(P2.13)) R14.12 = IMAD.IADD(R14.11, 1, -R4.4);
+        P2.14 = ISETP.GT.U32.AND(PT, R3.7, R14.12, PT);
+        _ = STS.U8(*R2.6, R13.7);
+        _ = STS.U8(*R17.2, R16.2);
+        R18.2 = LDS.U8(*(R2.6 + 1));
+        if (!(P2.14)) R14.13 = IMAD.IADD(R14.12, 1, -R4.4);
+        if (!(P3.5)) R14.14 = IMAD.MOV(RZ, RZ, -R14.13);
+        R14.15 = SEL(R5.7, R14.14, !(P1.7));
+        (R10.5, P2.15) = IADD3(R14.15, ConstMem(0, 352), RZ);
+        R11.6 = LEA.HI.X.SX32(R14.15, ConstMem(0, 356), 1, P2.15);
+        R12.14 = IADD3(R9.7, R17.2, R18.2);
+        R9.8 = SHF.R.S32.HI(RZ, 31, R12.14);
+        R13.8 = LEA.HI(R9.8, R12.14, RZ, 8);
+        R9.9 = LDG.E.U8(*addr64(R10.5, R11.6));
+        R13.9 = LOP3.LUT(R13.8, 4294967040, RZ, 192, !PT());
+        R17.3 = IMAD.IADD(R12.14, 1, -R13.9);
+        R12.15 = IADD3(R2.6, 5, RZ);
+        R13.10 = LDS.U8(*R17.3);
+        R15.4 = IABS(R12.15);
+        P3.6 = ISETP.GE.AND(PT, R12.15, RZ, PT);
+        R14.16 = IMAD.HI.U32(R6.8, R15.4, RZ);
+        R14.17 = IMAD.MOV(RZ, RZ, -R14.16);
+        R14.18 = IMAD(R4.4, R14.17, R15.4);
+        P2.16 = ISETP.GT.U32.AND(PT, R3.7, R14.18, PT);
+        if (!(P2.16)) R14.19 = IMAD.IADD(R14.18, 1, -R4.4);
+        P2.17 = ISETP.GT.U32.AND(PT, R3.7, R14.19, PT);
+        _ = STS.U8(*(R2.6 + 1), R13.10);
+        _ = STS.U8(*R17.3, R18.2);
+        R16.3 = LDS.U8(*(R2.6 + 2));
+        if (!(P2.17)) R14.20 = IMAD.IADD(R14.19, 1, -R4.4);
+        if (!(P3.6)) R14.21 = IMAD.MOV(RZ, RZ, -R14.20);
+        R14.22 = SEL(R5.7, R14.21, !(P1.7));
+        (R10.6, P2.18) = IADD3(R14.22, ConstMem(0, 352), RZ);
+        R11.7 = LEA.HI.X.SX32(R14.22, ConstMem(0, 356), 1, P2.18);
+        R12.16 = IADD3(R8.12, R17.3, R16.3);
+        R8.13 = LDG.E.U8(*addr64(R10.6, R11.7));
+        R13.11 = SHF.R.S32.HI(RZ, 31, R12.16);
+        R13.12 = LEA.HI(R13.11, R12.16, RZ, 8);
+        R13.13 = LOP3.LUT(R13.12, 4294967040, RZ, 192, !PT());
+        R17.4 = IMAD.IADD(R12.16, 1, -R13.13);
+        R13.14 = LDS.U8(*R17.4);
+        R12.17 = IADD3(R2.6, 6, RZ);
+        R15.5 = IABS(R12.17);
+        R14.23 = IMAD.HI.U32(R6.8, R15.5, RZ);
+        R14.24 = IMAD.MOV(RZ, RZ, -R14.23);
+        R14.25 = IMAD(R4.4, R14.24, R15.5);
+        P2.19 = ISETP.GT.U32.AND(PT, R3.7, R14.25, PT);
+        _ = STS.U8(*(R2.6 + 2), R13.14);
+        _ = STS.U8(*R17.4, R16.3);
+        R18.3 = LDS.U8(*(R2.6 + 3));
+        if (!(P2.19)) R14.26 = IMAD.IADD(R14.25, 1, -R4.4);
+        P3.7 = ISETP.GE.AND(PT, R12.17, RZ, PT);
+        P2.20 = ISETP.GT.U32.AND(PT, R3.7, R14.26, PT);
+        if (!(P2.20)) R14.27 = IMAD.IADD(R14.26, 1, -R4.4);
+        if (!(P3.7)) R14.28 = IMAD.MOV(RZ, RZ, -R14.27);
+        R14.29 = SEL(R5.7, R14.28, !(P1.7));
+        (R10.7, P2.21) = IADD3(R14.29, ConstMem(0, 352), RZ);
+        R12.18 = IADD3(R7.4, R17.4, R18.3);
+        R7.5 = SHF.R.S32.HI(RZ, 31, R12.18);
+        R11.8 = LEA.HI.X.SX32(R14.29, ConstMem(0, 356), 1, P2.21);
+        R13.15 = LEA.HI(R7.5, R12.18, RZ, 8);
+        R7.6 = LDG.E.U8(*addr64(R10.7, R11.8));
+        R13.16 = LOP3.LUT(R13.15, 4294967040, RZ, 192, !PT());
+        R16.4 = IMAD.IADD(R12.18, 1, -R13.16);
+        R13.17 = LDS.U8(*R16.4);
+        R12.19 = IADD3(R2.6, 7, RZ);
+        R15.6 = IABS(R12.19);
+        R14.30 = IMAD.HI.U32(R6.8, R15.6, RZ);
+        R14.31 = IMAD.MOV(RZ, RZ, -R14.30);
+        R14.32 = IMAD(R4.4, R14.31, R15.6);
+        P2.22 = ISETP.GT.U32.AND(PT, R3.7, R14.32, PT);
+        _ = STS.U8(*(R2.6 + 3), R13.17);
+        _ = STS.U8(*R16.4, R18.3);
+        R15.7 = LDS.U8(*(R2.6 + 4));
+        if (!(P2.22)) R14.33 = IMAD.IADD(R14.32, 1, -R4.4);
+        P3.8 = ISETP.GE.AND(PT, R12.19, RZ, PT);
+        P2.23 = ISETP.GT.U32.AND(PT, R3.7, R14.33, PT);
+        if (!(P2.23)) R14.34 = IMAD.IADD(R14.33, 1, -R4.4);
+        if (!(P3.8)) R14.35 = IMAD.MOV(RZ, RZ, -R14.34);
+        R5.8 = SEL(R5.7, R14.35, !(P1.7));
+        (R4.5, P1.8) = IADD3(R5.8, ConstMem(0, 352), RZ);
+        R9.10 = IADD3(R9.9, R16.4, R15.7);
+        R10.8 = SHF.R.S32.HI(RZ, 31, R9.10);
+        R5.9 = LEA.HI.X.SX32(R5.8, ConstMem(0, 356), 1, P1.8);
+        R10.9 = LEA.HI(R10.8, R9.10, RZ, 8);
+        R12.20 = LDG.E.U8(*addr64(R4.5, R5.9));
+        R10.10 = LOP3.LUT(R10.9, 4294967040, RZ, 192, !PT());
+        R10.11 = IMAD.IADD(R9.10, 1, -R10.10);
+        R9.11 = LDS.U8(*R10.11);
+        _ = STS.U8(*(R2.6 + 4), R9.11);
+        _ = STS.U8(*R10.11, R15.7);
+        R13.18 = LDS.U8(*(R2.6 + 5));
+        R8.14 = IADD3(R8.13, R10.11, R13.18);
+        R11.9 = SHF.R.S32.HI(RZ, 31, R8.14);
+        R11.10 = LEA.HI(R11.9, R8.14, RZ, 8);
+        R11.11 = LOP3.LUT(R11.10, 4294967040, RZ, 192, !PT());
+        R8.15 = IMAD.IADD(R8.14, 1, -R11.11);
+        R5.10 = LDS.U8(*R8.15);
+        _ = STS.U8(*(R2.6 + 5), R5.10);
+        _ = STS.U8(*R8.15, R13.18);
+        R11.12 = LDS.U8(*(R2.6 + 6));
+        R7.7 = IADD3(R7.6, R8.15, R11.12);
+        R4.6 = SHF.R.S32.HI(RZ, 31, R7.7);
+        R4.7 = LEA.HI(R4.6, R7.7, RZ, 8);
+        R4.8 = LOP3.LUT(R4.7, 4294967040, RZ, 192, !PT());
+        R4.9 = IMAD.IADD(R7.7, 1, -R4.8);
+        R9.12 = LDS.U8(*R4.9);
+        _ = STS.U8(*(R2.6 + 6), R9.12);
+        _ = STS.U8(*R4.9, R11.12);
+        R15.8 = LDS.U8(*(R2.6 + 7));
+        R12.21 = IADD3(R12.20, R4.9, R15.8);
+        R5.11 = SHF.R.S32.HI(RZ, 31, R12.21);
+        R5.12 = LEA.HI(R5.11, R12.21, RZ, 8);
+        R5.13 = LOP3.LUT(R5.12, 4294967040, RZ, 192, !PT());
+        R7.8 = IMAD.IADD(R12.21, 1, -R5.13);
+        R5.14 = LDS.U8(*R7.8);
+        _ = STS.U8(*(R2.6 + 7), R5.14);
+        _ = STS.U8(*R7.8, R15.8);
+        R2.7 = IADD3(R2.6, 8, RZ);
+        // 20 phi node(s) omitted
+      }
+    }
+  }
+  BB6 {
+    __syncthreads();
+  }
+  // Condition from BB6
+  if (!(P0.1)) {
+    // Condition from BB7
+    if (P0.2) {
+      // Condition from BB8
+      if (P1.11) {
+        BB9 {
+          R17.6 = IMAD(R0.0, ConstMem(0, 384), RZ);
+          R10.13 = IADD3(R6.10, -ConstMem(0, 384), RZ);
+          R9.15 = IMAD.MOV.U32(RZ, RZ, RZ);
+          (UR10.1, UR11.1) = ULDC.64(ConstMem(0, 368));
+          R8.17 = IADD3(R17.6, 3, RZ);
+          (UR8.1, UR9.1) = ULDC.64(ConstMem(0, 376));
+          R18.5 = SHF.R.S32.HI(RZ, 31, R17.6);
+        }
+        // Loop header BB10
+        while (P1.16) {
+          BB10 {
+            R2.11 = IADD3(R8.18, -3, RZ);
+            P2.26 = ISETP.GE.AND(PT, R2.11, R7.11, PT);
+            (R2.12, P1.13) = IADD3(R17.6, UR10.2, RZ);
+            R3.10 = IADD3.X(R18.5, UR11.2, RZ, P1.13, !PT());
+            if (!(P2.26)) R14.38 = LDG.E.U8(*addr64(R2.12, R3.10));
+            UR4.2 = UIADD3(UR4.1, 1, URZ);
+            UR5.2 = USHF.R.S32.HI(URZ, 31, UR4.2);
+            UR5.3 = ULEA.HI(UR5.2, UR4.2, URZ, 8);
+            UR5.4 = ULOP3.LUT(UR5.3, 4294967040, URZ, 192, !UPT());
+            UR4.3 = UIADD3(UR4.2, -UR5.4, URZ);
+            R12.24 = LDS.U8(*UR4.3);
+            R11.16 = IMAD.IADD(R12.24, 1, R11.15);
+            R4.12 = SHF.R.S32.HI(RZ, 31, R11.16);
+            R4.13 = LEA.HI(R4.12, R11.16, RZ, 8);
+            R4.14 = LOP3.LUT(R4.13, 4294967040, RZ, 192, !PT());
+            R19.2 = IMAD.IADD(R11.16, 1, -R4.14);
+            R4.15 = IADD3(R8.18, -2, RZ);
+            R11.17 = LDS.U8(*R19.2);
+            P1.14 = ISETP.GE.AND(PT, R4.15, R7.11, PT);
+            (R4.16, P3.11) = IADD3(R17.6, UR8.2, RZ);
+            _ = STS.U8(*UR4.3, R11.17);
+            _ = STS.U8(*R19.2, R12.24);
+            R5.17 = LDS.U8(*UR4.3);
+            R5.18 = IMAD.IADD(R12.24, 1, R5.17);
+            if (!(P2.26)) R13.21 = LOP3.LUT(R5.18, 255, RZ, 192, !PT());
+            R5.19 = IADD3.X(R18.5, UR9.2, RZ, P3.11, !PT());
+            if (!(P2.26)) R13.22 = LDS.U8(*R13.21);
+            UR4.4 = UIADD3(UR4.3, 1, URZ);
+            UR5.5 = USHF.R.S32.HI(URZ, 31, UR4.4);
+            UR5.6 = ULEA.HI(UR5.5, UR4.4, URZ, 8);
+            UR5.7 = ULOP3.LUT(UR5.6, 4294967040, URZ, 192, !UPT());
+            if (!(P2.26)) R15.11 = LOP3.LUT(R14.38, R13.22, RZ, 60, !PT());
+            if (!(P2.26)) _ = STG.E.U8(*addr64(R4.16, R5.19), R15.11);
+            if (!(P1.14)) R16.7 = LDG.E.U8(*(addr64(R2.12, R3.10) + 1));
+            UR4.5 = UIADD3(UR4.4, -UR5.7, URZ);
+            R11.18 = LDS.U8(*UR4.5);
+            R12.25 = IMAD.IADD(R19.2, 1, R11.18);
+            R13.23 = SHF.R.S32.HI(RZ, 31, R12.25);
+            R13.24 = LEA.HI(R13.23, R12.25, RZ, 8);
+            R13.25 = LOP3.LUT(R13.24, 4294967040, RZ, 192, !PT());
+            R20.2 = IMAD.IADD(R12.25, 1, -R13.25);
+            R12.26 = LDS.U8(*R20.2);
+            _ = STS.U8(*UR4.5, R12.26);
+            _ = STS.U8(*R20.2, R11.18);
+            R14.39 = LDS.U8(*UR4.5);
+            R13.26 = IMAD.IADD(R11.18, 1, R14.39);
+            R14.40 = IADD3(R8.18, -1, RZ);
+            if (!(P1.14)) R13.27 = LOP3.LUT(R13.26, 255, RZ, 192, !PT());
+            P2.27 = ISETP.GE.AND(PT, R14.40, R7.11, PT);
+            if (!(P1.14)) R13.28 = LDS.U8(*R13.27);
+            UR4.6 = UIADD3(UR4.5, 1, URZ);
+            UR5.8 = USHF.R.S32.HI(URZ, 31, UR4.6);
+            UR5.9 = ULEA.HI(UR5.8, UR4.6, URZ, 8);
+            UR5.10 = ULOP3.LUT(UR5.9, 4294967040, URZ, 192, !UPT());
+            UR4.7 = UIADD3(UR4.6, -UR5.10, URZ);
+            R11.19 = LDS.U8(*UR4.7);
+            if (!(P1.14)) R15.12 = LOP3.LUT(R16.7, R13.28, RZ, 60, !PT());
+            if (!(P1.14)) _ = STG.E.U8(*(addr64(R4.16, R5.19) + 1), R15.12);
+            if (!(P2.27)) R16.8 = LDG.E.U8(*(addr64(R2.12, R3.10) + 2));
+            R12.27 = IMAD.IADD(R20.2, 1, R11.19);
+            P1.15 = ISETP.GE.AND(PT, R8.18, R7.11, PT);
+            R13.29 = SHF.R.S32.HI(RZ, 31, R12.27);
+            R13.30 = LEA.HI(R13.29, R12.27, RZ, 8);
+            R13.31 = LOP3.LUT(R13.30, 4294967040, RZ, 192, !PT());
+            R19.3 = IMAD.IADD(R12.27, 1, -R13.31);
+            R12.28 = LDS.U8(*R19.3);
+            _ = STS.U8(*UR4.7, R12.28);
+            _ = STS.U8(*R19.3, R11.19);
+            R14.41 = LDS.U8(*UR4.7);
+            R13.32 = IMAD.IADD(R11.19, 1, R14.41);
+            if (!(P2.27)) R13.33 = LOP3.LUT(R13.32, 255, RZ, 192, !PT());
+            if (!(P2.27)) R13.34 = LDS.U8(*R13.33);
+            UR4.8 = UIADD3(UR4.7, 1, URZ);
+            UR5.11 = USHF.R.S32.HI(URZ, 31, UR4.8);
+            UR5.12 = ULEA.HI(UR5.11, UR4.8, URZ, 8);
+            UR5.13 = ULOP3.LUT(UR5.12, 4294967040, URZ, 192, !UPT());
+            UR4.9 = UIADD3(UR4.8, -UR5.13, URZ);
+            R12.29 = LDS.U8(*UR4.9);
+            if (!(P2.27)) R15.13 = LOP3.LUT(R16.8, R13.34, RZ, 60, !PT());
+            if (!(P2.27)) _ = STG.E.U8(*(addr64(R4.16, R5.19) + 2), R15.13);
+            if (!(P1.15)) R16.9 = LDG.E.U8(*(addr64(R2.12, R3.10) + 3));
+            R11.20 = IMAD.IADD(R19.3, 1, R12.29);
+            R10.15 = IADD3(R10.14, 4, RZ);
+            (UR8.3, UP0.2) = UIADD3(UR8.2, 4, URZ);
+            R9.17 = IADD3(R9.16, 4, RZ);
+            (UR10.3, UP1.2) = UIADD3(UR10.2, 4, URZ);
+            R14.42 = SHF.R.S32.HI(RZ, 31, R11.20);
+            UR9.3 = UIADD3.X(URZ, UR9.2, URZ, UP0.2, !UPT());
+            R8.19 = IADD3(R8.18, 4, RZ);
+            UR11.3 = UIADD3.X(URZ, UR11.2, URZ, UP1.2, !UPT());
+            R14.43 = LEA.HI(R14.42, R11.20, RZ, 8);
+            R14.44 = LOP3.LUT(R14.43, 4294967040, RZ, 192, !PT());
+            R11.21 = IMAD.IADD(R11.20, 1, -R14.44);
+            R2.13 = LDS.U8(*R11.21);
+            _ = STS.U8(*UR4.9, R2.13);
+            _ = STS.U8(*R11.21, R12.29);
+            R3.11 = LDS.U8(*UR4.9);
+            R3.12 = IMAD.IADD(R12.29, 1, R3.11);
+            if (!(P1.15)) R3.13 = LOP3.LUT(R3.12, 255, RZ, 192, !PT());
+            if (!(P1.15)) R3.14 = LDS.U8(*R3.13);
+            if (!(P1.15)) R13.35 = LOP3.LUT(R16.9, R3.14, RZ, 60, !PT());
+            if (!(P1.15)) _ = STG.E.U8(*(addr64(R4.16, R5.19) + 3), R13.35);
+            // 26 phi node(s) omitted
+          }
+        }
+      }
+      // Condition from BB11
+      if (P0.3) {
+        BB12 {
+          R0.1 = IMAD(R0.0, ConstMem(0, 384), R9.18);
+          (R12.31, P0.4) = IADD3(R0.1, ConstMem(0, 376), RZ);
+          (R9.19, P1.18) = IADD3(R0.1, ConstMem(0, 368), RZ);
+          R2.15 = SHF.R.S32.HI(RZ, 31, R0.1);
+          R13.37 = IADD3.X(R2.15, ConstMem(0, 380), RZ, P0.4, !PT());
+          R10.17 = IADD3.X(R2.15, ConstMem(0, 372), RZ, P1.18, !PT());
+        }
+        // Loop header BB13
+        while (P0.7) {
+          BB13 {
+            P0.6 = ISETP.GE.AND(PT, R0.2, R7.11, PT);
+            if (!(P0.6)) R2.17 = IMAD.MOV.U32(RZ, RZ, R9.20);
+            if (!(P0.6)) R3.17 = IMAD.MOV.U32(RZ, RZ, R10.18);
+            if (!(P0.6)) R5.22 = LDG.E.U8(*addr64(R2.17, R3.17));
+            UR4.12 = UIADD3(UR4.11, 1, URZ);
+            R6.12 = IADD3(R6.11, -1, RZ);
+            (R9.21, P2.30) = IADD3(R9.20, 1, RZ);
+            UR5.16 = USHF.R.S32.HI(URZ, 31, UR4.12);
+            R0.3 = IADD3(R0.2, 1, RZ);
+            UR5.17 = ULEA.HI(UR5.16, UR4.12, URZ, 8);
+            R10.19 = IMAD.X(RZ, RZ, R10.18, P2.30);
+            UR5.18 = ULOP3.LUT(UR5.17, 4294967040, URZ, 192, !UPT());
+            UR4.13 = UIADD3(UR4.12, -UR5.18, URZ);
+            R4.19 = LDS.U8(*UR4.13);
+            R11.24 = IMAD.IADD(R4.19, 1, R11.23);
+            R8.22 = SHF.R.S32.HI(RZ, 31, R11.24);
+            R8.23 = LEA.HI(R8.22, R11.24, RZ, 8);
+            R8.24 = LOP3.LUT(R8.23, 4294967040, RZ, 192, !PT());
+            R11.25 = IMAD.IADD(R11.24, 1, -R8.24);
+            R2.18 = LDS.U8(*R11.25);
+            _ = STS.U8(*UR4.13, R2.18);
+            _ = STS.U8(*R11.25, R4.19);
+            R3.18 = LDS.U8(*UR4.13);
+            if (!(P0.6)) R2.19 = IMAD.MOV.U32(RZ, RZ, R12.32);
+            (R12.33, P1.20) = IADD3(R12.32, 1, RZ);
+            R3.19 = IMAD.IADD(R4.19, 1, R3.18);
+            if (!(P0.6)) R3.20 = LOP3.LUT(R3.19, 255, RZ, 192, !PT());
+            if (!(P0.6)) R8.25 = LDS.U8(*R3.20);
+            if (!(P0.6)) R3.21 = IMAD.MOV.U32(RZ, RZ, R13.38);
+            R13.39 = IMAD.X(RZ, RZ, R13.38, P1.20);
+            if (!(P0.6)) R5.23 = LOP3.LUT(R5.22, R8.25, RZ, 60, !PT());
+            if (!(P0.6)) _ = STG.E.U8(*addr64(R2.19, R3.21), R5.23);
+            // 17 phi node(s) omitted
+          }
+        }
+      }
+    }
+  }
+}
+

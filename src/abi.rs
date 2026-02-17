@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::ir::{DisplayCtx, FunctionIR, IRExpr, RegId, RValue};
+use crate::ir::{DisplayCtx, FunctionIR, IRExpr, IRStatement, RegId, RValue};
 use crate::parser::{Instruction, Operand};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,17 +295,23 @@ pub fn infer_local_typed_declarations_with_abi(
                 block_id: block.id,
                 stmt_idx,
             };
-            if let Some(IRExpr::Reg(r)) = &stmt.dest {
+            for (def_idx, def) in stmt.defs.iter().enumerate() {
+                let IRExpr::Reg(r) = def else {
+                    continue;
+                };
                 if is_immutable_reg(r) {
                     continue;
                 }
                 let key = (r.class.clone(), r.idx);
                 regs.insert(key.clone());
-                if let Some(h) = hint_from_dest_stmt(stmt) {
+                if let Some(h) = hint_from_def_stmt(r, stmt) {
                     hints.entry(key.clone()).or_default().insert(h);
                 }
-                if let Some(h) = abi_pointer_hint_from_dest_stmt(stmt_ref, stmt, annotations, aliases) {
-                    hints.entry(key).or_default().insert(h);
+                if def_idx == 0 {
+                    if let Some(h) = abi_pointer_hint_from_dest_stmt(stmt_ref, stmt, annotations, aliases)
+                    {
+                        hints.entry(key.clone()).or_default().insert(h);
+                    }
                 }
             }
             collect_pointer_hints_from_stmt(stmt, &mut hints);
@@ -355,11 +361,8 @@ fn abi_pointer_hint_from_dest_stmt(
     }
 }
 
-fn hint_from_dest_stmt(stmt: &crate::ir::IRStatement) -> Option<LocalTypeHint> {
+fn hint_from_def_stmt(dest: &RegId, stmt: &IRStatement) -> Option<LocalTypeHint> {
     let RValue::Op { opcode, .. } = &stmt.value else {
-        return None;
-    };
-    let Some(IRExpr::Reg(dest)) = &stmt.dest else {
         return None;
     };
     if dest.class == "P" || dest.class == "UP" {
@@ -404,11 +407,11 @@ fn hint_from_opcode_data_suffix(opcode: &str) -> Option<LocalTypeHint> {
 }
 
 fn collect_pointer_hints_from_stmt(
-    stmt: &crate::ir::IRStatement,
+    stmt: &IRStatement,
     hints: &mut BTreeMap<(String, i32), BTreeSet<LocalTypeHint>>,
 ) {
-    if let Some(dest) = &stmt.dest {
-        collect_pointer_hints_from_expr(dest, hints);
+    for def in &stmt.defs {
+        collect_pointer_hints_from_expr(def, hints);
     }
     if let Some(pred) = &stmt.pred {
         collect_pointer_hints_from_expr(pred, hints);
@@ -752,8 +755,8 @@ pub fn annotate_function_ir_constmem(function_ir: &FunctionIR, profile: AbiProfi
     for block in &function_ir.blocks {
         for (stmt_idx, stmt) in block.stmts.iter().enumerate() {
             let mut raw_pairs = Vec::new();
-            if let Some(dest) = &stmt.dest {
-                collect_constmem_from_expr(dest, &mut raw_pairs);
+            for def in &stmt.defs {
+                collect_constmem_from_expr(def, &mut raw_pairs);
             }
             if let Some(pred) = &stmt.pred {
                 collect_constmem_from_expr(pred, &mut raw_pairs);

@@ -1,11 +1,13 @@
 BB0 {
   v0 = ConstMem(0, 40);
   v1 = abs(ConstMem(0, 356));
-  u0 = uldc64(ConstMem(0, 352));
-  u1 = u0 ^ u2;
+  u0 = ConstMem(0, 352);
+  u1 = ConstMem(0, 356);
+  u2 = u0 ^ u1;
   v2 = i2f_rp(v1);
-  b0 = RZ <= u1;
-  u3 = uldc64(ConstMem(0, 280));
+  b0 = RZ <= u2;
+  u3 = ConstMem(0, 280);
+  u4 = ConstMem(0, 284);
   v3 = rcp_approx(v2);
   v4 = v3 + 268435454;
   v5 = f2i_trunc_u32_ftz_ntz(v4);

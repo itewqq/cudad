@@ -230,8 +230,13 @@ fn ssa_iadd3_pred_output_is_defined_and_reused_by_lea_hi_x() {
         let RValue::Op { opcode, args } = &stmt.value else {
             continue;
         };
-        if opcode == "IADD3.CARRY" {
-            carry_def = stmt.dest.as_ref().and_then(|d| d.get_reg()).cloned();
+        if opcode == "IADD3" {
+            carry_def = stmt
+                .defs
+                .iter()
+                .filter_map(|d| d.get_reg())
+                .find(|r| r.class == "P")
+                .cloned();
         }
         if opcode == "LEA.HI.X.SX32" {
             let Some(IRExpr::Reg(r)) = args.get(3) else {
@@ -241,11 +246,113 @@ fn ssa_iadd3_pred_output_is_defined_and_reused_by_lea_hi_x() {
         }
     }
 
-    let carry_def = carry_def.expect("expected synthetic IADD3.CARRY def");
+    let carry_def = carry_def.expect("expected IADD3 predicate carry def");
     let lea_carry_use = lea_carry_use.expect("expected LEA.HI.X carry predicate use");
     assert_eq!(carry_def.class, lea_carry_use.class);
     assert_eq!(carry_def.idx, lea_carry_use.idx);
     assert_eq!(carry_def.ssa, lea_carry_use.ssa);
+}
+
+#[test]
+fn ssa_uiadd3_pred_output_feeds_uiadd3_x_carry_input() {
+    let sample = r#"
+        /*0000*/ UIADD3 UR8, UP0, UR8, 0x4, URZ ;
+        /*0010*/ UIADD3.X UR9, URZ, UR9, URZ, UP0, !UPT ;
+        /*0020*/ EXIT ;
+    "#;
+    let cfg = build_cfg(parse_sass(sample));
+    let fir = build_ssa(&cfg);
+    let block0 = fir
+        .blocks
+        .iter()
+        .find(|b| b.id == 0)
+        .expect("expected BB0");
+
+    let mut carry_def: Option<RegId> = None;
+    let mut carry_use: Option<RegId> = None;
+    for stmt in &block0.stmts {
+        let RValue::Op { opcode, args } = &stmt.value else {
+            continue;
+        };
+        if opcode == "UIADD3" {
+            carry_def = stmt
+                .defs
+                .iter()
+                .filter_map(|d| d.get_reg())
+                .find(|r| r.class == "UP")
+                .cloned();
+        }
+        if opcode == "UIADD3.X" {
+            carry_use = args
+                .iter()
+                .filter_map(|a| match a {
+                    IRExpr::Reg(r) if r.class == "UP" => Some(r.clone()),
+                    _ => None,
+                })
+                .next();
+        }
+    }
+
+    let carry_def = carry_def.expect("expected UIADD3 carry predicate def");
+    let carry_use = carry_use.expect("expected UIADD3.X carry predicate use");
+    assert_eq!(carry_def.class, carry_use.class);
+    assert_eq!(carry_def.idx, carry_use.idx);
+    assert_eq!(carry_def.ssa, carry_use.ssa);
+}
+
+#[test]
+fn semantic_lift_carry_def_uses_pre_increment_low_operand() {
+    let sample = r#"
+        /*0000*/ IADD3 R1, P0, R1, 0x1, RZ ;
+        /*0010*/ IADD3.X R2, R2, RZ, RZ, P0, !PT ;
+        /*0020*/ EXIT ;
+    "#;
+    let cfg = build_cfg(parse_sass(sample));
+    let fir = build_ssa(&cfg);
+    let lifted = lift_function_ir(&fir, &SemanticLiftConfig::default());
+
+    let low = lifted
+        .by_def
+        .get(&DefRef {
+            block_id: 0,
+            stmt_idx: 0,
+            def_idx: 0,
+        })
+        .expect("expected low add def");
+    let carry = lifted
+        .by_def
+        .get(&DefRef {
+            block_id: 0,
+            stmt_idx: 0,
+            def_idx: 1,
+        })
+        .expect("expected carry def");
+
+    assert_eq!(low.rhs.render(), "R1.0 + 1");
+    assert_eq!(carry.rhs.render(), "carry_u32_add3(R1.0, 1, RZ)");
+    assert!(!carry.rhs.render().contains("R1.1"));
+}
+
+#[test]
+fn ssa_ir_does_not_emit_synthetic_carry_opcodes() {
+    let sample = r#"
+        /*0000*/ IADD3 R10, P2, R6, c[0x0][0x160], RZ ;
+        /*0010*/ UIADD3 UR8, UP0, UR8, 0x4, URZ ;
+        /*0020*/ EXIT ;
+    "#;
+    let cfg = build_cfg(parse_sass(sample));
+    let fir = build_ssa(&cfg);
+    for block in &fir.blocks {
+        for stmt in &block.stmts {
+            let RValue::Op { opcode, .. } = &stmt.value else {
+                continue;
+            };
+            assert_ne!(opcode, "IADD3.CARRY");
+            assert_ne!(opcode, "IADD3.CARRY2");
+            assert_ne!(opcode, "UIADD3.CARRY");
+            assert_ne!(opcode, "UIADD3.CARRY2");
+        }
+    }
 }
 
 #[test]

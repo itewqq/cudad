@@ -27,15 +27,18 @@ void kernel(uint64_t arg0_u64, uint64_t arg1_u64) {
   uint32_t R5;
   uint32_t R7;
   uint32_t UR4;
+  uint32_t UR5;
 
   BB0 {
     v0 = abi_internal_0x28;
     v1 = abs(arg0_u64.hi32);
-    u0 = uldc64(arg0_u64.lo32);
-    u1 = u0 ^ u2;
+    u0 = arg0_u64.lo32;
+    u1 = arg0_u64.hi32;
+    u2 = u0 ^ u1;
     v2 = i2f_rp(v1);
-    b0 = RZ <= u1;
-    u3 = uldc64(c[0x0][0x118]);
+    b0 = RZ <= u2;
+    u3 = c[0x0][0x118];
+    u4 = ConstMem(0, 284);
     v3 = rcp_approx(v2);
     v4 = v3 + 268435454;
     v5 = f2i_trunc_u32_ftz_ntz(v4);

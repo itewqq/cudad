@@ -119,8 +119,15 @@ pub struct SemanticLiftStats {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SemanticLiftResult {
-    pub by_stmt: BTreeMap<StatementRef, LiftedStmt>,
+    pub by_def: BTreeMap<DefRef, LiftedStmt>,
     pub stats: SemanticLiftStats,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DefRef {
+    pub block_id: usize,
+    pub stmt_idx: usize,
+    pub def_idx: usize,
 }
 
 pub fn lift_function_ir(function_ir: &FunctionIR, config: &SemanticLiftConfig<'_>) -> SemanticLiftResult {
@@ -142,8 +149,12 @@ pub fn lift_function_ir(function_ir: &FunctionIR, config: &SemanticLiftConfig<'_
                     .pred
                     .as_ref()
                     .map(|p| lift_ir_expr(p, stmt_ref, config));
-                out.by_stmt.insert(
-                    stmt_ref,
+                out.by_def.insert(
+                    DefRef {
+                        block_id: block.id,
+                        stmt_idx,
+                        def_idx: 0,
+                    },
                     LiftedStmt {
                         dest,
                         pred,
@@ -153,24 +164,35 @@ pub fn lift_function_ir(function_ir: &FunctionIR, config: &SemanticLiftConfig<'_
                 out.stats.lifted += 1;
                 continue;
             }
-            let lifted_rhs = lift_opcode_expr(opcode, args, stmt_ref, config);
-            if let Some(rhs) = lifted_rhs {
-                let dest = stmt
-                    .dest
-                    .as_ref()
-                    .map_or_else(|| "_".to_string(), |d| render_expr_raw(d, stmt_ref, config));
-                let pred = stmt
-                    .pred
-                    .as_ref()
-                    .map(|p| lift_ir_expr(p, stmt_ref, config));
-                out.by_stmt.insert(
-                    stmt_ref,
-                    LiftedStmt {
-                        dest,
-                        pred,
-                        rhs,
-                    },
-                );
+            let mut any_lifted = false;
+            let def_count = stmt.defs.len().max(1);
+            for def_idx in 0..def_count {
+                let lifted_rhs = lift_opcode_expr_for_def(opcode, args, def_idx, stmt_ref, config);
+                if let Some(rhs) = lifted_rhs {
+                    let dest = stmt
+                        .defs
+                        .get(def_idx)
+                        .map_or_else(|| "_".to_string(), |d| render_expr_raw(d, stmt_ref, config));
+                    let pred = stmt
+                        .pred
+                        .as_ref()
+                        .map(|p| lift_ir_expr(p, stmt_ref, config));
+                    out.by_def.insert(
+                        DefRef {
+                            block_id: block.id,
+                            stmt_idx,
+                            def_idx,
+                        },
+                        LiftedStmt {
+                            dest,
+                            pred,
+                            rhs,
+                        },
+                    );
+                    any_lifted = true;
+                }
+            }
+            if any_lifted {
                 out.stats.lifted += 1;
             } else {
                 out.stats.fallback += 1;
@@ -188,6 +210,90 @@ fn lift_opcode_expr(
     config: &SemanticLiftConfig<'_>,
 ) -> Option<LiftedExpr> {
     registry::dispatch_opcode(opcode, args, stmt_ref, config)
+}
+
+fn opcode_mnemonic(opcode: &str) -> &str {
+    opcode.split('.').next().unwrap_or(opcode)
+}
+
+fn opcode_has_mod(opcode: &str, needle: &str) -> bool {
+    opcode.split('.').skip(1).any(|m| m == needle)
+}
+
+fn lift_opcode_expr_for_def(
+    opcode: &str,
+    args: &[IRExpr],
+    def_idx: usize,
+    stmt_ref: StatementRef,
+    config: &SemanticLiftConfig<'_>,
+) -> Option<LiftedExpr> {
+    let mnem = opcode_mnemonic(opcode);
+    if matches!(mnem, "ULDC" | "LDC") && opcode_has_mod(opcode, "64") {
+        if def_idx == 0 {
+            return lift_opcode_expr(opcode, args, stmt_ref, config);
+        }
+        if def_idx == 1 {
+            if let Some(expr) = lift_uldc64_hi_from_lo(args.first()?, stmt_ref, config) {
+                return Some(expr);
+            }
+            let hi_arg = args.first().and_then(constmem_plus_word_offset)?;
+            return Some(lift_ir_expr(&hi_arg, stmt_ref, config));
+        }
+        return None;
+    }
+    if def_idx > 0 && matches!(mnem, "IADD3" | "UIADD3") && !opcode_has_mod(opcode, "X") {
+        return lift_iadd3_carry("carry_u32_add3", args, stmt_ref, config);
+    }
+    lift_opcode_expr(opcode, args, stmt_ref, config)
+}
+
+fn constmem_plus_word_offset(expr: &IRExpr) -> Option<IRExpr> {
+    let IRExpr::Op { op, args } = expr else {
+        return None;
+    };
+    if op != "ConstMem" || args.len() != 2 {
+        return None;
+    }
+    let IRExpr::ImmI(bank) = args[0] else {
+        return None;
+    };
+    let IRExpr::ImmI(offset) = args[1] else {
+        return None;
+    };
+    Some(IRExpr::Op {
+        op: "ConstMem".to_string(),
+        args: vec![IRExpr::ImmI(bank), IRExpr::ImmI(offset + 4)],
+    })
+}
+
+fn lift_uldc64_hi_from_lo(
+    lo_expr: &IRExpr,
+    stmt_ref: StatementRef,
+    config: &SemanticLiftConfig<'_>,
+) -> Option<LiftedExpr> {
+    let IRExpr::Op { op, args } = lo_expr else {
+        return None;
+    };
+    if op != "ConstMem" || args.len() != 2 {
+        return None;
+    }
+    let bank = imm_as_u32(&args[0])?;
+    let offset = imm_as_u32(&args[1])?;
+    let anns = config.abi_annotations?;
+    let matches_stmt = anns.constmem_by_stmt.get(&stmt_ref)?;
+    let ann = matches_stmt
+        .iter()
+        .find(|ann| ann.bank == bank && ann.offset == offset)?;
+    if let ConstMemSemantic::ParamWord { param_idx, word_idx } = ann.semantic {
+        let hi_word = word_idx.checked_add(1)?;
+        if let Some(aliases) = config.abi_aliases {
+            if let Some(alias) = aliases.render_param_word(param_idx, hi_word) {
+                return Some(LiftedExpr::Raw(alias));
+            }
+        }
+        return Some(LiftedExpr::Raw(format!("param_{}[{}]", param_idx, hi_word)));
+    }
+    None
 }
 
 fn lift_s2r(args: &[IRExpr]) -> Option<LiftedExpr> {
@@ -448,7 +554,13 @@ fn lift_uldc64(
     stmt_ref: StatementRef,
     config: &SemanticLiftConfig<'_>,
 ) -> Option<LiftedExpr> {
-    lift_unary_intrinsic("uldc64", args, stmt_ref, config)
+    if args.len() != 1 {
+        return None;
+    }
+    // ULDC.64 loads a 64-bit kernel argument pair into uniform regs.
+    // For the modeled low-half def, render the source symbol directly
+    // instead of a synthetic helper call to avoid misleading "load by value".
+    Some(lift_ir_expr(&args[0], stmt_ref, config))
 }
 
 fn lift_unary_intrinsic(
@@ -825,11 +937,13 @@ fn lift_shf(
     if !matches!(args[1], IRExpr::ImmI(_)) {
         return None;
     }
-    Some(LiftedExpr::Binary {
-        op: ">>".to_string(),
-        lhs: Box::new(lift_ir_expr(&args[2], stmt_ref, config)),
-        rhs: Box::new(lift_ir_expr(&args[1], stmt_ref, config)),
-    })
+    let lhs = lift_ir_expr(&args[2], stmt_ref, config).render();
+    let rhs = lift_ir_expr(&args[1], stmt_ref, config).render();
+    let signed = opcode.split('.').any(|t| t == "S32");
+    if signed {
+        return Some(LiftedExpr::Raw(format!("((int32_t){}) >> {}", lhs, rhs)));
+    }
+    Some(LiftedExpr::Raw(format!("{} >> {}", lhs, rhs)))
 }
 
 fn lift_lea(
@@ -1322,10 +1436,11 @@ mod tests {
         "#;
         let out = run_lift(sass);
         let lifted = out
-            .by_stmt
-            .get(&StatementRef {
+            .by_def
+            .get(&DefRef {
                 block_id: 0,
                 stmt_idx: 0,
+                def_idx: 0,
             })
             .expect("expected lifted IMAD.MOV");
         assert_eq!(lifted.rhs.render(), "42");
@@ -1339,10 +1454,11 @@ mod tests {
         "#;
         let out = run_lift(sass);
         let lifted = out
-            .by_stmt
-            .get(&StatementRef {
+            .by_def
+            .get(&DefRef {
                 block_id: 0,
                 stmt_idx: 0,
+                def_idx: 0,
             })
             .expect("expected lifted IADD3");
         let rendered = lifted.rhs.render();
@@ -1357,10 +1473,11 @@ mod tests {
         "#;
         let out = run_lift(sass);
         let lifted = out
-            .by_stmt
-            .get(&StatementRef {
+            .by_def
+            .get(&DefRef {
                 block_id: 0,
                 stmt_idx: 0,
+                def_idx: 0,
             })
             .expect("expected lifted UIADD3");
         assert_eq!(lifted.rhs.render(), "UR8.0 + 4");
@@ -1374,10 +1491,11 @@ mod tests {
         "#;
         let out = run_lift(sass);
         let lifted = out
-            .by_stmt
-            .get(&StatementRef {
+            .by_def
+            .get(&DefRef {
                 block_id: 0,
                 stmt_idx: 0,
+                def_idx: 0,
             })
             .expect("expected lifted IMAD.IADD");
         assert_eq!(lifted.rhs.render(), "R12.0 + R11.0");
@@ -1391,10 +1509,11 @@ mod tests {
         "#;
         let out = run_lift(sass);
         let lifted = out
-            .by_stmt
-            .get(&StatementRef {
+            .by_def
+            .get(&DefRef {
                 block_id: 0,
                 stmt_idx: 0,
+                def_idx: 0,
             })
             .expect("expected lifted IMAD.IADD");
         assert_eq!(lifted.rhs.render(), "R12.0 + false");
@@ -1408,10 +1527,11 @@ mod tests {
         "#;
         let out = run_lift(sass);
         let lifted = out
-            .by_stmt
-            .get(&StatementRef {
+            .by_def
+            .get(&DefRef {
                 block_id: 0,
                 stmt_idx: 0,
+                def_idx: 0,
             })
             .expect("expected lifted ISETP");
         assert_eq!(lifted.rhs.render(), "R0.0 >= 1");
@@ -1425,10 +1545,11 @@ mod tests {
         "#;
         let out = run_lift(sass);
         let lifted = out
-            .by_stmt
-            .get(&StatementRef {
+            .by_def
+            .get(&DefRef {
                 block_id: 0,
                 stmt_idx: 0,
+                def_idx: 0,
             })
             .expect("expected lifted S2R");
         assert_eq!(lifted.rhs.render(), "blockIdx.x");
@@ -1442,10 +1563,11 @@ mod tests {
         "#;
         let out = run_lift(sass);
         let lifted = out
-            .by_stmt
-            .get(&StatementRef {
+            .by_def
+            .get(&DefRef {
                 block_id: 0,
                 stmt_idx: 0,
+                def_idx: 0,
             })
             .expect("expected lifted FSEL");
         let rendered = lifted.rhs.render();
@@ -1460,10 +1582,11 @@ mod tests {
         "#;
         let out = run_lift(sass);
         let lifted = out
-            .by_stmt
-            .get(&StatementRef {
+            .by_def
+            .get(&DefRef {
                 block_id: 0,
                 stmt_idx: 0,
+                def_idx: 0,
             })
             .expect("expected lifted SEL");
         assert_eq!(lifted.rhs.render(), "!P1.0 ? R5.0 : R6.0");
@@ -1477,13 +1600,14 @@ mod tests {
         "#;
         let out = run_lift(sass);
         let lifted = out
-            .by_stmt
-            .get(&StatementRef {
+            .by_def
+            .get(&DefRef {
                 block_id: 0,
                 stmt_idx: 0,
+                def_idx: 0,
             })
             .expect("expected lifted SHF");
-        assert_eq!(lifted.rhs.render(), "R0.0 >> 31");
+        assert_eq!(lifted.rhs.render(), "((int32_t)R0.0) >> 31");
     }
 
     #[test]
@@ -1494,10 +1618,11 @@ mod tests {
         "#;
         let out = run_lift(sass);
         let lifted = out
-            .by_stmt
-            .get(&StatementRef {
+            .by_def
+            .get(&DefRef {
                 block_id: 0,
                 stmt_idx: 0,
+                def_idx: 0,
             })
             .expect("expected lifted IMAD.WIDE");
         assert_eq!(lifted.rhs.render(), "R27.0 * R2.0 + ConstMem(0, 360)");
@@ -1511,10 +1636,11 @@ mod tests {
         "#;
         let out = run_lift(sass);
         let lifted = out
-            .by_stmt
-            .get(&StatementRef {
+            .by_def
+            .get(&DefRef {
                 block_id: 0,
                 stmt_idx: 0,
+                def_idx: 0,
             })
             .expect("expected lifted LEA");
         assert_eq!(lifted.rhs.render(), "R0.0 + (ConstMem(0, 368) << 2)");
@@ -1528,10 +1654,11 @@ mod tests {
         "#;
         let out = run_lift(sass);
         let lifted = out
-            .by_stmt
-            .get(&StatementRef {
+            .by_def
+            .get(&DefRef {
                 block_id: 0,
                 stmt_idx: 0,
+                def_idx: 0,
             })
             .expect("expected lifted IADD3.X");
         assert_eq!(lifted.rhs.render(), "R1.0 + R2.0 + (P1.0 ? 1 : 0)");
@@ -1545,10 +1672,11 @@ mod tests {
         "#;
         let out = run_lift(sass);
         let lifted = out
-            .by_stmt
-            .get(&StatementRef {
+            .by_def
+            .get(&DefRef {
                 block_id: 0,
                 stmt_idx: 0,
+                def_idx: 0,
             })
             .expect("expected lifted LEA.HI");
         assert_eq!(lifted.rhs.render(), "hi32(R5.0 + (R6.0 << 8))");
@@ -1562,10 +1690,11 @@ mod tests {
         "#;
         let out = run_lift(sass);
         let lifted = out
-            .by_stmt
-            .get(&StatementRef {
+            .by_def
+            .get(&DefRef {
                 block_id: 0,
                 stmt_idx: 0,
+                def_idx: 0,
             })
             .expect("expected lifted LEA.HI.X");
         assert_eq!(
@@ -1582,10 +1711,11 @@ mod tests {
         "#;
         let out = run_lift(sass);
         let lifted = out
-            .by_stmt
-            .get(&StatementRef {
+            .by_def
+            .get(&DefRef {
                 block_id: 0,
                 stmt_idx: 0,
+                def_idx: 0,
             })
             .expect("expected lifted LOP3.LUT");
         assert_eq!(lifted.rhs.render(), "R22.0 & R17.0");
@@ -1599,10 +1729,11 @@ mod tests {
         "#;
         let out = run_lift(sass);
         let lifted = out
-            .by_stmt
-            .get(&StatementRef {
+            .by_def
+            .get(&DefRef {
                 block_id: 0,
                 stmt_idx: 0,
+                def_idx: 0,
             })
             .expect("expected lifted LOP3.LUT");
         assert_eq!(lifted.rhs.render(), "R8.0 | R9.0");
@@ -1616,10 +1747,11 @@ mod tests {
         "#;
         let out = run_lift(sass);
         let lifted = out
-            .by_stmt
-            .get(&StatementRef {
+            .by_def
+            .get(&DefRef {
                 block_id: 0,
                 stmt_idx: 0,
+                def_idx: 0,
             })
             .expect("expected lifted LOP3.LUT");
         assert_eq!(lifted.rhs.render(), "~R6.0");
@@ -1633,10 +1765,11 @@ mod tests {
         "#;
         let out = run_lift(sass);
         let lifted = out
-            .by_stmt
-            .get(&StatementRef {
+            .by_def
+            .get(&DefRef {
                 block_id: 0,
                 stmt_idx: 0,
+                def_idx: 0,
             })
             .expect("expected lifted LOP3.LUT");
         assert_eq!(lifted.rhs.render(), "R6.0 ^ R7.0");
@@ -1650,10 +1783,11 @@ mod tests {
         "#;
         let out = run_lift(sass);
         let lifted = out
-            .by_stmt
-            .get(&StatementRef {
+            .by_def
+            .get(&DefRef {
                 block_id: 0,
                 stmt_idx: 0,
+                def_idx: 0,
             })
             .expect("expected lifted LDS");
         assert_eq!(lifted.rhs.render(), "shmem_u8[UR4.0]");
@@ -1667,10 +1801,11 @@ mod tests {
         "#;
         let out = run_lift(sass);
         let lifted = out
-            .by_stmt
-            .get(&StatementRef {
+            .by_def
+            .get(&DefRef {
                 block_id: 0,
                 stmt_idx: 0,
+                def_idx: 0,
             })
             .expect("expected lifted STS");
         assert_eq!(lifted.dest, "shmem_u8[UR4.0]");
@@ -1685,10 +1820,11 @@ mod tests {
         "#;
         let out = run_lift(sass);
         let lifted = out
-            .by_stmt
-            .get(&StatementRef {
+            .by_def
+            .get(&DefRef {
                 block_id: 0,
                 stmt_idx: 0,
+                def_idx: 0,
             })
             .expect("expected lifted IMAD");
         assert_eq!(lifted.rhs.render(), "R1.0 * R2.0 + R3.0");
@@ -1702,10 +1838,11 @@ mod tests {
         "#;
         let out = run_lift(sass);
         let lifted = out
-            .by_stmt
-            .get(&StatementRef {
+            .by_def
+            .get(&DefRef {
                 block_id: 0,
                 stmt_idx: 0,
+                def_idx: 0,
             })
             .expect("expected lifted IMAD.HI.U32");
         assert_eq!(lifted.rhs.render(), "mul_hi_u32(R8.0, R11.0) + R9.0");
@@ -1719,10 +1856,11 @@ mod tests {
         "#;
         let out = run_lift(sass);
         let lifted = out
-            .by_stmt
-            .get(&StatementRef {
+            .by_def
+            .get(&DefRef {
                 block_id: 0,
                 stmt_idx: 0,
+                def_idx: 0,
             })
             .expect("expected lifted IMAD.X");
         assert_eq!(lifted.rhs.render(), "R3.0 + (P0.0 ? 1 : 0)");
@@ -1736,10 +1874,11 @@ mod tests {
         "#;
         let out = run_lift(sass);
         let lifted = out
-            .by_stmt
-            .get(&StatementRef {
+            .by_def
+            .get(&DefRef {
                 block_id: 0,
                 stmt_idx: 0,
+                def_idx: 0,
             })
             .expect("expected lifted IABS");
         assert_eq!(lifted.rhs.render(), "abs(R2.0)");
@@ -1753,10 +1892,11 @@ mod tests {
         "#;
         let out = run_lift(sass);
         let lifted = out
-            .by_stmt
-            .get(&StatementRef {
+            .by_def
+            .get(&DefRef {
                 block_id: 0,
                 stmt_idx: 0,
+                def_idx: 0,
             })
             .expect("expected lifted I2F.RP");
         assert_eq!(lifted.rhs.render(), "i2f_rp(R3.0)");
@@ -1770,10 +1910,11 @@ mod tests {
         "#;
         let out = run_lift(sass);
         let lifted = out
-            .by_stmt
-            .get(&StatementRef {
+            .by_def
+            .get(&DefRef {
                 block_id: 0,
                 stmt_idx: 0,
+                def_idx: 0,
             })
             .expect("expected lifted F2I.FTZ.U32.TRUNC.NTZ");
         assert_eq!(lifted.rhs.render(), "f2i_trunc_u32_ftz_ntz(R7.0)");
@@ -1787,10 +1928,11 @@ mod tests {
         "#;
         let out = run_lift(sass);
         let lifted = out
-            .by_stmt
-            .get(&StatementRef {
+            .by_def
+            .get(&DefRef {
                 block_id: 0,
                 stmt_idx: 0,
+                def_idx: 0,
             })
             .expect("expected lifted MUFU.RCP");
         assert_eq!(lifted.rhs.render(), "rcp_approx(R5.0)");
@@ -1803,14 +1945,24 @@ mod tests {
             /*0010*/ EXIT ;
         "#;
         let out = run_lift(sass);
-        let lifted = out
-            .by_stmt
-            .get(&StatementRef {
+        let lifted_lo = out
+            .by_def
+            .get(&DefRef {
                 block_id: 0,
                 stmt_idx: 0,
+                def_idx: 0,
             })
             .expect("expected lifted ULDC.64");
-        assert_eq!(lifted.rhs.render(), "uldc64(ConstMem(0, 280))");
+        assert_eq!(lifted_lo.rhs.render(), "ConstMem(0, 280)");
+        let lifted_hi = out
+            .by_def
+            .get(&DefRef {
+                block_id: 0,
+                stmt_idx: 0,
+                def_idx: 1,
+            })
+            .expect("expected lifted ULDC.64 high half");
+        assert_eq!(lifted_hi.rhs.render(), "ConstMem(0, 284)");
     }
 
     #[test]
@@ -1821,10 +1973,11 @@ mod tests {
         "#;
         let out = run_lift(sass);
         let lifted = out
-            .by_stmt
-            .get(&StatementRef {
+            .by_def
+            .get(&DefRef {
                 block_id: 0,
                 stmt_idx: 0,
+                def_idx: 0,
             })
             .expect("expected lifted IADD3 in strict mode");
         assert_eq!(lifted.rhs.render(), "R2.0 + R3.0 + R4.0");
@@ -1837,7 +1990,7 @@ mod tests {
             /*0010*/ EXIT ;
         "#;
         let out = run_lift(sass);
-        assert!(out.by_stmt.is_empty());
+        assert!(out.by_def.is_empty());
         assert_eq!(out.stats.attempted, 2);
         assert_eq!(out.stats.lifted, 0);
         assert_eq!(out.stats.fallback, 2);
