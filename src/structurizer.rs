@@ -12,6 +12,7 @@ use petgraph::algo::dominators::{Dominators, simple_fast};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use petgraph::Direction;
+
 // --- Structured AST Definition ---
 #[derive(Debug, Clone, PartialEq)]
 pub enum LoopType {
@@ -94,9 +95,33 @@ pub struct Structurizer<'a> {
     block_id_to_node_index: HashMap<usize, NodeIndex>,
     addr_to_node_index: HashMap<u32, NodeIndex>,
     processed_cfg_nodes: HashSet<NodeIndex>,
+    /// Registers defined by phi nodes — used to detect loop-carried live-in
+    /// old values in predicated ternaries.
+    phi_defined_regs: HashSet<RegId>,
 }
 
 impl<'a> Structurizer<'a> {
+    fn choose_entry_node(cfg: &ControlFlowGraph) -> Option<NodeIndex> {
+        let mut candidates = cfg
+            .node_indices()
+            .filter(|&n| cfg.neighbors_directed(n, Direction::Incoming).count() == 0)
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return cfg.node_indices().next();
+        }
+        candidates.sort_by_key(|&n| cfg[n].id);
+        candidates.first().copied()
+    }
+
+    /// Check if a predicated instruction's old-value register (at `def_idx`)
+    /// was defined by a phi node, indicating it is a loop-carried live-in.
+    fn is_pred_old_phi(&self, stmt: &IRStatement, def_idx: usize) -> bool {
+        stmt.pred_old_defs
+            .get(def_idx)
+            .and_then(|e| e.get_reg())
+            .map_or(false, |r| self.phi_defined_regs.contains(r))
+    }
+
     fn lifted_def_emit_order(stmt: &IRStatement) -> Vec<usize> {
         if stmt.defs.is_empty() {
             return vec![0];
@@ -270,7 +295,7 @@ impl<'a> Structurizer<'a> {
     }
 
     pub fn new(cfg: &'a ControlFlowGraph, function_ir: &'a FunctionIR) -> Self {
-        let entry_node = NodeIndex::new(0); // Assuming block 0 is the entry
+        let entry_node = Self::choose_entry_node(cfg).unwrap_or_else(|| NodeIndex::new(0));
         let dom = simple_fast(cfg, entry_node);
 
         let mut block_id_to_node_index = HashMap::new();
@@ -284,6 +309,20 @@ impl<'a> Structurizer<'a> {
         let (pdom_algo_result, immediate_pdom_map) =
             Self::calculate_post_dominators(cfg, function_ir);
 
+        // Pre-compute the set of registers defined by phi nodes.
+        let mut phi_defined_regs = HashSet::new();
+        for block in &function_ir.blocks {
+            for stmt in &block.stmts {
+                if matches!(stmt.value, RValue::Phi(_)) {
+                    for def in &stmt.defs {
+                        if let IRExpr::Reg(r) = def {
+                            phi_defined_regs.insert(r.clone());
+                        }
+                    }
+                }
+            }
+        }
+
         Structurizer {
             cfg,
             function_ir,
@@ -293,6 +332,7 @@ impl<'a> Structurizer<'a> {
             block_id_to_node_index,
             addr_to_node_index,
             processed_cfg_nodes: HashSet::new(),
+            phi_defined_regs,
         }
     }
 
@@ -347,7 +387,9 @@ impl<'a> Structurizer<'a> {
         let pdom_entry_node: NodeIndex;
         if original_exit_nodes_in_rev_cfg.is_empty() {
             if reversed_cfg.node_count() > 0 {
-                pdom_entry_node = node_map_orig_to_rev.get(&NodeIndex::new(0)).copied().unwrap_or_else(|| reversed_cfg.node_indices().next().unwrap());
+                pdom_entry_node = Self::choose_entry_node(original_cfg)
+                    .and_then(|orig_entry| node_map_orig_to_rev.get(&orig_entry).copied())
+                    .unwrap_or_else(|| reversed_cfg.node_indices().next().unwrap());
             } else {
                 return (simple_fast(&reversed_cfg, NodeIndex::new(0)), HashMap::new());
             }
@@ -385,7 +427,9 @@ impl<'a> Structurizer<'a> {
 
     pub fn structure_function(&mut self) -> Option<StructuredStatement> {
         self.processed_cfg_nodes.clear(); // Ensure clean state for new function
-        let entry_cfg_node = self.block_id_to_node_index.get(&0).copied().unwrap_or_else(|| NodeIndex::new(0));
+        let entry_cfg_node = Self::choose_entry_node(self.cfg)
+            .or_else(|| self.block_id_to_node_index.get(&0).copied())
+            .unwrap_or_else(|| NodeIndex::new(0));
         self.structure_region_recursive(entry_cfg_node, None)
     }
 
@@ -1085,17 +1129,42 @@ impl<'a> Structurizer<'a> {
                     let Some(lifted_stmt) = res.by_def.get(&def_ref) else {
                         continue;
                     };
-                    let pred_str = lifted_stmt
-                        .pred
-                        .as_ref()
-                        .map_or_else(String::new, |p| format!("if ({}) ", p.render()));
-                    lines.push_str(&format!(
-                        "{}{}{} = {};\n",
-                        "  ".repeat(indent_level + 1),
-                        pred_str,
-                        lifted_stmt.dest,
-                        lifted_stmt.rhs.render()
-                    ));
+                    match (&lifted_stmt.pred, &lifted_stmt.pred_old_val) {
+                        (Some(p), Some(old)) => {
+                            // Predicated instruction with old value:
+                            // emit `dest = pred ? rhs : [/*phi*/]old;`
+                            let phi_tag = if self.is_pred_old_phi(ir_s, def_idx) { "/*phi*/" } else { "" };
+                            lines.push_str(&format!(
+                                "{}{} = {} ? ({}) : {}{};
+",
+                                "  ".repeat(indent_level + 1),
+                                lifted_stmt.dest,
+                                p.render(),
+                                lifted_stmt.rhs.render(),
+                                phi_tag,
+                                old
+                            ));
+                        }
+                        (Some(p), None) => {
+                            // Predicated but no old value (e.g. store) –
+                            // keep the `if (pred)` guard.
+                            lines.push_str(&format!(
+                                "{}if ({}) {} = {};\n",
+                                "  ".repeat(indent_level + 1),
+                                p.render(),
+                                lifted_stmt.dest,
+                                lifted_stmt.rhs.render()
+                            ));
+                        }
+                        (None, _) => {
+                            lines.push_str(&format!(
+                                "{}{} = {};\n",
+                                "  ".repeat(indent_level + 1),
+                                lifted_stmt.dest,
+                                lifted_stmt.rhs.render()
+                            ));
+                        }
+                    };
                     emitted_any = true;
                 }
                 if emitted_any {
@@ -1133,13 +1202,29 @@ impl<'a> Structurizer<'a> {
                 .pred
                 .as_ref()
                 .map_or("".to_string(), |p| format!("if ({}) ", ctx.expr(p)));
-            lines.push_str(&format!(
-                "{}{}{} = {};\n",
-                "  ".repeat(indent_level + 1),
-                pred_str,
-                dest_str,
-                value_str
-            ));
+            if ir_s.pred.is_some() && !ir_s.pred_old_defs.is_empty() && ir_s.defs.len() == 1 {
+                let old_str = ctx.expr(&ir_s.pred_old_defs[0]);
+                let pred_expr = ir_s.pred.as_ref().unwrap();
+                // Predicated instruction with old value: emit ternary select.
+                let phi_tag = if self.is_pred_old_phi(ir_s, 0) { "/*phi*/" } else { "" };
+                lines.push_str(&format!(
+                    "{}{} = {} ? ({}) : {}{};\n",
+                    "  ".repeat(indent_level + 1),
+                    dest_str,
+                    ctx.expr(pred_expr),
+                    value_str,
+                    phi_tag,
+                    old_str
+                ));
+            } else {
+                lines.push_str(&format!(
+                    "{}{}{} = {};\n",
+                    "  ".repeat(indent_level + 1),
+                    pred_str,
+                    dest_str,
+                    value_str
+                ));
+            }
         }
 
         if lines.is_empty() {
@@ -1336,17 +1421,37 @@ impl<'a> Structurizer<'a> {
                             let Some(lifted_stmt) = res.by_def.get(&def_ref) else {
                                 continue;
                             };
-                            let pred_str = lifted_stmt
-                                .pred
-                                .as_ref()
-                                .map_or_else(String::new, |p| format!("if ({}) ", p.render()));
-                            s_out.push_str(&format!(
-                                "{}{}{} = {};\n",
-                                "  ".repeat(indent_level + 1),
-                                pred_str,
-                                lifted_stmt.dest,
-                                lifted_stmt.rhs.render()
-                            ));
+                            match (&lifted_stmt.pred, &lifted_stmt.pred_old_val) {
+                                (Some(p), Some(old)) => {
+                                    let phi_tag = if self.is_pred_old_phi(ir_s, def_idx) { "/*phi*/" } else { "" };
+                                    s_out.push_str(&format!(
+                                        "{}{} = {} ? ({}) : {}{};\n",
+                                        "  ".repeat(indent_level + 1),
+                                        lifted_stmt.dest,
+                                        p.render(),
+                                        lifted_stmt.rhs.render(),
+                                        phi_tag,
+                                        old
+                                    ));
+                                }
+                                (Some(p), None) => {
+                                    s_out.push_str(&format!(
+                                        "{}if ({}) {} = {};\n",
+                                        "  ".repeat(indent_level + 1),
+                                        p.render(),
+                                        lifted_stmt.dest,
+                                        lifted_stmt.rhs.render()
+                                    ));
+                                }
+                                (None, _) => {
+                                    s_out.push_str(&format!(
+                                        "{}{} = {};\n",
+                                        "  ".repeat(indent_level + 1),
+                                        lifted_stmt.dest,
+                                        lifted_stmt.rhs.render()
+                                    ));
+                                }
+                            };
                             emitted_any = true;
                         }
                         if emitted_any {
@@ -1380,7 +1485,23 @@ impl<'a> Structurizer<'a> {
                         RValue::ImmF(f) => format!("{}", f),
                     };
                     let pred_str = ir_s.pred.as_ref().map_or("".to_string(), |p| format!("if ({}) ", ctx.expr(p)));
-                    s_out.push_str(&format!("{}{}{} = {};\n", "  ".repeat(indent_level + 1), pred_str, dest_str, value_str));
+                    if ir_s.pred.is_some() && !ir_s.pred_old_defs.is_empty() && ir_s.defs.len() == 1 {
+                        let old_str = ctx.expr(&ir_s.pred_old_defs[0]);
+                        let pred_expr = ir_s.pred.as_ref().unwrap();
+                        // Predicated instruction with old value: emit ternary select.
+                        let phi_tag = if self.is_pred_old_phi(ir_s, 0) { "/*phi*/" } else { "" };
+                        s_out.push_str(&format!(
+                            "{}{} = {} ? ({}) : {}{};\n",
+                            "  ".repeat(indent_level + 1),
+                            dest_str,
+                            ctx.expr(pred_expr),
+                            value_str,
+                            phi_tag,
+                            old_str
+                        ));
+                    } else {
+                        s_out.push_str(&format!("{}{}{} = {};\n", "  ".repeat(indent_level + 1), pred_str, dest_str, value_str));
+                    }
                 }
                 if omitted_phi_count > 0 {
                     s_out.push_str(&format!(
@@ -1529,6 +1650,7 @@ mod tests {
             value: RValue::Op { opcode: opcode.to_string(), args: vec![] },
             pred: None,
             mem_addr_args: None,
+            pred_old_defs: vec![],
         }
     }
 
@@ -1538,6 +1660,7 @@ mod tests {
             value: RValue::Op { opcode: opcode.to_string(), args: vec![] },
             pred: Some(pred),
             mem_addr_args: None,
+            pred_old_defs: vec![],
         }
     }
 
@@ -1830,6 +1953,7 @@ mod tests {
                 },
                 pred: Some(IRExpr::Reg(RegId::new("P", 0, 1))),
                 mem_addr_args: None,
+                pred_old_defs: vec![],
             }],
         };
         assert!(!Structurizer::is_block_return(&block));
@@ -1893,6 +2017,7 @@ mod tests {
                     ]),
                     pred: None,
                     mem_addr_args: None,
+                    pred_old_defs: vec![],
                 },
                 stmt("IADD3"),
             ],

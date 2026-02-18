@@ -18,7 +18,7 @@ if (!(P0.0)) {
     P1.0 = ISETP.GE.AND(PT, R2.0, 1, PT);
     R9.0 = FADD(R6.1, R5.1);
     P0.1 = FSETP.GT.AND(PT, R9.0, 1, PT);
-    if (!(P0.1)) R9.1 = FMUL(R6.1, R5.1);
+    R9.1 = !(P0.1) ? (FMUL(R6.1, R5.1)) : R9.0;
   }
   // Condition from BB1
   if (P1.0) {

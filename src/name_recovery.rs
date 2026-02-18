@@ -131,7 +131,7 @@ pub fn recover_structured_output_names(
                 let Some(dest_key) = reg_ssa(dest) else {
                     continue;
                 };
-                let Some(dest_idx) = idx_of.get(&dest_key).copied() else {
+                let Some(dest_uf_idx) = idx_of.get(&dest_key).copied() else {
                     continue;
                 };
 
@@ -140,7 +140,7 @@ pub fn recover_structured_output_names(
                         if let Some(arg_key) = reg_ssa_from_expr(arg) {
                             if arg_key.base == dest_key.base {
                                 if let Some(arg_idx) = idx_of.get(&arg_key).copied() {
-                                    uf.union(dest_idx, arg_idx);
+                                    uf.union(dest_uf_idx, arg_idx);
                                 }
                             }
                         }
@@ -149,7 +149,7 @@ pub fn recover_structured_output_names(
                     if let Some(src_key) = conservative_copy_source(opcode, args) {
                         if src_key.base == dest_key.base {
                             if let Some(src_idx) = idx_of.get(&src_key).copied() {
-                                uf.union(dest_idx, src_idx);
+                                uf.union(dest_uf_idx, src_idx);
                             }
                         }
                     }
@@ -258,6 +258,38 @@ pub fn recover_structured_output_names(
         token_map.remove(&bad);
     }
 
+    // For predicated instructions, the dest and its pred_old_def frequently
+    // denote the same logical variable (dest keeps old value when predicate is
+    // false). Prefer mapping old-value tokens to the same recovered name as the
+    // dest, but never overwrite an existing conflicting mapping: preserving a
+    // stable one-to-one token map is correctness-critical.
+    //
+    // We do this as a post-map fixup rather than a Union-Find edge because
+    // unioning them would alter the global component count and shift the
+    // sequential name counters for every subsequent component.
+    for block in &function_ir.blocks {
+        for stmt in &block.stmts {
+            if stmt.pred.is_none() || stmt.pred_old_defs.is_empty() {
+                continue;
+            }
+            for (def_idx, def) in stmt.defs.iter().enumerate() {
+                let Some(dest_key) = reg_ssa_from_expr(def) else {
+                    continue;
+                };
+                let dest_tok = reg_token_core(&dest_key);
+                let Some(dest_name) = token_map.get(&dest_tok).cloned() else {
+                    continue;
+                };
+                if let Some(old_expr) = stmt.pred_old_defs.get(def_idx) {
+                    if let Some(old_key) = reg_ssa_from_expr(old_expr) {
+                        let old_tok = reg_token_core(&old_key);
+                        merge_pred_old_token_mapping(&mut token_map, old_tok, &dest_name);
+                    }
+                }
+            }
+        }
+    }
+
     let re = Regex::new(r"\b(?:UR|UP|R|P)\d+\.\d+\b").expect("valid regex");
     let mut ssa_tokens_seen = 0usize;
     let mut rewritten_tokens = 0usize;
@@ -273,6 +305,12 @@ pub fn recover_structured_output_names(
             }
         })
         .into_owned();
+
+    // Post-pass: convert self-referencing ternaries to if-guards.
+    // After name recovery, patterns like `v17 = b3 ? (v17 + 1) : v17;` have
+    // identical dest and old-value names.  These are clearer as
+    // `if (b3) v17 = v17 + 1;`.  Genuine selects (dest != old) are left alone.
+    output = simplify_predicated_ternaries(&output);
 
     if config.rewrite_control_predicates {
         let mut pred_map = HashMap::<String, String>::new();
@@ -399,6 +437,226 @@ fn semantic_name_seed(rhs: &str) -> Option<String> {
         ));
     }
     None
+}
+
+/// Simplify predicated-instruction ternary selects in the recovered output.
+///
+/// Two classes of ternary are converted to cleaner if-guarded assignments:
+///
+/// 1. **Self-referencing**: `v17 = b3 ? (v17 + 1) : v17;` → `if (b3) v17 = v17 + 1;`
+///    The dest and old-value are the same variable after name recovery; the
+///    else branch just keeps the current value — an if-guard is clearer.
+///
+/// 2. **Phi-marked old value**:
+///    `v165 = !b41 ? (load(...)) : /*phi*/v17;` → `if (!b41) v165 = load(...);`
+///    A `/*phi*/` old arm denotes loop-carried old state. Emitting it as an
+///    if-guard avoids fabricating a meaningful else-value in pseudocode dataflow.
+///
+/// Genuine conditional selects (different dest/old) are left
+/// as ternaries.
+fn simplify_predicated_ternaries(output: &str) -> String {
+    let out = simplify_predicated_ternaries_primary(output);
+    let out = simplify_predicated_only_ternaries_with_gated_uses(&out);
+    simplify_predicated_ternaries_primary(&out)
+}
+
+fn simplify_predicated_ternaries_primary(output: &str) -> String {
+    // Match ternaries, optionally with a /*phi*/ tag before the old-value.
+    //
+    // Capture groups:
+    //  1 – leading whitespace (indent)
+    //  2 – dest variable name
+    //  3 – predicate expression
+    //  4 – RHS expression (inside the outermost parens after `?`)
+    //  5 – optional `/*phi*/` marker (ignored for rewrite legality)
+    //  6 – old-value variable name
+    let re = Regex::new(
+        r"^(\s*)(\S+) = (.+?) \? \((.*)\) : (/\*phi\*/)?(\S+);$"
+    ).expect("valid regex");
+    let if_assign_re = Regex::new(
+        r"^\s*if \((.+)\)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=.*;$",
+    )
+    .expect("valid regex");
+    let plain_assign_re = Regex::new(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=.*;$").expect("valid regex");
+    let ident_re = Regex::new(r"\b[A-Za-z_][A-Za-z0-9_]*\b").expect("valid regex");
+
+    // Track variables that are currently known to be conditionally assigned on
+    // a specific predicate guard (`if (pred) v = ...;`).
+    //
+    // This allows a conservative rewrite of suspicious forms like
+    // `v177 = !b41 ? (shmem_u8[v176]) : v176;` where `v176` was only assigned
+    // under `if (!b41)` right above. Emitting an if-guard avoids fabricating
+    // else-path dataflow from a value that does not exist on that path.
+    let mut conditional_assign_pred = HashMap::<String, String>::new();
+
+    let mut out = String::with_capacity(output.len());
+    for line in output.lines() {
+        if let Some(caps) = re.captures(line) {
+            let indent = &caps[1];
+            let dest = &caps[2];
+            let pred = &caps[3];
+            let rhs = &caps[4];
+            let has_phi_marker = caps.get(5).is_some();
+            let old = &caps[6];
+            let pred_norm = normalize_predicate_text(pred);
+
+            let old_is_cond_defined_on_same_pred = conditional_assign_pred
+                .get(old)
+                .map_or(false, |p| p == &pred_norm);
+            let old_is_cond_defined_any = conditional_assign_pred.contains_key(old);
+            let rhs_uses_cond_defined_same_pred = ident_re.find_iter(rhs).any(|m| {
+                conditional_assign_pred
+                    .get(m.as_str())
+                    .map_or(false, |p| p == &pred_norm)
+            });
+            let rhs_uses_cond_defined_any = ident_re
+                .find_iter(rhs)
+                .any(|m| conditional_assign_pred.contains_key(m.as_str()));
+
+            if dest == old
+                || has_phi_marker
+                || old_is_cond_defined_on_same_pred
+                || rhs_uses_cond_defined_same_pred
+                || old_is_cond_defined_any
+                || rhs_uses_cond_defined_any
+            {
+                // Self-referencing or phi-marked ternary → if-guard.
+                out.push_str(&format!(
+                    "{}if ({}) {} = {};\n",
+                    indent, pred, dest, rhs
+                ));
+                conditional_assign_pred.insert(dest.to_string(), pred_norm);
+                continue;
+            }
+
+            // Keep genuine select; this defines dest unconditionally.
+            conditional_assign_pred.remove(dest);
+        }
+
+        if let Some(caps) = if_assign_re.captures(line) {
+            let pred_norm = normalize_predicate_text(caps.get(1).expect("pred").as_str());
+            let dest = caps.get(2).expect("dest").as_str().to_string();
+            conditional_assign_pred.insert(dest, pred_norm);
+        } else if let Some(caps) = plain_assign_re.captures(line) {
+            let dest = caps.get(1).expect("dest").as_str();
+            conditional_assign_pred.remove(dest);
+        }
+
+        out.push_str(line);
+        out.push('\n');
+    }
+    // Remove trailing newline if the original didn't end with one.
+    if !output.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+fn simplify_predicated_only_ternaries_with_gated_uses(output: &str) -> String {
+    let lines: Vec<&str> = output.lines().collect();
+    if lines.is_empty() {
+        return output.to_string();
+    }
+
+    let ternary_re = Regex::new(r"^(\s*)(\S+) = (.+?) \? \((.*)\) : (/\*phi\*/)?(\S+);$")
+        .expect("valid regex");
+    let if_assign_re = Regex::new(
+        r"^\s*if \((.+)\)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=.*;$",
+    )
+    .expect("valid regex");
+    let plain_assign_re = Regex::new(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=.*;$").expect("valid regex");
+    let ident_re = Regex::new(r"\b[A-Za-z_][A-Za-z0-9_]*\b").expect("valid regex");
+
+    let mut rewrite_line = vec![false; lines.len()];
+
+    for i in 0..lines.len() {
+        let Some(caps) = ternary_re.captures(lines[i]) else {
+            continue;
+        };
+        let dest = caps.get(2).expect("dest").as_str();
+        let pred_norm = normalize_predicate_text(caps.get(3).expect("pred").as_str());
+
+        let mut saw_use = false;
+        let mut only_gated_uses = true;
+
+        for line in lines.iter().skip(i + 1) {
+            if let Some(c) = if_assign_re.captures(line) {
+                if c.get(2).expect("dest").as_str() == dest {
+                    break;
+                }
+            } else if let Some(c) = plain_assign_re.captures(line) {
+                if c.get(1).expect("dest").as_str() == dest {
+                    break;
+                }
+            }
+
+            let uses_dest = ident_re.find_iter(line).any(|m| m.as_str() == dest);
+            if !uses_dest {
+                continue;
+            }
+            saw_use = true;
+
+            let gated_by_same_pred_if = if_assign_re.captures(line).map_or(false, |c| {
+                normalize_predicate_text(c.get(1).expect("pred").as_str()) == pred_norm
+            });
+            let gated_by_same_pred_ternary = ternary_re.captures(line).map_or(false, |c| {
+                normalize_predicate_text(c.get(3).expect("pred").as_str()) == pred_norm
+            });
+
+            if !(gated_by_same_pred_if || gated_by_same_pred_ternary) {
+                only_gated_uses = false;
+                break;
+            }
+        }
+
+        if saw_use && only_gated_uses {
+            rewrite_line[i] = true;
+        }
+    }
+
+    let mut out = String::with_capacity(output.len());
+    for (i, line) in lines.iter().enumerate() {
+        if rewrite_line[i] {
+            if let Some(caps) = ternary_re.captures(line) {
+                let indent = caps.get(1).expect("indent").as_str();
+                let dest = caps.get(2).expect("dest").as_str();
+                let pred = caps.get(3).expect("pred").as_str();
+                let rhs = caps.get(4).expect("rhs").as_str();
+                out.push_str(&format!("{}if ({}) {} = {};\n", indent, pred, dest, rhs));
+                continue;
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+
+    if !output.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+fn normalize_predicate_text(pred: &str) -> String {
+    pred.split_whitespace().collect::<String>()
+}
+
+fn merge_pred_old_token_mapping(
+    token_map: &mut HashMap<String, String>,
+    old_tok: String,
+    dest_name: &str,
+) {
+    match token_map.get(&old_tok) {
+        None => {
+            token_map.insert(old_tok, dest_name.to_string());
+        }
+        Some(existing) if existing == dest_name => {
+            // Already mapped consistently.
+        }
+        Some(_) => {
+            // Keep existing mapping. Overwriting would conflate different
+            // recovered names and can create unsound dataflow in output.
+        }
+    }
 }
 
 fn rewrite_control_guard_predicates(output: &str, pred_map: &HashMap<String, String>) -> String {
@@ -862,6 +1120,84 @@ mod tests {
         assert!(out.output.contains("phi merge:"));
         // live-ins summary is emitted only when cross-name phi inputs exist.
         // Keep phi-merge comments as the strict opt-in contract here.
+    }
+
+    #[test]
+    fn simplify_predicated_ternary_rewrites_only_self_reference() {
+        let input = "  v1 = !b0 ? (v1 + 1) : v1;\n";
+        let out = simplify_predicated_ternaries(input);
+        assert_eq!(out, "  if (!b0) v1 = v1 + 1;\n");
+    }
+
+    #[test]
+    fn simplify_predicated_ternary_rewrites_phi_marked_non_self() {
+        let input = "  v177 = !b41 ? (v175 & 255) : /*phi*/v176;\n";
+        let out = simplify_predicated_ternaries(input);
+        assert_eq!(out, "  if (!b41) v177 = v175 & 255;\n");
+    }
+
+    #[test]
+    fn simplify_predicated_ternary_rewrites_when_old_only_exists_under_same_predicate() {
+        let input =
+            "  if (!b41) v176 = v175 & 255;\n  v177 = !b41 ? (shmem_u8[v176]) : v176;\n";
+        let out = simplify_predicated_ternaries(input);
+        assert_eq!(
+            out,
+            "  if (!b41) v176 = v175 & 255;\n  if (!b41) v177 = shmem_u8[v176];\n"
+        );
+    }
+
+    #[test]
+    fn simplify_predicated_ternary_rewrites_when_rhs_depends_on_conditional_value() {
+        let input =
+            "  if (!b47) v217 = *((uint8_t*)addr64(v215, v216));\n  v8 = !b47 ? (v217 ^ v6) : v217;\n";
+        let out = simplify_predicated_ternaries(input);
+        assert_eq!(
+            out,
+            "  if (!b47) v217 = *((uint8_t*)addr64(v215, v216));\n  if (!b47) v8 = v217 ^ v6;\n"
+        );
+    }
+
+    #[test]
+    fn simplify_predicated_ternary_rewrites_when_old_is_any_conditional_value() {
+        let input =
+            "  if (!b43) v179 = *((uint8_t*)(addr64(v163, v164) + 1));\n  v193 = !b4 ? (*((uint8_t*)(addr64(v163, v164) + 2))) : v179;\n";
+        let out = simplify_predicated_ternaries(input);
+        assert_eq!(
+            out,
+            "  if (!b43) v179 = *((uint8_t*)(addr64(v163, v164) + 1));\n  if (!b4) v193 = *((uint8_t*)(addr64(v163, v164) + 2));\n"
+        );
+    }
+
+    #[test]
+    fn simplify_predicated_ternary_rewrites_predicated_only_chain() {
+        let input = "  v201 = !b4 ? (v200 & 255) : v200;\n  v202 = !b4 ? (shmem_u8[v201]) : v201;\n  if (!b4) v16 = v193 ^ v202;\n";
+        let out = simplify_predicated_ternaries(input);
+        assert_eq!(
+            out,
+            "  if (!b4) v201 = v200 & 255;\n  if (!b4) v202 = shmem_u8[v201];\n  if (!b4) v16 = v193 ^ v202;\n"
+        );
+    }
+
+    #[test]
+    fn simplify_predicated_ternary_rewrites_bb13_v225_else_use_after_chain_rewrite() {
+        let input =
+            "  v225 = !b47 ? (v224 & 255) : v224;\n  if (!b47) v6 = shmem_u8[v225];\n  v3 = !b47 ? (v213) : v225;\n";
+        let out = simplify_predicated_ternaries(input);
+        assert_eq!(
+            out,
+            "  if (!b47) v225 = v224 & 255;\n  if (!b47) v6 = shmem_u8[v225];\n  if (!b47) v3 = v213;\n"
+        );
+    }
+
+    #[test]
+    fn merge_pred_old_token_mapping_does_not_overwrite_conflict() {
+        let mut token_map = HashMap::new();
+        token_map.insert("R2.7".to_string(), "v9".to_string());
+
+        merge_pred_old_token_mapping(&mut token_map, "R2.7".to_string(), "v3");
+
+        assert_eq!(token_map.get("R2.7").map(String::as_str), Some("v9"));
     }
 
     #[test]

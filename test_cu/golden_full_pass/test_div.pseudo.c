@@ -72,7 +72,7 @@ void kernel(int32_t arg0, int32_t arg1, uint32_t arg2, uint32_t arg3) {
     u1 = arg1;
     u2 = u0 ^ u1;
     v2 = i2f_rp(v1);
-    b0 = 0 <= u2;
+    b0 = (int32_t)(0) <= (int32_t)(u2);
     u3 = c[0x0][0x118];
     u4 = ConstMem(0, 284);
     v3 = rcp_approx(v2);
@@ -88,15 +88,15 @@ void kernel(int32_t arg0, int32_t arg1, uint32_t arg2, uint32_t arg3) {
     v13 = -v12 + 0 + 0;
     v14 = v1 * v13 + v9;
     b1 = v1 > v14;
-    if (!b1) v15 = v14 - v1;
-    if (!b1) v16 = v12 + 1;
+    v15 = !b1 ? (v14 - v1) : v14;
+    v16 = !b1 ? (v12 + 1) : v12;
     b2 = 0 != arg1;
     b3 = v15 >= v1;
-    if (b3) v17 = v16 + 1;
+    v17 = b3 ? (v16 + 1) : v16;
     v18 = v17;
     v19 = arg3;
-    if (!b0) v20 = -v18 + 0 + 0;
-    if (!b2) v21 = ~arg1;
+    v20 = !b0 ? (-v18 + 0 + 0) : v18;
+    v21 = !b2 ? (~arg1) : v20;
     *addr64(v11, v19) = v21;
   }
   return;

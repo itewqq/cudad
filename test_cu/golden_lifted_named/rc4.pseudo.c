@@ -3,22 +3,22 @@ BB0 {
   v1 = blockIdx.x;
 }
 // Condition from BB0
-if (!(v1 >= ConstMem(0, 388))) {
+if (!((int32_t)(v1) >= (int32_t)(ConstMem(0, 388)))) {
   BB1 {
     v2 = threadIdx.x;
     u0 = ConstMem(0, 280);
     u1 = ConstMem(0, 284);
-    b1 = v2 > 255;
+    b1 = (int32_t)(v2) > (int32_t)(255);
     b2 = v2 != 0;
   }
   // Condition from BB1
-  if (!(v2 > 255)) {
+  if (!((int32_t)(v2) > (int32_t)(255))) {
     BB2 {
       shmem_u8[v2] = v2;
       v2 = v2 + ConstMem(0, 0);
     }
     // Loop header BB2
-    while (!(v2 >= 256)) {
+    while (!((int32_t)(v2) >= (int32_t)(256))) {
       BB2 {
         shmem_u8[v2] = v2;
         v2 = v2 + ConstMem(0, 0);
@@ -48,18 +48,18 @@ if (!(v1 >= ConstMem(0, 388))) {
       v22 = abs(v2);
       v23 = shmem_u8[v2];
       v24 = abs(ConstMem(0, 360));
-      b5 = v2 >= 0;
+      b5 = (int32_t)(v2) >= (int32_t)(0);
       v25 = mul_hi_u32(v12, v22);
       v26 = i2f_rp(v24);
       v25 = -v25;
       v27 = v24 * v25 + v22;
       b6 = v3 > v27;
       v28 = rcp_approx(v26);
-      if (!b6) v29 = v27 - v24;
+      v29 = !b6 ? (v27 - v24) : v27;
       b7 = v3 > v29;
       v30 = v28 + 268435454;
       v31 = f2i_trunc_u32_ftz_ntz(v30);
-      if (!b7) v32 = v29 - v24;
+      v32 = !b7 ? (v29 - v24) : v29;
       b8 = 0 != ConstMem(0, 360);
       v33 = v32;
       v34 = ~ConstMem(0, 360);
@@ -74,7 +74,7 @@ if (!(v1 >= ConstMem(0, 388))) {
       v41 = 0;
       v42 = v39 * v24 + 0;
       v43 = abs(v40);
-      b10 = v40 >= 0;
+      b10 = (int32_t)(v40) >= (int32_t)(0);
       v12 = mul_hi_u32(v31, v42) + v41;
       v44 = v43;
       v45 = mul_hi_u32(v12, v44);
@@ -82,9 +82,9 @@ if (!(v1 >= ConstMem(0, 388))) {
       v46 = v24 * v45 + v44;
       v3 = v24;
       b11 = v3 > v46;
-      if (!b11) v47 = v46 - v24;
+      v47 = !b11 ? (v46 - v24) : v46;
       b12 = v3 > v47;
-      if (!b12) v48 = v47 - v24;
+      v48 = !b12 ? (v47 - v24) : v47;
       if (!b10) v48 = -v48;
       v49 = !b8 ? v34 : v48;
       b13 = carry_u32_add3(v49, ConstMem(0, 352), 0);
@@ -93,14 +93,14 @@ if (!(v1 >= ConstMem(0, 388))) {
       v52 = *((uint8_t*)addr64(v50, v51));
       v53 = v2 + 2;
       v54 = abs(v53);
-      b14 = v53 >= 0;
+      b14 = (int32_t)(v53) >= (int32_t)(0);
       v55 = mul_hi_u32(v12, v54);
       v55 = -v55;
       v56 = v24 * v55 + v54;
       b15 = v3 > v56;
-      if (!b15) v57 = v56 - v24;
+      v57 = !b15 ? (v56 - v24) : v56;
       b16 = v3 > v57;
-      if (!b16) v58 = v57 - v24;
+      v58 = !b16 ? (v57 - v24) : v57;
       if (!b14) v58 = -v58;
       v59 = !b8 ? v34 : v58;
       b17 = carry_u32_add3(v59, ConstMem(0, 352), 0);
@@ -109,14 +109,14 @@ if (!(v1 >= ConstMem(0, 388))) {
       v62 = *((uint8_t*)addr64(v60, v61));
       v63 = v2 + 3;
       v64 = abs(v63);
-      b18 = v63 >= 0;
+      b18 = (int32_t)(v63) >= (int32_t)(0);
       v65 = mul_hi_u32(v12, v64);
       v65 = -v65;
       v66 = v24 * v65 + v64;
       b19 = v3 > v66;
-      if (!b19) v67 = v66 - v24;
+      v67 = !b19 ? (v66 - v24) : v66;
       b20 = v3 > v67;
-      if (!b20) v68 = v67 - v24;
+      v68 = !b20 ? (v67 - v24) : v67;
       if (!b18) v68 = -v68;
       v69 = !b8 ? v34 : v68;
       v70 = v38 + v4 + v23;
@@ -131,17 +131,17 @@ if (!(v1 >= ConstMem(0, 388))) {
       v78 = v2 + 4;
       v79 = shmem_u8[v77];
       v80 = abs(v78);
-      b22 = v78 >= 0;
+      b22 = (int32_t)(v78) >= (int32_t)(0);
       v81 = mul_hi_u32(v12, v80);
       v81 = -v81;
       v82 = v24 * v81 + v80;
       b23 = v3 > v82;
-      if (!b23) v83 = v82 - v24;
+      v83 = !b23 ? (v82 - v24) : v82;
       b24 = v3 > v83;
       shmem_u8[v2] = v79;
       shmem_u8[v77] = v23;
       v84 = shmem_u8[v2 + 1];
-      if (!b24) v85 = v83 - v24;
+      v85 = !b24 ? (v83 - v24) : v83;
       if (!b22) v85 = -v85;
       v86 = !b8 ? v34 : v85;
       b25 = carry_u32_add3(v86, ConstMem(0, 352), 0);
@@ -156,17 +156,17 @@ if (!(v1 >= ConstMem(0, 388))) {
       v95 = v2 + 5;
       v96 = shmem_u8[v94];
       v97 = abs(v95);
-      b26 = v95 >= 0;
+      b26 = (int32_t)(v95) >= (int32_t)(0);
       v98 = mul_hi_u32(v12, v97);
       v98 = -v98;
       v99 = v24 * v98 + v97;
       b27 = v3 > v99;
-      if (!b27) v100 = v99 - v24;
+      v100 = !b27 ? (v99 - v24) : v99;
       b28 = v3 > v100;
       shmem_u8[v2 + 1] = v96;
       shmem_u8[v94] = v84;
       v101 = shmem_u8[v2 + 2];
-      if (!b28) v102 = v100 - v24;
+      v102 = !b28 ? (v100 - v24) : v100;
       if (!b26) v102 = -v102;
       v103 = !b8 ? v34 : v102;
       b29 = carry_u32_add3(v103, ConstMem(0, 352), 0);
@@ -188,10 +188,10 @@ if (!(v1 >= ConstMem(0, 388))) {
       shmem_u8[v2 + 2] = v111;
       shmem_u8[v14] = v101;
       v13 = shmem_u8[v2 + 3];
-      if (!b30) v116 = v115 - v24;
-      b31 = v112 >= 0;
+      v116 = !b30 ? (v115 - v24) : v115;
+      b31 = (int32_t)(v112) >= (int32_t)(0);
       b32 = v3 > v116;
-      if (!b32) v117 = v116 - v24;
+      v117 = !b32 ? (v116 - v24) : v116;
       if (!b31) v117 = -v117;
       v118 = !b8 ? v34 : v117;
       b33 = carry_u32_add3(v118, ConstMem(0, 352), 0);
@@ -213,10 +213,10 @@ if (!(v1 >= ConstMem(0, 388))) {
       shmem_u8[v2 + 3] = v126;
       shmem_u8[v15] = v13;
       v131 = shmem_u8[v2 + 4];
-      if (!b34) v132 = v130 - v24;
-      b3 = v127 >= 0;
+      v132 = !b34 ? (v130 - v24) : v130;
+      b3 = (int32_t)(v127) >= (int32_t)(0);
       b4 = v3 > v132;
-      if (!b4) v17 = v132 - v24;
+      v17 = !b4 ? (v132 - v24) : v132;
       if (!b3) v17 = -v17;
       v133 = !b8 ? v34 : v17;
       b35 = carry_u32_add3(v133, ConstMem(0, 352), 0);
@@ -266,18 +266,18 @@ if (!(v1 >= ConstMem(0, 388))) {
         v22 = abs(v2);
         v23 = shmem_u8[v2];
         v24 = abs(ConstMem(0, 360));
-        b5 = v2 >= 0;
+        b5 = (int32_t)(v2) >= (int32_t)(0);
         v25 = mul_hi_u32(v12, v22);
         v26 = i2f_rp(v24);
         v25 = -v25;
         v27 = v24 * v25 + v22;
         b6 = v3 > v27;
         v28 = rcp_approx(v26);
-        if (!b6) v29 = v27 - v24;
+        v29 = !b6 ? (v27 - v24) : v27;
         b7 = v3 > v29;
         v30 = v28 + 268435454;
         v31 = f2i_trunc_u32_ftz_ntz(v30);
-        if (!b7) v32 = v29 - v24;
+        v32 = !b7 ? (v29 - v24) : v29;
         b8 = 0 != ConstMem(0, 360);
         v33 = v32;
         v34 = ~ConstMem(0, 360);
@@ -292,7 +292,7 @@ if (!(v1 >= ConstMem(0, 388))) {
         v41 = 0;
         v42 = v39 * v24 + 0;
         v43 = abs(v40);
-        b10 = v40 >= 0;
+        b10 = (int32_t)(v40) >= (int32_t)(0);
         v12 = mul_hi_u32(v31, v42) + v41;
         v44 = v43;
         v45 = mul_hi_u32(v12, v44);
@@ -300,9 +300,9 @@ if (!(v1 >= ConstMem(0, 388))) {
         v46 = v24 * v45 + v44;
         v3 = v24;
         b11 = v3 > v46;
-        if (!b11) v47 = v46 - v24;
+        v47 = !b11 ? (v46 - v24) : v46;
         b12 = v3 > v47;
-        if (!b12) v48 = v47 - v24;
+        v48 = !b12 ? (v47 - v24) : v47;
         if (!b10) v48 = -v48;
         v49 = !b8 ? v34 : v48;
         b13 = carry_u32_add3(v49, ConstMem(0, 352), 0);
@@ -311,14 +311,14 @@ if (!(v1 >= ConstMem(0, 388))) {
         v52 = *((uint8_t*)addr64(v50, v51));
         v53 = v2 + 2;
         v54 = abs(v53);
-        b14 = v53 >= 0;
+        b14 = (int32_t)(v53) >= (int32_t)(0);
         v55 = mul_hi_u32(v12, v54);
         v55 = -v55;
         v56 = v24 * v55 + v54;
         b15 = v3 > v56;
-        if (!b15) v57 = v56 - v24;
+        v57 = !b15 ? (v56 - v24) : v56;
         b16 = v3 > v57;
-        if (!b16) v58 = v57 - v24;
+        v58 = !b16 ? (v57 - v24) : v57;
         if (!b14) v58 = -v58;
         v59 = !b8 ? v34 : v58;
         b17 = carry_u32_add3(v59, ConstMem(0, 352), 0);
@@ -327,14 +327,14 @@ if (!(v1 >= ConstMem(0, 388))) {
         v62 = *((uint8_t*)addr64(v60, v61));
         v63 = v2 + 3;
         v64 = abs(v63);
-        b18 = v63 >= 0;
+        b18 = (int32_t)(v63) >= (int32_t)(0);
         v65 = mul_hi_u32(v12, v64);
         v65 = -v65;
         v66 = v24 * v65 + v64;
         b19 = v3 > v66;
-        if (!b19) v67 = v66 - v24;
+        v67 = !b19 ? (v66 - v24) : v66;
         b20 = v3 > v67;
-        if (!b20) v68 = v67 - v24;
+        v68 = !b20 ? (v67 - v24) : v67;
         if (!b18) v68 = -v68;
         v69 = !b8 ? v34 : v68;
         v70 = v38 + v4 + v23;
@@ -349,17 +349,17 @@ if (!(v1 >= ConstMem(0, 388))) {
         v78 = v2 + 4;
         v79 = shmem_u8[v77];
         v80 = abs(v78);
-        b22 = v78 >= 0;
+        b22 = (int32_t)(v78) >= (int32_t)(0);
         v81 = mul_hi_u32(v12, v80);
         v81 = -v81;
         v82 = v24 * v81 + v80;
         b23 = v3 > v82;
-        if (!b23) v83 = v82 - v24;
+        v83 = !b23 ? (v82 - v24) : v82;
         b24 = v3 > v83;
         shmem_u8[v2] = v79;
         shmem_u8[v77] = v23;
         v84 = shmem_u8[v2 + 1];
-        if (!b24) v85 = v83 - v24;
+        v85 = !b24 ? (v83 - v24) : v83;
         if (!b22) v85 = -v85;
         v86 = !b8 ? v34 : v85;
         b25 = carry_u32_add3(v86, ConstMem(0, 352), 0);
@@ -374,17 +374,17 @@ if (!(v1 >= ConstMem(0, 388))) {
         v95 = v2 + 5;
         v96 = shmem_u8[v94];
         v97 = abs(v95);
-        b26 = v95 >= 0;
+        b26 = (int32_t)(v95) >= (int32_t)(0);
         v98 = mul_hi_u32(v12, v97);
         v98 = -v98;
         v99 = v24 * v98 + v97;
         b27 = v3 > v99;
-        if (!b27) v100 = v99 - v24;
+        v100 = !b27 ? (v99 - v24) : v99;
         b28 = v3 > v100;
         shmem_u8[v2 + 1] = v96;
         shmem_u8[v94] = v84;
         v101 = shmem_u8[v2 + 2];
-        if (!b28) v102 = v100 - v24;
+        v102 = !b28 ? (v100 - v24) : v100;
         if (!b26) v102 = -v102;
         v103 = !b8 ? v34 : v102;
         b29 = carry_u32_add3(v103, ConstMem(0, 352), 0);
@@ -406,10 +406,10 @@ if (!(v1 >= ConstMem(0, 388))) {
         shmem_u8[v2 + 2] = v111;
         shmem_u8[v14] = v101;
         v13 = shmem_u8[v2 + 3];
-        if (!b30) v116 = v115 - v24;
-        b31 = v112 >= 0;
+        v116 = !b30 ? (v115 - v24) : v115;
+        b31 = (int32_t)(v112) >= (int32_t)(0);
         b32 = v3 > v116;
-        if (!b32) v117 = v116 - v24;
+        v117 = !b32 ? (v116 - v24) : v116;
         if (!b31) v117 = -v117;
         v118 = !b8 ? v34 : v117;
         b33 = carry_u32_add3(v118, ConstMem(0, 352), 0);
@@ -431,10 +431,10 @@ if (!(v1 >= ConstMem(0, 388))) {
         shmem_u8[v2 + 3] = v126;
         shmem_u8[v15] = v13;
         v131 = shmem_u8[v2 + 4];
-        if (!b34) v132 = v130 - v24;
-        b3 = v127 >= 0;
+        v132 = !b34 ? (v130 - v24) : v130;
+        b3 = (int32_t)(v127) >= (int32_t)(0);
         b4 = v3 > v132;
-        if (!b4) v17 = v132 - v24;
+        v17 = !b4 ? (v132 - v24) : v132;
         if (!b3) v17 = -v17;
         v133 = !b8 ? v34 : v17;
         b35 = carry_u32_add3(v133, ConstMem(0, 352), 0);
@@ -490,7 +490,7 @@ if (!(v1 >= ConstMem(0, 388))) {
       v154 = ConstMem(0, 384);
     }
     // Condition from BB7
-    if (v154 >= 1) {
+    if ((int32_t)(v154) >= (int32_t)(1)) {
       BB8 {
         v155 = v154 - 1;
         u2 = 0;
@@ -516,7 +516,7 @@ if (!(v1 >= ConstMem(0, 388))) {
         }
         BB10 {
           v162 = v6 - 3;
-          b41 = v162 >= v157;
+          b41 = (int32_t)(v162) >= (int32_t)(v157);
           b42 = carry_u32_add3(v14, u3, 0);
           v163 = v14 + u3;
           v164 = v13 + u4 + (b42 ? 1 : 0);
@@ -534,7 +534,7 @@ if (!(v1 >= ConstMem(0, 388))) {
           v171 = v167 - v170;
           v172 = v6 - 2;
           v173 = shmem_u8[v171];
-          b43 = v172 >= v157;
+          b43 = (int32_t)(v172) >= (int32_t)(v157);
           b3 = carry_u32_add3(v14, u5, 0);
           v9 = v14 + u5;
           shmem_u8[u12] = v173;
@@ -565,7 +565,7 @@ if (!(v1 >= ConstMem(0, 388))) {
           v187 = v180 + v186;
           v188 = v6 - 1;
           if (!b43) v189 = v187 & 255;
-          b4 = v188 >= v157;
+          b4 = (int32_t)(v188) >= (int32_t)(v157);
           if (!b43) v190 = shmem_u8[v189];
           u18 = u17 + 1;
           u19 = ((int32_t)u18) >> 31;
@@ -577,7 +577,7 @@ if (!(v1 >= ConstMem(0, 388))) {
           if (!b43) *((uint8_t*)(addr64(v9, v8) + 1)) = v192;
           if (!b4) v193 = *((uint8_t*)(addr64(v163, v164) + 2));
           v194 = v160 + v191;
-          b44 = v6 >= v157;
+          b44 = (int32_t)(v6) >= (int32_t)(v157);
           v195 = ((int32_t)v194) >> 31;
           v196 = hi32(v195 + (v194 << 8));
           v197 = v196 & 4294967040;
@@ -626,7 +626,7 @@ if (!(v1 >= ConstMem(0, 388))) {
         while (v21 != 0) {
           BB10 {
             v162 = v6 - 3;
-            b41 = v162 >= v157;
+            b41 = (int32_t)(v162) >= (int32_t)(v157);
             b42 = carry_u32_add3(v14, u3, 0);
             v163 = v14 + u3;
             v164 = v13 + u4 + (b42 ? 1 : 0);
@@ -644,7 +644,7 @@ if (!(v1 >= ConstMem(0, 388))) {
             v171 = v167 - v170;
             v172 = v6 - 2;
             v173 = shmem_u8[v171];
-            b43 = v172 >= v157;
+            b43 = (int32_t)(v172) >= (int32_t)(v157);
             b3 = carry_u32_add3(v14, u5, 0);
             v9 = v14 + u5;
             shmem_u8[u12] = v173;
@@ -675,7 +675,7 @@ if (!(v1 >= ConstMem(0, 388))) {
             v187 = v180 + v186;
             v188 = v6 - 1;
             if (!b43) v189 = v187 & 255;
-            b4 = v188 >= v157;
+            b4 = (int32_t)(v188) >= (int32_t)(v157);
             if (!b43) v190 = shmem_u8[v189];
             u18 = u17 + 1;
             u19 = ((int32_t)u18) >> 31;
@@ -687,7 +687,7 @@ if (!(v1 >= ConstMem(0, 388))) {
             if (!b43) *((uint8_t*)(addr64(v9, v8) + 1)) = v192;
             if (!b4) v193 = *((uint8_t*)(addr64(v163, v164) + 2));
             v194 = v160 + v191;
-            b44 = v6 >= v157;
+            b44 = (int32_t)(v6) >= (int32_t)(v157);
             v195 = ((int32_t)v194) >> 31;
             v196 = hi32(v195 + (v194 << 8));
             v197 = v196 & 4294967040;
@@ -748,7 +748,7 @@ if (!(v1 >= ConstMem(0, 388))) {
           v214 = v212 + ConstMem(0, 372) + (b46 ? 1 : 0);
         }
         BB13 {
-          b47 = v209 >= v157;
+          b47 = (int32_t)(v209) >= (int32_t)(v157);
           if (!b47) v215 = v211;
           if (!b47) v216 = v214;
           if (!b47) v217 = *((uint8_t*)addr64(v215, v216));
@@ -772,7 +772,7 @@ if (!(v1 >= ConstMem(0, 388))) {
           shmem_u8[u2] = v222;
           shmem_u8[v159] = v9;
           v223 = shmem_u8[u2];
-          if (!b47) v212 = v210;
+          v212 = !b47 ? (v210) : v222;
           b46 = carry_u32_add3(v210, 1, 0);
           v210 = v210 + 1;
           v224 = v9 + v223;
@@ -786,7 +786,7 @@ if (!(v1 >= ConstMem(0, 388))) {
         // Loop header BB13
         while (v156 != 0) {
           BB13 {
-            b47 = v209 >= v157;
+            b47 = (int32_t)(v209) >= (int32_t)(v157);
             if (!b47) v215 = v211;
             if (!b47) v216 = v214;
             if (!b47) v217 = *((uint8_t*)addr64(v215, v216));
@@ -810,7 +810,7 @@ if (!(v1 >= ConstMem(0, 388))) {
             shmem_u8[u2] = v222;
             shmem_u8[v159] = v9;
             v223 = shmem_u8[u2];
-            if (!b47) v212 = v210;
+            v212 = !b47 ? (v210) : v222;
             b46 = carry_u32_add3(v210, 1, 0);
             v210 = v210 + 1;
             v224 = v9 + v223;

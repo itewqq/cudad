@@ -5,7 +5,7 @@ BB0 {
   u1 = ConstMem(0, 356);
   u2 = u0 ^ u1;
   v2 = i2f_rp(v1);
-  b0 = 0 <= u2;
+  b0 = (int32_t)(0) <= (int32_t)(u2);
   u3 = ConstMem(0, 280);
   u4 = ConstMem(0, 284);
   v3 = rcp_approx(v2);
@@ -21,15 +21,15 @@ BB0 {
   v13 = -v12 + 0 + 0;
   v14 = v1 * v13 + v9;
   b1 = v1 > v14;
-  if (!b1) v15 = v14 - v1;
-  if (!b1) v16 = v12 + 1;
+  v15 = !b1 ? (v14 - v1) : v14;
+  v16 = !b1 ? (v12 + 1) : v12;
   b2 = 0 != ConstMem(0, 356);
   b3 = v15 >= v1;
-  if (b3) v17 = v16 + 1;
+  v17 = b3 ? (v16 + 1) : v16;
   v18 = v17;
   v19 = ConstMem(0, 364);
-  if (!b0) v20 = -v18 + 0 + 0;
-  if (!b2) v21 = ~ConstMem(0, 356);
+  v20 = !b0 ? (-v18 + 0 + 0) : v18;
+  v21 = !b2 ? (~ConstMem(0, 356)) : v20;
   *addr64(v11, v19) = v21;
 }
 return;

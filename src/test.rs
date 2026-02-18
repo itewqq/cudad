@@ -363,12 +363,14 @@ fn test_predicated_instruction_preserves_negated_sense() {
         /*0020*/ EXIT ;
     "#;
     let out = run_structured_output(sample);
+    // In the raw SSA path (without name recovery), predicated instructions
+    // with old values always render as ternary selects.  The self-referencing
+    // ternary → if-guard conversion happens later, during name recovery.
     assert!(
-        out.contains("if (!(P0.0))"),
-        "expected negated predicate to be preserved, got:\n{}",
+        out.contains("!(P0.0) ? (IADD3(") && out.contains(") : R2.0"),
+        "expected ternary select with negated predicate, got:\n{}",
         out
     );
-    assert!(out.contains("IADD3("));
 }
 
 fn run_structured_output(sass: &str) -> String {
@@ -580,7 +582,7 @@ fn infer_self_contained_locals_for_test(
 
     let mut out = Vec::<String>::new();
     if code_output.contains("shmem_u8[") && !declared.contains("shmem_u8") {
-        out.push("uint8_t shmem_u8[256];".to_string());
+        out.push("__shared__ uint8_t shmem_u8[256];".to_string());
     }
     for name in ordered {
         let is_bool = name.starts_with('b')

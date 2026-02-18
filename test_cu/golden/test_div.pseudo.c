@@ -19,15 +19,15 @@ BB0 {
   R0.2 = IADD3(-R3.2, RZ, RZ);
   R0.3 = IMAD(R5.0, R0.2, R4.1);
   P2.0 = ISETP.GT.U32.AND(PT, R5.0, R0.3, PT);
-  if (!(P2.0)) R0.4 = IMAD.IADD(R0.3, 1, -R5.0);
-  if (!(P2.0)) R3.3 = IADD3(R3.2, 1, RZ);
+  R0.4 = !(P2.0) ? (IMAD.IADD(R0.3, 1, -R5.0)) : R0.3;
+  R3.3 = !(P2.0) ? (IADD3(R3.2, 1, RZ)) : R3.2;
   P2.1 = ISETP.NE.AND(PT, RZ, ConstMem(0, 356), PT);
   P0.0 = ISETP.GE.U32.AND(PT, R0.4, R5.0, PT);
-  if (P0.0) R3.4 = IADD3(R3.3, 1, RZ);
+  R3.4 = P0.0 ? (IADD3(R3.3, 1, RZ)) : R3.3;
   R5.1 = IMAD.MOV.U32(RZ, RZ, R3.4);
   R3.5 = MOV(ConstMem(0, 364));
-  if (!(P1.0)) R5.2 = IADD3(-R5.1, RZ, RZ);
-  if (!(P2.1)) R5.3 = LOP3.LUT(RZ, ConstMem(0, 356), RZ, 51, !PT());
+  R5.2 = !(P1.0) ? (IADD3(-R5.1, RZ, RZ)) : R5.1;
+  R5.3 = !(P2.1) ? (LOP3.LUT(RZ, ConstMem(0, 356), RZ, 51, !PT())) : R5.2;
   _ = STG.E(*addr64(R2.2, R3.5), R5.3);
 }
 return;

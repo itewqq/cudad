@@ -16,7 +16,7 @@ void kernel(uint32_t arg9) {
   uint32_t R2;
   uint32_t UR6;
   uint32_t UR7;
-  uint8_t shmem_u8[256];
+  __shared__ uint8_t shmem_u8[256];
   uint32_t v0;
   uint32_t abi_internal_0x28; // live-in
   bool b0; // live-in
@@ -34,17 +34,17 @@ void kernel(uint32_t arg9) {
     tid_x = threadIdx.x;
     u0 = c[0x0][0x118];
     u1 = ConstMem(0, 284);
-    b1 = tid_x > 255;
+    b1 = (int32_t)(tid_x) > (int32_t)(255);
     b2 = tid_x != 0;
   }
   // Condition from BB1
-  if (!(tid_x > 255)) {
+  if (!((int32_t)(tid_x) > (int32_t)(255))) {
     BB2 {
       shmem_u8[tid_x] = tid_x;
       tid_x = tid_x + blockDimX;
     }
     // Loop header BB2
-    while (!(tid_x >= 256)) {
+    while (!((int32_t)(tid_x) >= (int32_t)(256))) {
       BB2 {
         shmem_u8[tid_x] = tid_x;
         tid_x = tid_x + blockDimX;

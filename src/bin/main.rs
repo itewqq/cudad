@@ -114,7 +114,7 @@ fn infer_self_contained_locals(
 
     let mut out = Vec::<String>::new();
     if code_output.contains("shmem_u8[") && !declared.contains("shmem_u8") {
-        out.push("uint8_t shmem_u8[256];".to_string());
+        out.push("__shared__ uint8_t shmem_u8[256];".to_string());
     }
     for name in ordered {
         let is_bool = name.starts_with('b')

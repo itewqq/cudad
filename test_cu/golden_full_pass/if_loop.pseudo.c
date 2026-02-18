@@ -140,7 +140,7 @@ void kernel(uint32_t arg0, uint32_t arg2, uintptr_t arg4_ptr, uint32_t arg6, uin
     v3 = ctaid_x * blockDimX + tid_x;
   }
   // Condition from BB0
-  if (!(v3 >= arg6)) {
+  if (!((int32_t)(v3) >= (int32_t)(arg6))) {
     BB1 {
       v4 = 4;
       u0 = c[0x0][0x118];
@@ -151,13 +151,13 @@ void kernel(uint32_t arg0, uint32_t arg2, uintptr_t arg4_ptr, uint32_t arg6, uin
       v9 = *addr64(v6, v4);
       v10 = arg7;
       v11 = ((int32_t)v3) >> 31;
-      b1 = v10 >= 1;
+      b1 = (int32_t)(v10) >= (int32_t)(1);
       v12 = v9 + v7;
       b2 = v12 > 1;
-      if (!b2) v13 = v9 * v7;
+      v13 = !b2 ? (v9 * v7) : v12;
     }
     // Condition from BB1
-    if (v10 >= 1) {
+    if ((int32_t)(v10) >= (int32_t)(1)) {
       BB2 {
         v5 = v10 - 1;
         v10 = v10 & 3;
@@ -168,13 +168,13 @@ void kernel(uint32_t arg0, uint32_t arg2, uintptr_t arg4_ptr, uint32_t arg6, uin
           v9 = -v10 + arg7;
         }
         // Condition from BB3
-        if (v9 > 0) {
+        if ((int32_t)(v9) > (int32_t)(0)) {
           BB4 {
-            b4 = v9 > 12;
+            b4 = (int32_t)(v9) > (int32_t)(12);
             b5 = PLOP3.LUT(PT, PT, PT, PT, 128, 0);
           }
           // Condition from BB4
-          if (v9 > 12) {
+          if ((int32_t)(v9) > (int32_t)(12)) {
             BB5 {
               b5 = PLOP3.LUT(PT, PT, PT, PT, 8, 0);
             }
@@ -183,7 +183,7 @@ void kernel(uint32_t arg0, uint32_t arg2, uintptr_t arg4_ptr, uint32_t arg6, uin
               b7 = v13 > 0.5;
               v9 = v9 - 16;
               v14 = b7 ? v4 : 0.8999999761581421;
-              b6 = v9 > 12;
+              b6 = (int32_t)(v9) > (int32_t)(12);
               v15 = v14 * v13;
               b8 = v15 > 0.5;
               v16 = b8 ? v4 : 0.8999999761581421;
@@ -232,13 +232,13 @@ void kernel(uint32_t arg0, uint32_t arg2, uintptr_t arg4_ptr, uint32_t arg6, uin
               v13 = v5 * v42;
             }
             // Loop header BB6
-            while (v9 > 12) {
+            while ((int32_t)(v9) > (int32_t)(12)) {
               BB6 {
                 v4 = 1066192077;
                 b7 = v13 > 0.5;
                 v9 = v9 - 16;
                 v14 = b7 ? v4 : 0.8999999761581421;
-                b6 = v9 > 12;
+                b6 = (int32_t)(v9) > (int32_t)(12);
                 v15 = v14 * v13;
                 b8 = v15 > 0.5;
                 v16 = b8 ? v4 : 0.8999999761581421;
@@ -297,7 +297,7 @@ void kernel(uint32_t arg0, uint32_t arg2, uintptr_t arg4_ptr, uint32_t arg6, uin
             }
           }
           // Condition from BB7
-          if (v9 > 4) {
+          if ((int32_t)(v9) > (int32_t)(4)) {
             BB8 {
               v4 = 1066192077;
               b22 = v13 > 0.5;

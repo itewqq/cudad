@@ -119,6 +119,11 @@ pub struct IRStatement{
     pub value:RValue,
     pub pred:Option<IRExpr>,
     pub mem_addr_args:Option<Vec<IRExpr>>,
+    /// For predicated non-branch instructions: the *previous* SSA version of
+    /// each def register (i.e. the value the register keeps when the predicate
+    /// is false).  Populated during SSA renaming so the renderer can emit
+    /// `dest = pred ? rhs : old;` instead of `if (pred) dest = rhs;`.
+    pub pred_old_defs:Vec<IRExpr>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -320,6 +325,17 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
         }
         slot.last().unwrap()
     }
+    fn find_entry_node(cfg: &ControlFlowGraph) -> Option<NodeIndex> {
+        let mut candidates = cfg
+            .node_indices()
+            .filter(|&n| cfg.neighbors_directed(n, Direction::Incoming).count() == 0)
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return cfg.node_indices().next();
+        }
+        candidates.sort_by_key(|&n| cfg[n].id);
+        candidates.first().copied()
+    }
     fn rename_expr(
         e: &mut IRExpr,
         stack: &mut HashMap<RegId, Vec<RegId>>,
@@ -348,6 +364,17 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
             }
             _ => {}
         }
+    }
+    fn parse_pred_reg_name(name: &str) -> Option<RegId> {
+        if let Some(num) = name.strip_prefix("UP") {
+            let idx = num.parse::<i32>().ok()?;
+            return Some(RegId::new("UP", idx, 1));
+        }
+        if let Some(num) = name.strip_prefix('P') {
+            let idx = num.parse::<i32>().ok()?;
+            return Some(RegId::new("P", idx, 1));
+        }
+        None
     }
 
     /* ---------- step-0: build IR blocks & defsites ---------- */
@@ -412,19 +439,14 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
             }
 
             let pred_expr = ins.pred.as_ref().and_then(|p| {
-                if p.reg.starts_with('P') {
-                    let idx = p.reg[1..].parse().ok()?;
-                    let base = IRExpr::Reg(RegId::new("P", idx, 1));
-                    if p.sense {
-                        Some(base)
-                    } else {
-                        Some(IRExpr::Op {
-                            op: "!".into(),
-                            args: vec![base],
-                        })
-                    }
+                let base = IRExpr::Reg(parse_pred_reg_name(&p.reg)?);
+                if p.sense {
+                    Some(base)
                 } else {
-                    None
+                    Some(IRExpr::Op {
+                        op: "!".into(),
+                        args: vec![base],
+                    })
                 }
             });
 
@@ -436,6 +458,7 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
                 },
                 pred: pred_expr,
                 mem_addr_args,
+                pred_old_defs: vec![],
             });
         }
 
@@ -447,10 +470,10 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
             match *e.weight() {
                 EdgeKind::CondBranch => {
                     if let Some(p) = last_pred {
-                        if let Ok(idx) = p.reg[1..].parse::<i32>() {
+                        if let Some(pred_reg) = parse_pred_reg_name(&p.reg) {
                             irdst.push((
                                 Some(IRCond::Pred {
-                                    reg: RegId::new("P", idx, 1),
+                                    reg: pred_reg,
                                     sense: p.sense,
                                 }),
                                 tgt_addr,
@@ -460,10 +483,10 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
                 }
                 EdgeKind::FallThrough => {
                     if let Some(p) = last_pred {
-                        if let Ok(idx) = p.reg[1..].parse::<i32>() {
+                        if let Some(pred_reg) = parse_pred_reg_name(&p.reg) {
                             irdst.push((
                                 Some(IRCond::Pred {
-                                    reg: RegId::new("P", idx, 1),
+                                    reg: pred_reg,
                                     sense: !p.sense,
                                 }),
                                 tgt_addr,
@@ -489,7 +512,7 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
     }
 
     /* ---------- step-1: DomTree + DF ---------- */
-    let entry = NodeIndex::new(0);
+    let entry = find_entry_node(cfg).unwrap_or_else(|| NodeIndex::new(0));
     let doms = simple_fast(cfg, entry);
     let mut idom = BTreeMap::<NodeIndex, NodeIndex>::new();
     for n in cfg.node_indices() {
@@ -497,7 +520,7 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
             idom.insert(n, i);
         }
     }
-    let df = compute_df(cfg, &idom);
+    let df = compute_df(cfg, &idom, entry);
 
     /* ---------- step-2: Φ placement ---------- */
     let mut phi_needed = BTreeSet::<(NodeIndex, RegId)>::new();
@@ -532,6 +555,7 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
                     value: RValue::Phi(placeholder),
                     pred: None,
                     mem_addr_args: None,
+                    pred_old_defs: vec![],
                 },
             );
     }
@@ -594,12 +618,20 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
                 }
 
                 if !matches!(stmt.value, RValue::Phi(_)) {
+                    let is_predicated = stmt.pred.is_some();
                     for def in &mut stmt.defs {
                         let cur = def.get_reg().unwrap().clone();
                         if is_immutable_reg(&cur) {
                             continue;
                         }
                         let k = base_reg(&cur);
+                        // For predicated instructions, record the *previous*
+                        // SSA version so the renderer can emit a conditional
+                        // select instead of an unconditional assignment.
+                        if is_predicated {
+                            let old = top_or_new(&k, stack, counter).clone();
+                            stmt.pred_old_defs.push(IRExpr::Reg(old));
+                        }
                         let new = IRExpr::Reg(new_ssa(&k, counter));
                         stack
                             .entry(k.clone())
@@ -668,7 +700,6 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
         }
     }
 
-    let entry = NodeIndex::new(0);
     rename(
         entry,
         cfg,
@@ -685,7 +716,7 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
 }
 
 /* ==================== DF helper ==================== */
-fn compute_df(cfg:&ControlFlowGraph,idom:&BTreeMap<NodeIndex,NodeIndex>)
+fn compute_df(cfg:&ControlFlowGraph,idom:&BTreeMap<NodeIndex,NodeIndex>, root: NodeIndex)
 ->HashMap<NodeIndex,BTreeSet<NodeIndex>>
 {
     let mut local=HashMap::<NodeIndex,BTreeSet<NodeIndex>>::new();
@@ -713,7 +744,6 @@ fn compute_df(cfg:&ControlFlowGraph,idom:&BTreeMap<NodeIndex,NodeIndex>)
         }
     }
     let mut df=local;
-    let root=cfg.node_indices().next().unwrap();
     up(root,&children,&mut df,idom);
     df
 }

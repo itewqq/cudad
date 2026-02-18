@@ -108,6 +108,10 @@ pub struct LiftedStmt {
     pub dest: String,
     pub pred: Option<LiftedExpr>,
     pub rhs: LiftedExpr,
+    /// The previous SSA value of the destination when the predicate is false.
+    /// Populated from `IRStatement::pred_old_defs` so the renderer can emit
+    /// `dest = pred ? rhs : pred_old_val` instead of `if (pred) dest = rhs`.
+    pub pred_old_val: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -149,6 +153,7 @@ pub fn lift_function_ir(function_ir: &FunctionIR, config: &SemanticLiftConfig<'_
                     .pred
                     .as_ref()
                     .map(|p| lift_ir_expr(p, stmt_ref, config));
+                // Store statements have no def register, so no pred_old_val.
                 out.by_def.insert(
                     DefRef {
                         block_id: block.id,
@@ -159,6 +164,7 @@ pub fn lift_function_ir(function_ir: &FunctionIR, config: &SemanticLiftConfig<'_
                         dest,
                         pred,
                         rhs,
+                        pred_old_val: None,
                     },
                 );
                 out.stats.lifted += 1;
@@ -177,6 +183,10 @@ pub fn lift_function_ir(function_ir: &FunctionIR, config: &SemanticLiftConfig<'_
                         .pred
                         .as_ref()
                         .map(|p| lift_ir_expr(p, stmt_ref, config));
+                    let pred_old_val = stmt
+                        .pred_old_defs
+                        .get(def_idx)
+                        .map(|d| render_expr_raw(d, stmt_ref, config));
                     out.by_def.insert(
                         DefRef {
                             block_id: block.id,
@@ -187,6 +197,7 @@ pub fn lift_function_ir(function_ir: &FunctionIR, config: &SemanticLiftConfig<'_
                             dest,
                             pred,
                             rhs,
+                            pred_old_val,
                         },
                     );
                     any_lifted = true;
@@ -732,10 +743,23 @@ fn lift_setp_compare(
         return None;
     }
     let cmp = cmp_token_to_op(opcode)?;
+
+    let mut lhs = lift_ir_expr(&args[1], stmt_ref, config);
+    let mut rhs = lift_ir_expr(&args[2], stmt_ref, config);
+
+    // For integer comparisons (ISETP): if the opcode does NOT contain `.U32`,
+    // the comparison is signed.  Wrap operands in `(int32_t)` casts for
+    // ordered comparisons (< <= > >=) so the C output has correct semantics
+    // (all locals are declared uint32_t).
+    if is_signed_int_compare(opcode) && is_ordered_cmp(cmp) {
+        lhs = signed_cast(lhs);
+        rhs = signed_cast(rhs);
+    }
+
     Some(LiftedExpr::Binary {
         op: cmp.to_string(),
-        lhs: Box::new(lift_ir_expr(&args[1], stmt_ref, config)),
-        rhs: Box::new(lift_ir_expr(&args[2], stmt_ref, config)),
+        lhs: Box::new(lhs),
+        rhs: Box::new(rhs),
     })
 }
 
@@ -1049,6 +1073,27 @@ fn cmp_token_to_op(opcode: &str) -> Option<&'static str> {
         return Some(op);
     }
     None
+}
+
+/// Returns `true` when the ISETP opcode uses signed comparison.
+/// ISETP without `.U32` is signed; ISETP with `.U32` is unsigned.
+/// FSETP is always floating-point (signedness N/A), so returns false.
+fn is_signed_int_compare(opcode: &str) -> bool {
+    let parts: Vec<&str> = opcode.split('.').collect();
+    if parts.first().map_or(true, |m| *m != "ISETP") {
+        return false;
+    }
+    !parts.iter().any(|p| *p == "U32")
+}
+
+/// Returns `true` for relational operators where signedness matters.
+fn is_ordered_cmp(op: &str) -> bool {
+    matches!(op, "<" | "<=" | ">" | ">=")
+}
+
+/// Wrap a lifted expression in an `(int32_t)` cast.
+fn signed_cast(expr: LiftedExpr) -> LiftedExpr {
+    LiftedExpr::Raw(format!("(int32_t)({})", expr.render()))
 }
 
 fn add_like_expr(lhs: LiftedExpr, rhs: LiftedExpr) -> LiftedExpr {
@@ -1558,7 +1603,8 @@ mod tests {
                 def_idx: 0,
             })
             .expect("expected lifted ISETP");
-        assert_eq!(lifted.rhs.render(), "R0.0 >= 1");
+        // ISETP.GE (no .U32) is signed → operands wrapped in (int32_t).
+        assert_eq!(lifted.rhs.render(), "(int32_t)(R0.0) >= (int32_t)(1)");
     }
 
     #[test]
