@@ -219,8 +219,37 @@ fn classify_operand(tok: &str) -> Operand {
     Operand::Raw(t.to_string())
 }
 
+/// Strip SM 120-style scheduling annotations from the operand region.
+///
+/// SM 120 SASS appends tokens like `&wr=0x0`, `&req={1,0}`, `?trans1`,
+/// `?WAIT5_END_GROUP` after the last operand but before the `;`.
+/// We truncate at the first `&` or `?` that is preceded by whitespace and
+/// followed by a letter — this avoids touching `&` inside bracket expressions
+/// such as `c[0x0][0x28]` or `[R4.64+0x20]`.
+fn strip_scheduling_annotations(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Only consider `&` or `?` preceded by at least one whitespace character.
+        if (bytes[i] == b'&' || bytes[i] == b'?')
+            && i > 0
+            && bytes[i - 1].is_ascii_whitespace()
+        {
+            // The next character must be an ASCII letter (scheduling keywords).
+            if i + 1 < bytes.len() && bytes[i + 1].is_ascii_alphabetic() {
+                // Walk backwards to strip trailing whitespace before the token.
+                let end = s[..i].trim_end().len();
+                return &s[..end];
+            }
+        }
+        i += 1;
+    }
+    s
+}
+
 fn parse_operands(input: &str) -> IResult<&str, Vec<Operand>> {
     let (rest, list) = take_until(";")(input)?;
+    let list = strip_scheduling_annotations(list);
     let ops = list
         .split(',')
         .map(str::trim)
@@ -343,4 +372,75 @@ pub fn parse_sm_version(text: &str) -> Option<u32> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── strip_scheduling_annotations ──────────────────────────────────
+
+    #[test]
+    fn strip_sched_single_wr() {
+        let input = " R1, c[0x0][0x37c]                                 &wr=0x0          ?trans8";
+        assert_eq!(strip_scheduling_annotations(input), " R1, c[0x0][0x37c]");
+    }
+
+    #[test]
+    fn strip_sched_req_and_wr() {
+        let input = " R12, desc[UR6][R4.64]                  &req={0} &wr=0x2 ?trans4";
+        assert_eq!(strip_scheduling_annotations(input), " R12, desc[UR6][R4.64]");
+    }
+
+    #[test]
+    fn strip_sched_wait_end_group() {
+        let input = " R7, R7, UR4, R0  &req={1}  ?WAIT5_END_GROUP";
+        assert_eq!(strip_scheduling_annotations(input), " R7, R7, UR4, R0");
+    }
+
+    #[test]
+    fn strip_sched_question_only() {
+        // Some SM 120 lines have only ?trans with no & token.
+        let input = " R0, R1                                                             ?WAIT12_END_GROUP";
+        assert_eq!(strip_scheduling_annotations(input), " R0, R1");
+    }
+
+    #[test]
+    fn strip_sched_preserves_brackets() {
+        // `&` inside brackets like c[0x0][0x28] must NOT be touched.
+        let input = " R1, c[0x0][0x28]";
+        assert_eq!(strip_scheduling_annotations(input), " R1, c[0x0][0x28]");
+    }
+
+    #[test]
+    fn strip_sched_no_annotations() {
+        let input = " R1, R2, R3";
+        assert_eq!(strip_scheduling_annotations(input), " R1, R2, R3");
+    }
+
+    // ── Full instruction parsing with annotations ─────────────────────
+
+    #[test]
+    fn parse_sm120_imad_with_annotations() {
+        let line =
+            "        /*0030*/                   IADD3 R1, PT, PT, R1, -0x100, RZ                      &req={0}         ?WAIT2_END_GROUP;  /* 0xffffff0001017810 */";
+        let instr = parse_instruction_line(line).expect("should parse");
+        assert_eq!(instr.opcode, "IADD3");
+        assert_eq!(instr.operands.len(), 6);
+        assert_eq!(instr.operands[0], Operand::Register { class: "R".into(), idx: 1, ty: None, sign: 1 });
+        assert_eq!(instr.operands[5], Operand::Register { class: "RZ".into(), idx: 0, ty: None, sign: 1 });
+    }
+
+    #[test]
+    fn parse_sm120_ldg_desc_with_multi_annotations() {
+        // This has both &req={0} &wr=0x2 plus ?trans4.
+        let line =
+            "        /*00d0*/                   LDG.E.CONSTANT R12, desc[UR6][R4.64]                  &req={0} &wr=0x2 ?trans4;           /* 0x00000006040c7981 */";
+        let instr = parse_instruction_line(line).expect("should parse");
+        assert_eq!(instr.opcode, "LDG.E.CONSTANT");
+        assert_eq!(instr.operands.len(), 2);
+        assert_eq!(instr.operands[0], Operand::Register { class: "R".into(), idx: 12, ty: None, sign: 1 });
+        // desc[UR6][R4.64] → Raw for now (Commit 2 will parse it as MemRef)
+        assert!(matches!(&instr.operands[1], Operand::Raw(s) if s.contains("desc")));
+    }
 }
