@@ -1617,11 +1617,24 @@ fn corpus_sm100_every_function_produces_non_empty_output() {
 fn corpus_sm100_output_contains_no_raw_convergence_barriers() {
     // SM 100 reliability-annotated forms (`BSSY.RECONVERGENT`,
     // `BSYNC.RELIABLE`, ...) must be folded away by the structurizer
-    // just like the legacy plain mnemonics.
+    // just like the legacy plain mnemonics.  We bias towards
+    // false-negative-free needles by anchoring on the convergence
+    // mnemonics in both their bare-token and dot-suffixed forms; the
+    // function-call form (`BSSY(...)`) is also banned because that is
+    // how an unfolded barrier shows up in the rendered pseudo-C.
+    //
+    // Suffix forms must cover *every* reliability tag the toolchain
+    // emits today (`BSSY.RECONVERGENT`, `BSSY.RELIABLE`, `BSYNC.*`,
+    // ...) plus the legacy plain mnemonics that pre-Blackwell dumps
+    // still produce, so we explicitly include `SSY.`/`SYNC.` even
+    // though SM 100 itself does not currently emit those.
     let banned = [
-        " BSSY ", " BSYNC ", " SSY ", " SYNC ",
-        "BSSY(", "BSYNC(", "WARPSYNC(",
-        "BSSY.", "BSYNC.",
+        // Bare tokens with leading/trailing whitespace.
+        " BSSY ", " BSYNC ", " SSY ", " SYNC ", " WARPSYNC ",
+        // Function-call form (rendered output of an unfolded barrier).
+        "BSSY(", "BSYNC(", "WARPSYNC(", "SSY(", "SYNC(",
+        // Suffix forms — `BSSY.RECONVERGENT`, `SYNC.RELIABLE`, ...
+        "BSSY.", "BSYNC.", "WARPSYNC.", "SSY.", "SYNC.",
     ];
     for (file, name, out) in run_corpus_sm100() {
         for needle in banned.iter() {
@@ -1669,24 +1682,80 @@ fn corpus_sm100_output_has_no_ssa_suffix_tokens() {
 
 #[test]
 fn corpus_sm100_resolves_blackwell_builtins() {
-    // The Blackwell ABI relocates `blockDim*` to c[0x0][0x360..0x378].
-    // Across the SM 100 corpus we expect at least one function to bind a
-    // builtin to its symbolic name (proves auto-detection of the
-    // BlackwellParam380 profile is reaching the rendered output, not just
-    // the explicit unit tests).
+    // The Blackwell ABI relocates `blockDim*` and `gridDim*` from
+    // `c[0x0][0x0..0x18]` to `c[0x0][0x360..0x378]`.  This test pins three
+    // overlapping invariants instead of the much weaker "at least one
+    // function across the entire corpus binds a builtin" check:
+    //
+    //   1. Every input file has at least one function that binds a
+    //      builtin.  Catches per-file regressions where one .sass dump
+    //      stops resolving while every other dump papers it over.
+    //   2. The overall fraction of bound functions stays above a floor
+    //      (currently 50/59 ~= 85%).  Catches a global drop where most
+    //      functions stop binding while a few test-friendly ones still
+    //      do.
+    //   3. The handful of functions that genuinely never reference
+    //      `blockDim*`/`gridDim*` in their SASS body is small and
+    //      stable.  If that count grows we either lost a binding or
+    //      added a corpus dump that needs reclassification.
+    //
+    // The current corpus baseline is 52/59 functions bound; the floor is
+    // set at 50 to leave a tiny amount of headroom for benign churn but
+    // still catch a real regression.
     let outputs = run_corpus_sm100();
-    let any_builtin = outputs.iter().any(|(_, _, out)| {
-        out.contains("blockDimX")
+    assert!(
+        !outputs.is_empty(),
+        "SM 100 corpus produced zero functions — fixture is broken"
+    );
+
+    let total = outputs.len();
+    let mut bound = 0usize;
+    let mut per_file: std::collections::BTreeMap<String, (usize, usize)> =
+        std::collections::BTreeMap::new();
+    for (file, _name, out) in &outputs {
+        let entry = per_file.entry((*file).to_string()).or_insert((0, 0));
+        entry.0 += 1;
+        let has_builtin = out.contains("blockDimX")
             || out.contains("blockDimY")
             || out.contains("blockDimZ")
             || out.contains("gridDimX")
             || out.contains("gridDimY")
-            || out.contains("gridDimZ")
-    });
+            || out.contains("gridDimZ");
+        if has_builtin {
+            bound += 1;
+            entry.1 += 1;
+        }
+    }
+
+    // Invariant 1: every file has at least one function binding a builtin.
+    let files_without_any: Vec<String> = per_file
+        .iter()
+        .filter_map(|(file, (_, with))| {
+            if *with == 0 {
+                Some(file.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
     assert!(
-        any_builtin,
-        "no Blackwell builtin (block/gridDim*) appeared in SM 100 corpus output — \
-         BlackwellParam380 profile likely failed to bind c[0x0][0x360..0x378]"
+        files_without_any.is_empty(),
+        "no Blackwell builtin (block/gridDim*) bound in these SM 100 files: {:?} \
+         — BlackwellParam380 profile likely failed to bind c[0x0][0x360..0x378]",
+        files_without_any
+    );
+
+    // Invariant 2: at least 50/59 functions bind a builtin (~85%).
+    // Tighten this threshold once the corpus stops growing.
+    const MIN_BOUND_FUNCTIONS: usize = 50;
+    assert!(
+        bound >= MIN_BOUND_FUNCTIONS,
+        "only {}/{} SM 100 functions bound a Blackwell builtin (floor: {}). \
+         A drop usually means BlackwellParam380 detection or builtin resolution \
+         regressed for a class of kernels.",
+        bound,
+        total,
+        MIN_BOUND_FUNCTIONS
     );
 }
 
