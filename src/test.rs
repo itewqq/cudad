@@ -1788,7 +1788,7 @@ fn corpus_sm100_goto_budget_is_loose() {
     //
     // The current SM 100 corpus baseline (as of 2026-04-08) is 46 total
     // gotos with a max of 26 per function (`multi_exit_loop`).  The
-    // ceilings below give roughly 30%-40% headroom over that baseline:
+    // ceilings below give roughly 15%-30% headroom over that baseline:
     // tight enough to catch a real explosion (e.g. 46 -> 200) and loose
     // enough to absorb benign churn from added rules or new corpus
     // dumps.  Tighten in lockstep with the structurizer once a per-fn

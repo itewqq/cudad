@@ -612,10 +612,10 @@ impl AbiProfile {
         Self::modern_param_160()
     }
 
-    /// Map a known SM major.minor (encoded as `sm * 10`) to the matching
-    /// ABI generation.  SM 100+ is Blackwell, 80..99 is modern, anything
-    /// older is legacy.
-    fn profile_for_sm(sm: u32) -> Self {
+    /// Map a known SM number to the matching ABI generation.
+    /// SM 100+ is Blackwell (param_base 0x380), 80–99 is modern
+    /// (param_base 0x160), anything older is legacy (param_base 0x140).
+    pub(crate) fn profile_for_sm(sm: u32) -> Self {
         if sm >= 100 {
             return Self::blackwell_param_380();
         }
