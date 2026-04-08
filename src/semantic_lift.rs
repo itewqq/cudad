@@ -2428,6 +2428,48 @@ mod tests {
     }
 
     #[test]
+    fn lifts_scalar_uldc_and_ldcu_to_symbolic_constmem() {
+        // Scalar ULDC/LDCU (no .64/.128 suffix) loads a single 32-bit
+        // uniform register.  Both should lift through the same path as
+        // the lo lane of a wide load.
+        let cases = [
+            ("ULDC UR5, c[0x0][0x0]", "blockDimX"),        // SM 89 builtin
+            ("LDCU UR5, c[0x0][0x360]", "blockDimX"),       // SM 100 builtin
+            ("LDCU UR4, c[0x0][0x390]", "param_4"),          // SM 100 param
+        ];
+        for (instr, want) in cases {
+            let sass = format!(
+                "/*0000*/ {} ;\n/*0010*/ EXIT ;\n",
+                instr
+            );
+            let profile = if instr.starts_with("LDCU") {
+                crate::abi::AbiProfile::blackwell_param_380()
+            } else {
+                crate::abi::AbiProfile::modern_param_160()
+            };
+            let out = run_lift_with_abi(&sass, profile);
+            let lifted = out
+                .by_def
+                .get(&DefRef {
+                    block_id: 0,
+                    stmt_idx: 0,
+                    def_idx: 0,
+                })
+                .unwrap_or_else(|| {
+                    panic!("scalar {} should be lifted, not raw", instr)
+                });
+            assert_eq!(
+                lifted.rhs.render(),
+                want,
+                "scalar {}: expected {} but got {}",
+                instr,
+                want,
+                lifted.rhs.render()
+            );
+        }
+    }
+
+    #[test]
     fn strict_iadd3_allows_exact_three_term_addition() {
         let sass = r#"
             /*0000*/ IADD3 R1, R2, R3, R4 ;
