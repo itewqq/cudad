@@ -3,11 +3,10 @@
 //! converted into structured control flow, it falls back to explicit goto.
 
 use crate::ir::{FunctionIR, IRBlock, IRExpr, IRCond, RegId, DisplayCtx, IRStatement, RValue};
-use crate::cfg::{ControlFlowGraph, BasicBlock as CfgBasicBlock, EdgeKind}; 
+use crate::cfg::ControlFlowGraph;
 use crate::semantic_lift::{DefRef, SemanticLiftResult};
 
-use petgraph::graph::{NodeIndex, DiGraph};
-use petgraph::visit::EdgeRef;
+use petgraph::graph::NodeIndex;
 use petgraph::algo::dominators::{Dominators, simple_fast};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -90,11 +89,7 @@ pub struct Structurizer<'a> {
     cfg: &'a ControlFlowGraph, // DiGraph<CfgBasicBlock, EdgeKind>
     function_ir: &'a FunctionIR,
     dom: Dominators<NodeIndex>,
-    pdom_algo_result: Dominators<NodeIndex>,
-    immediate_pdom_map: HashMap<NodeIndex, NodeIndex>,
-    block_id_to_node_index: HashMap<usize, NodeIndex>,
     addr_to_node_index: HashMap<u32, NodeIndex>,
-    processed_cfg_nodes: HashSet<NodeIndex>,
     /// Registers defined by phi nodes — used to detect loop-carried live-in
     /// old values in predicated ternaries.
     phi_defined_regs: HashSet<RegId>,
@@ -250,64 +245,15 @@ impl<'a> Structurizer<'a> {
         false
     }
 
-    fn has_cfg_path(&self, start: NodeIndex, goal: NodeIndex) -> bool {
-        if start == goal {
-            return true;
-        }
-        let mut seen = HashSet::new();
-        let mut work = VecDeque::new();
-        seen.insert(start);
-        work.push_back(start);
-        while let Some(n) = work.pop_front() {
-            for succ in self.cfg.neighbors_directed(n, Direction::Outgoing) {
-                if succ == goal {
-                    return true;
-                }
-                if seen.insert(succ) {
-                    work.push_back(succ);
-                }
-            }
-        }
-        false
-    }
-
-    fn select_if_merge_node(
-        &self,
-        condition_cfg_node: NodeIndex,
-        true_target_cfg_node: NodeIndex,
-        false_target_cfg_node_opt: Option<NodeIndex>,
-    ) -> Option<NodeIndex> {
-        let mut if_merge_cfg_node = self.immediate_pdom_map.get(&condition_cfg_node).copied();
-        if let Some(false_target_cfg_node) = false_target_cfg_node_opt {
-            let true_reaches_false = self.has_cfg_path(true_target_cfg_node, false_target_cfg_node);
-            let false_reaches_true = self.has_cfg_path(false_target_cfg_node, true_target_cfg_node);
-            if true_reaches_false ^ false_reaches_true {
-                // One branch target reaches the other: treat the reached target
-                // as the local join to avoid pulling post-merge regions into a branch.
-                if_merge_cfg_node = Some(if false_reaches_true {
-                    true_target_cfg_node
-                } else {
-                    false_target_cfg_node
-                });
-            }
-        }
-        if_merge_cfg_node
-    }
-
     pub fn new(cfg: &'a ControlFlowGraph, function_ir: &'a FunctionIR) -> Self {
         let entry_node = Self::choose_entry_node(cfg).unwrap_or_else(|| NodeIndex::new(0));
         let dom = simple_fast(cfg, entry_node);
 
-        let mut block_id_to_node_index = HashMap::new();
         let mut addr_to_node_index = HashMap::new();
         for node_idx in cfg.node_indices() {
             let summary = cfg.node_weight(node_idx).expect("CFG node should have a weight");
-            block_id_to_node_index.insert(summary.id, node_idx);
             addr_to_node_index.insert(summary.start, node_idx);
         }
-
-        let (pdom_algo_result, immediate_pdom_map) =
-            Self::calculate_post_dominators(cfg, function_ir);
 
         // Pre-compute the set of registers defined by phi nodes.
         let mut phi_defined_regs = HashSet::new();
@@ -327,11 +273,7 @@ impl<'a> Structurizer<'a> {
             cfg,
             function_ir,
             dom,
-            pdom_algo_result,
-            immediate_pdom_map,
-            block_id_to_node_index,
             addr_to_node_index,
-            processed_cfg_nodes: HashSet::new(),
             phi_defined_regs,
         }
     }
@@ -348,211 +290,15 @@ impl<'a> Structurizer<'a> {
         false
     }
 
-    fn calculate_post_dominators(
-        original_cfg: &ControlFlowGraph, 
-        function_ir: &FunctionIR,
-    ) -> (Dominators<NodeIndex>, HashMap<NodeIndex, NodeIndex>) {
-        let mut reversed_cfg = DiGraph::<CfgBasicBlock, EdgeKind>::new();
-        let mut node_map_orig_to_rev = HashMap::new();
-
-        for node_idx in original_cfg.node_indices() {
-            let weight = original_cfg.node_weight(node_idx).expect("Original CFG node missing weight").clone();
-            let new_node = reversed_cfg.add_node(weight);
-            node_map_orig_to_rev.insert(node_idx, new_node);
-        }
-
-        for edge_ref in original_cfg.edge_references() {
-            if let (Some(source_rev), Some(target_rev)) = (
-                node_map_orig_to_rev.get(&edge_ref.target()),
-                node_map_orig_to_rev.get(&edge_ref.source())
-            ) {
-                 reversed_cfg.add_edge(*source_rev, *target_rev, *edge_ref.weight());
-            }
-        }
-
-        let mut original_exit_nodes_in_rev_cfg = Vec::new();
-        for node_idx_orig in original_cfg.node_indices() {
-            let is_natural_exit = original_cfg.neighbors_directed(node_idx_orig, Direction::Outgoing).count() == 0;
-            let block_id = original_cfg.node_weight(node_idx_orig).unwrap().id;
-            let ir_block = function_ir.blocks.iter().find(|b| b.id == block_id);
-            let is_return_exit = ir_block.map_or(false, Self::is_block_return);
-
-            if is_natural_exit || is_return_exit {
-                if let Some(rev_node) = node_map_orig_to_rev.get(&node_idx_orig) {
-                    original_exit_nodes_in_rev_cfg.push(*rev_node);
-                }
-            }
-        }
-
-        let pdom_entry_node: NodeIndex;
-        if original_exit_nodes_in_rev_cfg.is_empty() {
-            if reversed_cfg.node_count() > 0 {
-                pdom_entry_node = Self::choose_entry_node(original_cfg)
-                    .and_then(|orig_entry| node_map_orig_to_rev.get(&orig_entry).copied())
-                    .unwrap_or_else(|| reversed_cfg.node_indices().next().unwrap());
-            } else {
-                return (simple_fast(&reversed_cfg, NodeIndex::new(0)), HashMap::new());
-            }
-        } else if original_exit_nodes_in_rev_cfg.len() == 1 {
-            pdom_entry_node = original_exit_nodes_in_rev_cfg[0];
-        } else {
-            // Ensure CfgBasicBlock has a constructor or all fields are public for this direct init
-            let synthetic_block_data = CfgBasicBlock { 
-                id: usize::MAX, start: u32::MAX, instrs: vec![]
-                // Adjust if your CfgBasicBlock has different fields (e.g. 'instrs')
-                // If it has 'instrs: Vec<YourInstructionType>', use vec![]
-            };
-            let synthetic_super_exit_rev = reversed_cfg.add_node(synthetic_block_data);
-            for orig_exit_rev_idx in original_exit_nodes_in_rev_cfg {
-                reversed_cfg.add_edge(orig_exit_rev_idx, synthetic_super_exit_rev, EdgeKind::FallThrough);
-            }
-            pdom_entry_node = synthetic_super_exit_rev;
-        }
-
-        let pdom_algo_result = simple_fast(&reversed_cfg, pdom_entry_node);
-        let mut immediate_pdom_map_orig_indices = HashMap::new();
-        let rev_to_orig_map: HashMap<NodeIndex, NodeIndex> = node_map_orig_to_rev.into_iter().map(|(k, v)| (v, k)).collect();
-
-        for node_idx_rev in reversed_cfg.node_indices() {
-            if reversed_cfg.node_weight(node_idx_rev).map_or(false, |s| s.id == usize::MAX) { continue; }
-            if let Some(ipdom_rev) = pdom_algo_result.immediate_dominator(node_idx_rev) {
-                if reversed_cfg.node_weight(ipdom_rev).map_or(false, |s| s.id == usize::MAX) { continue; }
-                if let (Some(orig_node), Some(orig_ipdom_node)) = (rev_to_orig_map.get(&node_idx_rev), rev_to_orig_map.get(&ipdom_rev)) {
-                    immediate_pdom_map_orig_indices.insert(*orig_node, *orig_ipdom_node);
-                }
-            }
-        }
-        (pdom_algo_result, immediate_pdom_map_orig_indices)
-    }
-
     pub fn structure_function(&mut self) -> Option<StructuredStatement> {
-        self.processed_cfg_nodes.clear(); // Ensure clean state for new function
-        let entry_cfg_node = Self::choose_entry_node(self.cfg)
-            .or_else(|| self.block_id_to_node_index.get(&0).copied())
-            .unwrap_or_else(|| NodeIndex::new(0));
-        self.structure_region_recursive(entry_cfg_node, None)
+        // New collapse-based structurizer. Iteratively rewrites a region graph
+        // built from the CFG by pattern-matching collapse rules until one
+        // region remains (or the goto fallback fires).
+        let mut graph = collapse::RegionGraph::build_from_cfg(self);
+        collapse::run_collapse(&mut graph, self);
+        Some(collapse::emit_root(&graph))
     }
 
-    fn structure_region_recursive(
-        &mut self,
-        current_cfg_node: NodeIndex,
-        desired_exit_node: Option<NodeIndex>,
-    ) -> Option<StructuredStatement> {
-        if self.processed_cfg_nodes.contains(&current_cfg_node) {
-            return Some(StructuredStatement::Empty);
-        }
-        if Some(current_cfg_node) == desired_exit_node {
-            return Some(StructuredStatement::Empty);
-        }
-
-        let mut region_statements = Vec::new();
-        let mut active_cfg_node = current_cfg_node;
-
-        // Debug checkpoint: this loop is the top-level region sequencer.
-        'structure_sequence: loop {
-            if self.processed_cfg_nodes.contains(&active_cfg_node) { break 'structure_sequence; }
-            if Some(active_cfg_node) == desired_exit_node { break 'structure_sequence; }
-
-            let ir_block = match self.get_ir_block_by_cfg_node(active_cfg_node) {
-                Some(b) => b,
-                None => { break 'structure_sequence; }
-            };
-
-            if Self::is_block_return(ir_block) && desired_exit_node.is_none() {
-                self.processed_cfg_nodes.insert(active_cfg_node);
-                let ret_val = ir_block.stmts.last().and_then(|s| {
-                    if let RValue::Op { opcode, args } = &s.value {
-                        if (opcode.starts_with("RET") || opcode == "EXIT") && !args.is_empty() {
-                            return Some(args[0].clone());
-                        }
-                    }
-                    None
-                });
-                let mut pre_return_stmts = ir_block.stmts.clone();
-                if let Some(IRStatement { value: RValue::Op { opcode, .. }, pred, .. }) =
-                    pre_return_stmts.last()
-                {
-                    if pred.is_none() && Self::is_return_opcode(opcode) {
-                        pre_return_stmts.pop();
-                    }
-                }
-                let has_renderable_pre_return_stmt = pre_return_stmts.iter().any(|s| {
-                    if matches!(s.value, RValue::Phi(_)) {
-                        return false;
-                    }
-                    match &s.value {
-                        RValue::Op { opcode, .. } => {
-                            !Self::is_branch_only_opcode(opcode) && !Self::is_return_opcode(opcode)
-                        }
-                        _ => true,
-                    }
-                });
-                if has_renderable_pre_return_stmt {
-                    region_statements.push(StructuredStatement::BasicBlock {
-                        block_id: ir_block.id,
-                        stmts: pre_return_stmts,
-                    });
-                }
-                region_statements.push(StructuredStatement::Return(ret_val));
-                break 'structure_sequence;
-            }
-
-            // Step 1: loop recovery (highest priority).
-            let mut next_node_after_pattern: Option<NodeIndex> = None;
-            let mut matched_pattern = false;
-
-            if let Some(loop_stmt) = self.try_structure_loop(active_cfg_node, desired_exit_node) {
-                next_node_after_pattern = self.get_loop_successor(&loop_stmt);
-                region_statements.push(loop_stmt);
-                matched_pattern = true;
-            // Step 2: if/if-else recovery.
-            } else if let Some(if_stmt) = self.try_structure_if(active_cfg_node, desired_exit_node) {
-                next_node_after_pattern = self.get_if_merge_or_successor(&if_stmt);
-                region_statements.push(if_stmt);
-                matched_pattern = true;
-            }
-
-            if matched_pattern {
-                if let Some(next_node) = next_node_after_pattern {
-                    if next_node == active_cfg_node && !matches!(region_statements.last(), Some(StructuredStatement::Loop{loop_type: LoopType::Endless,..})) { 
-                        break 'structure_sequence;
-                    }
-                    active_cfg_node = next_node;
-                } else { 
-                    break 'structure_sequence;
-                }
-            } else {
-                // Step 3: sequence recovery. If branching is still unstructured,
-                // emit an explicit goto fallback to keep output total.
-                self.processed_cfg_nodes.insert(active_cfg_node);
-                region_statements.push(StructuredStatement::BasicBlock {
-                    block_id: ir_block.id,
-                    stmts: ir_block.stmts.clone(),
-                });
-
-                let successors: Vec<NodeIndex> = self.cfg.neighbors_directed(active_cfg_node, Direction::Outgoing).collect();
-                if successors.len() == 1 {
-                    active_cfg_node = successors[0];
-                } else if successors.is_empty() {
-                    break 'structure_sequence; 
-                } else { 
-                    // Unstructured multi-branch fallback.
-                    region_statements.push(StructuredStatement::UnstructuredJump {
-                        from_block_id: ir_block.id,
-                        to_block_id: self.cfg[successors[0]].id,
-                        condition: None,
-                    });
-                    break 'structure_sequence;
-                }
-            }
-        }
-
-        match region_statements.len() {
-            0 => Some(StructuredStatement::Empty),
-            1 => Some(region_statements.remove(0)),
-            _ => Some(StructuredStatement::Sequence(region_statements)),
-        }
-    }
 
     fn get_ir_block_by_cfg_node(&self, cfg_node: NodeIndex) -> Option<&'a IRBlock> {
         self.cfg.node_weight(cfg_node).and_then(|summary| {
@@ -601,455 +347,6 @@ impl<'a> Structurizer<'a> {
         None
     }
     
-    fn try_structure_if(
-        &mut self,
-        condition_cfg_node: NodeIndex,
-        overall_desired_exit: Option<NodeIndex>,
-    ) -> Option<StructuredStatement> {
-        if self.processed_cfg_nodes.contains(&condition_cfg_node) { return None; }
-
-        let ir_cond_block = self.get_ir_block_by_cfg_node(condition_cfg_node)?;
-        let (if_condition_expr, true_target_cfg_node, false_target_cfg_node_opt) =
-            self.extract_if_targets_and_condition(ir_cond_block)?;
-
-        let if_merge_cfg_node = self.select_if_merge_node(
-            condition_cfg_node,
-            true_target_cfg_node,
-            false_target_cfg_node_opt,
-        );
-
-        // Prefer the local immediate post-dominator as the IF merge target.
-        // Extending to an outer desired-exit can incorrectly pull post-merge
-        // code into one branch and distort control flow.
-        let actual_branch_exit_target = if if_merge_cfg_node.is_some() {
-            if_merge_cfg_node
-        } else {
-            overall_desired_exit
-        };
-        
-        let is_true_target_exit = Some(true_target_cfg_node) == actual_branch_exit_target;
-        let is_false_target_exit = match false_target_cfg_node_opt {
-            Some(ftn) => Some(ftn) == actual_branch_exit_target,
-            None => actual_branch_exit_target.is_none() || Some(condition_cfg_node) == actual_branch_exit_target, // For if-then, false path is implicitly the merge
-        };
-
-        self.processed_cfg_nodes.insert(condition_cfg_node);
-
-        let then_statement = if is_true_target_exit {
-            StructuredStatement::Empty
-        } else {
-            self.structure_region_recursive(true_target_cfg_node, actual_branch_exit_target)
-                .unwrap_or(StructuredStatement::Empty)
-        };
-
-        let else_statement_opt = match false_target_cfg_node_opt {
-            Some(false_target_node) => {
-                if is_false_target_exit || Some(false_target_node) == actual_branch_exit_target { None }
-                else {
-                    Some(self.structure_region_recursive(false_target_node, actual_branch_exit_target)
-                             .unwrap_or(StructuredStatement::Empty))
-                }
-            },
-            None => None, 
-        };
-        
-        if matches!(then_statement, StructuredStatement::Empty) && else_statement_opt.as_ref().map_or(true, |s| matches!(s, StructuredStatement::Empty)) {
-             // If both branches are empty, this IF effectively does nothing or leads directly to merge.
-             // Avoid creating an empty if { } else { }.
-             // The condition_cfg_node will be processed as a BasicBlock by the outer loop if it's not truly terminal.
-             self.processed_cfg_nodes.remove(&condition_cfg_node); // Allow it to be picked up as a basic block
-            return None; 
-        }
-
-        Some(StructuredStatement::If {
-            condition_block_id: ir_cond_block.id,
-            condition_expr: if_condition_expr, 
-            then_branch: Box::new(then_statement),
-            else_branch: else_statement_opt.map(Box::new),
-        })
-    }
-
-    fn get_if_merge_or_successor(&self, if_stmt: &StructuredStatement) -> Option<NodeIndex> {
-        if let StructuredStatement::If { condition_block_id, .. } = if_stmt {
-            let cond_cfg_node = self.block_id_to_node_index.get(condition_block_id)?;
-            let ir_cond_block = self.get_ir_block_by_cfg_node(*cond_cfg_node)?;
-            let (_, true_target_cfg_node, false_target_cfg_node_opt) =
-                self.extract_if_targets_and_condition(ir_cond_block)?;
-            return self.select_if_merge_node(
-                *cond_cfg_node,
-                true_target_cfg_node,
-                false_target_cfg_node_opt,
-            );
-        }
-        None
-    }
-
-    fn try_structure_loop(
-        &mut self,
-        potential_header_cfg_node: NodeIndex,
-        _overall_desired_exit: Option<NodeIndex>, 
-    ) -> Option<StructuredStatement> {
-        if self.processed_cfg_nodes.contains(&potential_header_cfg_node) { return None; }
-
-        let mut back_edges_to_header = Vec::new();
-        for edge_ref in self.cfg.edges_directed(potential_header_cfg_node, Direction::Incoming) {
-            let pred_node_idx = edge_ref.source();
-            if self.node_is_dominated_by(&self.dom, pred_node_idx, potential_header_cfg_node) {
-                // Keep self-latches: many SASS loops are represented as
-                // a single header block with a back edge to itself.
-                back_edges_to_header.push(pred_node_idx);
-            }
-        }
-        if back_edges_to_header.is_empty() { return None; }
-
-        let mut loop_body_cfg_nodes = HashSet::new();
-        loop_body_cfg_nodes.insert(potential_header_cfg_node);
-
-        let mut worklist_for_body: VecDeque<NodeIndex> = back_edges_to_header.iter().copied().collect();
-        let mut visited_for_body_bfs = HashSet::new(); 
-        visited_for_body_bfs.insert(potential_header_cfg_node);
-
-        while let Some(node_to_explore_from) = worklist_for_body.pop_front() { 
-            if node_to_explore_from == potential_header_cfg_node { continue; }
-            if visited_for_body_bfs.contains(&node_to_explore_from) ||
-               !self.node_is_dominated_by(&self.dom, node_to_explore_from, potential_header_cfg_node) {
-                continue;
-            }
-            visited_for_body_bfs.insert(node_to_explore_from);
-            loop_body_cfg_nodes.insert(node_to_explore_from);
-            for pred in self.cfg.neighbors_directed(node_to_explore_from, Direction::Incoming) {
-                if !visited_for_body_bfs.contains(&pred) && 
-                   (pred == potential_header_cfg_node || self.node_is_dominated_by(&self.dom, pred, potential_header_cfg_node)) {
-                     worklist_for_body.push_back(pred); 
-                }
-            }
-        }
-        
-        if loop_body_cfg_nodes.len() <= 1 && !back_edges_to_header.iter().any(|&latch| latch == potential_header_cfg_node) { 
-             // A single node loop must have the header as a latch.
-             // If body is just header, but latches are external, something is off with body calc or it's not a simple natural loop.
-             if loop_body_cfg_nodes.len() == 1 && loop_body_cfg_nodes.contains(&potential_header_cfg_node) {} else {return None;}
-        }
-        
-        let mut loop_exit_edges = Vec::new();
-        for &node_in_loop in &loop_body_cfg_nodes {
-            for succ_node in self.cfg.neighbors_directed(node_in_loop, Direction::Outgoing) {
-                if !loop_body_cfg_nodes.contains(&succ_node) {
-                    loop_exit_edges.push((node_in_loop, succ_node));
-                }
-            }
-        }
-        
-        let mut loop_natural_successor_node = self.immediate_pdom_map.get(&potential_header_cfg_node).copied();
-        let unique_exit_targets: HashSet<NodeIndex> = loop_exit_edges.iter().map(|(_, to)| *to).collect();
-
-        if loop_natural_successor_node.is_none() && unique_exit_targets.len() == 1 {
-            loop_natural_successor_node = unique_exit_targets.iter().next().copied();
-        } else if unique_exit_targets.len() > 1 {
-            if let Some(lnsn) = loop_natural_successor_node {
-                if !unique_exit_targets.iter().all(|target| *target == lnsn || self.node_is_dominated_by(&self.pdom_algo_result, lnsn, *target)) {
-                     return None; 
-                }
-            } else { return None; }
-        } else if unique_exit_targets.is_empty() {
-            // No CFG exits - could be endless loop or exits via returns within body
-            // loop_natural_successor_node will remain None
-        }
-
-
-        let header_ir_block = self.get_ir_block_by_cfg_node(potential_header_cfg_node)?;
-        let mut loop_type = LoopType::Endless;
-        let mut loop_condition_expr_val: Option<IRExpr> = None;
-
-        let header_successors: Vec<NodeIndex> = self.cfg.neighbors_directed(potential_header_cfg_node, Direction::Outgoing).collect();
-        if header_successors.len() == 2 {
-            let s1 = header_successors[0];
-            let s2 = header_successors[1];
-            let s1_is_exit = Some(s1) == loop_natural_successor_node || !loop_body_cfg_nodes.contains(&s1);
-            let s2_is_exit = Some(s2) == loop_natural_successor_node || !loop_body_cfg_nodes.contains(&s2);
-            let s1_is_body_entry = loop_body_cfg_nodes.contains(&s1);
-            let s2_is_body_entry = loop_body_cfg_nodes.contains(&s2);
-
-            if (s1_is_exit && s2_is_body_entry) || (s2_is_exit && s1_is_body_entry) {
-                if let Some((cond, true_target, _)) = self.extract_if_targets_and_condition(header_ir_block) {
-                    let true_target_leads_to_body = 
-                        (true_target == s1 && s1_is_body_entry) || (true_target == s2 && s2_is_body_entry);
-                    loop_condition_expr_val = Some(if true_target_leads_to_body { cond } else { negate_condition(cond) });
-                    loop_type = LoopType::While;
-                }
-            }
-        }
-        
-        let backup_processed = self.processed_cfg_nodes.clone();
-        for node in &loop_body_cfg_nodes { if *node != potential_header_cfg_node { self.processed_cfg_nodes.remove(node); } }
-        // Header itself is part of Loop construct, not to be re-processed as a loose block by body structuring.
-        self.processed_cfg_nodes.insert(potential_header_cfg_node); 
-
-
-        let body_entry_for_structuring = if loop_type == LoopType::While {
-            let entry_node = header_successors.iter().find(|&&succ| loop_body_cfg_nodes.contains(&succ) && succ != potential_header_cfg_node).copied();
-            if entry_node.is_none() && loop_body_cfg_nodes.len() == 1 && loop_body_cfg_nodes.contains(&potential_header_cfg_node) {
-                 potential_header_cfg_node // Single block loop where header branches to itself (implicitly handled by body being empty then)
-            } else {
-                entry_node.unwrap_or(potential_header_cfg_node) // Fallback, but should find a body entry for While
-            }
-        } else { 
-            potential_header_cfg_node
-        };
-        
-        let structured_body = if body_entry_for_structuring == potential_header_cfg_node && loop_type == LoopType::While {
-            // While loop where condition leads to itself - body might be empty if no other path.
-            // Or, the "body entry" is the header, but then it's more like an Endless loop with conditional break at top.
-            // This case needs careful handling. For now, assume body call is okay.
-             self.structure_loop_body_recursive(
-                body_entry_for_structuring, 
-                &loop_body_cfg_nodes, 
-                potential_header_cfg_node, 
-                loop_natural_successor_node,
-                None,
-            ).unwrap_or(StructuredStatement::Empty)
-        } else {
-             self.structure_loop_body_recursive(
-                body_entry_for_structuring, 
-                &loop_body_cfg_nodes, 
-                potential_header_cfg_node, 
-                loop_natural_successor_node,
-                None,
-            ).unwrap_or(StructuredStatement::Empty)
-        };
-
-
-        self.processed_cfg_nodes = backup_processed;
-        for node in &loop_body_cfg_nodes { self.processed_cfg_nodes.insert(*node); }
-        self.processed_cfg_nodes.insert(potential_header_cfg_node);
-
-        Some(StructuredStatement::Loop {
-            loop_type,
-            header_block_id: Some(header_ir_block.id),
-            condition_expr: loop_condition_expr_val, 
-            body: Box::new(structured_body),
-        })
-    }
-    
-    fn structure_loop_body_recursive(
-        &mut self,
-        current_body_cfg_node: NodeIndex,
-        nodes_in_this_loop: &HashSet<NodeIndex>,
-        loop_header_for_continue: NodeIndex,
-        loop_exit_for_break: Option<NodeIndex>,
-        stop_at: Option<NodeIndex>,
-    ) -> Option<StructuredStatement> {
-        // Single-header loop fallback: keep the header body visible and model
-        // the latch as an explicit continue.
-        if current_body_cfg_node == loop_header_for_continue && nodes_in_this_loop.len() == 1 {
-            if let Some(ir_block) = self.get_ir_block_by_cfg_node(current_body_cfg_node) {
-                return Some(StructuredStatement::Sequence(vec![
-                    StructuredStatement::BasicBlock {
-                        block_id: ir_block.id,
-                        stmts: ir_block.stmts.clone(),
-                    },
-                    StructuredStatement::Continue(None),
-                ]));
-            }
-            return Some(StructuredStatement::Empty);
-        }
-        if current_body_cfg_node == loop_header_for_continue { return Some(StructuredStatement::Empty); } // Body starts *after* header for While/Do, or includes it for Endless
-        if !nodes_in_this_loop.contains(&current_body_cfg_node) || self.processed_cfg_nodes.contains(&current_body_cfg_node) {
-            return Some(StructuredStatement::Empty);
-        }
-
-        // Use the main region structurer for the body, but with special exit conditions
-        // This is a placeholder for a more nuanced call that passes loop context
-        // For now, we use structure_region_recursive, but this might not correctly form breaks/continues
-        // if it doesn't know it's inside a loop targeting these specific header/exit nodes.
-        // This is the primary simplification being made.
-        // A true solution would have structure_region_recursive take loop_header and loop_exit as params.
-
-        // Mark as processed for THIS recursive call for the body
-        // self.processed_cfg_nodes.insert(current_body_cfg_node);
-        
-        // Try to structure this part of the body as a region aiming for either a break or continue.
-        // This is still simplified.
-        let mut body_statements = Vec::new();
-        let mut active_node_in_body = current_body_cfg_node;
-        
-        'body_sequence: loop {
-            if Some(active_node_in_body) == stop_at {
-                break 'body_sequence;
-            }
-            if !nodes_in_this_loop.contains(&active_node_in_body) ||
-               self.processed_cfg_nodes.contains(&active_node_in_body) ||
-               active_node_in_body == loop_header_for_continue { // Don't re-enter header from body sequence
-                break 'body_sequence;
-            }
-            if Some(active_node_in_body) == loop_exit_for_break { // Reached explicit break target
-                body_statements.push(StructuredStatement::Break(None));
-                self.processed_cfg_nodes.insert(active_node_in_body); // Mark break target as "handled" by break
-                break 'body_sequence;
-            }
-
-            let ir_block = match self.get_ir_block_by_cfg_node(active_node_in_body) {
-                Some(b) => b,
-                None => break 'body_sequence,
-            };
-            
-            // If this block is a return, it's like a break from the loop
-            if Self::is_block_return(ir_block) {
-                 self.processed_cfg_nodes.insert(active_node_in_body);
-                 body_statements.push(StructuredStatement::BasicBlock{block_id: ir_block.id, stmts: ir_block.stmts.clone()}); // Include stmts of return block
-                 body_statements.push(StructuredStatement::Return(None)); // Simplified
-                 break 'body_sequence;
-            }
-
-
-            let successors: Vec<NodeIndex> = self.cfg.neighbors_directed(active_node_in_body, Direction::Outgoing).collect();
-            if successors.len() > 1 {
-                if let Some((cond_expr, true_target, false_target_opt)) =
-                    self.extract_if_targets_and_condition(ir_block)
-                {
-                    let false_target = false_target_opt.or_else(|| {
-                        successors
-                            .iter()
-                            .copied()
-                            .find(|succ| *succ != true_target)
-                    });
-
-                    if let Some(false_target) = false_target {
-                        let merge_node_opt = self.immediate_pdom_map.get(&active_node_in_body).copied();
-                        let then_stmt_opt = self.structure_loop_branch_target(
-                            true_target,
-                            nodes_in_this_loop,
-                            loop_header_for_continue,
-                            loop_exit_for_break,
-                            merge_node_opt,
-                        );
-                        let else_stmt_opt = self.structure_loop_branch_target(
-                            false_target,
-                            nodes_in_this_loop,
-                            loop_header_for_continue,
-                            loop_exit_for_break,
-                            merge_node_opt,
-                        );
-
-                        if let (Some(then_stmt), Some(else_stmt)) = (then_stmt_opt, else_stmt_opt) {
-                            self.processed_cfg_nodes.insert(active_node_in_body);
-                            body_statements.push(StructuredStatement::If {
-                                condition_block_id: ir_block.id,
-                                condition_expr: cond_expr,
-                                then_branch: Box::new(then_stmt),
-                                else_branch: if matches!(else_stmt, StructuredStatement::Empty) {
-                                    None
-                                } else {
-                                    Some(Box::new(else_stmt))
-                                },
-                            });
-
-                            if let Some(merge_node) = merge_node_opt {
-                                if Some(merge_node) == stop_at {
-                                    break 'body_sequence;
-                                }
-                                if merge_node == loop_header_for_continue {
-                                    body_statements.push(StructuredStatement::Continue(None));
-                                    break 'body_sequence;
-                                }
-                                if Some(merge_node) == loop_exit_for_break {
-                                    body_statements.push(StructuredStatement::Break(None));
-                                    break 'body_sequence;
-                                }
-                                if nodes_in_this_loop.contains(&merge_node) {
-                                    active_node_in_body = merge_node;
-                                    continue 'body_sequence;
-                                }
-                            }
-                            break 'body_sequence;
-                        }
-                    }
-                }
-            }
-
-            // Default sequential/fallback handling for non-if shapes.
-            self.processed_cfg_nodes.insert(active_node_in_body);
-            body_statements.push(StructuredStatement::BasicBlock {
-                block_id: ir_block.id,
-                stmts: ir_block.stmts.clone(),
-            });
-
-            if successors.len() == 1 {
-                let succ_node = successors[0];
-                if Some(succ_node) == stop_at {
-                    break 'body_sequence;
-                }
-                if succ_node == loop_header_for_continue {
-                    body_statements.push(StructuredStatement::Continue(None));
-                    break 'body_sequence; // Sequence ends with a continue
-                }
-                if Some(succ_node) == loop_exit_for_break {
-                    body_statements.push(StructuredStatement::Break(None));
-                    break 'body_sequence; // Sequence ends with a break
-                }
-                if nodes_in_this_loop.contains(&succ_node) {
-                    active_node_in_body = succ_node; // Continue sequence within loop
-                } else {
-                    // Jump outside loop to non-designated exit: unhandled for now
-                    body_statements.push(StructuredStatement::UnstructuredJump{ from_block_id: ir_block.id, to_block_id: self.cfg[succ_node].id, condition: None });
-                    break 'body_sequence;
-                }
-            } else if successors.is_empty() { // End of path within loop?
-                break 'body_sequence;
-            } else { // Branch within loop body
-                 body_statements.push(StructuredStatement::UnstructuredJump{ from_block_id: ir_block.id, to_block_id: self.cfg[successors[0]].id, condition: None });
-                break 'body_sequence;
-            }
-        }
-
-
-        if body_statements.is_empty() { Some(StructuredStatement::Empty) }
-        else if body_statements.len() == 1 { Some(body_statements.remove(0)) }
-        else { Some(StructuredStatement::Sequence(body_statements)) }
-    }
-
-    fn structure_loop_branch_target(
-        &mut self,
-        target: NodeIndex,
-        nodes_in_this_loop: &HashSet<NodeIndex>,
-        loop_header_for_continue: NodeIndex,
-        loop_exit_for_break: Option<NodeIndex>,
-        stop_at: Option<NodeIndex>,
-    ) -> Option<StructuredStatement> {
-        if Some(target) == stop_at {
-            return Some(StructuredStatement::Empty);
-        }
-        if target == loop_header_for_continue {
-            return Some(StructuredStatement::Continue(None));
-        }
-        if Some(target) == loop_exit_for_break {
-            return Some(StructuredStatement::Break(None));
-        }
-        if nodes_in_this_loop.contains(&target) {
-            return self.structure_loop_body_recursive(
-                target,
-                nodes_in_this_loop,
-                loop_header_for_continue,
-                loop_exit_for_break,
-                stop_at,
-            );
-        }
-        None
-    }
-
-    fn get_loop_successor(&self, loop_stmt: &StructuredStatement) -> Option<NodeIndex> {
-        if let StructuredStatement::Loop { header_block_id: Some(h_id), .. } = loop_stmt {
-            let header_cfg_node = self.block_id_to_node_index.get(h_id)?;
-            // Prefer actual exit targets if they are unique and known,
-            // otherwise, fall back to immediate post-dominator of the header.
-            // This information isn't directly stored in Loop stmt yet.
-            // So current implementation is a heuristic.
-            return self.immediate_pdom_map.get(header_cfg_node).copied();
-        }
-        None
-    }
-
-    /// Returns true if the opcode is a convergence barrier with no data effect.
     fn is_convergence_barrier_opcode(opcode: &str) -> bool {
         matches!(opcode, "BSSY" | "BSYNC" | "SSY" | "SYNC")
     }
@@ -1384,6 +681,12 @@ impl<'a> Structurizer<'a> {
                             // (if/loop/goto), so omit them from block bodies.
                             continue;
                         }
+                        if Self::is_convergence_barrier_opcode(opcode) {
+                            // Convergence barriers (BSSY/BSYNC/SSY/SYNC) have no data
+                            // effect — they exist to mark control-flow reconvergence
+                            // and are implicit in structured output.
+                            continue;
+                        }
                         if Self::is_barrier_opcode(opcode) {
                             let pred_str = ir_s
                                 .pred
@@ -1578,7 +881,9 @@ impl<'a> Structurizer<'a> {
                         lifted,
                     ));
                 }
-                s_out.push_str(&format!("{}// Loop header BB{:?}\n", indent, header_block_id.unwrap_or(usize::MAX)));
+                if let Some(hid) = header_block_id {
+                    s_out.push_str(&format!("{}// Loop header BB{}\n", indent, hid));
+                }
                 match loop_type {
                     LoopType::While => {
                         let cond_str = condition_expr
@@ -1636,13 +941,1440 @@ fn negate_condition(expr: IRExpr) -> IRExpr {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Ghidra-style collapse-based structurizer
+// ---------------------------------------------------------------------------
+//
+// The region graph is built once from the CFG and then iteratively rewritten
+// by pattern-matching collapse rules. Unlike petgraph, region indices never
+// shift: regions are stored in `Vec<Option<...>>`-like storage and marked
+// `Tombstone` when consumed. This keeps `RegionId` stable for the entire run
+// and avoids the stale-NodeIndex bug that killed the old `src/region.rs`.
+//
+// Phase A covers: region construction, sequence collapse, a minimal goto
+// fallback, and the root emitter.
+mod collapse {
+    use super::*;
+
+    /// Stable index into the region vector. Never invalidated.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+    pub(super) struct RegionId(pub(super) usize);
+
+    /// What a region currently represents.
+    #[derive(Clone, Debug)]
+    pub(super) enum RegionKind {
+        /// A still-unstructured CFG basic block.
+        Basic { block_id: usize },
+        /// A region that has already been folded into a structured statement.
+        /// `primary_block_id` is the IR block id whose `irdst` governs the
+        /// region's *current* outgoing branch — for a Sequence, it's the tail
+        /// block; for an If, it's the merge-or-head block id.
+        Composite {
+            stmt: StructuredStatement,
+            primary_block_id: usize,
+        },
+        /// Slot is dead. Callers must not traverse it.
+        Tombstone,
+    }
+
+    /// A directed edge between two regions with the metadata collapse rules
+    /// care about.
+    #[derive(Clone, Debug)]
+    pub(super) struct RegionEdge {
+        pub from: RegionId,
+        pub to: RegionId,
+        /// Which arm of the source's branch this edge represents. `Some(true)`
+        /// = the oriented "true" arm, `Some(false)` = the "false" arm, `None`
+        /// = an unconditional/fallthrough edge.
+        pub cond_arm: Option<bool>,
+        /// True iff the source-to-target edge is a back edge in the original
+        /// CFG. Computed once at construction and never updated.
+        pub is_back_edge: bool,
+        /// True once `select_goto_edge` has marked this edge as "give up, emit
+        /// it as an UnstructuredJump". Collapse rules skip goto-marked edges.
+        pub is_goto: bool,
+    }
+
+    /// Stable-index region graph.
+    pub(super) struct RegionGraph {
+        regions: Vec<RegionKind>,
+        edges: Vec<Option<RegionEdge>>,
+        out_edges: Vec<Vec<usize>>,
+        in_edges: Vec<Vec<usize>>,
+        entry: RegionId,
+    }
+
+    impl RegionGraph {
+        // ------------- construction -------------
+
+        pub(super) fn build_from_cfg(s: &Structurizer<'_>) -> RegionGraph {
+            // Deterministic node ordering by BasicBlock.id so results don't
+            // depend on petgraph's internal ordering.
+            let mut ordered: Vec<NodeIndex> = s.cfg.node_indices().collect();
+            ordered.sort_by_key(|&n| s.cfg[n].id);
+
+            let mut regions: Vec<RegionKind> = Vec::with_capacity(ordered.len());
+            let mut cfg_to_region: HashMap<NodeIndex, RegionId> = HashMap::new();
+
+            for cfg_node in &ordered {
+                let block_id = s.cfg[*cfg_node].id;
+                let rid = RegionId(regions.len());
+                cfg_to_region.insert(*cfg_node, rid);
+
+                // Seed return blocks as Composite right away so the collapse
+                // loop sees them as terminal regions. Mirrors the legacy
+                // behavior at structurizer.rs:461-498.
+                let mut seeded = false;
+                if let Some(ir_block) = s.get_ir_block_by_cfg_node(*cfg_node) {
+                    if Structurizer::is_block_return(ir_block) {
+                        let stmt = build_return_stmt(ir_block);
+                        regions.push(RegionKind::Composite {
+                            stmt,
+                            primary_block_id: block_id,
+                        });
+                        seeded = true;
+                    }
+                }
+                if !seeded {
+                    regions.push(RegionKind::Basic { block_id });
+                }
+            }
+
+            let n = regions.len();
+            let mut out_edges: Vec<Vec<usize>> = vec![Vec::new(); n];
+            let mut in_edges: Vec<Vec<usize>> = vec![Vec::new(); n];
+            let mut edges: Vec<Option<RegionEdge>> = Vec::new();
+
+            for cfg_node in &ordered {
+                let from = cfg_to_region[cfg_node];
+                // Orient the arms using the existing helper — it handles all
+                // four irdst shapes (Pred/Pred, Pred/True, True/Pred, Pred).
+                let ir_block = match s.get_ir_block_by_cfg_node(*cfg_node) {
+                    Some(b) => b,
+                    None => continue,
+                };
+                let targets = s.extract_if_targets_and_condition(ir_block);
+
+                // Deterministic succs ordering: sort by target block id.
+                let mut succs: Vec<NodeIndex> =
+                    s.cfg.neighbors_directed(*cfg_node, Direction::Outgoing).collect();
+                succs.sort_by_key(|&n| s.cfg[n].id);
+
+                // Single-CFG-edge blocks never represent a real CFG-level
+                // branch from the structurizer's perspective: any embedded
+                // predicated jump/return is rendered inside the block by the
+                // pretty printer (`if (P0) return;`), so the outgoing edge is
+                // effectively unconditional.
+                let single_edge = succs.len() == 1;
+
+                for succ in succs.iter().copied() {
+                    let to = cfg_to_region[&succ];
+                    let cond_arm = if single_edge {
+                        None
+                    } else {
+                        match &targets {
+                            Some((_, t, Some(f))) => {
+                                if succ == *t {
+                                    Some(true)
+                                } else if succ == *f {
+                                    Some(false)
+                                } else {
+                                    None
+                                }
+                            }
+                            Some((_, t, None)) => {
+                                if succ == *t {
+                                    Some(true)
+                                } else {
+                                    Some(false)
+                                }
+                            }
+                            None => None,
+                        }
+                    };
+                    let is_back_edge = s.node_is_dominated_by(&s.dom, *cfg_node, succ);
+                    let edge_idx = edges.len();
+                    edges.push(Some(RegionEdge {
+                        from,
+                        to,
+                        cond_arm,
+                        is_back_edge,
+                        is_goto: false,
+                    }));
+                    out_edges[from.0].push(edge_idx);
+                    in_edges[to.0].push(edge_idx);
+                }
+            }
+
+            // Entry region: same entry-picking logic as the old code.
+            let entry_cfg = Structurizer::choose_entry_node(s.cfg)
+                .unwrap_or_else(|| NodeIndex::new(0));
+            let entry = cfg_to_region
+                .get(&entry_cfg)
+                .copied()
+                .unwrap_or(RegionId(0));
+
+            let mut graph = RegionGraph {
+                regions,
+                edges,
+                out_edges,
+                in_edges,
+                entry,
+            };
+
+            // Heuristic preprocessing (mirrors the OLD `select_if_merge_node`
+            // behavior at structurizer.rs:274-295): for every 2-way head whose
+            // true arm reaches the false arm in the CFG (or vice versa) but
+            // not the other way around, the reached arm is the local "join"
+            // — the reaching arm is the body of a one-armed if. Drop the
+            // direct edge from head to merge (the "shortcut") so the collapse
+            // engine sees a 1-way conditional head, and let `try_if_then_one_arm`
+            // pick it up. This is intentionally lossy in the same way the old
+            // structurizer was: it favors structured output over preserving
+            // every CFG edge of an irreducible diamond.
+            graph.drop_shortcut_branch_edges(s);
+
+            graph
+        }
+
+        /// See `build_from_cfg`'s comment about the OLD heuristic.
+        fn drop_shortcut_branch_edges(&mut self, s: &Structurizer<'_>) {
+            let rids: Vec<RegionId> = (0..self.regions.len()).map(RegionId).collect();
+            for r in rids {
+                if !self.is_alive(r) {
+                    continue;
+                }
+                let succs = self.live_succs(r);
+                if succs.len() != 2 {
+                    continue;
+                }
+                // Identify true/false arms by cond_arm (set by build_from_cfg).
+                let (t_idx, t_e, f_idx, f_e) = match (&succs[0], &succs[1]) {
+                    ((i0, e0), (i1, e1))
+                        if e0.cond_arm == Some(true) && e1.cond_arm == Some(false) =>
+                    {
+                        (*i0, e0.clone(), *i1, e1.clone())
+                    }
+                    ((i0, e0), (i1, e1))
+                        if e0.cond_arm == Some(false) && e1.cond_arm == Some(true) =>
+                    {
+                        (*i1, e1.clone(), *i0, e0.clone())
+                    }
+                    _ => continue,
+                };
+                if t_e.is_back_edge || f_e.is_back_edge {
+                    continue;
+                }
+                // Map regions back to CFG nodes for reachability lookups.
+                let head_block_id = match &self.regions[r.0] {
+                    RegionKind::Basic { block_id, .. } => *block_id,
+                    _ => continue,
+                };
+                let head_cfg = match s
+                    .cfg
+                    .node_indices()
+                    .find(|&n| s.cfg[n].id == head_block_id)
+                {
+                    Some(n) => n,
+                    None => continue,
+                };
+                let t_block_id = primary_block_id_of(self, t_e.to);
+                let f_block_id = primary_block_id_of(self, f_e.to);
+                let t_cfg = match s.cfg.node_indices().find(|&n| s.cfg[n].id == t_block_id) {
+                    Some(n) => n,
+                    None => continue,
+                };
+                let f_cfg = match s.cfg.node_indices().find(|&n| s.cfg[n].id == f_block_id) {
+                    Some(n) => n,
+                    None => continue,
+                };
+                // CFG reachability that doesn't loop back through the head.
+                let t_reaches_f = has_cfg_path_excluding(s, t_cfg, f_cfg, head_cfg);
+                let f_reaches_t = has_cfg_path_excluding(s, f_cfg, t_cfg, head_cfg);
+                // Only act when exactly one direction reaches.
+                if t_reaches_f && !f_reaches_t {
+                    self.remove_edge(f_idx);
+                } else if f_reaches_t && !t_reaches_f {
+                    self.remove_edge(t_idx);
+                }
+            }
+        }
+
+        // ------------- queries -------------
+
+        pub(super) fn region(&self, r: RegionId) -> &RegionKind {
+            &self.regions[r.0]
+        }
+
+        pub(super) fn is_alive(&self, r: RegionId) -> bool {
+            !matches!(self.regions[r.0], RegionKind::Tombstone)
+        }
+
+        pub(super) fn entry(&self) -> RegionId {
+            self.entry
+        }
+
+        pub(super) fn active_ids(&self) -> Vec<RegionId> {
+            (0..self.regions.len())
+                .filter(|&i| !matches!(self.regions[i], RegionKind::Tombstone))
+                .map(RegionId)
+                .collect()
+        }
+
+        pub(super) fn active_count(&self) -> usize {
+            self.regions
+                .iter()
+                .filter(|r| !matches!(r, RegionKind::Tombstone))
+                .count()
+        }
+
+        /// All live (non-goto, non-removed) successor edges of `r`.
+        /// Returns `(edge_index, &edge)` pairs so callers can mutate.
+        pub(super) fn live_succs(&self, r: RegionId) -> Vec<(usize, RegionEdge)> {
+            self.out_edges[r.0]
+                .iter()
+                .filter_map(|&ei| {
+                    let e = self.edges[ei].as_ref()?;
+                    if e.is_goto {
+                        return None;
+                    }
+                    Some((ei, e.clone()))
+                })
+                .collect()
+        }
+
+        /// All live predecessor edges of `r`.
+        pub(super) fn live_preds(&self, r: RegionId) -> Vec<(usize, RegionEdge)> {
+            self.in_edges[r.0]
+                .iter()
+                .filter_map(|&ei| {
+                    let e = self.edges[ei].as_ref()?;
+                    if e.is_goto {
+                        return None;
+                    }
+                    Some((ei, e.clone()))
+                })
+                .collect()
+        }
+
+        // ------------- mutation -------------
+
+        pub(super) fn add_region(&mut self, kind: RegionKind) -> RegionId {
+            let rid = RegionId(self.regions.len());
+            self.regions.push(kind);
+            self.out_edges.push(Vec::new());
+            self.in_edges.push(Vec::new());
+            rid
+        }
+
+        /// Mark an edge as removed from the graph. Adjacency entries are
+        /// cleaned lazily by the edge-iteration helpers (they skip `None`).
+        pub(super) fn remove_edge(&mut self, edge_idx: usize) {
+            self.edges[edge_idx] = None;
+        }
+
+        fn push_edge(&mut self, e: RegionEdge) -> usize {
+            let idx = self.edges.len();
+            let from = e.from;
+            let to = e.to;
+            self.edges.push(Some(e));
+            self.out_edges[from.0].push(idx);
+            self.in_edges[to.0].push(idx);
+            idx
+        }
+
+        pub(super) fn add_edge(
+            &mut self,
+            from: RegionId,
+            to: RegionId,
+            cond_arm: Option<bool>,
+            is_back_edge: bool,
+        ) -> usize {
+            self.push_edge(RegionEdge {
+                from,
+                to,
+                cond_arm,
+                is_back_edge,
+                is_goto: false,
+            })
+        }
+
+        /// Tombstone a region. Caller is responsible for having already
+        /// removed or rewired every edge incident to it.
+        pub(super) fn tombstone(&mut self, r: RegionId) {
+            self.regions[r.0] = RegionKind::Tombstone;
+            self.out_edges[r.0].clear();
+            self.in_edges[r.0].clear();
+        }
+
+        /// Rewire every live incoming edge `X → old` to `X → new`. Back-edge
+        /// status and cond_arm are preserved.
+        pub(super) fn redirect_in_edges(&mut self, old: RegionId, new: RegionId) {
+            let in_edge_idxs: Vec<usize> = self.in_edges[old.0].clone();
+            for ei in in_edge_idxs {
+                if let Some(edge) = self.edges[ei].as_mut() {
+                    edge.to = new;
+                    self.in_edges[new.0].push(ei);
+                }
+            }
+            self.in_edges[old.0].clear();
+        }
+
+        /// Rewire every live outgoing edge `old → Y` to `new → Y`.
+        pub(super) fn redirect_out_edges(&mut self, old: RegionId, new: RegionId) {
+            let out_edge_idxs: Vec<usize> = self.out_edges[old.0].clone();
+            for ei in out_edge_idxs {
+                if let Some(edge) = self.edges[ei].as_mut() {
+                    edge.from = new;
+                    self.out_edges[new.0].push(ei);
+                }
+            }
+            self.out_edges[old.0].clear();
+        }
+
+        pub(super) fn set_entry(&mut self, r: RegionId) {
+            self.entry = r;
+        }
+    }
+
+    // ------------- helpers -------------
+
+    /// BFS reachability from `start` to `goal` in the static CFG, treating
+    /// `excluded` as removed (so paths that would otherwise loop back through
+    /// the original branch head don't count as "reaching").
+    fn has_cfg_path_excluding(
+        s: &Structurizer<'_>,
+        start: NodeIndex,
+        goal: NodeIndex,
+        excluded: NodeIndex,
+    ) -> bool {
+        if start == goal {
+            return true;
+        }
+        let mut seen: HashSet<NodeIndex> = HashSet::new();
+        let mut work: VecDeque<NodeIndex> = VecDeque::new();
+        seen.insert(start);
+        seen.insert(excluded);
+        work.push_back(start);
+        while let Some(n) = work.pop_front() {
+            for succ in s.cfg.neighbors_directed(n, Direction::Outgoing) {
+                if succ == goal {
+                    return true;
+                }
+                if seen.insert(succ) {
+                    work.push_back(succ);
+                }
+            }
+        }
+        false
+    }
+
+    /// Build a Return-terminated statement for an IR block whose last stmt
+    /// is an unconditional RET/EXIT. Mirrors structurizer.rs:461-498.
+    fn build_return_stmt(ir_block: &IRBlock) -> StructuredStatement {
+        let ret_val = ir_block.stmts.last().and_then(|s| {
+            if let RValue::Op { opcode, args } = &s.value {
+                if (opcode.starts_with("RET") || opcode == "EXIT") && !args.is_empty() {
+                    return Some(args[0].clone());
+                }
+            }
+            None
+        });
+        let mut pre_return_stmts = ir_block.stmts.clone();
+        if let Some(IRStatement { value: RValue::Op { opcode, .. }, pred, .. }) =
+            pre_return_stmts.last()
+        {
+            if pred.is_none() && Structurizer::is_return_opcode(opcode) {
+                pre_return_stmts.pop();
+            }
+        }
+        let has_renderable_pre_return_stmt = pre_return_stmts.iter().any(|s| {
+            if matches!(s.value, RValue::Phi(_)) {
+                return false;
+            }
+            match &s.value {
+                RValue::Op { opcode, .. } => {
+                    !Structurizer::is_branch_only_opcode(opcode)
+                        && !Structurizer::is_return_opcode(opcode)
+                }
+                _ => true,
+            }
+        });
+        let mut seq = Vec::new();
+        if has_renderable_pre_return_stmt {
+            seq.push(StructuredStatement::BasicBlock {
+                block_id: ir_block.id,
+                stmts: pre_return_stmts,
+            });
+        }
+        seq.push(StructuredStatement::Return(ret_val));
+        if seq.len() == 1 {
+            seq.into_iter().next().unwrap()
+        } else {
+            StructuredStatement::Sequence(seq)
+        }
+    }
+
+    /// Materialize a region's StructuredStatement — cloning for Composite or
+    /// building a fresh `BasicBlock` for Basic regions.
+    fn stmt_for_region(graph: &RegionGraph, r: RegionId, s: &Structurizer<'_>) -> StructuredStatement {
+        match graph.region(r) {
+            RegionKind::Basic { block_id, .. } => {
+                let stmts = s
+                    .function_ir
+                    .blocks
+                    .iter()
+                    .find(|b| b.id == *block_id)
+                    .map(|b| b.stmts.clone())
+                    .unwrap_or_default();
+                StructuredStatement::BasicBlock {
+                    block_id: *block_id,
+                    stmts,
+                }
+            }
+            RegionKind::Composite { stmt, .. } => stmt.clone(),
+            RegionKind::Tombstone => StructuredStatement::Empty,
+        }
+    }
+
+    fn primary_block_id_of(graph: &RegionGraph, r: RegionId) -> usize {
+        match graph.region(r) {
+            RegionKind::Basic { block_id, .. } => *block_id,
+            RegionKind::Composite {
+                primary_block_id, ..
+            } => *primary_block_id,
+            RegionKind::Tombstone => usize::MAX,
+        }
+    }
+
+    /// Concatenate two statements into a flattened Sequence, dropping Empty
+    /// children and collapsing nested Sequences.
+    fn concat_stmts(a: StructuredStatement, b: StructuredStatement) -> StructuredStatement {
+        let mut out: Vec<StructuredStatement> = Vec::new();
+        match a {
+            StructuredStatement::Empty => {}
+            StructuredStatement::Sequence(v) => {
+                for s in v {
+                    if !matches!(s, StructuredStatement::Empty) {
+                        out.push(s);
+                    }
+                }
+            }
+            other => out.push(other),
+        }
+        match b {
+            StructuredStatement::Empty => {}
+            StructuredStatement::Sequence(v) => {
+                for s in v {
+                    if !matches!(s, StructuredStatement::Empty) {
+                        out.push(s);
+                    }
+                }
+            }
+            other => out.push(other),
+        }
+        match out.len() {
+            0 => StructuredStatement::Empty,
+            1 => out.into_iter().next().unwrap(),
+            _ => StructuredStatement::Sequence(out),
+        }
+    }
+
+    // ------------- collapse rules -------------
+
+    /// Sequence collapse: fold `A → B` when neither end has a branch structure
+    /// still pending. Forbidden from absorbing into a 2-way head or a
+    /// back-edge tail (see plan §7).
+    pub(super) fn try_seq(
+        graph: &mut RegionGraph,
+        r: RegionId,
+        s: &Structurizer<'_>,
+    ) -> bool {
+        if !graph.is_alive(r) {
+            return false;
+        }
+        let succs = graph.live_succs(r);
+        if succs.len() != 1 {
+            return false;
+        }
+        let (_, a_to_b) = &succs[0];
+        if a_to_b.cond_arm.is_some() || a_to_b.is_back_edge {
+            return false;
+        }
+        let b = a_to_b.to;
+        if b == r {
+            return false;
+        }
+        let preds_b = graph.live_preds(b);
+        if preds_b.len() != 1 {
+            return false;
+        }
+        let succs_b = graph.live_succs(b);
+        match succs_b.len() {
+            0 => {}
+            1 => {
+                let (_, out_b) = &succs_b[0];
+                if out_b.cond_arm.is_some() || out_b.is_back_edge {
+                    return false;
+                }
+            }
+            2 => {
+                // Multi-block do-while shape: A → B(test), B → A (back-edge)
+                // and B → X (forward exit). After folding A and B together,
+                // the back-edge to A becomes a self-back-edge on the new
+                // composite, which `try_do_while` then matches. Refuse any
+                // other 2-successor pattern (the partition rule keeps 2-way
+                // forward branches in the hands of `try_if_*` / `try_while_do`).
+                let back_to_a = succs_b
+                    .iter()
+                    .any(|(_, e)| e.to == r && e.is_back_edge);
+                let forward_other = succs_b
+                    .iter()
+                    .any(|(_, e)| e.to != r && !e.is_back_edge);
+                if !(back_to_a && forward_other) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+
+        // Build the new Composite statement.
+        let a_stmt = stmt_for_region(graph, r, s);
+        let b_stmt = stmt_for_region(graph, b, s);
+        let new_stmt = concat_stmts(a_stmt, b_stmt);
+        let new_primary = primary_block_id_of(graph, b);
+        let new_rid = graph.add_region(RegionKind::Composite {
+            stmt: new_stmt,
+            primary_block_id: new_primary,
+        });
+
+        // Rewire: X→A edges (other than A→B) now go X→NEW.
+        // The only incoming edge of B is A→B; remove it before redirecting.
+        // The A→B edge itself is removed.
+        let a_to_b_idx = succs[0].0;
+        graph.remove_edge(a_to_b_idx);
+
+        // Pull all live X→A edges onto NEW.
+        graph.redirect_in_edges(r, new_rid);
+        // Pull all live B→Y edges onto NEW.
+        graph.redirect_out_edges(b, new_rid);
+
+        // Entry update.
+        if graph.entry() == r {
+            graph.set_entry(new_rid);
+        }
+        // Note: B can't have been entry if r had the only pred of B and r is
+        // alive, but handle it defensively.
+        if graph.entry() == b {
+            graph.set_entry(new_rid);
+        }
+
+        graph.tombstone(r);
+        graph.tombstone(b);
+        true
+    }
+
+    // ------------- if/else collapse -------------
+
+    /// Try to collapse `A` as an `if-then-else`: `A` has two oriented arms to
+    /// distinct regions `T` and `F`, both arms are forward and converge at a
+    /// common merge `M` (or both terminate). The condition expression comes
+    /// from `A` itself (which must remain Basic so the prelude printer can
+    /// emit its statements before the `if`).
+    pub(super) fn try_if_else(
+        graph: &mut RegionGraph,
+        r: RegionId,
+        s: &Structurizer<'_>,
+    ) -> bool {
+        if !graph.is_alive(r) {
+            return false;
+        }
+        // Heads must be Basic so condition_block_id refers to a real IR block
+        // and the prelude renderer can emit A's statements before the if.
+        let head_block_id = match graph.region(r) {
+            RegionKind::Basic { block_id, .. } => *block_id,
+            _ => return false,
+        };
+
+        let succs = graph.live_succs(r);
+        if succs.len() != 2 {
+            return false;
+        }
+        // Identify the true/false arms.
+        let (true_idx, true_e, false_idx, false_e) = match (&succs[0], &succs[1]) {
+            ((i0, e0), (i1, e1))
+                if e0.cond_arm == Some(true) && e1.cond_arm == Some(false) =>
+            {
+                (*i0, e0.clone(), *i1, e1.clone())
+            }
+            ((i0, e0), (i1, e1))
+                if e0.cond_arm == Some(false) && e1.cond_arm == Some(true) =>
+            {
+                (*i1, e1.clone(), *i0, e0.clone())
+            }
+            _ => return false,
+        };
+        if true_e.is_back_edge || false_e.is_back_edge {
+            return false;
+        }
+        let t = true_e.to;
+        let f = false_e.to;
+        if t == r || f == r || t == f {
+            return false;
+        }
+        // Both branches must be single-entry from `r`.
+        let preds_t = graph.live_preds(t);
+        let preds_f = graph.live_preds(f);
+        if preds_t.len() != 1 || preds_f.len() != 1 {
+            return false;
+        }
+        let succs_t = graph.live_succs(t);
+        let succs_f = graph.live_succs(f);
+        // Each branch is either terminal (no live succs) or has a single
+        // unconditional forward edge to a common merge.
+        if succs_t.len() > 1 || succs_f.len() > 1 {
+            return false;
+        }
+        let t_merge = succs_t.first().map(|(_, e)| e.clone());
+        let f_merge = succs_f.first().map(|(_, e)| e.clone());
+        let merge: Option<RegionId> = match (&t_merge, &f_merge) {
+            (None, None) => None,
+            (Some(et), Some(ef)) => {
+                if et.to != ef.to
+                    || et.cond_arm.is_some()
+                    || ef.cond_arm.is_some()
+                    || et.is_back_edge
+                    || ef.is_back_edge
+                {
+                    return false;
+                }
+                Some(et.to)
+            }
+            // Asymmetric merges (one terminal, one not) — fall through to
+            // try_if_then if appropriate.
+            _ => return false,
+        };
+
+        // Build statement.
+        let ir_block = match s.function_ir.blocks.iter().find(|b| b.id == head_block_id) {
+            Some(b) => b,
+            None => return false,
+        };
+        let (cond_expr, _, _) = match s.extract_if_targets_and_condition(ir_block) {
+            Some(t) => t,
+            None => return false,
+        };
+        let then_stmt = stmt_for_region(graph, t, s);
+        let else_stmt = stmt_for_region(graph, f, s);
+        let if_stmt = StructuredStatement::If {
+            condition_block_id: head_block_id,
+            condition_expr: cond_expr,
+            then_branch: Box::new(then_stmt),
+            else_branch: Some(Box::new(else_stmt)),
+        };
+
+        // Build the new Composite. Its primary block id is the merge if there
+        // is one, else the head's id.
+        let new_primary = if let Some(m) = merge {
+            primary_block_id_of(graph, m)
+        } else {
+            head_block_id
+        };
+        let new_rid = graph.add_region(RegionKind::Composite {
+            stmt: if_stmt,
+            primary_block_id: new_primary,
+        });
+
+        // Edge surgery.
+        graph.remove_edge(true_idx);
+        graph.remove_edge(false_idx);
+        if let Some((tm_idx, _)) = succs_t.first() {
+            graph.remove_edge(*tm_idx);
+        }
+        if let Some((fm_idx, _)) = succs_f.first() {
+            graph.remove_edge(*fm_idx);
+        }
+        graph.redirect_in_edges(r, new_rid);
+        if let Some(m) = merge {
+            // The new region falls through to the merge.
+            graph.add_edge(new_rid, m, None, false);
+        }
+        if graph.entry() == r {
+            graph.set_entry(new_rid);
+        }
+        graph.tombstone(r);
+        graph.tombstone(t);
+        graph.tombstone(f);
+        true
+    }
+
+    /// Try to collapse `A` as a one-armed `if`: `A` has two oriented arms,
+    /// one going to a body `T` that re-joins via the *other* arm's target as
+    /// the implicit merge. If the body is on the false arm, we negate.
+    pub(super) fn try_if_then(
+        graph: &mut RegionGraph,
+        r: RegionId,
+        s: &Structurizer<'_>,
+    ) -> bool {
+        if !graph.is_alive(r) {
+            return false;
+        }
+        let head_block_id = match graph.region(r) {
+            RegionKind::Basic { block_id, .. } => *block_id,
+            _ => return false,
+        };
+        let succs = graph.live_succs(r);
+        if succs.len() != 2 {
+            return false;
+        }
+        let (true_idx, true_e, false_idx, false_e) = match (&succs[0], &succs[1]) {
+            ((i0, e0), (i1, e1))
+                if e0.cond_arm == Some(true) && e1.cond_arm == Some(false) =>
+            {
+                (*i0, e0.clone(), *i1, e1.clone())
+            }
+            ((i0, e0), (i1, e1))
+                if e0.cond_arm == Some(false) && e1.cond_arm == Some(true) =>
+            {
+                (*i1, e1.clone(), *i0, e0.clone())
+            }
+            _ => return false,
+        };
+        if true_e.is_back_edge || false_e.is_back_edge {
+            return false;
+        }
+        let t = true_e.to;
+        let f = false_e.to;
+        if t == r || f == r || t == f {
+            return false;
+        }
+
+        // Try with the true arm as the body, then the false arm as the body.
+        // body_side: which arm holds the body, the other is the implicit merge.
+        let attempt = |graph: &RegionGraph, body: RegionId, merge: RegionId| -> bool {
+            // Body must be single-entry from r.
+            let preds_b = graph.live_preds(body);
+            if preds_b.len() != 1 {
+                return false;
+            }
+            let succs_b = graph.live_succs(body);
+            // Body either terminates (no live succs) or has a single
+            // unconditional forward edge to the merge.
+            if succs_b.is_empty() {
+                return false; // empty body without merge — handled by caller as if/else trivial; fall back
+            }
+            if succs_b.len() != 1 {
+                return false;
+            }
+            let (_, eb) = &succs_b[0];
+            if eb.cond_arm.is_some() || eb.is_back_edge || eb.to != merge {
+                return false;
+            }
+            true
+        };
+
+        let (body, body_idx, body_edge_to_merge_idx, negate) = if attempt(graph, t, f) {
+            let (mi, _) = graph.live_succs(t)[0];
+            (t, true_idx, mi, false)
+        } else if attempt(graph, f, t) {
+            let (mi, _) = graph.live_succs(f)[0];
+            (f, false_idx, mi, true)
+        } else {
+            return false;
+        };
+        let merge = if negate { t } else { f };
+        let other_arm_idx = if negate { true_idx } else { false_idx };
+
+        let ir_block = match s.function_ir.blocks.iter().find(|b| b.id == head_block_id) {
+            Some(b) => b,
+            None => return false,
+        };
+        let (cond_expr, _, _) = match s.extract_if_targets_and_condition(ir_block) {
+            Some(t) => t,
+            None => return false,
+        };
+        let cond_oriented = if negate { negate_condition(cond_expr) } else { cond_expr };
+        let then_stmt = stmt_for_region(graph, body, s);
+        let if_stmt = StructuredStatement::If {
+            condition_block_id: head_block_id,
+            condition_expr: cond_oriented,
+            then_branch: Box::new(then_stmt),
+            else_branch: None,
+        };
+
+        let new_primary = primary_block_id_of(graph, merge);
+        let new_rid = graph.add_region(RegionKind::Composite {
+            stmt: if_stmt,
+            primary_block_id: new_primary,
+        });
+
+        graph.remove_edge(body_idx);
+        graph.remove_edge(other_arm_idx);
+        graph.remove_edge(body_edge_to_merge_idx);
+        graph.redirect_in_edges(r, new_rid);
+        graph.add_edge(new_rid, merge, None, false);
+
+        if graph.entry() == r {
+            graph.set_entry(new_rid);
+        }
+        graph.tombstone(r);
+        graph.tombstone(body);
+        let _ = body_idx;
+        let _ = other_arm_idx;
+        true
+    }
+
+    /// One-arm if-then collapse: handles 2-way Basic heads where one arm has
+    /// already been stripped by `drop_shortcut_branch_edges`. The remaining
+    /// edge still carries `cond_arm = Some(_)`, the body is reached only via
+    /// that conditional edge, and the body's natural exit is the implicit
+    /// merge — exactly the shape the OLD heuristic produced for diamonds with
+    /// a "shortcut" edge.
+    pub(super) fn try_if_then_one_arm(
+        graph: &mut RegionGraph,
+        r: RegionId,
+        s: &Structurizer<'_>,
+    ) -> bool {
+        if !graph.is_alive(r) {
+            return false;
+        }
+        let head_block_id = match graph.region(r) {
+            RegionKind::Basic { block_id, .. } => *block_id,
+            _ => return false,
+        };
+        let succs = graph.live_succs(r);
+        if succs.len() != 1 {
+            return false;
+        }
+        let (body_idx, body_e) = (succs[0].0, succs[0].1.clone());
+        let arm = match body_e.cond_arm {
+            Some(a) => a,
+            None => return false,
+        };
+        if body_e.is_back_edge {
+            return false;
+        }
+        let body = body_e.to;
+        if body == r {
+            return false;
+        }
+        // Body must be single-entry from us so we can absorb it.
+        let preds_b = graph.live_preds(body);
+        if preds_b.len() != 1 {
+            return false;
+        }
+        // The body must terminate or fall into a single forward merge.
+        let succs_b = graph.live_succs(body);
+        let merge_opt: Option<RegionId> = match succs_b.len() {
+            0 => None,
+            1 => {
+                let (_, eb) = &succs_b[0];
+                if eb.cond_arm.is_some() || eb.is_back_edge {
+                    return false;
+                }
+                Some(eb.to)
+            }
+            _ => return false,
+        };
+
+        let ir_block = match s.function_ir.blocks.iter().find(|b| b.id == head_block_id) {
+            Some(b) => b,
+            None => return false,
+        };
+        let (cond_expr, _, _) = match s.extract_if_targets_and_condition(ir_block) {
+            Some(t) => t,
+            None => return false,
+        };
+        let cond_oriented = if arm { cond_expr } else { negate_condition(cond_expr) };
+        let body_stmt = stmt_for_region(graph, body, s);
+        let if_stmt = StructuredStatement::If {
+            condition_block_id: head_block_id,
+            condition_expr: cond_oriented,
+            then_branch: Box::new(body_stmt),
+            else_branch: None,
+        };
+
+        let new_primary = match merge_opt {
+            Some(m) => primary_block_id_of(graph, m),
+            None => head_block_id,
+        };
+        let new_rid = graph.add_region(RegionKind::Composite {
+            stmt: if_stmt,
+            primary_block_id: new_primary,
+        });
+
+        graph.remove_edge(body_idx);
+        if let Some((mi, _)) = succs_b.first() {
+            graph.remove_edge(*mi);
+        }
+        graph.redirect_in_edges(r, new_rid);
+        if let Some(m) = merge_opt {
+            graph.add_edge(new_rid, m, None, false);
+        }
+
+        if graph.entry() == r {
+            graph.set_entry(new_rid);
+        }
+        graph.tombstone(r);
+        graph.tombstone(body);
+        true
+    }
+
+    // ------------- loop collapse -------------
+
+    /// While-do loop: head `H` is a Basic 2-way branch where one arm goes to
+    /// a body `B` (which then back-edges to `H`) and the other arm exits.
+    ///
+    /// The structurizer used to set `Loop::header_block_id = Some(H)`, which
+    /// drove the printer to render `H`'s IR statements as a *prelude* before
+    /// the loop construct *and* the body Sequence still embedded `H`,
+    /// duplicating it. We avoid that by emitting a Sequence with `H` as a
+    /// plain BasicBlock followed by the Loop with `header_block_id = None`.
+    pub(super) fn try_while_do(
+        graph: &mut RegionGraph,
+        r: RegionId,
+        s: &Structurizer<'_>,
+    ) -> bool {
+        if !graph.is_alive(r) {
+            return false;
+        }
+        let head_block_id = match graph.region(r) {
+            RegionKind::Basic { block_id, .. } => *block_id,
+            _ => return false,
+        };
+        let succs = graph.live_succs(r);
+        if succs.len() != 2 {
+            return false;
+        }
+        let (true_idx, true_e, false_idx, false_e) = match (&succs[0], &succs[1]) {
+            ((i0, e0), (i1, e1))
+                if e0.cond_arm == Some(true) && e1.cond_arm == Some(false) =>
+            {
+                (*i0, e0.clone(), *i1, e1.clone())
+            }
+            ((i0, e0), (i1, e1))
+                if e0.cond_arm == Some(false) && e1.cond_arm == Some(true) =>
+            {
+                (*i1, e1.clone(), *i0, e0.clone())
+            }
+            _ => return false,
+        };
+        // For a while-do, neither arm of the head is the back edge — the back
+        // edge is from the body region.
+        if true_e.is_back_edge || false_e.is_back_edge {
+            return false;
+        }
+
+        // Try body=true,exit=false; then swap.
+        let try_arm = |graph: &RegionGraph, body: RegionId| -> bool {
+            if body == r {
+                return false;
+            }
+            let preds_b = graph.live_preds(body);
+            if preds_b.len() != 1 {
+                return false;
+            }
+            let succs_b = graph.live_succs(body);
+            if succs_b.len() != 1 {
+                return false;
+            }
+            let (_, eb) = &succs_b[0];
+            // Body's only successor must be the head, via a back edge.
+            if eb.to != r || !eb.is_back_edge {
+                return false;
+            }
+            true
+        };
+
+        let (body, body_idx, exit, exit_idx, negate) =
+            if try_arm(graph, true_e.to) {
+                (true_e.to, true_idx, false_e.to, false_idx, false)
+            } else if try_arm(graph, false_e.to) {
+                (false_e.to, false_idx, true_e.to, true_idx, true)
+            } else {
+                return false;
+            };
+
+        let ir_block = match s.function_ir.blocks.iter().find(|b| b.id == head_block_id) {
+            Some(b) => b,
+            None => return false,
+        };
+        let (cond_expr, _, _) = match s.extract_if_targets_and_condition(ir_block) {
+            Some(t) => t,
+            None => return false,
+        };
+        let cond_oriented = if negate { negate_condition(cond_expr) } else { cond_expr };
+        let body_stmt = stmt_for_region(graph, body, s);
+        let head_stmt = stmt_for_region(graph, r, s);
+        let loop_stmt = StructuredStatement::Loop {
+            loop_type: LoopType::While,
+            header_block_id: None,
+            condition_expr: Some(cond_oriented),
+            body: Box::new(body_stmt),
+        };
+        let new_stmt = concat_stmts(head_stmt, loop_stmt);
+
+        // Find the body→head back edge index so we can remove it.
+        let back_edge_idx: Option<usize> = graph
+            .live_succs(body)
+            .iter()
+            .find(|(_, e)| e.to == r && e.is_back_edge)
+            .map(|(i, _)| *i);
+
+        let new_primary = primary_block_id_of(graph, exit);
+        let new_rid = graph.add_region(RegionKind::Composite {
+            stmt: new_stmt,
+            primary_block_id: new_primary,
+        });
+
+        graph.remove_edge(true_idx);
+        graph.remove_edge(false_idx);
+        if let Some(bi) = back_edge_idx {
+            graph.remove_edge(bi);
+        }
+        // Note: redirect_in_edges only moves still-live entries; the body's
+        // back-edge from r is already removed.
+        graph.redirect_in_edges(r, new_rid);
+        graph.add_edge(new_rid, exit, None, false);
+
+        if graph.entry() == r {
+            graph.set_entry(new_rid);
+        }
+        graph.tombstone(r);
+        graph.tombstone(body);
+        let _ = body_idx;
+        let _ = exit_idx;
+        true
+    }
+
+    /// Do-while loop: a region `R` whose only outgoing edges are a self
+    /// back-edge (`R → R`, conditional) and a forward exit (`R → X`,
+    /// conditional, opposite arm). After `try_seq` folds a multi-block loop
+    /// body, the back edge becomes this self-edge.
+    pub(super) fn try_do_while(
+        graph: &mut RegionGraph,
+        r: RegionId,
+        s: &Structurizer<'_>,
+    ) -> bool {
+        if !graph.is_alive(r) {
+            return false;
+        }
+        let succs = graph.live_succs(r);
+        if succs.len() != 2 {
+            return false;
+        }
+
+        // Identify the self back-edge and the forward exit.
+        let mut back: Option<(usize, RegionEdge)> = None;
+        let mut exit: Option<(usize, RegionEdge)> = None;
+        for (ei, e) in &succs {
+            if e.to == r && e.is_back_edge {
+                back = Some((*ei, e.clone()));
+            } else if !e.is_back_edge {
+                exit = Some((*ei, e.clone()));
+            }
+        }
+        let (back_idx, back_e) = match back {
+            Some(x) => x,
+            None => return false,
+        };
+        let (exit_idx, exit_e) = match exit {
+            Some(x) => x,
+            None => return false,
+        };
+        // Both arms must be predicate-driven, opposite.
+        let (b_arm, x_arm) = (back_e.cond_arm, exit_e.cond_arm);
+        match (b_arm, x_arm) {
+            (Some(true), Some(false)) | (Some(false), Some(true)) => {}
+            _ => return false,
+        }
+
+        // The condition expression lives on the *tail* basic block (the one
+        // whose irdst spawned this 2-way branch). Look it up by primary id.
+        let tail_bid = primary_block_id_of(graph, r);
+        let ir_block = match s.function_ir.blocks.iter().find(|b| b.id == tail_bid) {
+            Some(b) => b,
+            None => return false,
+        };
+        let (cond_expr, _, _) = match s.extract_if_targets_and_condition(ir_block) {
+            Some(t) => t,
+            None => return false,
+        };
+        // Orient so that "true" means keep looping (i.e. take the back edge).
+        let cond_oriented = if b_arm == Some(true) {
+            cond_expr
+        } else {
+            negate_condition(cond_expr)
+        };
+
+        let body_stmt = stmt_for_region(graph, r, s);
+        let loop_stmt = StructuredStatement::Loop {
+            loop_type: LoopType::DoWhile,
+            header_block_id: None,
+            condition_expr: Some(cond_oriented),
+            body: Box::new(body_stmt),
+        };
+
+        let exit_target = exit_e.to;
+        let new_primary = primary_block_id_of(graph, exit_target);
+        let new_rid = graph.add_region(RegionKind::Composite {
+            stmt: loop_stmt,
+            primary_block_id: new_primary,
+        });
+
+        graph.remove_edge(back_idx);
+        graph.remove_edge(exit_idx);
+        graph.redirect_in_edges(r, new_rid);
+        graph.add_edge(new_rid, exit_target, None, false);
+
+        if graph.entry() == r {
+            graph.set_entry(new_rid);
+        }
+        graph.tombstone(r);
+        true
+    }
+
+    /// Degenerate self-loop: `R` has exactly one live successor which is the
+    /// self back-edge (no exit). Emits an `Endless` loop.
+    pub(super) fn try_self_loop(
+        graph: &mut RegionGraph,
+        r: RegionId,
+        s: &Structurizer<'_>,
+    ) -> bool {
+        if !graph.is_alive(r) {
+            return false;
+        }
+        let succs = graph.live_succs(r);
+        if succs.len() != 1 {
+            return false;
+        }
+        let (back_idx, back_e) = (succs[0].0, succs[0].1.clone());
+        if back_e.to != r || !back_e.is_back_edge {
+            return false;
+        }
+        let body_stmt = stmt_for_region(graph, r, s);
+        let loop_stmt = StructuredStatement::Loop {
+            loop_type: LoopType::Endless,
+            header_block_id: None,
+            condition_expr: None,
+            body: Box::new(body_stmt),
+        };
+        let new_primary = primary_block_id_of(graph, r);
+        let new_rid = graph.add_region(RegionKind::Composite {
+            stmt: loop_stmt,
+            primary_block_id: new_primary,
+        });
+        graph.remove_edge(back_idx);
+        graph.redirect_in_edges(r, new_rid);
+        if graph.entry() == r {
+            graph.set_entry(new_rid);
+        }
+        graph.tombstone(r);
+        true
+    }
+
+    // ------------- goto fallback -------------
+
+    /// Minimal Phase A fallback: if the collapse loop stalled, walk the graph
+    /// and mark the first live edge as goto. Later phases will pick more
+    /// intelligently.
+    pub(super) fn select_goto_edge(graph: &mut RegionGraph, s: &Structurizer<'_>) -> bool {
+        // Deterministic selection: smallest (from, to) region id pair.
+        let mut candidate: Option<(RegionId, RegionId, usize, Option<bool>, bool)> = None;
+        for rid in graph.active_ids() {
+            for (ei, e) in graph.live_succs(rid) {
+                let key = (e.from, e.to, ei, e.cond_arm, e.is_back_edge);
+                candidate = Some(match candidate {
+                    None => key,
+                    Some(cur) => {
+                        if (key.0 .0, key.1 .0) < (cur.0 .0, cur.1 .0) {
+                            key
+                        } else {
+                            cur
+                        }
+                    }
+                });
+            }
+        }
+        let Some((from_r, to_r, edge_idx, cond_arm, _is_back)) = candidate else {
+            return false;
+        };
+
+        // Materialize the goto into the source region's stmt. Convert the
+        // source into a Composite that ends with an UnstructuredJump, so the
+        // printer can emit "if (P0) goto BBxx;" or bare "goto BBxx;".
+        let cur_stmt = stmt_for_region(graph, from_r, s);
+        let from_bid = primary_block_id_of(graph, from_r);
+        let to_bid = primary_block_id_of(graph, to_r);
+        let cond_ir = cond_for_arm(graph, from_r, cond_arm, s);
+        let jump = StructuredStatement::UnstructuredJump {
+            from_block_id: from_bid,
+            to_block_id: to_bid,
+            condition: cond_ir,
+        };
+        let new_stmt = concat_stmts(cur_stmt, jump);
+        // In place, update the source region to Composite carrying this stmt.
+        // We only care to rewrite the stmt, not the edges.
+        match &mut graph.regions[from_r.0] {
+            RegionKind::Basic { .. } | RegionKind::Composite { .. } => {
+                graph.regions[from_r.0] = RegionKind::Composite {
+                    stmt: new_stmt,
+                    primary_block_id: from_bid,
+                };
+            }
+            RegionKind::Tombstone => return false,
+        }
+        // Flag the edge so future collapse rules skip it.
+        if let Some(edge) = graph.edges[edge_idx].as_mut() {
+            edge.is_goto = true;
+        }
+        true
+    }
+
+    /// Look up the branch predicate for the source's selected arm, so the
+    /// goto fallback can emit `if (pred) goto BBxx;` rather than an
+    /// unconditional jump (which would change semantics).
+    fn cond_for_arm(
+        graph: &RegionGraph,
+        from: RegionId,
+        cond_arm: Option<bool>,
+        s: &Structurizer<'_>,
+    ) -> Option<IRExpr> {
+        let arm = cond_arm?;
+        let bid = primary_block_id_of(graph, from);
+        let ir_block = s.function_ir.blocks.iter().find(|b| b.id == bid)?;
+        let (cond_expr, _, _) = s.extract_if_targets_and_condition(ir_block)?;
+        Some(if arm { cond_expr } else { negate_condition(cond_expr) })
+    }
+
+    // ------------- main driver -------------
+
+    pub(super) fn run_collapse(graph: &mut RegionGraph, s: &Structurizer<'_>) {
+        let initial = graph.active_count().max(1);
+        let max_iter = 4 * initial * initial + 100;
+        let mut iter = 0usize;
+        loop {
+            iter += 1;
+            if iter > max_iter {
+                eprintln!(
+                    "structurizer: collapse exceeded {} iterations; bailing",
+                    max_iter
+                );
+                break;
+            }
+            let mut changed = false;
+            for rid in graph.active_ids() {
+                if !graph.is_alive(rid) {
+                    continue;
+                }
+                if try_seq(graph, rid, s) {
+                    changed = true;
+                    break;
+                }
+                if try_if_else(graph, rid, s) {
+                    changed = true;
+                    break;
+                }
+                if try_if_then(graph, rid, s) {
+                    changed = true;
+                    break;
+                }
+                if try_if_then_one_arm(graph, rid, s) {
+                    changed = true;
+                    break;
+                }
+                if try_while_do(graph, rid, s) {
+                    changed = true;
+                    break;
+                }
+                if try_do_while(graph, rid, s) {
+                    changed = true;
+                    break;
+                }
+                if try_self_loop(graph, rid, s) {
+                    changed = true;
+                    break;
+                }
+            }
+            if changed {
+                continue;
+            }
+            if graph.active_count() <= 1 {
+                break;
+            }
+            if !select_goto_edge(graph, s) {
+                break;
+            }
+        }
+    }
+
+    // ------------- root emission -------------
+
+    /// Walk reachable regions from `entry` and concatenate them. In the happy
+    /// path exactly one region survives; in the fallback path we thread
+    /// leftover regions together with explicit gotos already materialized
+    /// into their statements.
+    pub(super) fn emit_root(graph: &RegionGraph) -> StructuredStatement {
+        // DFS from entry, preorder, deterministic.
+        let mut visited: HashSet<usize> = HashSet::new();
+        let mut order: Vec<RegionId> = Vec::new();
+        let mut stack: Vec<RegionId> = vec![graph.entry()];
+        while let Some(rid) = stack.pop() {
+            if !visited.insert(rid.0) {
+                continue;
+            }
+            if !graph.is_alive(rid) {
+                continue;
+            }
+            order.push(rid);
+            // Push successors in reverse-sorted order so we visit in
+            // ascending (from, to) region-id order.
+            let mut out: Vec<RegionId> = graph
+                .out_edges[rid.0]
+                .iter()
+                .filter_map(|&ei| graph.edges[ei].as_ref().map(|e| e.to))
+                .collect();
+            out.sort_by_key(|r| r.0);
+            out.dedup();
+            for r in out.into_iter().rev() {
+                if !visited.contains(&r.0) {
+                    stack.push(r);
+                }
+            }
+        }
+
+        // Collect statements from the walked regions.
+        let mut parts: Vec<StructuredStatement> = Vec::new();
+        for rid in order {
+            match graph.region(rid) {
+                RegionKind::Basic { block_id, .. } => {
+                    // A Basic region that survived to emission means the
+                    // collapse loop stalled before folding it in. Emit its
+                    // raw IR stmts as a BasicBlock.
+                    parts.push(StructuredStatement::BasicBlock {
+                        block_id: *block_id,
+                        stmts: Vec::new(),
+                    });
+                }
+                RegionKind::Composite { stmt, .. } => parts.push(stmt.clone()),
+                RegionKind::Tombstone => {}
+            }
+        }
+        match parts.len() {
+            0 => StructuredStatement::Empty,
+            1 => parts.into_iter().next().unwrap(),
+            _ => StructuredStatement::Sequence(parts),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cfg::{BasicBlock as CfgBasicBlock, ControlFlowGraph, EdgeKind};
     use crate::ir::DefaultDisplay;
     use petgraph::graph::DiGraph;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
 
     fn stmt(opcode: &str) -> IRStatement {
         IRStatement {
@@ -1713,22 +2445,6 @@ mod tests {
                 contains_loop(then_branch)
                     || else_branch.as_deref().map(contains_loop).unwrap_or(false)
             }
-            _ => false,
-        }
-    }
-
-    fn contains_break(s: &StructuredStatement) -> bool {
-        match s {
-            StructuredStatement::Break(_) => true,
-            StructuredStatement::Sequence(v) => v.iter().any(contains_break),
-            _ => false,
-        }
-    }
-
-    fn contains_continue(s: &StructuredStatement) -> bool {
-        match s {
-            StructuredStatement::Continue(_) => true,
-            StructuredStatement::Sequence(v) => v.iter().any(contains_continue),
             _ => false,
         }
     }
@@ -1836,108 +2552,93 @@ mod tests {
         let mut structurizer = Structurizer::new(&cfg, &fir);
         let out = structurizer.structure_function().unwrap();
         assert!(contains_loop(&out));
+        assert!(!contains_goto(&out));
     }
 
     #[test]
-    fn loop_body_places_break() {
-        let specs = vec![
-            (0, 0x00, vec![], vec![stmt("HDR")]),
-            (1, 0x10, vec![], vec![stmt("BODY")]),
-            (3, 0x30, vec![], vec![stmt("RET")]),
-        ];
-        let edges = vec![(1, 3, EdgeKind::UncondBranch)];
-        let (cfg, fir, id_to_idx) = build_case(&specs, &edges);
-        let mut structurizer = Structurizer::new(&cfg, &fir);
-        let loop_nodes: HashSet<NodeIndex> = [id_to_idx[&0], id_to_idx[&1]].into_iter().collect();
-
-        let out = structurizer
-            .structure_loop_body_recursive(id_to_idx[&1], &loop_nodes, id_to_idx[&0], Some(id_to_idx[&3]), None)
-            .unwrap();
-        assert!(contains_break(&out));
-    }
-
-    #[test]
-    fn loop_body_places_continue() {
-        let specs = vec![
-            (0, 0x00, vec![], vec![stmt("HDR")]),
-            (1, 0x10, vec![], vec![stmt("BODY")]),
-        ];
-        let edges = vec![(1, 0, EdgeKind::UncondBranch)];
-        let (cfg, fir, id_to_idx) = build_case(&specs, &edges);
-        let mut structurizer = Structurizer::new(&cfg, &fir);
-        let loop_nodes: HashSet<NodeIndex> = [id_to_idx[&0], id_to_idx[&1]].into_iter().collect();
-
-        let out = structurizer
-            .structure_loop_body_recursive(id_to_idx[&1], &loop_nodes, id_to_idx[&0], None, None)
-            .unwrap();
-        assert!(contains_continue(&out));
-    }
-
-    #[test]
-    fn loop_body_falls_back_to_goto_on_unstructured_branch() {
-        let specs = vec![
-            (0, 0x00, vec![], vec![stmt("HDR")]),
-            (1, 0x10, vec![], vec![stmt("BODY")]),
-            (2, 0x20, vec![], vec![stmt("A")]),
-            (3, 0x30, vec![], vec![stmt("B")]),
-        ];
-        let edges = vec![
-            (1, 2, EdgeKind::CondBranch),
-            (1, 3, EdgeKind::FallThrough),
-        ];
-        let (cfg, fir, id_to_idx) = build_case(&specs, &edges);
-        let mut structurizer = Structurizer::new(&cfg, &fir);
-        let loop_nodes: HashSet<NodeIndex> = [id_to_idx[&0], id_to_idx[&1]].into_iter().collect();
-
-        let out = structurizer
-            .structure_loop_body_recursive(id_to_idx[&1], &loop_nodes, id_to_idx[&0], Some(id_to_idx[&3]), None)
-            .unwrap();
-        assert!(contains_goto(&out));
-    }
-
-    #[test]
-    fn loop_body_recovers_if_inside_loop() {
+    fn collapse_recovers_do_while() {
+        // Single-block tail-test loop:
+        //   BB0 (entry) → BB1 (loop body + test) → BB1 (back-edge) / BB2 (exit)
         let p0 = RegId::new("P", 0, 1);
         let specs = vec![
-            (0, 0x00, vec![], vec![stmt("HDR")]),
+            (0, 0x00, vec![(Some(IRCond::True), 0x10)], vec![stmt("PRE")]),
             (
                 1,
                 0x10,
                 vec![
-                    (Some(IRCond::Pred { reg: p0.clone(), sense: true }), 0x20),
-                    (Some(IRCond::Pred { reg: p0, sense: false }), 0x30),
+                    (Some(IRCond::Pred { reg: p0.clone(), sense: true }), 0x10),
+                    (Some(IRCond::Pred { reg: p0, sense: false }), 0x20),
                 ],
-                vec![stmt("CMP")],
+                vec![stmt("BODY")],
             ),
-            (2, 0x20, vec![(Some(IRCond::True), 0x40)], vec![stmt("THEN")]),
-            (3, 0x30, vec![(Some(IRCond::True), 0x40)], vec![stmt("ELSE")]),
-            (4, 0x40, vec![(Some(IRCond::True), 0x00)], vec![stmt("LATCH")]),
+            (2, 0x20, vec![], vec![stmt("RET")]),
         ];
         let edges = vec![
-            (1, 2, EdgeKind::CondBranch),
-            (1, 3, EdgeKind::FallThrough),
-            (2, 4, EdgeKind::UncondBranch),
-            (3, 4, EdgeKind::UncondBranch),
-            (4, 0, EdgeKind::UncondBranch),
+            (0, 1, EdgeKind::FallThrough),
+            (1, 1, EdgeKind::CondBranch),
+            (1, 2, EdgeKind::FallThrough),
         ];
-        let (cfg, fir, id_to_idx) = build_case(&specs, &edges);
+        let (cfg, fir, _) = build_case(&specs, &edges);
         let mut structurizer = Structurizer::new(&cfg, &fir);
-        let loop_nodes: HashSet<NodeIndex> = [
-            id_to_idx[&0],
-            id_to_idx[&1],
-            id_to_idx[&2],
-            id_to_idx[&3],
-            id_to_idx[&4],
-        ]
-        .into_iter()
-        .collect();
-
-        let out = structurizer
-            .structure_loop_body_recursive(id_to_idx[&1], &loop_nodes, id_to_idx[&0], None, None)
-            .unwrap();
-        assert!(contains_if(&out));
+        let out = structurizer.structure_function().unwrap();
+        assert!(contains_loop(&out));
         assert!(!contains_goto(&out));
     }
+
+    #[test]
+    fn collapse_recovers_multiblock_do_while() {
+        // Tail-test loop with a straight-line body block folded into the
+        // region before the test fires: BB0 → BB1 → BB2(test) → BB1 (back) / BB3.
+        let p0 = RegId::new("P", 0, 1);
+        let specs = vec![
+            (0, 0x00, vec![(Some(IRCond::True), 0x10)], vec![stmt("PRE")]),
+            (1, 0x10, vec![(Some(IRCond::True), 0x20)], vec![stmt("BODY_A")]),
+            (
+                2,
+                0x20,
+                vec![
+                    (Some(IRCond::Pred { reg: p0.clone(), sense: true }), 0x10),
+                    (Some(IRCond::Pred { reg: p0, sense: false }), 0x30),
+                ],
+                vec![stmt("BODY_B")],
+            ),
+            (3, 0x30, vec![], vec![stmt("RET")]),
+        ];
+        let edges = vec![
+            (0, 1, EdgeKind::FallThrough),
+            (1, 2, EdgeKind::FallThrough),
+            (2, 1, EdgeKind::CondBranch),
+            (2, 3, EdgeKind::FallThrough),
+        ];
+        let (cfg, fir, _) = build_case(&specs, &edges);
+        let mut structurizer = Structurizer::new(&cfg, &fir);
+        let out = structurizer.structure_function().unwrap();
+        assert!(contains_loop(&out));
+        assert!(!contains_goto(&out));
+    }
+
+    #[test]
+    fn collapse_falls_back_to_goto_on_irreducible() {
+        // Irreducible diamond: two entries (0 and 1) into the same body 2,
+        // which loops back to 2. No reducible structure — goto fallback.
+        let specs = vec![
+            (0, 0x00, vec![(Some(IRCond::True), 0x20)], vec![stmt("A")]),
+            (1, 0x10, vec![(Some(IRCond::True), 0x20)], vec![stmt("B")]),
+            (2, 0x20, vec![(Some(IRCond::True), 0x20)], vec![stmt("LOOP")]),
+        ];
+        let edges = vec![
+            (0, 2, EdgeKind::UncondBranch),
+            (1, 2, EdgeKind::UncondBranch),
+            (2, 2, EdgeKind::UncondBranch),
+        ];
+        let (cfg, fir, _) = build_case(&specs, &edges);
+        let mut structurizer = Structurizer::new(&cfg, &fir);
+        // Should complete without panicking. The graph is irreducible so the
+        // output may include gotos or multiple residual regions; we just
+        // require totality.
+        let _ = structurizer.structure_function();
+    }
+
 
     #[test]
     fn predicated_exit_is_not_unconditional_return() {

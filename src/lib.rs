@@ -5,8 +5,6 @@ pub mod cfg;
 pub mod ir;
 pub mod abi;
 pub mod debug_util;
-pub mod ast;
-pub mod region;
 pub mod structurizer;
 pub mod cfg_analysis;
 pub mod high_il;

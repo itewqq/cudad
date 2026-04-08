@@ -39,12 +39,7 @@ void kernel(uint32_t arg9) {
   }
   // Condition from BB1
   if (!((int32_t)(tid_x) > (int32_t)(255))) {
-    BB2 {
-      shmem_u8[tid_x] = tid_x;
-      tid_x = tid_x + blockDimX;
-    }
-    // Loop header BB2
-    while (!((int32_t)(tid_x) >= (int32_t)(256))) {
+    do {
       BB2 {
         shmem_u8[tid_x] = tid_x;
         tid_x = tid_x + blockDimX;
@@ -52,10 +47,9 @@ void kernel(uint32_t arg9) {
         // phi merge: v2 <- phi(v2, v2)
         // phi merge: b1 <- phi(b1, b1)
       }
-    }
+    } while(!(b1));
   }
   BB3 {
-    _ = BSYNC();
     // 2 phi node(s) omitted
     // phi merge: v2 <- phi(v2, v2)
     // phi merge: b1 <- phi(b1, b1)

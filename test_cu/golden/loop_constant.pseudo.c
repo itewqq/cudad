@@ -11,20 +11,14 @@ BB1 {
 }
 // Condition from BB1
 if (!(P1.0)) {
-  BB2 {
-    _ = STS.U8(*R2.1, R2.1);
-    R2.2 = IADD3(R2.1, ConstMem(0, 0), RZ);
-  }
-  // Loop header BB2
-  while (!(P1.2)) {
+  do {
     BB2 {
       _ = STS.U8(*R2.1, R2.1);
       R2.2 = IADD3(R2.1, ConstMem(0, 0), RZ);
       // 2 phi node(s) omitted
     }
-  }
+  } while(!(P1.2));
 }
 BB3 {
-  _ = BSYNC();
   // 2 phi node(s) omitted
 }

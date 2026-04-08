@@ -12,20 +12,14 @@ BB1 {
 }
 // Condition from BB1
 if (!((int32_t)(v2) > (int32_t)(255))) {
-  BB2 {
-    shmem_u8[v2] = v2;
-    v2 = v2 + ConstMem(0, 0);
-  }
-  // Loop header BB2
-  while (!((int32_t)(v2) >= (int32_t)(256))) {
+  do {
     BB2 {
       shmem_u8[v2] = v2;
       v2 = v2 + ConstMem(0, 0);
       // 2 phi node(s) omitted
     }
-  }
+  } while(!(b1));
 }
 BB3 {
-  _ = BSYNC();
   // 2 phi node(s) omitted
 }
