@@ -1759,6 +1759,64 @@ fn corpus_sm100_resolves_blackwell_builtins() {
     );
 }
 
+/// Compute total and per-function `goto BB` counts across a corpus pass.
+/// Used by the SM 100/120 loose-budget gates below.
+fn corpus_goto_summary(outputs: &[(&'static str, String, String)]) -> (usize, usize) {
+    let mut total = 0usize;
+    let mut max_per_fn = 0usize;
+    for (_, _, out) in outputs {
+        let n = out.matches("goto BB").count();
+        total += n;
+        if n > max_per_fn {
+            max_per_fn = n;
+        }
+    }
+    (total, max_per_fn)
+}
+
+#[test]
+fn corpus_sm100_goto_budget_is_loose() {
+    // SM 100 (Blackwell) deliberately runs without the per-function
+    // allow-list that the SM 89 corpus uses (`corpus_goto_budget_is_tight`)
+    // because the structurizer's collapse rules have not been audited
+    // against the relocated builtin slots and reliability-annotated
+    // barriers yet.  We still want a loose ceiling so that a regression
+    // which floods the output with unstructured `goto BB` jumps does
+    // not silently slip through — the structurizer is the load-bearing
+    // pass for downstream tooling and a goto explosion would corrupt
+    // every consumer.
+    //
+    // The current SM 100 corpus baseline (as of 2026-04-08) is 46 total
+    // gotos with a max of 26 per function (`multi_exit_loop`).  The
+    // ceilings below give roughly 30%-40% headroom over that baseline:
+    // tight enough to catch a real explosion (e.g. 46 -> 200) and loose
+    // enough to absorb benign churn from added rules or new corpus
+    // dumps.  Tighten in lockstep with the structurizer once a per-fn
+    // allow-list is added.
+    const SM100_TOTAL_GOTO_CEILING: usize = 60;
+    const SM100_PER_FN_GOTO_CEILING: usize = 30;
+
+    let outputs = run_corpus_sm100();
+    let (total, max_per_fn) = corpus_goto_summary(&outputs);
+    assert!(
+        total <= SM100_TOTAL_GOTO_CEILING,
+        "SM 100 corpus emitted {} `goto BB` jumps (loose ceiling: {}). \
+         A real regression in the structurizer is the most likely cause; \
+         drop the ignored stats helper or rerun with `--nocapture` to \
+         see the per-function distribution.",
+        total,
+        SM100_TOTAL_GOTO_CEILING
+    );
+    assert!(
+        max_per_fn <= SM100_PER_FN_GOTO_CEILING,
+        "an SM 100 function emitted {} `goto BB` jumps (loose per-fn ceiling: {}). \
+         If this is a benign baseline drift, raise the ceiling; otherwise the \
+         structurizer regressed on a multi-exit pattern.",
+        max_per_fn,
+        SM100_PER_FN_GOTO_CEILING
+    );
+}
+
 // ----------------------------------------------------------------------
 // SM 120 corpus invariants
 // ----------------------------------------------------------------------
@@ -1824,6 +1882,36 @@ fn corpus_sm120_output_is_deterministic() {
             a.0, a.1
         );
     }
+}
+
+#[test]
+fn corpus_sm120_goto_budget_is_loose() {
+    // Mirror of `corpus_sm100_goto_budget_is_loose`.  SM 120 shares the
+    // Blackwell ABI and currently produces an identical goto baseline
+    // (46 total, 26 max-per-fn) because the SM 120 corpus is the SM 100
+    // corpus reassembled with inline scheduling annotations stripped by
+    // the parser.  We still want an independent gate here because the
+    // strip path could itself regress in a way that does not affect
+    // SM 100 output.
+    const SM120_TOTAL_GOTO_CEILING: usize = 60;
+    const SM120_PER_FN_GOTO_CEILING: usize = 30;
+
+    let outputs = run_corpus_sm120();
+    let (total, max_per_fn) = corpus_goto_summary(&outputs);
+    assert!(
+        total <= SM120_TOTAL_GOTO_CEILING,
+        "SM 120 corpus emitted {} `goto BB` jumps (loose ceiling: {}). \
+         If the SM 100 ceiling still holds, the strip path for inline \
+         scheduling annotations may have regressed.",
+        total,
+        SM120_TOTAL_GOTO_CEILING
+    );
+    assert!(
+        max_per_fn <= SM120_PER_FN_GOTO_CEILING,
+        "an SM 120 function emitted {} `goto BB` jumps (loose per-fn ceiling: {}).",
+        max_per_fn,
+        SM120_PER_FN_GOTO_CEILING
+    );
 }
 
 #[test]
