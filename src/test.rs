@@ -1472,7 +1472,9 @@ fn corpus_goto_budget_is_tight() {
     .into();
 
     let mut violations: Vec<(String, usize, usize)> = Vec::new();
-    for (file, name, out) in run_corpus() {
+    let outputs = run_corpus();
+    assert!(!outputs.is_empty(), "SM 89 corpus produced no outputs — fixture broken?");
+    for (file, name, out) in outputs {
         let key = format!("{}:{}", file, name);
         let gotos = out.matches("goto BB").count();
         let budget = allow_list.get(key.as_str()).copied().unwrap_or(0);
