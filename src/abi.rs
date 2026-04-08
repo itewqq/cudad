@@ -13,6 +13,10 @@ pub enum AbiGeneration {
     LegacyParam140,
     /// Common newer layout with parameter window beginning near c[0x0][0x160].
     ModernParam160,
+    /// Blackwell (SM 100+) layout: parameter window starts at c[0x0][0x380],
+    /// built-in thread/block dimensions live at c[0x0][0x360+], and the
+    /// descriptor register source sits at c[0x0][0x358].
+    BlackwellParam380,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -564,6 +568,14 @@ impl AbiProfile {
         }
     }
 
+    pub fn blackwell_param_380() -> Self {
+        Self {
+            generation: AbiGeneration::BlackwellParam380,
+            const_bank: 0,
+            param_base: 0x380,
+        }
+    }
+
     /// Detect the best-effort ABI profile from observed constant-memory offsets.
     /// This keeps current behavior for callers without metadata.
     pub fn detect(instructions: &[Instruction]) -> Self {
@@ -573,14 +585,18 @@ impl AbiProfile {
     /// Detect profile using offsets first, then optional SM metadata fallback.
     ///
     /// Fallback rule (when no offset evidence exists):
-    /// - `sm >= 80` -> modern parameter base (`0x160`)
-    /// - otherwise -> legacy parameter base (`0x140`)
+    /// - `sm >= 100` -> Blackwell parameter base (`0x380`)
+    /// - `sm >= 80`  -> modern parameter base (`0x160`)
+    /// - otherwise   -> legacy parameter base (`0x140`)
     pub fn detect_with_sm(instructions: &[Instruction], sm: Option<u32>) -> Self {
         if let Some(by_offset) = Self::detect_from_offsets(instructions) {
             return by_offset;
         }
 
         if let Some(sm_val) = sm {
+            if sm_val >= 100 {
+                return Self::blackwell_param_380();
+            }
             if sm_val >= 80 {
                 return Self::modern_param_160();
             }
@@ -594,6 +610,7 @@ impl AbiProfile {
     fn detect_from_offsets(instructions: &[Instruction]) -> Option<Self> {
         let mut near_140_hits = 0usize;
         let mut near_160_hits = 0usize;
+        let mut near_380_hits = 0usize;
 
         for ins in instructions {
             for op in &ins.operands {
@@ -607,10 +624,18 @@ impl AbiProfile {
                     if (0x160..0x180).contains(&off) && off % 4 == 0 {
                         near_160_hits += 1;
                     }
+                    if (0x380..0x3a0).contains(&off) && off % 4 == 0 {
+                        near_380_hits += 1;
+                    }
                 });
             }
         }
 
+        // Blackwell wins outright whenever we see any 0x380+ evidence —
+        // the older windows never reach that offset range.
+        if near_380_hits > 0 {
+            return Some(Self::blackwell_param_380());
+        }
         if near_160_hits > 0 && near_160_hits >= near_140_hits {
             return Some(Self::modern_param_160());
         }
@@ -626,15 +651,24 @@ impl AbiProfile {
             return None;
         }
 
-        let builtin = match offset {
-            0x0 => Some("blockDimX"),
-            0x4 => Some("blockDimY"),
-            0x8 => Some("blockDimZ"),
-            0xc => Some("gridDimX"),
-            0x10 => Some("gridDimY"),
-            0x14 => Some("gridDimZ"),
-            _ => None,
+        // Built-in thread/block dimensions.  Blackwell relocates this block
+        // from c[0x0][0x0..] to c[0x0][0x360..]; older architectures keep it
+        // anchored at zero.
+        let builtin_base = match self.generation {
+            AbiGeneration::BlackwellParam380 => 0x360u32,
+            _ => 0x0,
         };
+        let builtin = offset
+            .checked_sub(builtin_base)
+            .and_then(|rel| match rel {
+                0x0 => Some("blockDimX"),
+                0x4 => Some("blockDimY"),
+                0x8 => Some("blockDimZ"),
+                0xc => Some("gridDimX"),
+                0x10 => Some("gridDimY"),
+                0x14 => Some("gridDimZ"),
+                _ => None,
+            });
         if let Some(name) = builtin {
             return Some(ResolvedConstMem {
                 symbol: name.to_string(),
@@ -655,7 +689,17 @@ impl AbiProfile {
             });
         }
 
-        if matches!(offset, 0x28 | 0x44) {
+        // ABI-internal scratch slots (frame pointer source, descriptor
+        // register source, etc.).  The exact offsets depend on the ABI
+        // generation.
+        let is_internal = match self.generation {
+            // Blackwell: 0x358 = descriptor register source, 0x37c = frame
+            // pointer source (R1 is loaded from this at kernel entry).
+            AbiGeneration::BlackwellParam380 => matches!(offset, 0x358 | 0x37c),
+            // Older generations: scratch slots at 0x28 / 0x44.
+            _ => matches!(offset, 0x28 | 0x44),
+        };
+        if is_internal {
             return Some(ResolvedConstMem {
                 symbol: format!("abi_internal_0x{:x}", offset),
                 kind: ConstMemKind::AbiInternal(offset),
@@ -1073,6 +1117,66 @@ mod tests {
             AbiProfile::detect_with_sm(&instrs, Some(70)),
             AbiProfile::legacy_param_140()
         );
+        // SM 100+ falls back to the Blackwell profile.
+        assert_eq!(
+            AbiProfile::detect_with_sm(&instrs, Some(100)),
+            AbiProfile::blackwell_param_380()
+        );
+        assert_eq!(
+            AbiProfile::detect_with_sm(&instrs, Some(120)),
+            AbiProfile::blackwell_param_380()
+        );
+    }
+
+    #[test]
+    fn detects_blackwell_profile_from_param_window() {
+        // These are the offsets actually observed at the start of an SM 100
+        // crypto kernel in the corpus.
+        let sass = r#"
+            /*0000*/ LDC R1, c[0x0][0x37c] ;
+            /*0010*/ LDCU UR5, c[0x0][0x360] ;
+            /*0020*/ LDC.64 R2, c[0x0][0x380] ;
+            /*0030*/ LDCU.64 UR6, c[0x0][0x358] ;
+        "#;
+        let instrs = parse_sass(sass);
+        let p = AbiProfile::detect(&instrs);
+        assert_eq!(p, AbiProfile::blackwell_param_380());
+    }
+
+    #[test]
+    fn resolves_blackwell_builtins_and_internals() {
+        let p = AbiProfile::blackwell_param_380();
+        // Built-in dimensions live at 0x360+.
+        assert_eq!(p.resolve_constmem(0, 0x360).unwrap().symbol, "blockDimX");
+        assert_eq!(p.resolve_constmem(0, 0x364).unwrap().symbol, "blockDimY");
+        assert_eq!(p.resolve_constmem(0, 0x368).unwrap().symbol, "blockDimZ");
+        assert_eq!(p.resolve_constmem(0, 0x36c).unwrap().symbol, "gridDimX");
+        assert_eq!(p.resolve_constmem(0, 0x370).unwrap().symbol, "gridDimY");
+        assert_eq!(p.resolve_constmem(0, 0x374).unwrap().symbol, "gridDimZ");
+        // ABI internals relocated for Blackwell.
+        assert_eq!(p.resolve_constmem(0, 0x358).unwrap().symbol, "abi_internal_0x358");
+        assert_eq!(p.resolve_constmem(0, 0x37c).unwrap().symbol, "abi_internal_0x37c");
+        // Old legacy slots must NOT resolve under Blackwell.
+        assert!(p.resolve_constmem(0, 0x0).is_none());
+        assert!(p.resolve_constmem(0, 0x28).is_none());
+        assert!(p.resolve_constmem(0, 0x44).is_none());
+        // Params start at 0x380.
+        assert_eq!(p.resolve_constmem(0, 0x380).unwrap().symbol, "param_0");
+        assert_eq!(p.resolve_constmem(0, 0x384).unwrap().symbol, "param_1");
+        assert_eq!(p.resolve_constmem(0, 0x388).unwrap().symbol, "param_2");
+    }
+
+    #[test]
+    fn legacy_profile_still_resolves_builtins_at_zero() {
+        // Double-check the relocation gate doesn't break older generations.
+        let p = AbiProfile::modern_param_160();
+        assert_eq!(p.resolve_constmem(0, 0x0).unwrap().symbol, "blockDimX");
+        assert_eq!(p.resolve_constmem(0, 0x4).unwrap().symbol, "blockDimY");
+        // Under the modern profile, 0x360 must NOT be misclassified as a
+        // Blackwell built-in — it should look like a far-away param slot.
+        let sym = p.resolve_constmem(0, 0x360).unwrap().symbol;
+        assert!(sym.starts_with("param_"), "got {}", sym);
+        assert_ne!(sym, "blockDimX");
     }
 
     #[test]
