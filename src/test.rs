@@ -1388,17 +1388,27 @@ fn corpus_every_function_produces_non_empty_output() {
     }
 }
 
+/// Needle patterns that should never appear in rendered pseudo-C output.
+/// Covers all five convergence barrier mnemonics in three forms:
+///   1. Bare tokens with leading/trailing whitespace (`" BSSY "`)
+///   2. Function-call form from unfolded barriers (`"BSSY("`)
+///   3. Suffix forms for reliability-annotated Blackwell variants (`"BSSY."`)
+const CONVERGENCE_BARRIER_BANNED_NEEDLES: &[&str] = &[
+    // Bare tokens
+    " BSSY ", " BSYNC ", " SSY ", " SYNC ", " WARPSYNC ",
+    // Function-call form
+    "BSSY(", "BSYNC(", "WARPSYNC(", "SSY(", "SYNC(",
+    // Suffix forms — `BSSY.RECONVERGENT`, `SYNC.RELIABLE`, etc.
+    "BSSY.", "BSYNC.", "WARPSYNC.", "SSY.", "SYNC.",
+];
+
 #[test]
 fn corpus_output_contains_no_raw_convergence_barriers() {
     // BSSY/BSYNC/SSY/SYNC/WARPSYNC are control-flow scaffolding the lifter
     // should fold away. Seeing them verbatim in the rendered C means the
     // semantic-lift and structurizer pipeline missed one.
-    let banned = [
-        " BSSY ", " BSYNC ", " SSY ", " SYNC ",
-        "BSSY(", "BSYNC(", "WARPSYNC(",
-    ];
     for (file, name, out) in run_corpus() {
-        for needle in banned.iter() {
+        for needle in CONVERGENCE_BARRIER_BANNED_NEEDLES {
             assert!(
                 !out.contains(needle),
                 "raw convergence barrier {:?} leaked into output for {}:{}\n---\n{}",
@@ -1617,27 +1627,12 @@ fn corpus_sm100_every_function_produces_non_empty_output() {
 fn corpus_sm100_output_contains_no_raw_convergence_barriers() {
     // SM 100 reliability-annotated forms (`BSSY.RECONVERGENT`,
     // `BSYNC.RELIABLE`, ...) must be folded away by the structurizer
-    // just like the legacy plain mnemonics.  We bias towards
-    // false-negative-free needles by anchoring on the convergence
-    // mnemonics in both their bare-token and dot-suffixed forms; the
-    // function-call form (`BSSY(...)`) is also banned because that is
-    // how an unfolded barrier shows up in the rendered pseudo-C.
-    //
-    // Suffix forms must cover *every* reliability tag the toolchain
-    // emits today (`BSSY.RECONVERGENT`, `BSSY.RELIABLE`, `BSYNC.*`,
-    // ...) plus the legacy plain mnemonics that pre-Blackwell dumps
-    // still produce, so we explicitly include `SSY.`/`SYNC.` even
-    // though SM 100 itself does not currently emit those.
-    let banned = [
-        // Bare tokens with leading/trailing whitespace.
-        " BSSY ", " BSYNC ", " SSY ", " SYNC ", " WARPSYNC ",
-        // Function-call form (rendered output of an unfolded barrier).
-        "BSSY(", "BSYNC(", "WARPSYNC(", "SSY(", "SYNC(",
-        // Suffix forms — `BSSY.RECONVERGENT`, `SYNC.RELIABLE`, ...
-        "BSSY.", "BSYNC.", "WARPSYNC.", "SSY.", "SYNC.",
-    ];
+    // just like the legacy plain mnemonics.  Uses the shared
+    // CONVERGENCE_BARRIER_BANNED_NEEDLES set which covers bare tokens,
+    // function-call form, and dot-suffixed forms for all five
+    // convergence barrier mnemonics.
     for (file, name, out) in run_corpus_sm100() {
-        for needle in banned.iter() {
+        for needle in CONVERGENCE_BARRIER_BANNED_NEEDLES {
             assert!(
                 !out.contains(needle),
                 "raw convergence barrier {:?} leaked into SM 100 output for {}:{}\n---\n{}",
