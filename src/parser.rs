@@ -263,6 +263,64 @@ pub fn parse_sass(text: &str) -> Vec<Instruction> {
     text.lines().filter_map(parse_instruction_line).collect()
 }
 
+/// One parsed function extracted from a multi-function SASS dump.
+#[derive(Debug, Clone)]
+pub struct SassFunction {
+    pub name: String,
+    pub sm: Option<u32>,
+    pub instrs: Vec<Instruction>,
+}
+
+/// Split a multi-function SASS dump (as produced by `cuobjdump --dump-sass`)
+/// into its constituent functions. Each function is delimited by a
+/// `Function : <name>` header line. The SM version is extracted from the
+/// per-function `.headerflags` line when present, otherwise from any
+/// `sm_xx` marker found before the first function.
+pub fn split_functions(text: &str) -> Vec<SassFunction> {
+    lazy_static! {
+        static ref RE_FUNCTION: Regex =
+            Regex::new(r"^\s*Function\s*:\s*(?P<name>\S+)\s*$").unwrap();
+    }
+
+    // Collect (name, start_line_idx) pairs, then slice the line vector.
+    let lines: Vec<&str> = text.lines().collect();
+    let mut markers: Vec<(String, usize)> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if let Some(cap) = RE_FUNCTION.captures(line) {
+            markers.push((cap["name"].to_string(), i));
+        }
+    }
+
+    if markers.is_empty() {
+        return Vec::new();
+    }
+
+    // Default SM from the preamble (everything before the first function).
+    let preamble = lines[..markers[0].1].join("\n");
+    let default_sm = parse_sm_version(&preamble);
+
+    let mut out = Vec::with_capacity(markers.len());
+    for (mi, (name, start)) in markers.iter().enumerate() {
+        let end = if mi + 1 < markers.len() {
+            markers[mi + 1].1
+        } else {
+            lines.len()
+        };
+        let region = lines[*start..end].join("\n");
+        let sm = parse_sm_version(&region).or(default_sm);
+        let instrs: Vec<Instruction> = lines[*start..end]
+            .iter()
+            .filter_map(|l| parse_instruction_line(l))
+            .collect();
+        out.push(SassFunction {
+            name: name.clone(),
+            sm,
+            instrs,
+        });
+    }
+    out
+}
+
 /// Parse SM generation from SASS metadata lines when available.
 /// Priority:
 /// 1) `.headerflags` entries containing `EF_CUDA_SMxx`

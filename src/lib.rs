@@ -15,7 +15,10 @@ pub mod op_semantics;
 #[cfg(test)]
 mod test;
 
-pub use parser::{parse_instruction_line, parse_sass, parse_sm_version, Instruction, Operand, PredicateUse};
+pub use parser::{
+    parse_instruction_line, parse_sass, parse_sm_version, split_functions, Instruction, Operand,
+    PredicateUse, SassFunction,
+};
 pub use cfg::*;
 pub use ir::*;
 pub use abi::*;

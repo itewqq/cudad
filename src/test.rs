@@ -153,6 +153,50 @@ fn test_parse_sm_version_from_target_fallback() {
 }
 
 #[test]
+fn test_split_functions_multi_function_dump() {
+    // Synthetic two-function SASS dump mirroring cuobjdump's layout.
+    let sample = "
+\tcode for sm_89
+\t\tFunction : first
+\t.headerflags\t@\"EF_CUDA_TEXMODE_UNIFIED EF_CUDA_64BIT_ADDRESS EF_CUDA_SM89\"
+        /*0000*/                   MOV R1, c[0x0][0x28] ;
+        /*0010*/                   EXIT ;
+\t\tFunction : second
+\t.headerflags\t@\"EF_CUDA_TEXMODE_UNIFIED EF_CUDA_64BIT_ADDRESS EF_CUDA_SM89\"
+        /*0000*/                   IADD3 R2, RZ, 0x1, RZ ;
+        /*0010*/                   IADD3 R3, RZ, 0x2, RZ ;
+        /*0020*/                   EXIT ;
+";
+    let funcs = crate::parser::split_functions(sample);
+    assert_eq!(funcs.len(), 2, "expected two functions");
+    assert_eq!(funcs[0].name, "first");
+    assert_eq!(funcs[1].name, "second");
+    assert_eq!(funcs[0].sm, Some(89));
+    assert_eq!(funcs[1].sm, Some(89));
+    assert_eq!(funcs[0].instrs.len(), 2, "first function: MOV + EXIT");
+    assert_eq!(funcs[1].instrs.len(), 3, "second function: 2 IADD3 + EXIT");
+    // Ensure the preamble lines (before the first Function marker) do not
+    // leak into any function's instrs list.
+    for f in &funcs {
+        assert!(
+            f.instrs.iter().all(|i| !i.raw.contains("headerflags")),
+            "instrs should only contain decoded instructions, not headerflags"
+        );
+    }
+}
+
+#[test]
+fn test_split_functions_empty_on_single_function_dump_without_marker() {
+    // A dump with no `Function :` markers returns empty — callers should
+    // fall back to `parse_sass` in that case.
+    let sample = r#"
+        /*0000*/ IMAD.MOV.U32 R1, RZ, RZ, c[0x0][0x28] ;
+        /*0010*/ EXIT ;
+    "#;
+    assert!(crate::parser::split_functions(sample).is_empty());
+}
+
+#[test]
 fn test_ssa_keeps_immutable_special_registers_unversioned() {
     let sample = r#"
         /*0000*/ ISETP.GE.AND P0, PT, R0, 0x1, PT ;
@@ -1183,4 +1227,265 @@ fn named_phi_merge_comments_are_opt_in() {
     let on = run_structured_output_lifted_named_with_phi_comments(include_str!("../test_cu/if_loop.sass"));
     assert!(!off.contains("phi merge:"));
     assert!(on.contains("phi merge:"));
+}
+
+// ----------------------------------------------------------------------
+// Corpus invariant runner
+// ----------------------------------------------------------------------
+//
+// Drives the full lifted+named pipeline against every function in
+// `test_cu/corpus/*.sass` (multi-function `cuobjdump --dump-sass` dumps)
+// and asserts structural invariants rather than byte-equality goldens.
+// The corpus exists to catch regressions that escape the hand-authored
+// per-kernel fixtures — adding a new CUDA source file and regenerating
+// the `.sass` dump immediately expands coverage without writing goldens.
+
+/// Render a single function's instructions through the lifted+named pipeline.
+/// Mirrors `run_structured_output_lifted_named` but takes an already-parsed
+/// instruction list so it can be driven from `split_functions`.
+fn run_lifted_named_from_instrs(instrs: Vec<Instruction>) -> String {
+    let cfg = build_cfg(instrs);
+    if cfg.node_count() == 0 {
+        return String::new();
+    }
+    let fir = build_ssa(&cfg);
+    let mut structurizer = Structurizer::new(&cfg, &fir);
+    let lift_cfg = SemanticLiftConfig::default();
+    let lifted = lift_function_ir(&fir, &lift_cfg);
+    let rendered = match structurizer.structure_function() {
+        Some(tree) => structurizer.pretty_print_with_lift(&tree, &DefaultDisplay, 0, Some(&lifted)),
+        None => String::new(),
+    };
+    recover_structured_output_names(
+        &fir,
+        &rendered,
+        &NameRecoveryConfig {
+            style: NameStyle::Temp,
+            rewrite_control_predicates: true,
+            emit_phi_merge_comments: false,
+            semantic_symbolization: false,
+        },
+    )
+    .output
+}
+
+/// Enumerate all `(file, function_name, output)` tuples from the corpus.
+/// Concentrated here so individual tests can assert independent invariants
+/// without re-walking the corpus each time.
+fn run_corpus() -> Vec<(&'static str, String, String)> {
+    // Each `include_str!` pulls in a real SASS dump at compile time, so the
+    // corpus test binary is self-contained and deterministic.
+    let files: &[(&str, &str)] = &[
+        ("arith_kernels.sass",    include_str!("../test_cu/corpus/arith_kernels.sass")),
+        ("branching_kernels.sass", include_str!("../test_cu/corpus/branching_kernels.sass")),
+        ("loop_kernels.sass",     include_str!("../test_cu/corpus/loop_kernels.sass")),
+        ("shared_mem_kernels.sass", include_str!("../test_cu/corpus/shared_mem_kernels.sass")),
+        ("crypto_kernels.sass",   include_str!("../test_cu/corpus/crypto_kernels.sass")),
+        ("compute_kernels.sass",  include_str!("../test_cu/corpus/compute_kernels.sass")),
+        ("control_flow_kernels.sass", include_str!("../test_cu/corpus/control_flow_kernels.sass")),
+        ("image_processing_kernels.sass", include_str!("../test_cu/corpus/image_processing_kernels.sass")),
+        ("ml_kernels.sass",         include_str!("../test_cu/corpus/ml_kernels.sass")),
+        ("simulation_kernels.sass", include_str!("../test_cu/corpus/simulation_kernels.sass")),
+        ("data_processing_kernels.sass", include_str!("../test_cu/corpus/data_processing_kernels.sass")),
+    ];
+
+    let mut results = Vec::new();
+    for (fname, text) in files.iter().copied() {
+        let funcs = crate::parser::split_functions(text);
+        assert!(
+            !funcs.is_empty(),
+            "corpus file {} should contain at least one function",
+            fname
+        );
+        for f in funcs {
+            let out = run_lifted_named_from_instrs(f.instrs.clone());
+            results.push((fname, f.name, out));
+        }
+    }
+    results
+}
+
+#[test]
+fn corpus_splits_at_least_one_function_per_file() {
+    // Sanity: each corpus file should split into >=1 functions and collectively
+    // cover the expected kernel count.
+    let results = run_corpus();
+    assert!(
+        results.len() >= 20,
+        "expected at least 20 functions in the corpus, got {}",
+        results.len()
+    );
+}
+
+#[test]
+fn corpus_every_function_produces_non_empty_output() {
+    for (file, name, out) in run_corpus() {
+        assert!(
+            !out.trim().is_empty(),
+            "empty pseudo-C output for {}:{}",
+            file,
+            name
+        );
+    }
+}
+
+#[test]
+fn corpus_output_contains_no_raw_convergence_barriers() {
+    // BSSY/BSYNC/SSY/SYNC/WARPSYNC are control-flow scaffolding the lifter
+    // should fold away. Seeing them verbatim in the rendered C means the
+    // semantic-lift and structurizer pipeline missed one.
+    let banned = [
+        " BSSY ", " BSYNC ", " SSY ", " SYNC ",
+        "BSSY(", "BSYNC(", "WARPSYNC(",
+    ];
+    for (file, name, out) in run_corpus() {
+        for needle in banned.iter() {
+            assert!(
+                !out.contains(needle),
+                "raw convergence barrier {:?} leaked into output for {}:{}\n---\n{}",
+                needle,
+                file,
+                name,
+                out
+            );
+        }
+    }
+}
+
+#[test]
+fn corpus_output_is_deterministic() {
+    // Running the same function twice should produce identical output.
+    // Determinism regressions here usually come from HashMap iteration
+    // order sneaking into the pipeline.
+    let first = run_corpus();
+    let second = run_corpus();
+    assert_eq!(first.len(), second.len());
+    for (a, b) in first.iter().zip(second.iter()) {
+        assert_eq!(a.0, b.0);
+        assert_eq!(a.1, b.1);
+        assert_eq!(
+            a.2, b.2,
+            "non-deterministic output for {}:{}",
+            a.0, a.1
+        );
+    }
+}
+
+#[test]
+fn corpus_goto_budget_is_tight() {
+    // Per-fixture goto budget. The aspiration is zero gotos everywhere, but
+    // until every pattern is covered by collapse rules we allow a small
+    // budget per function to keep progress visible. Tighten as the
+    // structurizer improves.
+    //
+    // Functions with genuinely complex multi-exit/early-return patterns get
+    // an explicit per-function budget. Everything else must be zero.
+    // When the structurizer gains new rules, reduce these budgets.
+    let allow_list: std::collections::HashMap<&str, usize> = [
+        // multi_exit_loop: 3 early-return paths inside a for-loop; the
+        // compiler generates multiple BRA-to-EXIT paths that the collapse
+        // loop cannot currently merge back to structured break/return.
+        ("control_flow_kernels.sass:multi_exit_loop", 26),
+        // find_pattern: 4-deep nested loop with early return from the
+        // innermost level + break propagating through 2 outer levels.
+        ("control_flow_kernels.sass:find_pattern", 8),
+        // nested_loop_break_continue: 2-level loop with break+continue
+        // at both levels — the compiler tail-duplicates some exits.
+        ("control_flow_kernels.sass:nested_loop_break_continue", 4),
+        // box_blur_variable_radius: nested loop with continue (skip OOB).
+        ("image_processing_kernels.sass:box_blur_variable_radius", 1),
+        // string_search: loop with early break on mismatch.
+        ("data_processing_kernels.sass:string_search", 3),
+        // utf8_count_chars: multi-way byte classification (if-chain on
+        // byte ranges) + continuation-byte skip loop.
+        ("data_processing_kernels.sass:utf8_count_chars", 5),
+    ]
+    .into();
+
+    let mut violations: Vec<(String, usize, usize)> = Vec::new();
+    for (file, name, out) in run_corpus() {
+        let key = format!("{}:{}", file, name);
+        let gotos = out.matches("goto BB").count();
+        let budget = allow_list.get(key.as_str()).copied().unwrap_or(0);
+        if gotos > budget {
+            violations.push((key, gotos, budget));
+        }
+    }
+    if !violations.is_empty() {
+        violations.sort();
+        let summary = violations
+            .iter()
+            .map(|(k, n, b)| format!("  {} — gotos: {} (budget: {})", k, n, b))
+            .collect::<Vec<_>>()
+            .join("\n");
+        panic!(
+            "corpus goto budget exceeded:\n{}",
+            summary
+        );
+    }
+
+    // Also verify the allow-list isn't stale: if a function's goto count
+    // drops below its budget, we want to tighten the budget.
+    let mut over_budget: Vec<String> = Vec::new();
+    for (file, name, out) in run_corpus() {
+        let key = format!("{}:{}", file, name);
+        let gotos = out.matches("goto BB").count();
+        if let Some(&budget) = allow_list.get(key.as_str()) {
+            if gotos < budget {
+                over_budget.push(format!(
+                    "  {} — gotos: {} but budget is {} (tighten!)",
+                    key, gotos, budget
+                ));
+            }
+        }
+    }
+    if !over_budget.is_empty() {
+        over_budget.sort();
+        eprintln!(
+            "HINT: some allow-list budgets can be tightened:\n{}",
+            over_budget.join("\n")
+        );
+    }
+}
+
+#[test]
+fn corpus_output_has_no_ssa_suffix_tokens() {
+    // After name recovery, SSA-suffixed tokens like `R3.0`, `P1.2`, `UR4.1`
+    // should not remain. A regression usually means name recovery failed to
+    // cover a newly-emitted token shape.
+    let re = Regex::new(r"\b(?:UR|UP|R|P)\d+\.\d+\b").expect("valid regex");
+    for (file, name, out) in run_corpus() {
+        assert!(
+            !re.is_match(&out),
+            "SSA-suffix token leaked into named output for {}:{}\n---\n{}",
+            file,
+            name,
+            out
+        );
+    }
+}
+
+#[test]
+#[ignore]
+fn dump_corpus_outputs_for_review() {
+    let targets = [
+        "gelu_forward", "softmax_forward", "layer_norm_forward",
+        "cross_entropy_loss", "fused_relu_bias_residual", "bilinear_resize",
+        "sobel_edge_detect", "nms_kernel", "nbody_forces", "bfs_expand",
+        "pagerank_iter", "lj_forces", "sgemm_tiled", "bitonic_sort",
+        "aes128_encrypt_block", "sha256_single_block",
+        "decision_tree", "state_machine", "dispatch_ops",
+        "string_search", "rle_compress", "csv_find_fields",
+        "utf8_count_chars", "topk_per_row", "radix_histogram",
+        "box_blur_variable_radius", "batched_sgemv",
+        "relu", "saxpy",
+    ];
+    for (file, name, out) in run_corpus() {
+        if targets.contains(&name.as_str()) {
+            println!("\n{}", "=".repeat(70));
+            println!("=== {}:{} ===", file, name);
+            println!("{}", "=".repeat(70));
+            println!("{}", out);
+        }
+    }
 }

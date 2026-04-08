@@ -296,7 +296,7 @@ impl<'a> Structurizer<'a> {
         // region remains (or the goto fallback fires).
         let mut graph = collapse::RegionGraph::build_from_cfg(self);
         collapse::run_collapse(&mut graph, self);
-        Some(collapse::emit_root(&graph))
+        Some(collapse::emit_root(&graph, self))
     }
 
 
@@ -348,7 +348,10 @@ impl<'a> Structurizer<'a> {
     }
     
     fn is_convergence_barrier_opcode(opcode: &str) -> bool {
-        matches!(opcode, "BSSY" | "BSYNC" | "SSY" | "SYNC")
+        matches!(
+            opcode,
+            "BSSY" | "BSYNC" | "SSY" | "SYNC" | "WARPSYNC"
+        )
     }
 
     fn render_condition_prelude_for_block(
@@ -1751,17 +1754,27 @@ mod collapse {
 
         // Try with the true arm as the body, then the false arm as the body.
         // body_side: which arm holds the body, the other is the implicit merge.
+        // A body is acceptable if it is single-entry from `r` AND either
+        //   (a) terminates with no live successors (e.g. a seeded return
+        //       composite), or
+        //   (b) has a single unconditional forward edge back to `merge`.
         let attempt = |graph: &RegionGraph, body: RegionId, merge: RegionId| -> bool {
-            // Body must be single-entry from r.
             let preds_b = graph.live_preds(body);
             if preds_b.len() != 1 {
                 return false;
             }
             let succs_b = graph.live_succs(body);
-            // Body either terminates (no live succs) or has a single
-            // unconditional forward edge to the merge.
             if succs_b.is_empty() {
-                return false; // empty body without merge — handled by caller as if/else trivial; fall back
+                // Terminal body (e.g. seeded return). Only safe when this
+                // is not actually a while-loop shape: reject if the merge
+                // arm has a back-edge to `r`, signaling that `r` is a loop
+                // header and `try_while_do` should run instead.
+                for (_, me) in graph.live_succs(merge) {
+                    if me.is_back_edge && me.to == r {
+                        return false;
+                    }
+                }
+                return true;
             }
             if succs_b.len() != 1 {
                 return false;
@@ -1774,10 +1787,10 @@ mod collapse {
         };
 
         let (body, body_idx, body_edge_to_merge_idx, negate) = if attempt(graph, t, f) {
-            let (mi, _) = graph.live_succs(t)[0];
+            let mi = graph.live_succs(t).first().map(|(i, _)| *i);
             (t, true_idx, mi, false)
         } else if attempt(graph, f, t) {
-            let (mi, _) = graph.live_succs(f)[0];
+            let mi = graph.live_succs(f).first().map(|(i, _)| *i);
             (f, false_idx, mi, true)
         } else {
             return false;
@@ -1810,7 +1823,9 @@ mod collapse {
 
         graph.remove_edge(body_idx);
         graph.remove_edge(other_arm_idx);
-        graph.remove_edge(body_edge_to_merge_idx);
+        if let Some(mi) = body_edge_to_merge_idx {
+            graph.remove_edge(mi);
+        }
         graph.redirect_in_edges(r, new_rid);
         graph.add_edge(new_rid, merge, None, false);
 
@@ -1819,8 +1834,6 @@ mod collapse {
         }
         graph.tombstone(r);
         graph.tombstone(body);
-        let _ = body_idx;
-        let _ = other_arm_idx;
         true
     }
 
@@ -1986,14 +1999,13 @@ mod collapse {
             true
         };
 
-        let (body, body_idx, exit, exit_idx, negate) =
-            if try_arm(graph, true_e.to) {
-                (true_e.to, true_idx, false_e.to, false_idx, false)
-            } else if try_arm(graph, false_e.to) {
-                (false_e.to, false_idx, true_e.to, true_idx, true)
-            } else {
-                return false;
-            };
+        let (body, exit, negate) = if try_arm(graph, true_e.to) {
+            (true_e.to, false_e.to, false)
+        } else if try_arm(graph, false_e.to) {
+            (false_e.to, true_e.to, true)
+        } else {
+            return false;
+        };
 
         let ir_block = match s.function_ir.blocks.iter().find(|b| b.id == head_block_id) {
             Some(b) => b,
@@ -2042,8 +2054,6 @@ mod collapse {
         }
         graph.tombstone(r);
         graph.tombstone(body);
-        let _ = body_idx;
-        let _ = exit_idx;
         true
     }
 
@@ -2180,10 +2190,10 @@ mod collapse {
     /// intelligently.
     pub(super) fn select_goto_edge(graph: &mut RegionGraph, s: &Structurizer<'_>) -> bool {
         // Deterministic selection: smallest (from, to) region id pair.
-        let mut candidate: Option<(RegionId, RegionId, usize, Option<bool>, bool)> = None;
+        let mut candidate: Option<(RegionId, RegionId, usize, Option<bool>)> = None;
         for rid in graph.active_ids() {
             for (ei, e) in graph.live_succs(rid) {
-                let key = (e.from, e.to, ei, e.cond_arm, e.is_back_edge);
+                let key = (e.from, e.to, ei, e.cond_arm);
                 candidate = Some(match candidate {
                     None => key,
                     Some(cur) => {
@@ -2196,7 +2206,7 @@ mod collapse {
                 });
             }
         }
-        let Some((from_r, to_r, edge_idx, cond_arm, _is_back)) = candidate else {
+        let Some((from_r, to_r, edge_idx, cond_arm)) = candidate else {
             return false;
         };
 
@@ -2314,7 +2324,10 @@ mod collapse {
     /// path exactly one region survives; in the fallback path we thread
     /// leftover regions together with explicit gotos already materialized
     /// into their statements.
-    pub(super) fn emit_root(graph: &RegionGraph) -> StructuredStatement {
+    pub(super) fn emit_root(
+        graph: &RegionGraph,
+        s: &Structurizer<'_>,
+    ) -> StructuredStatement {
         // DFS from entry, preorder, deterministic.
         let mut visited: HashSet<usize> = HashSet::new();
         let mut order: Vec<RegionId> = Vec::new();
@@ -2347,14 +2360,11 @@ mod collapse {
         let mut parts: Vec<StructuredStatement> = Vec::new();
         for rid in order {
             match graph.region(rid) {
-                RegionKind::Basic { block_id, .. } => {
+                RegionKind::Basic { .. } => {
                     // A Basic region that survived to emission means the
                     // collapse loop stalled before folding it in. Emit its
-                    // raw IR stmts as a BasicBlock.
-                    parts.push(StructuredStatement::BasicBlock {
-                        block_id: *block_id,
-                        stmts: Vec::new(),
-                    });
+                    // raw IR stmts via the shared lookup helper.
+                    parts.push(stmt_for_region(graph, rid, s));
                 }
                 RegionKind::Composite { stmt, .. } => parts.push(stmt.clone()),
                 RegionKind::Tombstone => {}
@@ -2496,6 +2506,38 @@ mod tests {
         let mut structurizer = Structurizer::new(&cfg, &fir);
         let out = structurizer.structure_function().unwrap();
         assert!(contains_if(&out));
+    }
+
+    #[test]
+    fn collapse_recovers_if_then_with_terminal_return() {
+        // Shape: `if (P) return; /* fallthrough */`
+        //   BB0 (cond) → BB1 (RET)      [true arm]
+        //   BB0        → BB2 (TAIL→RET) [false arm / fallthrough]
+        // BB1 is a seeded return composite with zero successors; the old
+        // try_if_then rejected this because succs_b was empty.
+        let p0 = RegId::new("P", 0, 1);
+        let specs = vec![
+            (
+                0,
+                0x00,
+                vec![
+                    (Some(IRCond::Pred { reg: p0.clone(), sense: true }), 0x10),
+                    (Some(IRCond::Pred { reg: p0, sense: false }), 0x20),
+                ],
+                vec![stmt("CMP")],
+            ),
+            (1, 0x10, vec![], vec![stmt("RET")]),
+            (2, 0x20, vec![], vec![stmt("TAIL"), stmt("RET")]),
+        ];
+        let edges = vec![
+            (0, 1, EdgeKind::CondBranch),
+            (0, 2, EdgeKind::FallThrough),
+        ];
+        let (cfg, fir, _) = build_case(&specs, &edges);
+        let mut structurizer = Structurizer::new(&cfg, &fir);
+        let out = structurizer.structure_function().unwrap();
+        assert!(contains_if(&out), "expected if structure, got: {:?}", out);
+        assert!(!contains_goto(&out), "expected no goto fallback, got: {:?}", out);
     }
 
     #[test]
