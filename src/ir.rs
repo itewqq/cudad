@@ -404,18 +404,32 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
                     }
                 }
             }
-            // ULDC/LDC/LDCU .64 define a register pair (lo in dst, hi in dst+1).
-            // Model the second def explicitly so high halves are not treated as live-ins.
-            // LDCU is the SM 100+ (Blackwell) rename of ULDC — same operand shape.
+            // ULDC/LDC/LDCU `.64` define a register pair, `.128` define a
+            // 4-wide tuple (`UR8..UR11`).  Model the implicit high halves as
+            // explicit defs so they are not treated as live-ins.  LDCU is the
+            // SM 100+ (Blackwell) rename of ULDC — same operand shape.
             let mnem = ins.opcode.split('.').next().unwrap_or(ins.opcode.as_str());
-            let is_64 = ins.opcode.split('.').skip(1).any(|t| t == "64");
-            if is_64 && matches!(mnem, "ULDC" | "LDC" | "LDCU") {
-                if let Some(mut hi) = ins.operands.first().and_then(phys_reg_of) {
-                    hi.idx += 1;
-                    hi.sign = 1;
-                    defs.push(IRExpr::Reg(hi.clone()));
-                    if !is_immutable_reg(&hi) {
-                        defsites.entry(base_reg(&hi)).or_default().insert(n);
+            let extra_defs = if matches!(mnem, "ULDC" | "LDC" | "LDCU") {
+                if ins.opcode.split('.').skip(1).any(|t| t == "128") {
+                    3
+                } else if ins.opcode.split('.').skip(1).any(|t| t == "64") {
+                    1
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            if extra_defs > 0 {
+                if let Some(base_def) = ins.operands.first().and_then(phys_reg_of) {
+                    for k in 1..=extra_defs {
+                        let mut hi = base_def.clone();
+                        hi.idx += k as i32;
+                        hi.sign = 1;
+                        defs.push(IRExpr::Reg(hi.clone()));
+                        if !is_immutable_reg(&hi) {
+                            defsites.entry(base_reg(&hi)).or_default().insert(n);
+                        }
                     }
                 }
             }

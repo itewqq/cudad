@@ -244,19 +244,35 @@ fn lift_opcode_expr_for_def(
     config: &SemanticLiftConfig<'_>,
 ) -> Option<LiftedExpr> {
     let mnem = opcode_mnemonic(opcode);
-    // LDCU is Blackwell's rename of ULDC — same 64-bit pair semantics.
-    if matches!(mnem, "ULDC" | "LDC" | "LDCU") && opcode_has_mod(opcode, "64") {
-        if def_idx == 0 {
-            return lift_opcode_expr(opcode, args, stmt_ref, config);
-        }
-        if def_idx == 1 {
-            if let Some(expr) = lift_uldc64_hi_from_lo(args.first()?, stmt_ref, config) {
-                return Some(expr);
+    // LDCU is Blackwell's rename of ULDC — same wide-load semantics.
+    // `.64` defines a register pair, `.128` defines a 4-wide tuple, and
+    // every implicit hi-half def lifts to the corresponding param word
+    // (`+4`, `+8`, `+12`).
+    if matches!(mnem, "ULDC" | "LDC" | "LDCU") {
+        let extra_defs = if opcode_has_mod(opcode, "128") {
+            3
+        } else if opcode_has_mod(opcode, "64") {
+            1
+        } else {
+            0
+        };
+        if extra_defs > 0 {
+            if def_idx == 0 {
+                return lift_opcode_expr(opcode, args, stmt_ref, config);
             }
-            let hi_arg = args.first().and_then(constmem_plus_word_offset)?;
-            return Some(lift_ir_expr(&hi_arg, stmt_ref, config));
+            if def_idx <= extra_defs {
+                if let Some(expr) =
+                    lift_uldc_wide_def_from_lo(args.first()?, def_idx, stmt_ref, config)
+                {
+                    return Some(expr);
+                }
+                let hi_arg = args
+                    .first()
+                    .and_then(|e| constmem_plus_word_offset_n(e, def_idx))?;
+                return Some(lift_ir_expr(&hi_arg, stmt_ref, config));
+            }
+            return None;
         }
-        return None;
     }
     if def_idx > 0 && matches!(mnem, "IADD3" | "UIADD3") && !opcode_has_mod(opcode, "X") {
         return lift_iadd3_carry("carry_u32_add3", args, stmt_ref, config);
@@ -264,7 +280,7 @@ fn lift_opcode_expr_for_def(
     lift_opcode_expr(opcode, args, stmt_ref, config)
 }
 
-fn constmem_plus_word_offset(expr: &IRExpr) -> Option<IRExpr> {
+fn constmem_plus_word_offset_n(expr: &IRExpr, words: usize) -> Option<IRExpr> {
     let IRExpr::Op { op, args } = expr else {
         return None;
     };
@@ -277,14 +293,20 @@ fn constmem_plus_word_offset(expr: &IRExpr) -> Option<IRExpr> {
     let IRExpr::ImmI(offset) = args[1] else {
         return None;
     };
+    let delta = i64::try_from(words).ok()?.checked_mul(4)?;
     Some(IRExpr::Op {
         op: "ConstMem".to_string(),
-        args: vec![IRExpr::ImmI(bank), IRExpr::ImmI(offset + 4)],
+        args: vec![IRExpr::ImmI(bank), IRExpr::ImmI(offset + delta)],
     })
 }
 
-fn lift_uldc64_hi_from_lo(
+/// Resolve the `def_idx`-th high-half def of a wide ULDC/LDC/LDCU load
+/// (`.64` has one hi def, `.128` has three) by looking up the relocated
+/// param word in the ABI annotations.  Falls through to `None` so the
+/// caller can use the raw `+4*def_idx` offset as a backup.
+fn lift_uldc_wide_def_from_lo(
     lo_expr: &IRExpr,
+    def_idx: usize,
     stmt_ref: StatementRef,
     config: &SemanticLiftConfig<'_>,
 ) -> Option<LiftedExpr> {
@@ -302,9 +324,11 @@ fn lift_uldc64_hi_from_lo(
         .iter()
         .find(|ann| ann.bank == bank && ann.offset == offset)?;
     if let ConstMemSemantic::ParamWord { param_idx, .. } = ann.semantic {
-        // With per-word param indexing the hi half of a 64-bit load lives at
-        // param_idx + 1, not at a different word_idx within the same param.
-        let hi_param = param_idx.checked_add(1)?;
+        // With per-word param indexing each successive 32-bit lane of the
+        // wide load lives at `param_idx + def_idx`, not at a different
+        // word_idx within the same param.
+        let hi_param = u32::try_from(def_idx).ok()?;
+        let hi_param = param_idx.checked_add(hi_param)?;
         if let Some(aliases) = config.abi_aliases {
             // Try rendering via the alias map — this handles Ptr64 pairs that
             // were merged under the even param_idx.
@@ -2300,6 +2324,41 @@ mod tests {
             })
             .expect("expected lifted LDCU.64 high half");
         assert_eq!(lifted_hi.rhs.render(), "ConstMem(0, 860)"); // 0x35c
+    }
+
+    #[test]
+    fn lifts_ldcu_128_into_four_constmem_words() {
+        // `LDCU.128 UR8, c[0x0][0x380]` (taken from
+        // `test_cu/corpus_sm100/loop_kernels.sass`) defines UR8..UR11.
+        // Each lane must lift to the corresponding 32-bit ConstMem word
+        // so downstream uses see the right symbolic source.
+        let sass = r#"
+            /*0000*/ LDCU.128 UR8, c[0x0][0x380] ;
+            /*0010*/ EXIT ;
+        "#;
+        let out = run_lift(sass);
+        let expected = [
+            (0, "ConstMem(0, 896)"),  // 0x380
+            (1, "ConstMem(0, 900)"),  // 0x384
+            (2, "ConstMem(0, 904)"),  // 0x388
+            (3, "ConstMem(0, 908)"),  // 0x38c
+        ];
+        for (def_idx, want) in expected {
+            let lifted = out
+                .by_def
+                .get(&DefRef {
+                    block_id: 0,
+                    stmt_idx: 0,
+                    def_idx,
+                })
+                .unwrap_or_else(|| panic!("expected lifted LDCU.128 def {}", def_idx));
+            assert_eq!(
+                lifted.rhs.render(),
+                want,
+                "LDCU.128 def {} did not lift correctly",
+                def_idx
+            );
+        }
     }
 
     #[test]
