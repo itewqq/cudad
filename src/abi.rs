@@ -611,6 +611,14 @@ impl AbiProfile {
         let mut near_140_hits = 0usize;
         let mut near_160_hits = 0usize;
         let mut near_380_hits = 0usize;
+        // Blackwell-only evidence: the relocated builtin block
+        // (`0x360..0x378`) and the new ABI internal slots (`0x358`, `0x37c`).
+        // Legacy/modern kernels can still legitimately read offsets in
+        // `[0x380, 0x3a0)` when their parameter list is huge, so the bare
+        // `near_380_hits` counter is not enough to disambiguate; we need
+        // at least one slot the older profiles never touch before forcing
+        // Blackwell over a kernel that also looks like SM 80/89.
+        let mut blackwell_unique_hits = 0usize;
 
         for ins in instructions {
             for op in &ins.operands {
@@ -627,13 +635,25 @@ impl AbiProfile {
                     if (0x380..0x3a0).contains(&off) && off % 4 == 0 {
                         near_380_hits += 1;
                     }
+                    if (0x360..0x378).contains(&off) && off % 4 == 0 {
+                        blackwell_unique_hits += 1;
+                    }
+                    if off == 0x358 || off == 0x37c {
+                        blackwell_unique_hits += 1;
+                    }
                 });
             }
         }
 
-        // Blackwell wins outright whenever we see any 0x380+ evidence —
-        // the older windows never reach that offset range.
-        if near_380_hits > 0 {
+        // Prefer Blackwell when (a) we see something only Blackwell uses
+        // (relocated builtins or new ABI internals), or (b) there is
+        // 0x380+ evidence and absolutely no contradicting hit in the
+        // legacy/modern parameter windows.  This keeps the SM 100 corpus
+        // happy without misclassifying a legacy kernel that happens to
+        // address a far-out param via 0x380.
+        if blackwell_unique_hits > 0
+            || (near_380_hits > 0 && near_140_hits == 0 && near_160_hits == 0)
+        {
             return Some(Self::blackwell_param_380());
         }
         if near_160_hits > 0 && near_160_hits >= near_140_hits {
@@ -1141,6 +1161,55 @@ mod tests {
         let instrs = parse_sass(sass);
         let p = AbiProfile::detect(&instrs);
         assert_eq!(p, AbiProfile::blackwell_param_380());
+    }
+
+    #[test]
+    fn blackwell_unique_evidence_outvotes_modern_window_hits() {
+        // Blackwell-only slots (0x358, 0x37c, 0x360..0x378) should still
+        // win even when the kernel also touches the modern 0x160 window
+        // — that combination only happens on a real Blackwell dump where
+        // the disassembly tool has spilled some `param_0` bytes back to
+        // a non-aligned offset, and we want the modern fallback only
+        // when there is *no* Blackwell-unique fingerprint.
+        let sass = r#"
+            /*0000*/ LDCU UR5, c[0x0][0x360] ;
+            /*0010*/ LDC R1, c[0x0][0x37c] ;
+            /*0020*/ LDC R2, c[0x0][0x160] ;
+        "#;
+        let instrs = parse_sass(sass);
+        let p = AbiProfile::detect(&instrs);
+        assert_eq!(p, AbiProfile::blackwell_param_380());
+    }
+
+    #[test]
+    fn modern_window_wins_when_no_blackwell_unique_evidence() {
+        // A modern (SM 80/89) kernel with a huge parameter list can put a
+        // load at c[0x0][0x380] (param_0x220 from base 0x160).  Without
+        // any Blackwell-unique evidence we must keep treating it as a
+        // modern kernel; otherwise the relocated builtin map would
+        // mis-resolve every constmem hit.
+        let sass = r#"
+            /*0000*/ LDC R1, c[0x0][0x160] ;
+            /*0010*/ LDC R2, c[0x0][0x164] ;
+            /*0020*/ LDC R3, c[0x0][0x380] ;
+        "#;
+        let instrs = parse_sass(sass);
+        let p = AbiProfile::detect(&instrs);
+        assert_eq!(p, AbiProfile::modern_param_160());
+    }
+
+    #[test]
+    fn legacy_window_wins_when_no_blackwell_unique_evidence() {
+        // Same idea as above for the legacy window: a 0x380 hit alone is
+        // not enough to override a clearly-legacy parameter pattern.
+        let sass = r#"
+            /*0000*/ LDC R1, c[0x0][0x140] ;
+            /*0010*/ LDC R2, c[0x0][0x144] ;
+            /*0020*/ LDC R3, c[0x0][0x380] ;
+        "#;
+        let instrs = parse_sass(sass);
+        let p = AbiProfile::detect(&instrs);
+        assert_eq!(p, AbiProfile::legacy_param_140());
     }
 
     #[test]
