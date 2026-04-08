@@ -645,15 +645,20 @@ impl AbiProfile {
             }
         }
 
-        // Prefer Blackwell when (a) we see something only Blackwell uses
-        // (relocated builtins or new ABI internals), or (b) there is
-        // 0x380+ evidence and absolutely no contradicting hit in the
-        // legacy/modern parameter windows.  This keeps the SM 100 corpus
-        // happy without misclassifying a legacy kernel that happens to
-        // address a far-out param via 0x380.
-        if blackwell_unique_hits > 0
-            || (near_380_hits > 0 && near_140_hits == 0 && near_160_hits == 0)
-        {
+        // The "Blackwell-unique" slots are unique only relative to the
+        // *built-in* tables of legacy/modern profiles — under those
+        // profiles `resolve_constmem` will still happily classify any
+        // aligned `offset >= param_base` as a far parameter word, so a
+        // very-large-param-list SM 80/89 kernel can land hits at exactly
+        // the same `0x358` / `0x360..0x378` / `0x37c` slots.  To stay
+        // safe we require *both* a Blackwell-area fingerprint *and* no
+        // contradicting hit in either older window before forcing
+        // Blackwell.  Real Blackwell kernels never read the legacy
+        // parameter windows because the Blackwell `param_base` is
+        // 0x380, so this gate is loss-free for the SM 100 corpus.
+        let blackwell_evidence = blackwell_unique_hits > 0 || near_380_hits > 0;
+        let older_evidence = near_140_hits > 0 || near_160_hits > 0;
+        if blackwell_evidence && !older_evidence {
             return Some(Self::blackwell_param_380());
         }
         if near_160_hits > 0 && near_160_hits >= near_140_hits {
@@ -1164,13 +1169,15 @@ mod tests {
     }
 
     #[test]
-    fn blackwell_unique_evidence_outvotes_modern_window_hits() {
-        // Blackwell-only slots (0x358, 0x37c, 0x360..0x378) should still
-        // win even when the kernel also touches the modern 0x160 window
-        // — that combination only happens on a real Blackwell dump where
-        // the disassembly tool has spilled some `param_0` bytes back to
-        // a non-aligned offset, and we want the modern fallback only
-        // when there is *no* Blackwell-unique fingerprint.
+    fn modern_wins_over_overlapping_blackwell_slots() {
+        // The "Blackwell-unique" slots (`0x358`, `0x360..0x378`, `0x37c`)
+        // are only unique relative to the built-in tables of older
+        // profiles.  Under the modern profile `resolve_constmem` will
+        // still classify these offsets as far parameter words (modern
+        // indices 126, 128..133, 135) so a 128+-param SM 80/89 kernel
+        // could legitimately address them.  The presence of any modern
+        // window hit must therefore force the modern profile, even when
+        // those slots are also touched.
         let sass = r#"
             /*0000*/ LDCU UR5, c[0x0][0x360] ;
             /*0010*/ LDC R1, c[0x0][0x37c] ;
@@ -1178,7 +1185,38 @@ mod tests {
         "#;
         let instrs = parse_sass(sass);
         let p = AbiProfile::detect(&instrs);
+        assert_eq!(p, AbiProfile::modern_param_160());
+    }
+
+    #[test]
+    fn blackwell_wins_when_only_blackwell_internals_appear() {
+        // A minimal Blackwell function may not touch any of the
+        // `0x380+` parameter slots (e.g. a void(void) kernel that only
+        // reads the frame pointer).  The lone `0x37c` hit must still
+        // resolve to Blackwell, otherwise the SM-fallback path would
+        // never trigger.
+        let sass = r#"
+            /*0000*/ LDC R1, c[0x0][0x37c] ;
+        "#;
+        let instrs = parse_sass(sass);
+        let p = AbiProfile::detect(&instrs);
         assert_eq!(p, AbiProfile::blackwell_param_380());
+    }
+
+    #[test]
+    fn offset_0x378_is_not_blackwell_unique() {
+        // The Blackwell built-in block ends at `0x378` (gridDimZ lives
+        // at `0x374`), so an isolated hit at `0x378` should NOT be
+        // treated as Blackwell-unique evidence.  Without any other
+        // signal, profile detection should fall through to `None`.
+        let sass = r#"
+            /*0000*/ LDC R1, c[0x0][0x378] ;
+        "#;
+        let instrs = parse_sass(sass);
+        let p = AbiProfile::detect(&instrs);
+        // Default fallback is the modern profile; the important thing
+        // is that we did NOT pick Blackwell on a single 0x378 hit.
+        assert_ne!(p, AbiProfile::blackwell_param_380());
     }
 
     #[test]
