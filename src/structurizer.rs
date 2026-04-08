@@ -348,8 +348,12 @@ impl<'a> Structurizer<'a> {
     }
     
     fn is_convergence_barrier_opcode(opcode: &str) -> bool {
+        // SM 100+ (Blackwell) annotates convergence barriers with reliability
+        // hints: `BSSY.RECONVERGENT`, `BSYNC.RELIABLE`, etc.  Compare against
+        // the base mnemonic so both the plain and annotated forms match.
+        let base = opcode.split('.').next().unwrap_or(opcode);
         matches!(
-            opcode,
+            base,
             "BSSY" | "BSYNC" | "SSY" | "SYNC" | "WARPSYNC"
         )
     }
@@ -2470,6 +2474,26 @@ mod tests {
             }
             _ => false,
         }
+    }
+
+    #[test]
+    fn is_convergence_barrier_opcode_accepts_legacy_and_blackwell_forms() {
+        // Legacy plain mnemonics must still match.
+        assert!(Structurizer::is_convergence_barrier_opcode("BSSY"));
+        assert!(Structurizer::is_convergence_barrier_opcode("BSYNC"));
+        assert!(Structurizer::is_convergence_barrier_opcode("SSY"));
+        assert!(Structurizer::is_convergence_barrier_opcode("SYNC"));
+        assert!(Structurizer::is_convergence_barrier_opcode("WARPSYNC"));
+        // Blackwell (SM 100+) reliability-annotated variants.
+        assert!(Structurizer::is_convergence_barrier_opcode("BSSY.RECONVERGENT"));
+        assert!(Structurizer::is_convergence_barrier_opcode("BSSY.RELIABLE"));
+        assert!(Structurizer::is_convergence_barrier_opcode("BSYNC.RECONVERGENT"));
+        assert!(Structurizer::is_convergence_barrier_opcode("BSYNC.RELIABLE"));
+        // Unrelated opcodes must NOT match.
+        assert!(!Structurizer::is_convergence_barrier_opcode("BRA"));
+        assert!(!Structurizer::is_convergence_barrier_opcode("BREAK.RELIABLE"));
+        assert!(!Structurizer::is_convergence_barrier_opcode("BREAK"));
+        assert!(!Structurizer::is_convergence_barrier_opcode("IMAD"));
     }
 
     #[test]
