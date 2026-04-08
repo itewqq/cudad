@@ -1797,6 +1797,7 @@ fn corpus_sm100_goto_budget_is_loose() {
     const SM100_PER_FN_GOTO_CEILING: usize = 30;
 
     let outputs = run_corpus_sm100();
+    assert!(!outputs.is_empty(), "SM 100 corpus produced no outputs — fixture broken?");
     let (total, max_per_fn) = corpus_goto_summary(&outputs);
     assert!(
         total <= SM100_TOTAL_GOTO_CEILING,
@@ -1897,6 +1898,7 @@ fn corpus_sm120_goto_budget_is_loose() {
     const SM120_PER_FN_GOTO_CEILING: usize = 30;
 
     let outputs = run_corpus_sm120();
+    assert!(!outputs.is_empty(), "SM 120 corpus produced no outputs — fixture broken?");
     let (total, max_per_fn) = corpus_goto_summary(&outputs);
     assert!(
         total <= SM120_TOTAL_GOTO_CEILING,
