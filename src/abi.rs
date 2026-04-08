@@ -577,34 +577,52 @@ impl AbiProfile {
     }
 
     /// Detect the best-effort ABI profile from observed constant-memory offsets.
-    /// This keeps current behavior for callers without metadata.
+    ///
+    /// This is the offset-only entry point and is preserved for callers that
+    /// genuinely have no SM metadata.  The offset heuristic is fundamentally
+    /// fragile in two directions: a modern kernel that addresses a
+    /// high-numbered parameter at `c[0x0][0x360]` looks like a Blackwell
+    /// builtin, and a Blackwell trace that touches `c[0x0][0x140/0x160]`
+    /// (e.g. from a runtime helper) looks legacy/modern.  Prefer
+    /// [`Self::detect_with_sm`] whenever SM metadata is available — it
+    /// trusts the architecture name and avoids both failure modes.
     pub fn detect(instructions: &[Instruction]) -> Self {
         Self::detect_with_sm(instructions, None)
     }
 
-    /// Detect profile using offsets first, then optional SM metadata fallback.
+    /// Pick an ABI profile, trusting SM metadata when present.
     ///
-    /// Fallback rule (when no offset evidence exists):
-    /// - `sm >= 100` -> Blackwell parameter base (`0x380`)
-    /// - `sm >= 80`  -> modern parameter base (`0x160`)
-    /// - otherwise   -> legacy parameter base (`0x140`)
+    /// SM metadata comes from the SASS dump's `// arch=` header, which is
+    /// authoritative: the toolchain stamps it on every dump and it cannot
+    /// disagree with the actual ABI generation.  When `sm` is `Some`, this
+    /// method uses [`Self::profile_for_sm`] directly and ignores constant-
+    /// memory offsets entirely; otherwise it falls back to
+    /// [`Self::detect_from_offsets`] (and finally to the modern profile
+    /// to keep the historical default stable for empty inputs).
     pub fn detect_with_sm(instructions: &[Instruction], sm: Option<u32>) -> Self {
+        if let Some(sm_val) = sm {
+            return Self::profile_for_sm(sm_val);
+        }
+
         if let Some(by_offset) = Self::detect_from_offsets(instructions) {
             return by_offset;
         }
 
-        if let Some(sm_val) = sm {
-            if sm_val >= 100 {
-                return Self::blackwell_param_380();
-            }
-            if sm_val >= 80 {
-                return Self::modern_param_160();
-            }
-            return Self::legacy_param_140();
-        }
-
         // Default keeps existing behavior and current fixtures stable.
         Self::modern_param_160()
+    }
+
+    /// Map a known SM major.minor (encoded as `sm * 10`) to the matching
+    /// ABI generation.  SM 100+ is Blackwell, 80..99 is modern, anything
+    /// older is legacy.
+    fn profile_for_sm(sm: u32) -> Self {
+        if sm >= 100 {
+            return Self::blackwell_param_380();
+        }
+        if sm >= 80 {
+            return Self::modern_param_160();
+        }
+        Self::legacy_param_140()
     }
 
     fn detect_from_offsets(instructions: &[Instruction]) -> Option<Self> {
@@ -1128,7 +1146,7 @@ mod tests {
     }
 
     #[test]
-    fn detects_profile_from_sm_fallback_when_offsets_absent() {
+    fn detect_with_sm_uses_sm_when_offsets_absent() {
         let sass = r#"
             /*0000*/ S2R R0, SR_CTAID.X ;
             /*0010*/ S2R R1, SR_TID.X ;
@@ -1142,7 +1160,6 @@ mod tests {
             AbiProfile::detect_with_sm(&instrs, Some(70)),
             AbiProfile::legacy_param_140()
         );
-        // SM 100+ falls back to the Blackwell profile.
         assert_eq!(
             AbiProfile::detect_with_sm(&instrs, Some(100)),
             AbiProfile::blackwell_param_380()
@@ -1150,6 +1167,56 @@ mod tests {
         assert_eq!(
             AbiProfile::detect_with_sm(&instrs, Some(120)),
             AbiProfile::blackwell_param_380()
+        );
+    }
+
+    #[test]
+    fn sm_metadata_beats_overlapping_offset_evidence_for_modern() {
+        // A modern (SM 89) kernel that addresses a high-numbered parameter
+        // at `c[0x0][0x360]` (modern param index 128) trips the offset-only
+        // heuristic into thinking the trace is Blackwell, because that
+        // slot collides with the relocated `blockDimX` builtin.  When the
+        // SM is known, `detect_with_sm` must trust the architecture name
+        // and ignore the misleading overlap entirely.
+        let sass = r#"
+            /*0000*/ LDC R1, c[0x0][0x360] ;
+        "#;
+        let instrs = parse_sass(sass);
+        assert_eq!(
+            AbiProfile::detect_with_sm(&instrs, Some(89)),
+            AbiProfile::modern_param_160()
+        );
+        // Sanity-check the failure mode: with SM unknown the offset-only
+        // path still picks Blackwell on this isolated hit, which is the
+        // exact reason `detect_with_sm` is the preferred entry point.
+        assert_eq!(
+            AbiProfile::detect_with_sm(&instrs, None),
+            AbiProfile::blackwell_param_380()
+        );
+    }
+
+    #[test]
+    fn sm_metadata_beats_stray_legacy_window_hits_for_blackwell() {
+        // A real Blackwell kernel never reads `c[0x0][0x140/0x160]`, but
+        // if some pathological trace ever did, the offset-only veto would
+        // suppress Blackwell and pick the older profile.  When the SM is
+        // pinned at 100+, `detect_with_sm` must trust the architecture
+        // name even in the face of contradictory offset hints.
+        let sass = r#"
+            /*0000*/ LDC R1, c[0x0][0x140] ;
+            /*0010*/ LDC R2, c[0x0][0x37c] ;
+        "#;
+        let instrs = parse_sass(sass);
+        assert_eq!(
+            AbiProfile::detect_with_sm(&instrs, Some(100)),
+            AbiProfile::blackwell_param_380()
+        );
+        // And without SM, the offset-only veto kicks in and we fall
+        // through to the legacy profile — exactly the false negative the
+        // SM-priority rule guards against.
+        assert_eq!(
+            AbiProfile::detect_with_sm(&instrs, None),
+            AbiProfile::legacy_param_140()
         );
     }
 
