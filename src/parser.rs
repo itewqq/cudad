@@ -60,6 +60,7 @@ pub struct Instruction {
 lazy_static! {
     static ref RE_REG_NUM: Regex = Regex::new(r"^(?P<cls>UP|UR|R|P)(?P<idx>\d+)$").unwrap();
     static ref RE_CONST : Regex = Regex::new(r"^c\[(?P<bank>0x[0-9A-Fa-f]+)\]\[(?P<off>0x[0-9A-Fa-f]+)\]$").unwrap();
+    static ref RE_DESC  : Regex = Regex::new(r"^desc\[UR(?P<desc>\d+)\](?P<mem>\[.+\])$").unwrap();
     static ref RE_HEX_I : Regex = Regex::new(r"^-?0x[0-9A-Fa-f]+$").unwrap();
     static ref RE_DEC_I : Regex = Regex::new(r"^-?\d+$").unwrap();
     static ref RE_FLOAT : Regex = Regex::new(r"^-?\d+\.\d+(e[+-]?\d+)?$").unwrap();
@@ -214,6 +215,14 @@ fn classify_operand(tok: &str) -> Operand {
         let bank = u32::from_str_radix(&cap["bank"][2..], 16).unwrap();
         let off  = u32::from_str_radix(&cap["off"][2..], 16).unwrap();
         return Operand::ConstMem { bank, offset: off };
+    }
+    // 5b) descriptor-based memory: desc[URx][Ry.64+off]
+    //     Strip the desc[URx] qualifier and parse the inner [...] as a MemRef.
+    if let Some(cap) = RE_DESC.captures(t) {
+        let mem_part = &cap["mem"];
+        if let Some(mem) = parse_mem_ref_operand(mem_part) {
+            return mem;
+        }
     }
     // 6) fallback raw token
     Operand::Raw(t.to_string())
@@ -440,7 +449,43 @@ mod tests {
         assert_eq!(instr.opcode, "LDG.E.CONSTANT");
         assert_eq!(instr.operands.len(), 2);
         assert_eq!(instr.operands[0], Operand::Register { class: "R".into(), idx: 12, ty: None, sign: 1 });
-        // desc[UR6][R4.64] → Raw for now (Commit 2 will parse it as MemRef)
-        assert!(matches!(&instr.operands[1], Operand::Raw(s) if s.contains("desc")));
+        // desc[UR6][R4.64] → MemRef (descriptor prefix stripped)
+        assert!(matches!(
+            &instr.operands[1],
+            Operand::MemRef { base, offset: None, width: Some(64), .. }
+            if matches!(base.as_ref(), Operand::Register { class, idx: 4, .. } if class == "R")
+        ));
+    }
+
+    // ── Descriptor operand parsing ────────────────────────────────────
+
+    #[test]
+    fn classify_desc_operand_no_offset() {
+        let op = classify_operand("desc[UR6][R4.64]");
+        assert!(matches!(
+            &op,
+            Operand::MemRef { base, offset: None, width: Some(64), .. }
+            if matches!(base.as_ref(), Operand::Register { class, idx: 4, .. } if class == "R")
+        ));
+    }
+
+    #[test]
+    fn classify_desc_operand_with_offset() {
+        let op = classify_operand("desc[UR6][R2.64+0x4]");
+        assert!(matches!(
+            &op,
+            Operand::MemRef { base, offset: Some(4), width: Some(64), .. }
+            if matches!(base.as_ref(), Operand::Register { class, idx: 2, .. } if class == "R")
+        ));
+    }
+
+    #[test]
+    fn classify_desc_operand_large_offset() {
+        let op = classify_operand("desc[UR6][R4.64+0x3c]");
+        assert!(matches!(
+            &op,
+            Operand::MemRef { base, offset: Some(0x3c), width: Some(64), .. }
+            if matches!(base.as_ref(), Operand::Register { class, idx: 4, .. } if class == "R")
+        ));
     }
 }
