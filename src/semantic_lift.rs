@@ -2429,24 +2429,24 @@ mod tests {
 
     #[test]
     fn lifts_scalar_uldc_and_ldcu_to_symbolic_constmem() {
-        // Scalar ULDC/LDCU (no .64/.128 suffix) loads a single 32-bit
-        // uniform register.  Both should lift through the same path as
-        // the lo lane of a wide load.
-        let cases = [
-            ("ULDC UR5, c[0x0][0x0]", "blockDimX"),        // SM 89 builtin
-            ("LDCU UR5, c[0x0][0x360]", "blockDimX"),       // SM 100 builtin
-            ("LDCU UR4, c[0x0][0x390]", "param_4"),          // SM 100 param
+        // Scalar ULDC/LDC/LDCU (no .64/.128 suffix) loads a single 32-bit
+        // register from constant memory.  All three should lift through the
+        // same path as the lo lane of a wide load.
+        let modern = crate::abi::AbiProfile::modern_param_160();
+        let blackwell = crate::abi::AbiProfile::blackwell_param_380();
+        let cases: &[(&str, &str, crate::abi::AbiProfile)] = &[
+            ("ULDC UR5, c[0x0][0x0]", "blockDimX", modern),      // SM 89 builtin (uniform)
+            ("LDC R5, c[0x0][0x0]", "blockDimX", modern),        // SM 89 builtin (non-uniform)
+            ("LDCU UR5, c[0x0][0x360]", "blockDimX", blackwell), // SM 100 builtin
+            ("LDC R1, c[0x0][0x360]", "blockDimX", blackwell),   // SM 100 builtin (non-uniform)
+            ("LDCU UR4, c[0x0][0x390]", "param_4", blackwell),   // SM 100 param
+            ("LDC R4, c[0x0][0x390]", "param_4", blackwell),     // SM 100 param (non-uniform)
         ];
-        for (instr, want) in cases {
+        for &(instr, want, profile) in cases {
             let sass = format!(
                 "/*0000*/ {} ;\n/*0010*/ EXIT ;\n",
                 instr
             );
-            let profile = if instr.starts_with("LDCU") {
-                crate::abi::AbiProfile::blackwell_param_380()
-            } else {
-                crate::abi::AbiProfile::modern_param_160()
-            };
             let out = run_lift_with_abi(&sass, profile);
             let lifted = out
                 .by_def

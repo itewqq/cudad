@@ -10,6 +10,13 @@ pub(super) fn register(registry: &mut RuleRegistry) {
     registry.register("LDG", "ldg", |sig, args, stmt_ref, config| {
         crate::semantic_lift::lift_ldg_expr(&sig.raw_opcode, args, stmt_ref, config)
     });
+    registry.register("LDC", "ldc", |_sig, args, stmt_ref, config| {
+        // LDC loads a (non-uniform) register from constant memory.
+        // Scalar, `.64`, and `.128` all lift the low-half (or only) def
+        // from the operand directly; hi defs for wide loads are handled
+        // in `lift_opcode_expr_for_def`.
+        crate::semantic_lift::lift_uldc64(args, stmt_ref, config)
+    });
     registry.register("ULDC", "uldc", |_sig, args, stmt_ref, config| {
         // Scalar, `.64`, and `.128` all lift the low-half (or only) def
         // from the operand directly.  Implicit hi defs for wide loads
