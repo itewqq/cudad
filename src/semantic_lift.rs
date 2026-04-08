@@ -1759,6 +1759,26 @@ mod tests {
         lift_function_ir(&fir, &SemanticLiftConfig::default())
     }
 
+    /// Like `run_lift`, but builds ABI annotations under the requested
+    /// profile and threads them through `SemanticLiftConfig`.  Used by
+    /// the wide-load tests that need to exercise the
+    /// `lift_uldc_wide_def_from_lo` annotation path (which exits early
+    /// when `config.abi_annotations` is `None`).
+    fn run_lift_with_abi(
+        sass: &str,
+        profile: crate::abi::AbiProfile,
+    ) -> SemanticLiftResult {
+        let cfg = build_cfg(parse_sass(sass));
+        let fir = build_ssa(&cfg);
+        let anns = crate::abi::annotate_function_ir_constmem(&fir, profile);
+        let config = SemanticLiftConfig {
+            abi_annotations: Some(&anns),
+            abi_aliases: None,
+            strict: true,
+        };
+        lift_function_ir(&fir, &config)
+    }
+
     #[test]
     fn lifts_imad_mov_to_direct_rhs() {
         let sass = r#"
@@ -2356,6 +2376,52 @@ mod tests {
                 lifted.rhs.render(),
                 want,
                 "LDCU.128 def {} did not lift correctly",
+                def_idx
+            );
+        }
+    }
+
+    #[test]
+    fn lifts_ldcu_128_high_lanes_through_abi_annotations() {
+        // The previous test only exercises the literal-offset fallback
+        // (`constmem_plus_word_offset_n`) because it runs with no ABI
+        // config, so `lift_uldc_wide_def_from_lo` exits at the
+        // `config.abi_annotations?` early return.  This test threads a
+        // real `BlackwellParam380` annotation set through and pins the
+        // `param_idx + def_idx` walk for `def_idx 1..=3`, which is the
+        // path the production pipeline actually takes for SM 100/120
+        // dumps.  Without it a regression that broke the
+        // `param_idx + def_idx` arithmetic could leave the literal
+        // fallback test passing while every annotated kernel emitted
+        // wrong source labels for hi lanes.
+        let sass = r#"
+            /*0000*/ LDCU.128 UR8, c[0x0][0x380] ;
+            /*0010*/ EXIT ;
+        "#;
+        let out = run_lift_with_abi(sass, crate::abi::AbiProfile::blackwell_param_380());
+        // Lo lane goes through the normal `lift_uldc_wide` rule and
+        // resolves the bank/offset annotation directly to `param_0`.
+        let expected = [
+            (0, "param_0"),
+            (1, "param_1"),
+            (2, "param_2"),
+            (3, "param_3"),
+        ];
+        for (def_idx, want) in expected {
+            let lifted = out
+                .by_def
+                .get(&DefRef {
+                    block_id: 0,
+                    stmt_idx: 0,
+                    def_idx,
+                })
+                .unwrap_or_else(|| {
+                    panic!("expected lifted LDCU.128 def {} under ABI annotations", def_idx)
+                });
+            assert_eq!(
+                lifted.rhs.render(),
+                want,
+                "LDCU.128 def {} did not walk param_idx + def_idx via ABI annotations",
                 def_idx
             );
         }
