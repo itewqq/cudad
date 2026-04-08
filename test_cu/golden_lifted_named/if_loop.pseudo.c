@@ -14,7 +14,7 @@ BB1 {
   v7 = *addr64(v5, v8);
   v9 = *addr64(v6, v4);
   v10 = ConstMem(0, 380);
-  v11 = ((int32_t)v3) >> 31;
+  v11 = (int32_t)v3 >> 31;
   b1 = (int32_t)(v10) >= (int32_t)(1);
   v12 = v9 + v7;
   b2 = v12 > 1;

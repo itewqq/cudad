@@ -150,7 +150,7 @@ void kernel(uint32_t arg0, uint32_t arg2, uintptr_t arg4_ptr, uint32_t arg6, uin
     v7 = *addr64(v5, v8);
     v9 = *addr64(v6, v4);
     v10 = arg7;
-    v11 = ((int32_t)v3) >> 31;
+    v11 = (int32_t)v3 >> 31;
     b1 = (int32_t)(v10) >= (int32_t)(1);
     v12 = v9 + v7;
     b2 = v12 > 1;

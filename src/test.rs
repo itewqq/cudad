@@ -1243,17 +1243,25 @@ fn named_phi_merge_comments_are_opt_in() {
 /// Render a single function's instructions through the lifted+named pipeline.
 /// Mirrors `run_structured_output_lifted_named` but takes an already-parsed
 /// instruction list so it can be driven from `split_functions`.
-fn run_lifted_named_from_instrs(instrs: Vec<Instruction>) -> String {
+fn run_lifted_named_from_instrs(instrs: Vec<Instruction>, sm: Option<u32>) -> String {
+    let profile = AbiProfile::detect_with_sm(&instrs, sm);
     let cfg = build_cfg(instrs);
     if cfg.node_count() == 0 {
         return String::new();
     }
     let fir = build_ssa(&cfg);
+    let abi_annotations = annotate_function_ir_constmem(&fir, profile);
+    let abi_aliases = infer_arg_aliases(&fir, &abi_annotations);
     let mut structurizer = Structurizer::new(&cfg, &fir);
-    let lift_cfg = SemanticLiftConfig::default();
+    let lift_cfg = SemanticLiftConfig {
+        abi_annotations: Some(&abi_annotations),
+        abi_aliases: Some(&abi_aliases),
+        strict: true,
+    };
     let lifted = lift_function_ir(&fir, &lift_cfg);
+    let abi_display = AbiDisplay::with_aliases(profile, abi_aliases);
     let rendered = match structurizer.structure_function() {
-        Some(tree) => structurizer.pretty_print_with_lift(&tree, &DefaultDisplay, 0, Some(&lifted)),
+        Some(tree) => structurizer.pretty_print_with_lift(&tree, &abi_display, 0, Some(&lifted)),
         None => String::new(),
     };
     recover_structured_output_names(
@@ -1263,7 +1271,7 @@ fn run_lifted_named_from_instrs(instrs: Vec<Instruction>) -> String {
             style: NameStyle::Temp,
             rewrite_control_predicates: true,
             emit_phi_merge_comments: false,
-            semantic_symbolization: false,
+            semantic_symbolization: true,
         },
     )
     .output
@@ -1298,7 +1306,7 @@ fn run_corpus() -> Vec<(&'static str, String, String)> {
             fname
         );
         for f in funcs {
-            let out = run_lifted_named_from_instrs(f.instrs.clone());
+            let out = run_lifted_named_from_instrs(f.instrs.clone(), f.sm);
             results.push((fname, f.name, out));
         }
     }
@@ -1444,6 +1452,61 @@ fn corpus_goto_budget_is_tight() {
         eprintln!(
             "HINT: some allow-list budgets can be tightened:\n{}",
             over_budget.join("\n")
+        );
+    }
+}
+
+#[test]
+fn corpus_output_no_raw_ffma() {
+    // After semantic lifting, FFMA instructions should be rendered as
+    // `a * b + c`, not as raw `FFMA(...)` opcode calls. This guards
+    // against regressions in the FFMA lift rule.
+    for (file, name, out) in run_corpus() {
+        assert!(
+            !out.contains("FFMA("),
+            "raw FFMA opcode leaked into output for {}:{}\n---\n{}",
+            file,
+            name,
+            out
+        );
+    }
+}
+
+#[test]
+fn corpus_output_no_raw_fmnmx() {
+    for (file, name, out) in run_corpus() {
+        assert!(
+            !out.contains("FMNMX("),
+            "raw FMNMX opcode leaked into output for {}:{}\n---\n{}",
+            file,
+            name,
+            out
+        );
+    }
+}
+
+#[test]
+fn corpus_output_no_raw_mufu_rsq() {
+    for (file, name, out) in run_corpus() {
+        assert!(
+            !out.contains("MUFU.RSQ("),
+            "raw MUFU.RSQ opcode leaked into output for {}:{}\n---\n{}",
+            file,
+            name,
+            out
+        );
+    }
+}
+
+#[test]
+fn corpus_output_no_raw_mufu_ex2() {
+    for (file, name, out) in run_corpus() {
+        assert!(
+            !out.contains("MUFU.EX2("),
+            "raw MUFU.EX2 opcode leaked into output for {}:{}\n---\n{}",
+            file,
+            name,
+            out
         );
     }
 }

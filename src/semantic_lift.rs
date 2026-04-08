@@ -59,7 +59,7 @@ impl LiftedExpr {
         match self {
             LiftedExpr::Raw(s) | LiftedExpr::Imm(s) | LiftedExpr::Reg(s) => s.clone(),
             LiftedExpr::Unary { op, arg } => {
-                let prec = 7;
+                let prec = 14; // tightest binding, above * (13)
                 let inner = format!("{}{}", op, arg.render_with_prec(prec));
                 if prec < parent_prec {
                     format!("({})", inner)
@@ -86,11 +86,16 @@ impl LiftedExpr {
                 then_expr,
                 else_expr,
             } => {
+                // Lowest precedence, below || (4), matching C's ?: level.
+                // C's ?: is right-associative: `a?b:c?d:e` = `a?b:(c?d:e)`.
+                // Force parens on condition sub-expr (prec+1) to prevent ambiguity.
+                // The then-branch (between ? and :) is unambiguous so prec 0.
+                // The else-branch keeps same prec (right-assoc is natural).
                 let prec = 1;
                 let inner = format!(
                     "{} ? {} : {}",
-                    cond.render_with_prec(prec),
-                    then_expr.render_with_prec(prec),
+                    cond.render_with_prec(prec + 1),
+                    then_expr.render_with_prec(0),
                     else_expr.render_with_prec(prec)
                 );
                 if prec < parent_prec {
@@ -564,6 +569,65 @@ fn lift_mufu_rcp(
     lift_unary_intrinsic("rcp_approx", args, stmt_ref, config)
 }
 
+fn lift_ffma(
+    args: &[IRExpr],
+    stmt_ref: StatementRef,
+    config: &SemanticLiftConfig<'_>,
+) -> Option<LiftedExpr> {
+    if args.len() != 3 {
+        return None;
+    }
+    let mul = LiftedExpr::Binary {
+        op: "*".to_string(),
+        lhs: Box::new(lift_ir_expr(&args[0], stmt_ref, config)),
+        rhs: Box::new(lift_ir_expr(&args[1], stmt_ref, config)),
+    };
+    Some(add_like_expr(mul, lift_ir_expr(&args[2], stmt_ref, config)))
+}
+
+fn lift_fmnmx(
+    args: &[IRExpr],
+    stmt_ref: StatementRef,
+    config: &SemanticLiftConfig<'_>,
+) -> Option<LiftedExpr> {
+    if args.len() != 3 {
+        return None;
+    }
+    let pred = &args[2];
+
+    // FMNMX semantics: when pred is true → min, when false → max.
+    // Check for constant predicates first to avoid unnecessary allocations.
+    if is_true_pred_expr(pred) {
+        let a = lift_ir_expr(&args[0], stmt_ref, config);
+        let b = lift_ir_expr(&args[1], stmt_ref, config);
+        return Some(LiftedExpr::Raw(format!(
+            "fminf({}, {})",
+            a.render(),
+            b.render()
+        )));
+    }
+    if is_false_pred_expr(pred) {
+        let a = lift_ir_expr(&args[0], stmt_ref, config);
+        let b = lift_ir_expr(&args[1], stmt_ref, config);
+        return Some(LiftedExpr::Raw(format!(
+            "fmaxf({}, {})",
+            a.render(),
+            b.render()
+        )));
+    }
+
+    // General case: pred ? fminf(a,b) : fmaxf(a,b)
+    let a = lift_ir_expr(&args[0], stmt_ref, config);
+    let b = lift_ir_expr(&args[1], stmt_ref, config);
+    let fmin = LiftedExpr::Raw(format!("fminf({}, {})", a.render(), b.render()));
+    let fmax = LiftedExpr::Raw(format!("fmaxf({}, {})", a.render(), b.render()));
+    Some(LiftedExpr::Ternary {
+        cond: Box::new(lift_ir_expr(pred, stmt_ref, config)),
+        then_expr: Box::new(fmin),
+        else_expr: Box::new(fmax),
+    })
+}
+
 fn lift_uldc64(
     args: &[IRExpr],
     stmt_ref: StatementRef,
@@ -779,6 +843,7 @@ fn lift_lop3_lut(
         return None;
     }
 
+    // The & 0xff mask guarantees the value fits in u8; try_from is belt-and-suspenders.
     let imm = u8::try_from(imm_as_u32(&args[3])? & 0xff).ok()?;
     let a0z = is_zero_expr(&args[0]);
     let a1z = is_zero_expr(&args[1]);
@@ -836,7 +901,14 @@ fn lift_lop3_lut(
         );
     }
 
-    None
+    // General 3-input case: all inputs are non-zero.
+    // Check for common recognizable patterns first, then fall back to a
+    // readable helper form `lop3_lut_0xNN(a, b, c)`.
+    let a_expr = lift_ir_expr(&args[0], stmt_ref, config);
+    let b_expr = lift_ir_expr(&args[1], stmt_ref, config);
+    let c_expr = lift_ir_expr(&args[2], stmt_ref, config);
+
+    lop3_ternary_expr(a_expr, b_expr, c_expr, imm)
 }
 
 fn lop3_bit(imm: u8, a: u8, b: u8, c: u8) -> bool {
@@ -928,19 +1000,166 @@ fn lop3_binary_expr(x: LiftedExpr, y: LiftedExpr, nibble: u8) -> Option<LiftedEx
     }
 }
 
+fn lop3_ternary_expr(a: LiftedExpr, b: LiftedExpr, c: LiftedExpr, imm: u8) -> Option<LiftedExpr> {
+    // Common recognizable 3-input LOP3 patterns.
+    // Bit index = (a<<2)|(b<<1)|c, so a is the MSB of the 3-bit index.
+    match imm {
+        // Bitwise MUX: (a & b) | (~a & c)  (very common in crypto)
+        // Note: this is a per-bit select, NOT C's scalar ternary operator.
+        0xCA => {
+            return Some(LiftedExpr::Raw(format!(
+                "bitmux({}, {}, {})",
+                a.render(),
+                b.render(),
+                c.render()
+            )));
+        }
+        // Reversed bitwise MUX: (a & c) | (~a & b)
+        0xAC => {
+            return Some(LiftedExpr::Raw(format!(
+                "bitmux({}, {}, {})",
+                a.render(),
+                c.render(),
+                b.render()
+            )));
+        }
+        // 3-way AND: a & b & c
+        0x80 => {
+            return Some(LiftedExpr::Binary {
+                op: "&".to_string(),
+                lhs: Box::new(LiftedExpr::Binary {
+                    op: "&".to_string(),
+                    lhs: Box::new(a),
+                    rhs: Box::new(b),
+                }),
+                rhs: Box::new(c),
+            });
+        }
+        // 3-way OR: a | b | c
+        0xFE => {
+            return Some(LiftedExpr::Binary {
+                op: "|".to_string(),
+                lhs: Box::new(LiftedExpr::Binary {
+                    op: "|".to_string(),
+                    lhs: Box::new(a),
+                    rhs: Box::new(b),
+                }),
+                rhs: Box::new(c),
+            });
+        }
+        // 3-way XOR: a ^ b ^ c
+        0x96 => {
+            return Some(LiftedExpr::Binary {
+                op: "^".to_string(),
+                lhs: Box::new(LiftedExpr::Binary {
+                    op: "^".to_string(),
+                    lhs: Box::new(a),
+                    rhs: Box::new(b),
+                }),
+                rhs: Box::new(c),
+            });
+        }
+        // Majority: (a & b) | (a & c) | (b & c)
+        0xE8 => {
+            return Some(LiftedExpr::Raw(format!(
+                "majority({}, {}, {})",
+                a.render(),
+                b.render(),
+                c.render()
+            )));
+        }
+        // a | (b & c)
+        0xF8 => {
+            return Some(LiftedExpr::Binary {
+                op: "|".to_string(),
+                lhs: Box::new(a),
+                rhs: Box::new(LiftedExpr::Binary {
+                    op: "&".to_string(),
+                    lhs: Box::new(b),
+                    rhs: Box::new(c),
+                }),
+            });
+        }
+        // c & (a | b)
+        0xA8 => {
+            return Some(LiftedExpr::Binary {
+                op: "&".to_string(),
+                lhs: Box::new(c),
+                rhs: Box::new(LiftedExpr::Binary {
+                    op: "|".to_string(),
+                    lhs: Box::new(a),
+                    rhs: Box::new(b),
+                }),
+            });
+        }
+        // a & (b ^ c)  — common in crypto (conditional XOR)
+        0x60 => {
+            return Some(LiftedExpr::Binary {
+                op: "&".to_string(),
+                lhs: Box::new(a),
+                rhs: Box::new(LiftedExpr::Binary {
+                    op: "^".to_string(),
+                    lhs: Box::new(b),
+                    rhs: Box::new(c),
+                }),
+            });
+        }
+        // a & (b | c)  — symmetric to 0xA8
+        0xE0 => {
+            return Some(LiftedExpr::Binary {
+                op: "&".to_string(),
+                lhs: Box::new(a),
+                rhs: Box::new(LiftedExpr::Binary {
+                    op: "|".to_string(),
+                    lhs: Box::new(b),
+                    rhs: Box::new(c),
+                }),
+            });
+        }
+        // (a & b) | c  — symmetric to 0xF8
+        0xEA => {
+            return Some(LiftedExpr::Binary {
+                op: "|".to_string(),
+                lhs: Box::new(LiftedExpr::Binary {
+                    op: "&".to_string(),
+                    lhs: Box::new(a),
+                    rhs: Box::new(b),
+                }),
+                rhs: Box::new(c),
+            });
+        }
+        // a ^ (b & c)  — common in crypto (SHA)
+        0x78 => {
+            return Some(LiftedExpr::Binary {
+                op: "^".to_string(),
+                lhs: Box::new(a),
+                rhs: Box::new(LiftedExpr::Binary {
+                    op: "&".to_string(),
+                    lhs: Box::new(b),
+                    rhs: Box::new(c),
+                }),
+            });
+        }
+        _ => {}
+    }
+
+    // Fallback: emit a readable helper call instead of raw LOP3.LUT(...)
+    Some(LiftedExpr::Raw(format!(
+        "lop3_lut_0x{:02x}({}, {}, {})",
+        imm,
+        a.render(),
+        b.render(),
+        c.render()
+    )))
+}
+
 fn lift_sel(
     args: &[IRExpr],
     stmt_ref: StatementRef,
     config: &SemanticLiftConfig<'_>,
 ) -> Option<LiftedExpr> {
-    if args.len() != 3 {
-        return None;
-    }
-    Some(LiftedExpr::Ternary {
-        cond: Box::new(lift_ir_expr(&args[2], stmt_ref, config)),
-        then_expr: Box::new(lift_ir_expr(&args[0], stmt_ref, config)),
-        else_expr: Box::new(lift_ir_expr(&args[1], stmt_ref, config)),
-    })
+    // SEL and FSEL share identical semantics: pred ? src0 : src1
+    lift_fsel(args, stmt_ref, config)
 }
 
 fn lift_shf(
@@ -965,13 +1184,23 @@ fn lift_shf(
     if !matches!(args[1], IRExpr::ImmI(_)) {
         return None;
     }
-    let lhs = lift_ir_expr(&args[2], stmt_ref, config).render();
-    let rhs = lift_ir_expr(&args[1], stmt_ref, config).render();
+    let lhs_expr = lift_ir_expr(&args[2], stmt_ref, config);
+    let rhs_expr = lift_ir_expr(&args[1], stmt_ref, config);
     let signed = opcode.split('.').any(|t| t == "S32");
     if signed {
-        return Some(LiftedExpr::Raw(format!("((int32_t){}) >> {}", lhs, rhs)));
+        // Signed shift: cast to int32_t first, then shift.
+        // The cast is a unary prefix, composed properly with the >> binary.
+        return Some(LiftedExpr::Binary {
+            op: ">>".to_string(),
+            lhs: Box::new(LiftedExpr::Raw(format!("(int32_t){}", lhs_expr.render()))),
+            rhs: Box::new(rhs_expr),
+        });
     }
-    Some(LiftedExpr::Raw(format!("{} >> {}", lhs, rhs)))
+    Some(LiftedExpr::Binary {
+        op: ">>".to_string(),
+        lhs: Box::new(lhs_expr),
+        rhs: Box::new(rhs_expr),
+    })
 }
 
 fn lift_lea(
@@ -1365,14 +1594,22 @@ fn parse_inline_predicate_expr(op: &str) -> Option<LiftedExpr> {
 }
 
 fn binary_prec(op: &str) -> u8 {
+    // Mirrors C operator precedence (higher number = tighter binding).
+    // C99 §6.5: multiplicative(13) > additive(12) > shift(11) >
+    //   relational(10) > equality(9) > bit-and(8) > bit-xor(7) >
+    //   bit-or(6) > logical-and(5) > logical-or(4) > ternary(1)
     match op {
-        "*" | "/" | "%" => 6,
-        "+" | "-" => 5,
-        "<<" | ">>" => 4,
-        "==" | "!=" | "<" | "<=" | ">" | ">=" => 3,
-        "&&" => 2,
-        "||" => 1,
-        _ => 3,
+        "*" | "/" | "%" => 13,
+        "+" | "-" => 12,
+        "<<" | ">>" => 11,
+        "<" | "<=" | ">" | ">=" => 10,
+        "==" | "!=" => 9,
+        "&" => 8,
+        "^" => 7,
+        "|" => 6,
+        "&&" => 5,
+        "||" => 4,
+        _ => 9, // default to equality level
     }
 }
 
@@ -1677,7 +1914,7 @@ mod tests {
                 def_idx: 0,
             })
             .expect("expected lifted SHF");
-        assert_eq!(lifted.rhs.render(), "((int32_t)R0.0) >> 31");
+        assert_eq!(lifted.rhs.render(), "(int32_t)R0.0 >> 31");
     }
 
     #[test]
@@ -2055,14 +2292,306 @@ mod tests {
 
     #[test]
     fn unsupported_opcode_is_counted_as_fallback() {
+        // PRMT (byte-permute) has no lift rule, but writes to a register,
+        // so the lift loop will attempt it and count it as a fallback.
         let sass = r#"
-            /*0000*/ LOP3.LUT R0, R1, R2, R3, 0xf8, PT ;
+            /*0000*/ PRMT R5, R1, 0x5410, R3 ;
             /*0010*/ EXIT ;
         "#;
         let out = run_lift(sass);
-        assert!(out.by_def.is_empty());
-        assert_eq!(out.stats.attempted, 2);
-        assert_eq!(out.stats.lifted, 0);
-        assert_eq!(out.stats.fallback, 2);
+        assert!(out.by_def.is_empty(), "PRMT should not be lifted");
+        assert!(
+            out.stats.attempted > 0,
+            "PRMT should be attempted (has defs)"
+        );
+        assert!(
+            out.stats.fallback > 0,
+            "PRMT should fall through as unsupported"
+        );
+        assert_eq!(
+            out.stats.lifted, 0,
+            "nothing should be lifted for a single unsupported opcode"
+        );
+    }
+
+    #[test]
+    fn lifts_ffma_to_mul_add() {
+        let sass = r#"
+            /*0000*/ FFMA R5, R1, R2, R3 ;
+            /*0010*/ EXIT ;
+        "#;
+        let out = run_lift(sass);
+        let lifted = out
+            .by_def
+            .get(&DefRef {
+                block_id: 0,
+                stmt_idx: 0,
+                def_idx: 0,
+            })
+            .expect("expected lifted FFMA");
+        assert_eq!(lifted.rhs.render(), "R1.0 * R2.0 + R3.0");
+    }
+
+    #[test]
+    fn lifts_ffma_ftz_to_mul_add() {
+        let sass = r#"
+            /*0000*/ FFMA.FTZ R5, R1, R2, R3 ;
+            /*0010*/ EXIT ;
+        "#;
+        let out = run_lift(sass);
+        let lifted = out
+            .by_def
+            .get(&DefRef {
+                block_id: 0,
+                stmt_idx: 0,
+                def_idx: 0,
+            })
+            .expect("expected lifted FFMA.FTZ");
+        assert_eq!(lifted.rhs.render(), "R1.0 * R2.0 + R3.0");
+    }
+
+    #[test]
+    fn lifts_fmnmx_with_pt_to_fminf() {
+        let sass = r#"
+            /*0000*/ FMNMX R5, R1, R2, PT ;
+            /*0010*/ EXIT ;
+        "#;
+        let out = run_lift(sass);
+        let lifted = out
+            .by_def
+            .get(&DefRef {
+                block_id: 0,
+                stmt_idx: 0,
+                def_idx: 0,
+            })
+            .expect("expected lifted FMNMX");
+        assert_eq!(lifted.rhs.render(), "fminf(R1.0, R2.0)");
+    }
+
+    #[test]
+    fn lifts_fmnmx_with_not_pt_to_fmaxf() {
+        let sass = r#"
+            /*0000*/ FMNMX R5, R1, R2, !PT ;
+            /*0010*/ EXIT ;
+        "#;
+        let out = run_lift(sass);
+        let lifted = out
+            .by_def
+            .get(&DefRef {
+                block_id: 0,
+                stmt_idx: 0,
+                def_idx: 0,
+            })
+            .expect("expected lifted FMNMX with !PT");
+        assert_eq!(lifted.rhs.render(), "fmaxf(R1.0, R2.0)");
+    }
+
+    #[test]
+    fn lifts_fmnmx_with_pred_to_ternary() {
+        let sass = r#"
+            /*0000*/ FMNMX R5, R1, R2, P0 ;
+            /*0010*/ EXIT ;
+        "#;
+        let out = run_lift(sass);
+        let lifted = out
+            .by_def
+            .get(&DefRef {
+                block_id: 0,
+                stmt_idx: 0,
+                def_idx: 0,
+            })
+            .expect("expected lifted FMNMX with P0");
+        let rendered = lifted.rhs.render();
+        assert!(
+            rendered.contains("fminf") && rendered.contains("fmaxf"),
+            "expected ternary with fminf/fmaxf, got: {}",
+            rendered
+        );
+    }
+
+    #[test]
+    fn lifts_mufu_rsq_to_rsqrtf() {
+        let sass = r#"
+            /*0000*/ MUFU.RSQ R5, R3 ;
+            /*0010*/ EXIT ;
+        "#;
+        let out = run_lift(sass);
+        let lifted = out
+            .by_def
+            .get(&DefRef {
+                block_id: 0,
+                stmt_idx: 0,
+                def_idx: 0,
+            })
+            .expect("expected lifted MUFU.RSQ");
+        assert_eq!(lifted.rhs.render(), "rsqrtf(R3.0)");
+    }
+
+    #[test]
+    fn lifts_mufu_ex2_to_exp2f() {
+        let sass = r#"
+            /*0000*/ MUFU.EX2 R5, R3 ;
+            /*0010*/ EXIT ;
+        "#;
+        let out = run_lift(sass);
+        let lifted = out
+            .by_def
+            .get(&DefRef {
+                block_id: 0,
+                stmt_idx: 0,
+                def_idx: 0,
+            })
+            .expect("expected lifted MUFU.EX2");
+        assert_eq!(lifted.rhs.render(), "exp2f(R3.0)");
+    }
+
+    #[test]
+    fn lifts_lop3_lut_ternary_select_0xca() {
+        // LOP3.LUT with imm=0xCA: bitwise MUX (a & b) | (~a & c)
+        // Bit index = (a<<2)|(b<<1)|c, so a (=R1) is the selector.
+        let sass = r#"
+            /*0000*/ LOP3.LUT R5, R1, R2, R3, 0xca, !PT ;
+            /*0010*/ EXIT ;
+        "#;
+        let out = run_lift(sass);
+        let lifted = out
+            .by_def
+            .get(&DefRef {
+                block_id: 0,
+                stmt_idx: 0,
+                def_idx: 0,
+            })
+            .expect("expected lifted LOP3.LUT 0xCA");
+        let rendered = lifted.rhs.render();
+        // bitmux(sel, if1, if0) = (sel & if1) | (~sel & if0)
+        assert_eq!(
+            rendered, "bitmux(R1.0, R2.0, R3.0)",
+            "expected bitmux(a, b, c) for 0xCA, got: {}",
+            rendered
+        );
+    }
+
+    #[test]
+    fn lifts_lop3_lut_reversed_bitmux_0xac() {
+        // LOP3.LUT with imm=0xAC: bitwise MUX (a & c) | (~a & b)
+        let sass = r#"
+            /*0000*/ LOP3.LUT R5, R1, R2, R3, 0xac, !PT ;
+            /*0010*/ EXIT ;
+        "#;
+        let out = run_lift(sass);
+        let lifted = out
+            .by_def
+            .get(&DefRef {
+                block_id: 0,
+                stmt_idx: 0,
+                def_idx: 0,
+            })
+            .expect("expected lifted LOP3.LUT 0xAC");
+        let rendered = lifted.rhs.render();
+        // 0xAC = (a & c) | (~a & b) → bitmux(a, c, b) — note reversed if1/if0
+        assert_eq!(
+            rendered, "bitmux(R1.0, R3.0, R2.0)",
+            "expected bitmux(a, c, b) for 0xAC, got: {}",
+            rendered
+        );
+    }
+
+    #[test]
+    fn lifts_lop3_lut_three_way_and_0x80() {
+        let sass = r#"
+            /*0000*/ LOP3.LUT R5, R1, R2, R3, 0x80, !PT ;
+            /*0010*/ EXIT ;
+        "#;
+        let out = run_lift(sass);
+        let lifted = out
+            .by_def
+            .get(&DefRef {
+                block_id: 0,
+                stmt_idx: 0,
+                def_idx: 0,
+            })
+            .expect("expected lifted LOP3.LUT 0x80");
+        let rendered = lifted.rhs.render();
+        // 0x80 = a & b & c → "R1.0 & R2.0 & R3.0"
+        // (renderer elides parens for same-precedence associative chains)
+        assert_eq!(
+            rendered, "R1.0 & R2.0 & R3.0",
+            "expected a & b & c, got: {}",
+            rendered
+        );
+    }
+
+    #[test]
+    fn lifts_lop3_lut_three_way_xor_0x96() {
+        let sass = r#"
+            /*0000*/ LOP3.LUT R5, R1, R2, R3, 0x96, !PT ;
+            /*0010*/ EXIT ;
+        "#;
+        let out = run_lift(sass);
+        let lifted = out
+            .by_def
+            .get(&DefRef {
+                block_id: 0,
+                stmt_idx: 0,
+                def_idx: 0,
+            })
+            .expect("expected lifted LOP3.LUT 0x96");
+        let rendered = lifted.rhs.render();
+        // 0x96 = a ^ b ^ c → "R1.0 ^ R2.0 ^ R3.0"
+        assert_eq!(
+            rendered, "R1.0 ^ R2.0 ^ R3.0",
+            "expected a ^ b ^ c, got: {}",
+            rendered
+        );
+    }
+
+    #[test]
+    fn lifts_lop3_lut_unknown_to_helper() {
+        // Use an uncommon LUT value that doesn't match any named pattern
+        let sass = r#"
+            /*0000*/ LOP3.LUT R5, R1, R2, R3, 0x17, !PT ;
+            /*0010*/ EXIT ;
+        "#;
+        let out = run_lift(sass);
+        let lifted = out
+            .by_def
+            .get(&DefRef {
+                block_id: 0,
+                stmt_idx: 0,
+                def_idx: 0,
+            })
+            .expect("expected lifted LOP3.LUT 0x17");
+        let rendered = lifted.rhs.render();
+        // Unknown patterns use lop3_lut_0xNN(a, b, c) with correct operand order
+        assert_eq!(
+            rendered, "lop3_lut_0x17(R1.0, R2.0, R3.0)",
+            "expected lop3_lut_0x17 helper with correct operands, got: {}",
+            rendered
+        );
+    }
+
+    #[test]
+    fn lifts_lop3_lut_or_bc_0xf8() {
+        // 0xF8 = a | (b & c)
+        let sass = r#"
+            /*0000*/ LOP3.LUT R5, R1, R2, R3, 0xf8, !PT ;
+            /*0010*/ EXIT ;
+        "#;
+        let out = run_lift(sass);
+        let lifted = out
+            .by_def
+            .get(&DefRef {
+                block_id: 0,
+                stmt_idx: 0,
+                def_idx: 0,
+            })
+            .expect("expected lifted LOP3.LUT 0xF8");
+        let rendered = lifted.rhs.render();
+        // 0xF8 = a | (b & c) — with correct C precedence (& > |), no parens needed
+        assert_eq!(
+            rendered, "R1.0 | R2.0 & R3.0",
+            "expected a | (b & c), got: {}",
+            rendered
+        );
     }
 }

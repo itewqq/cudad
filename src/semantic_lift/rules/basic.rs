@@ -4,7 +4,7 @@ use crate::ir::IRExpr;
 use crate::semantic_lift::op_sig::OpSig;
 use crate::semantic_lift::registry::RuleRegistry;
 use crate::semantic_lift::{
-    lift_fsel, lift_i2f_rp, lift_iabs, lift_iadd3, lift_iadd3_x, lift_imad,
+    lift_ffma, lift_fmnmx, lift_fsel, lift_i2f_rp, lift_iabs, lift_iadd3, lift_iadd3_x, lift_imad,
     lift_imad_hi_u32, lift_imad_iadd, lift_imad_mov, lift_imad_wide, lift_imad_x, lift_mufu_rcp,
     lift_unary_intrinsic, LiftedExpr, SemanticLiftConfig,
 };
@@ -91,6 +91,48 @@ pub(super) fn register(registry: &mut RuleRegistry) {
             return lift_mufu_rcp(args, stmt_ref, config);
         }
         None
+    });
+    registry.register("MUFU", "mufu_rsq", |sig, args, stmt_ref, config| {
+        if sig.raw_opcode.starts_with("MUFU.RSQ") {
+            return lift_unary_intrinsic("rsqrtf", args, stmt_ref, config);
+        }
+        None
+    });
+    registry.register("MUFU", "mufu_ex2", |sig, args, stmt_ref, config| {
+        if sig.raw_opcode.starts_with("MUFU.EX2") {
+            return lift_unary_intrinsic("exp2f", args, stmt_ref, config);
+        }
+        None
+    });
+    registry.register("MUFU", "mufu_lg2", |sig, args, stmt_ref, config| {
+        if sig.raw_opcode.starts_with("MUFU.LG2") {
+            return lift_unary_intrinsic("log2f", args, stmt_ref, config);
+        }
+        None
+    });
+    registry.register("MUFU", "mufu_sin", |sig, args, stmt_ref, config| {
+        if sig.raw_opcode.starts_with("MUFU.SIN") {
+            return lift_unary_intrinsic("sinf", args, stmt_ref, config);
+        }
+        None
+    });
+    registry.register("MUFU", "mufu_cos", |sig, args, stmt_ref, config| {
+        if sig.raw_opcode.starts_with("MUFU.COS") {
+            return lift_unary_intrinsic("cosf", args, stmt_ref, config);
+        }
+        None
+    });
+    registry.register("MUFU", "mufu_sqrt", |sig, args, stmt_ref, config| {
+        if sig.raw_opcode.starts_with("MUFU.SQRT") {
+            return lift_unary_intrinsic("sqrtf", args, stmt_ref, config);
+        }
+        None
+    });
+    registry.register("FFMA", "ffma", |_, args, stmt_ref, config| {
+        lift_ffma(args, stmt_ref, config)
+    });
+    registry.register("FMNMX", "fmnmx", |_, args, stmt_ref, config| {
+        lift_fmnmx(args, stmt_ref, config)
     });
     registry.register("FSEL", "fsel", |_, args, stmt_ref, config| {
         lift_fsel(args, stmt_ref, config)
