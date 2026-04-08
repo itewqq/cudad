@@ -404,11 +404,12 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
                     }
                 }
             }
-            // ULDC/LDC .64 define a register pair (lo in dst, hi in dst+1).
+            // ULDC/LDC/LDCU .64 define a register pair (lo in dst, hi in dst+1).
             // Model the second def explicitly so high halves are not treated as live-ins.
+            // LDCU is the SM 100+ (Blackwell) rename of ULDC — same operand shape.
             let mnem = ins.opcode.split('.').next().unwrap_or(ins.opcode.as_str());
             let is_64 = ins.opcode.split('.').skip(1).any(|t| t == "64");
-            if is_64 && matches!(mnem, "ULDC" | "LDC") {
+            if is_64 && matches!(mnem, "ULDC" | "LDC" | "LDCU") {
                 if let Some(mut hi) = ins.operands.first().and_then(phys_reg_of) {
                     hi.idx += 1;
                     hi.sign = 1;

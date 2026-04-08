@@ -244,7 +244,8 @@ fn lift_opcode_expr_for_def(
     config: &SemanticLiftConfig<'_>,
 ) -> Option<LiftedExpr> {
     let mnem = opcode_mnemonic(opcode);
-    if matches!(mnem, "ULDC" | "LDC") && opcode_has_mod(opcode, "64") {
+    // LDCU is Blackwell's rename of ULDC — same 64-bit pair semantics.
+    if matches!(mnem, "ULDC" | "LDC" | "LDCU") && opcode_has_mod(opcode, "64") {
         if def_idx == 0 {
             return lift_opcode_expr(opcode, args, stmt_ref, config);
         }
@@ -2270,6 +2271,35 @@ mod tests {
             })
             .expect("expected lifted ULDC.64 high half");
         assert_eq!(lifted_hi.rhs.render(), "ConstMem(0, 284)");
+    }
+
+    #[test]
+    fn lifts_ldcu_64_like_uldc_64() {
+        // LDCU is the SM 100+ rename of ULDC. Both halves of the register pair
+        // must lift to the underlying ConstMem words, matching ULDC.64 output.
+        let sass = r#"
+            /*0000*/ LDCU.64 UR6, c[0x0][0x358] ;
+            /*0010*/ EXIT ;
+        "#;
+        let out = run_lift(sass);
+        let lifted_lo = out
+            .by_def
+            .get(&DefRef {
+                block_id: 0,
+                stmt_idx: 0,
+                def_idx: 0,
+            })
+            .expect("expected lifted LDCU.64 low half");
+        assert_eq!(lifted_lo.rhs.render(), "ConstMem(0, 856)"); // 0x358
+        let lifted_hi = out
+            .by_def
+            .get(&DefRef {
+                block_id: 0,
+                stmt_idx: 0,
+                def_idx: 1,
+            })
+            .expect("expected lifted LDCU.64 high half");
+        assert_eq!(lifted_hi.rhs.render(), "ConstMem(0, 860)"); // 0x35c
     }
 
     #[test]

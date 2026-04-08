@@ -16,4 +16,12 @@ pub(super) fn register(registry: &mut RuleRegistry) {
         }
         None
     });
+    // LDCU is the SM 100+ (Blackwell) rename of ULDC.  Reuse the same lift
+    // helper so the rendered output is identical across generations.
+    registry.register("LDCU", "ldcu64", |sig, args, stmt_ref, config| {
+        if sig.raw_opcode.starts_with("LDCU.64") {
+            return crate::semantic_lift::lift_uldc64(args, stmt_ref, config);
+        }
+        None
+    });
 }
