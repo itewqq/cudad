@@ -60,7 +60,11 @@ pub struct Instruction {
 lazy_static! {
     static ref RE_REG_NUM: Regex = Regex::new(r"^(?P<cls>UP|UR|R|P)(?P<idx>\d+)$").unwrap();
     static ref RE_CONST : Regex = Regex::new(r"^c\[(?P<bank>0x[0-9A-Fa-f]+)\]\[(?P<off>0x[0-9A-Fa-f]+)\]$").unwrap();
-    static ref RE_DESC  : Regex = Regex::new(r"^desc\[UR(?P<desc>\d+)\](?P<mem>\[.+\])$").unwrap();
+    // Blackwell descriptor-qualified memory: `desc[URx][...]`.  The inner
+    // bracket is restricted to a single non-nested group to prevent the
+    // greedy quantifier from crossing bracket boundaries.  Only `UR`
+    // descriptor registers are known to appear in SM 100+ SASS today.
+    static ref RE_DESC  : Regex = Regex::new(r"^desc\[UR(?P<desc>\d+)\](?P<mem>\[[^\[\]]+\])$").unwrap();
     static ref RE_HEX_I : Regex = Regex::new(r"^-?0x[0-9A-Fa-f]+$").unwrap();
     static ref RE_DEC_I : Regex = Regex::new(r"^-?\d+$").unwrap();
     static ref RE_FLOAT : Regex = Regex::new(r"^-?\d+\.\d+(e[+-]?\d+)?$").unwrap();
@@ -216,8 +220,13 @@ fn classify_operand(tok: &str) -> Operand {
         let off  = u32::from_str_radix(&cap["off"][2..], 16).unwrap();
         return Operand::ConstMem { bank, offset: off };
     }
-    // 5b) descriptor-based memory: desc[URx][Ry.64+off]
+    // 5b) descriptor-based memory: desc[URx][Ry[.width][+off]]
     //     Strip the desc[URx] qualifier and parse the inner [...] as a MemRef.
+    //     TODO: the descriptor register index (URx) is currently discarded —
+    //     two instructions loading through different descriptors produce
+    //     indistinguishable MemRef nodes.  Sufficient for present decompilation
+    //     needs but should become a dedicated Operand variant if we ever care
+    //     about round-tripping or descriptor-level differential analysis.
     if let Some(cap) = RE_DESC.captures(t) {
         let mem_part = &cap["mem"];
         if let Some(mem) = parse_mem_ref_operand(mem_part) {
@@ -228,13 +237,20 @@ fn classify_operand(tok: &str) -> Operand {
     Operand::Raw(t.to_string())
 }
 
-/// Strip SM 120-style scheduling annotations from the operand region.
+/// Return a prefix of `s` with SM 120 scheduling annotations removed.
 ///
 /// SM 120 SASS appends tokens like `&wr=0x0`, `&req={1,0}`, `?trans1`,
-/// `?WAIT5_END_GROUP` after the last operand but before the `;`.
-/// We truncate at the first `&` or `?` that is preceded by whitespace and
-/// followed by a letter — this avoids touching `&` inside bracket expressions
-/// such as `c[0x0][0x28]` or `[R4.64+0x20]`.
+/// and `?WAIT5_END_GROUP` after the last operand but before the `;`.
+/// We cut at the first `&` or `?` that is both preceded by whitespace **and**
+/// followed by an ASCII letter, then trim trailing whitespace from the result.
+///
+/// Assumptions (verified against the SM 100/120 corpus):
+/// * `&` inside bracketed sub-expressions like `c[0x0][0x28]` is never
+///   preceded by whitespace, so the scan leaves it intact.
+/// * Real scheduling keywords always start with an ASCII letter (`wr`,
+///   `req`, `trans`, `WAIT`), so tokens like `&0x1` or `?5` are preserved.
+/// * SASS never emits `?`-prefixed operands in current architectures; if
+///   NVIDIA ever introduces one, this heuristic would need revisiting.
 fn strip_scheduling_annotations(s: &str) -> &str {
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -487,5 +503,49 @@ mod tests {
             Operand::MemRef { base, offset: Some(0x3c), width: Some(64), .. }
             if matches!(base.as_ref(), Operand::Register { class, idx: 4, .. } if class == "R")
         ));
+    }
+
+    #[test]
+    fn classify_desc_operand_negative_offset() {
+        // Observed in SM 100 corpus: `+-0x1c` means base + (-28).
+        let op = classify_operand("desc[UR6][R4.64+-0x1c]");
+        assert!(matches!(
+            &op,
+            Operand::MemRef { base, offset: Some(-0x1c), width: Some(64), .. }
+            if matches!(base.as_ref(), Operand::Register { class, idx: 4, .. } if class == "R")
+        ));
+    }
+
+    #[test]
+    fn classify_desc_operand_large_descriptor_index() {
+        // Descriptor index `UR15` should still parse — the index itself is
+        // currently discarded (see TODO in classify_operand).
+        let op = classify_operand("desc[UR15][R4.64]");
+        assert!(matches!(
+            &op,
+            Operand::MemRef { base, offset: None, width: Some(64), .. }
+            if matches!(base.as_ref(), Operand::Register { class, idx: 4, .. } if class == "R")
+        ));
+    }
+
+    // ── strip_scheduling_annotations edge cases ───────────────────────
+
+    #[test]
+    fn strip_sched_empty_input() {
+        assert_eq!(strip_scheduling_annotations(""), "");
+    }
+
+    #[test]
+    fn strip_sched_ampersand_at_index_zero_is_kept() {
+        // No preceding whitespace → the `&` is assumed to be part of an
+        // operand, not a scheduling annotation.
+        assert_eq!(strip_scheduling_annotations("&literal"), "&literal");
+    }
+
+    #[test]
+    fn strip_sched_ampersand_followed_by_digit_is_kept() {
+        // Scheduling annotations always start with a letter (`wr`, `req`,
+        // `trans`, `WAIT`), so `&` followed by a digit should not trigger.
+        assert_eq!(strip_scheduling_annotations(" &0x1"), " &0x1");
     }
 }
