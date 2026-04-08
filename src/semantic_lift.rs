@@ -661,9 +661,9 @@ fn lift_uldc64(
     if args.len() != 1 {
         return None;
     }
-    // ULDC.64 loads a 64-bit kernel argument pair into uniform regs.
-    // For the modeled low-half def, render the source symbol directly
-    // instead of a synthetic helper call to avoid misleading "load by value".
+    // ULDC/LDC/LDCU loads a constant memory operand into a register.
+    // For the modeled low-half (or only) def, render the source symbol
+    // directly instead of a synthetic helper call.
     Some(lift_ir_expr(&args[0], stmt_ref, config))
 }
 
