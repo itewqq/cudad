@@ -1277,26 +1277,14 @@ fn run_lifted_named_from_instrs(instrs: Vec<Instruction>, sm: Option<u32>) -> St
     .output
 }
 
-/// Enumerate all `(file, function_name, output)` tuples from the corpus.
-/// Concentrated here so individual tests can assert independent invariants
-/// without re-walking the corpus each time.
-fn run_corpus() -> Vec<(&'static str, String, String)> {
-    // Each `include_str!` pulls in a real SASS dump at compile time, so the
-    // corpus test binary is self-contained and deterministic.
-    let files: &[(&str, &str)] = &[
-        ("arith_kernels.sass",    include_str!("../test_cu/corpus/arith_kernels.sass")),
-        ("branching_kernels.sass", include_str!("../test_cu/corpus/branching_kernels.sass")),
-        ("loop_kernels.sass",     include_str!("../test_cu/corpus/loop_kernels.sass")),
-        ("shared_mem_kernels.sass", include_str!("../test_cu/corpus/shared_mem_kernels.sass")),
-        ("crypto_kernels.sass",   include_str!("../test_cu/corpus/crypto_kernels.sass")),
-        ("compute_kernels.sass",  include_str!("../test_cu/corpus/compute_kernels.sass")),
-        ("control_flow_kernels.sass", include_str!("../test_cu/corpus/control_flow_kernels.sass")),
-        ("image_processing_kernels.sass", include_str!("../test_cu/corpus/image_processing_kernels.sass")),
-        ("ml_kernels.sass",         include_str!("../test_cu/corpus/ml_kernels.sass")),
-        ("simulation_kernels.sass", include_str!("../test_cu/corpus/simulation_kernels.sass")),
-        ("data_processing_kernels.sass", include_str!("../test_cu/corpus/data_processing_kernels.sass")),
-    ];
-
+/// Walk a list of `(filename, sass_text)` pairs through the lifted+named
+/// pipeline and return one `(file, function_name, output)` tuple per
+/// function.  Shared by the SM 89 corpus and the SM 100/120 (Blackwell)
+/// corpora so each architecture's invariant tests can pass its own file
+/// list without duplicating the per-function loop.
+fn run_corpus_files(
+    files: &[(&'static str, &'static str)],
+) -> Vec<(&'static str, String, String)> {
     let mut results = Vec::new();
     for (fname, text) in files.iter().copied() {
         let funcs = crate::parser::split_functions(text);
@@ -1311,6 +1299,69 @@ fn run_corpus() -> Vec<(&'static str, String, String)> {
         }
     }
     results
+}
+
+/// Enumerate all `(file, function_name, output)` tuples from the SM 89
+/// corpus.  Each `include_str!` pulls in a real SASS dump at compile
+/// time, so the corpus test binary is self-contained and deterministic.
+fn run_corpus() -> Vec<(&'static str, String, String)> {
+    let files: &[(&'static str, &'static str)] = &[
+        ("arith_kernels.sass",    include_str!("../test_cu/corpus/arith_kernels.sass")),
+        ("branching_kernels.sass", include_str!("../test_cu/corpus/branching_kernels.sass")),
+        ("loop_kernels.sass",     include_str!("../test_cu/corpus/loop_kernels.sass")),
+        ("shared_mem_kernels.sass", include_str!("../test_cu/corpus/shared_mem_kernels.sass")),
+        ("crypto_kernels.sass",   include_str!("../test_cu/corpus/crypto_kernels.sass")),
+        ("compute_kernels.sass",  include_str!("../test_cu/corpus/compute_kernels.sass")),
+        ("control_flow_kernels.sass", include_str!("../test_cu/corpus/control_flow_kernels.sass")),
+        ("image_processing_kernels.sass", include_str!("../test_cu/corpus/image_processing_kernels.sass")),
+        ("ml_kernels.sass",         include_str!("../test_cu/corpus/ml_kernels.sass")),
+        ("simulation_kernels.sass", include_str!("../test_cu/corpus/simulation_kernels.sass")),
+        ("data_processing_kernels.sass", include_str!("../test_cu/corpus/data_processing_kernels.sass")),
+    ];
+    run_corpus_files(files)
+}
+
+/// Enumerate `(file, function_name, output)` tuples from the SM 100
+/// (Blackwell) corpus.  Mirrors `run_corpus` but loads the dumps from
+/// `test_cu/corpus_sm100/`.  Lets the SM 100 invariant tests run the
+/// same lifted+named pipeline against Blackwell-era SASS so regressions
+/// in the new ABI / opcode coverage surface immediately.
+fn run_corpus_sm100() -> Vec<(&'static str, String, String)> {
+    let files: &[(&'static str, &'static str)] = &[
+        ("arith_kernels.sass",    include_str!("../test_cu/corpus_sm100/arith_kernels.sass")),
+        ("branching_kernels.sass", include_str!("../test_cu/corpus_sm100/branching_kernels.sass")),
+        ("loop_kernels.sass",     include_str!("../test_cu/corpus_sm100/loop_kernels.sass")),
+        ("shared_mem_kernels.sass", include_str!("../test_cu/corpus_sm100/shared_mem_kernels.sass")),
+        ("crypto_kernels.sass",   include_str!("../test_cu/corpus_sm100/crypto_kernels.sass")),
+        ("compute_kernels.sass",  include_str!("../test_cu/corpus_sm100/compute_kernels.sass")),
+        ("control_flow_kernels.sass", include_str!("../test_cu/corpus_sm100/control_flow_kernels.sass")),
+        ("image_processing_kernels.sass", include_str!("../test_cu/corpus_sm100/image_processing_kernels.sass")),
+        ("ml_kernels.sass",         include_str!("../test_cu/corpus_sm100/ml_kernels.sass")),
+        ("simulation_kernels.sass", include_str!("../test_cu/corpus_sm100/simulation_kernels.sass")),
+        ("data_processing_kernels.sass", include_str!("../test_cu/corpus_sm100/data_processing_kernels.sass")),
+    ];
+    run_corpus_files(files)
+}
+
+/// Enumerate `(file, function_name, output)` tuples from the SM 120
+/// corpus.  SM 120 dumps add inline scheduling annotations
+/// (`&req=...`, `?WAITn`, ...) that the parser strips before tokenizing
+/// — this corpus exists to keep that strip path covered end-to-end.
+fn run_corpus_sm120() -> Vec<(&'static str, String, String)> {
+    let files: &[(&'static str, &'static str)] = &[
+        ("arith_kernels.sass",    include_str!("../test_cu/corpus_sm120/arith_kernels.sass")),
+        ("branching_kernels.sass", include_str!("../test_cu/corpus_sm120/branching_kernels.sass")),
+        ("loop_kernels.sass",     include_str!("../test_cu/corpus_sm120/loop_kernels.sass")),
+        ("shared_mem_kernels.sass", include_str!("../test_cu/corpus_sm120/shared_mem_kernels.sass")),
+        ("crypto_kernels.sass",   include_str!("../test_cu/corpus_sm120/crypto_kernels.sass")),
+        ("compute_kernels.sass",  include_str!("../test_cu/corpus_sm120/compute_kernels.sass")),
+        ("control_flow_kernels.sass", include_str!("../test_cu/corpus_sm120/control_flow_kernels.sass")),
+        ("image_processing_kernels.sass", include_str!("../test_cu/corpus_sm120/image_processing_kernels.sass")),
+        ("ml_kernels.sass",         include_str!("../test_cu/corpus_sm120/ml_kernels.sass")),
+        ("simulation_kernels.sass", include_str!("../test_cu/corpus_sm120/simulation_kernels.sass")),
+        ("data_processing_kernels.sass", include_str!("../test_cu/corpus_sm120/data_processing_kernels.sass")),
+    ];
+    run_corpus_files(files)
 }
 
 #[test]
@@ -1524,6 +1575,184 @@ fn corpus_output_has_no_ssa_suffix_tokens() {
             file,
             name,
             out
+        );
+    }
+}
+
+// ----------------------------------------------------------------------
+// SM 100 (Blackwell) corpus invariants
+// ----------------------------------------------------------------------
+//
+// Mirror the most important SM 89 corpus invariants against the
+// Blackwell-era dumps so regressions in the new ABI / opcode coverage
+// (LDCU, BSSY.RECONVERGENT, descriptor memory, c[0x0][0x380]+ params)
+// surface immediately.  We deliberately skip the strict goto-budget gate
+// here because the structurizer has not yet been tuned for SM 100; the
+// budget will move out of the SM 89-only test once Blackwell lifters
+// fold the remaining new patterns.
+
+#[test]
+fn corpus_sm100_splits_at_least_one_function_per_file() {
+    let results = run_corpus_sm100();
+    assert!(
+        results.len() >= 20,
+        "expected at least 20 SM 100 functions in the corpus, got {}",
+        results.len()
+    );
+}
+
+#[test]
+fn corpus_sm100_every_function_produces_non_empty_output() {
+    for (file, name, out) in run_corpus_sm100() {
+        assert!(
+            !out.trim().is_empty(),
+            "empty pseudo-C output for SM 100 {}:{}",
+            file,
+            name
+        );
+    }
+}
+
+#[test]
+fn corpus_sm100_output_contains_no_raw_convergence_barriers() {
+    // SM 100 reliability-annotated forms (`BSSY.RECONVERGENT`,
+    // `BSYNC.RELIABLE`, ...) must be folded away by the structurizer
+    // just like the legacy plain mnemonics.
+    let banned = [
+        " BSSY ", " BSYNC ", " SSY ", " SYNC ",
+        "BSSY(", "BSYNC(", "WARPSYNC(",
+        "BSSY.", "BSYNC.",
+    ];
+    for (file, name, out) in run_corpus_sm100() {
+        for needle in banned.iter() {
+            assert!(
+                !out.contains(needle),
+                "raw convergence barrier {:?} leaked into SM 100 output for {}:{}\n---\n{}",
+                needle,
+                file,
+                name,
+                out
+            );
+        }
+    }
+}
+
+#[test]
+fn corpus_sm100_output_is_deterministic() {
+    let first = run_corpus_sm100();
+    let second = run_corpus_sm100();
+    assert_eq!(first.len(), second.len());
+    for (a, b) in first.iter().zip(second.iter()) {
+        assert_eq!(a.0, b.0);
+        assert_eq!(a.1, b.1);
+        assert_eq!(
+            a.2, b.2,
+            "non-deterministic SM 100 output for {}:{}",
+            a.0, a.1
+        );
+    }
+}
+
+#[test]
+fn corpus_sm100_output_has_no_ssa_suffix_tokens() {
+    let re = Regex::new(r"\b(?:UR|UP|R|P)\d+\.\d+\b").expect("valid regex");
+    for (file, name, out) in run_corpus_sm100() {
+        assert!(
+            !re.is_match(&out),
+            "SSA-suffix token leaked into SM 100 named output for {}:{}\n---\n{}",
+            file,
+            name,
+            out
+        );
+    }
+}
+
+#[test]
+fn corpus_sm100_resolves_blackwell_builtins() {
+    // The Blackwell ABI relocates `blockDim*` to c[0x0][0x360..0x378].
+    // Across the SM 100 corpus we expect at least one function to bind a
+    // builtin to its symbolic name (proves auto-detection of the
+    // BlackwellParam380 profile is reaching the rendered output, not just
+    // the explicit unit tests).
+    let outputs = run_corpus_sm100();
+    let any_builtin = outputs.iter().any(|(_, _, out)| {
+        out.contains("blockDimX")
+            || out.contains("blockDimY")
+            || out.contains("blockDimZ")
+            || out.contains("gridDimX")
+            || out.contains("gridDimY")
+            || out.contains("gridDimZ")
+    });
+    assert!(
+        any_builtin,
+        "no Blackwell builtin (block/gridDim*) appeared in SM 100 corpus output — \
+         BlackwellParam380 profile likely failed to bind c[0x0][0x360..0x378]"
+    );
+}
+
+// ----------------------------------------------------------------------
+// SM 120 corpus invariants
+// ----------------------------------------------------------------------
+//
+// SM 120 uses the same ABI as SM 100 but adds inline scheduling
+// annotations (`&req=`, `?WAITn`, ...) that the parser strips before
+// tokenizing.  Keeping a separate corpus pass guards that strip path
+// end-to-end.
+
+#[test]
+fn corpus_sm120_splits_at_least_one_function_per_file() {
+    let results = run_corpus_sm120();
+    assert!(
+        results.len() >= 20,
+        "expected at least 20 SM 120 functions in the corpus, got {}",
+        results.len()
+    );
+}
+
+#[test]
+fn corpus_sm120_every_function_produces_non_empty_output() {
+    for (file, name, out) in run_corpus_sm120() {
+        assert!(
+            !out.trim().is_empty(),
+            "empty pseudo-C output for SM 120 {}:{}",
+            file,
+            name
+        );
+    }
+}
+
+#[test]
+fn corpus_sm120_output_contains_no_scheduling_annotations() {
+    // The parser must strip every `&req=…` / `?WAITn` / `?trans` token
+    // before lifting; if any leak through they will surface verbatim in
+    // the rendered output and a downstream parse step will choke.
+    let banned = ["&req=", "&wr=", "&rd=", "?WAIT", "?trans"];
+    for (file, name, out) in run_corpus_sm120() {
+        for needle in banned.iter() {
+            assert!(
+                !out.contains(needle),
+                "scheduling annotation {:?} leaked into SM 120 output for {}:{}\n---\n{}",
+                needle,
+                file,
+                name,
+                out
+            );
+        }
+    }
+}
+
+#[test]
+fn corpus_sm120_output_is_deterministic() {
+    let first = run_corpus_sm120();
+    let second = run_corpus_sm120();
+    assert_eq!(first.len(), second.len());
+    for (a, b) in first.iter().zip(second.iter()) {
+        assert_eq!(a.0, b.0);
+        assert_eq!(a.1, b.1);
+        assert_eq!(
+            a.2, b.2,
+            "non-deterministic SM 120 output for {}:{}",
+            a.0, a.1
         );
     }
 }
