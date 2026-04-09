@@ -147,12 +147,67 @@ impl<'a> Structurizer<'a> {
         opcode == "RET" || opcode == "EXIT" || opcode.starts_with("RET")
     }
 
+    /// Checks if a structured statement ends with an unconditional return/exit,
+    /// meaning any subsequent siblings in a Sequence are dead code.
+    fn ends_with_unconditional_return(stmt: &StructuredStatement) -> bool {
+        match stmt {
+            StructuredStatement::Return(_) => true,
+            StructuredStatement::BasicBlock { stmts, .. } => {
+                // Look for an unconditional RET/EXIT in the block's stmts.
+                stmts.iter().any(|s| {
+                    if let RValue::Op { opcode, .. } = &s.value {
+                        Self::is_return_opcode(opcode) && s.pred.is_none()
+                    } else {
+                        false
+                    }
+                })
+            }
+            StructuredStatement::Sequence(children) => {
+                // A sequence ends with return if its last non-empty child does.
+                children
+                    .iter()
+                    .rev()
+                    .find(|c| !matches!(c, StructuredStatement::Empty))
+                    .map_or(false, Self::ends_with_unconditional_return)
+            }
+            _ => false,
+        }
+    }
+
     fn is_setp_opcode(opcode: &str) -> bool {
         opcode.starts_with("ISETP") || opcode.starts_with("FSETP")
     }
 
     fn is_barrier_opcode(opcode: &str) -> bool {
         opcode.starts_with("BAR.SYNC")
+    }
+
+    /// Returns true if the register is one of the "sink" registers (RZ, PT, URZ, UPT)
+    /// whose writes have no observable effect.
+    fn is_zero_or_true_reg(r: &IRExpr) -> bool {
+        match r {
+            IRExpr::Reg(reg) => matches!(reg.class.as_str(), "RZ" | "PT" | "URZ" | "UPT"),
+            _ => false,
+        }
+    }
+
+    /// Returns true if the instruction has memory side effects that must be preserved
+    /// even when all destination registers are RZ/PT.
+    fn is_memory_side_effect_opcode(value: &RValue) -> bool {
+        let opcode = match value {
+            RValue::Op { opcode, .. } => opcode.as_str(),
+            _ => return false,
+        };
+        // Store instructions, atomics, and shared-memory operations
+        opcode.starts_with("STG")
+            || opcode.starts_with("STS")
+            || opcode.starts_with("STL")
+            || opcode.starts_with("ST.")
+            || opcode.starts_with("ATOM")
+            || opcode.starts_with("RED")
+            || opcode.starts_with("CCTL")
+            || opcode.starts_with("MEMBAR")
+            || opcode.starts_with("BAR")
     }
 
     fn should_omit_control_predicate_def(
@@ -418,6 +473,20 @@ impl<'a> Structurizer<'a> {
                 continue;
             }
 
+            // Suppress NOP instructions.
+            if opcode == "NOP" {
+                continue;
+            }
+
+            // Suppress writes where all defs target zero/true registers (RZ, PT, URZ, UPT)
+            // unless the instruction has memory side effects.
+            if !ir_s.defs.is_empty()
+                && ir_s.defs.iter().all(|d| Self::is_zero_or_true_reg(d))
+                && !Self::is_memory_side_effect_opcode(&ir_s.value)
+            {
+                continue;
+            }
+
             // Skip the SETP that defines *only* the block's own branch predicate
             // (its semantics are captured by the structured if/while condition).
             if Self::should_omit_control_predicate_def(ir_s, stmt_idx, block, &control_pred_regs) {
@@ -494,18 +563,25 @@ impl<'a> Structurizer<'a> {
             }
 
             // Fallback: raw SSA rendering.
-            let dest_str = if ir_s.defs.is_empty() {
-                "_".to_string()
+            let side_effect_only = ir_s.defs.is_empty()
+                || ir_s.defs.iter().all(|d| Self::is_zero_or_true_reg(d));
+            let dest_str = if side_effect_only {
+                String::new()
             } else if ir_s.defs.len() == 1 {
                 ctx.expr(&ir_s.defs[0])
             } else {
                 let defs = ir_s
                     .defs
                     .iter()
+                    .filter(|d| !Self::is_zero_or_true_reg(d))
                     .map(|d| ctx.expr(d))
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("({})", defs)
+                if defs.is_empty() {
+                    String::new()
+                } else {
+                    format!("({})", defs)
+                }
             };
             let value_str = match &ir_s.value {
                 RValue::Op { opcode, args } => {
@@ -523,7 +599,14 @@ impl<'a> Structurizer<'a> {
                 .pred
                 .as_ref()
                 .map_or("".to_string(), |p| format!("if ({}) ", ctx.expr(p)));
-            if ir_s.pred.is_some() && !ir_s.pred_old_defs.is_empty() && ir_s.defs.len() == 1 {
+            if side_effect_only {
+                lines.push_str(&format!(
+                    "{}{}{};\n",
+                    "  ".repeat(indent_level + 1),
+                    pred_str,
+                    value_str
+                ));
+            } else if ir_s.pred.is_some() && !ir_s.pred_old_defs.is_empty() && ir_s.defs.len() == 1 {
                 let old_str = ctx.expr(&ir_s.pred_old_defs[0]);
                 let pred_expr = ir_s.pred.as_ref().unwrap();
                 // Predicated instruction with old value: emit ternary select.
@@ -552,12 +635,7 @@ impl<'a> Structurizer<'a> {
             return String::new();
         }
 
-        let indent = "  ".repeat(indent_level);
-        let mut out = String::new();
-        out.push_str(&format!("{}BB{} {{\n", indent, block_id));
-        out.push_str(&lines);
-        out.push_str(&format!("{}}}\n", indent));
-        out
+        lines
     }
 
     fn render_condition_expr(
@@ -654,7 +732,7 @@ impl<'a> Structurizer<'a> {
 
         match stmt {
             StructuredStatement::BasicBlock { block_id, stmts } => {
-                s_out.push_str(&format!("{}BB{} {{\n", indent, block_id));
+                // Emit statements directly without BB label wrapper.
                 let mut omitted_phi_count = 0usize;
                 let fir_block = self.get_ir_block(*block_id);
                 let mut fir_search_from = 0usize;
@@ -711,6 +789,10 @@ impl<'a> Structurizer<'a> {
                             // and are implicit in structured output.
                             continue;
                         }
+                        // Suppress NOP instructions — they have no semantic effect.
+                        if opcode == "NOP" {
+                            continue;
+                        }
                         if Self::is_barrier_opcode(opcode) {
                             let pred_str = ir_s
                                 .pred
@@ -718,7 +800,7 @@ impl<'a> Structurizer<'a> {
                                 .map_or_else(String::new, |p| format!("if ({}) ", ctx.expr(p)));
                             s_out.push_str(&format!(
                                 "{}{}__syncthreads();\n",
-                                "  ".repeat(indent_level + 1),
+                                indent,
                                 pred_str
                             ));
                             continue;
@@ -730,11 +812,23 @@ impl<'a> Structurizer<'a> {
                                 .map_or(String::new(), |p| format!("if ({}) ", ctx.expr(p)));
                             s_out.push_str(&format!(
                                 "{}{}return;\n",
-                                "  ".repeat(indent_level + 1),
+                                indent,
                                 pred_prefix
                             ));
+                            // If the return is unconditional, remaining stmts are dead code.
+                            if ir_s.pred.is_none() {
+                                break;
+                            }
                             continue;
                         }
+                    }
+                    // Suppress writes where all defs target zero/true registers (RZ, PT, URZ, UPT)
+                    // unless the instruction has memory side effects (stores, atomics).
+                    if !ir_s.defs.is_empty()
+                        && ir_s.defs.iter().all(|d| Self::is_zero_or_true_reg(d))
+                        && !Self::is_memory_side_effect_opcode(&ir_s.value)
+                    {
+                        continue;
                     }
 
                     if let Some(res) = lifted {
@@ -753,7 +847,7 @@ impl<'a> Structurizer<'a> {
                                     let phi_tag = if self.is_pred_old_phi(ir_s, def_idx) { "/*phi*/" } else { "" };
                                     s_out.push_str(&format!(
                                         "{}{} = {} ? ({}) : {}{};\n",
-                                        "  ".repeat(indent_level + 1),
+                                        indent,
                                         lifted_stmt.dest,
                                         p.render(),
                                         lifted_stmt.rhs.render(),
@@ -764,7 +858,7 @@ impl<'a> Structurizer<'a> {
                                 (Some(p), None) => {
                                     s_out.push_str(&format!(
                                         "{}if ({}) {} = {};\n",
-                                        "  ".repeat(indent_level + 1),
+                                        indent,
                                         p.render(),
                                         lifted_stmt.dest,
                                         lifted_stmt.rhs.render()
@@ -773,7 +867,7 @@ impl<'a> Structurizer<'a> {
                                 (None, _) => {
                                     s_out.push_str(&format!(
                                         "{}{} = {};\n",
-                                        "  ".repeat(indent_level + 1),
+                                        indent,
                                         lifted_stmt.dest,
                                         lifted_stmt.rhs.render()
                                     ));
@@ -786,18 +880,27 @@ impl<'a> Structurizer<'a> {
                         }
                     }
 
-                    let dest_str = if ir_s.defs.is_empty() {
-                        "_".to_string()
+                    // Determine if this is a side-effect-only call (no meaningful defs).
+                    let side_effect_only = ir_s.defs.is_empty()
+                        || ir_s.defs.iter().all(|d| Self::is_zero_or_true_reg(d));
+
+                    let dest_str = if side_effect_only {
+                        String::new()
                     } else if ir_s.defs.len() == 1 {
                         ctx.expr(&ir_s.defs[0])
                     } else {
                         let defs = ir_s
                             .defs
                             .iter()
+                            .filter(|d| !Self::is_zero_or_true_reg(d))
                             .map(|d| ctx.expr(d))
                             .collect::<Vec<_>>()
                             .join(", ");
-                        format!("({})", defs)
+                        if defs.is_empty() {
+                            String::new()
+                        } else {
+                            format!("({})", defs)
+                        }
                     };
                     let value_str = match &ir_s.value {
                         RValue::Op { opcode, args } => {
@@ -812,14 +915,17 @@ impl<'a> Structurizer<'a> {
                         RValue::ImmF(f) => format!("{}", f),
                     };
                     let pred_str = ir_s.pred.as_ref().map_or("".to_string(), |p| format!("if ({}) ", ctx.expr(p)));
-                    if ir_s.pred.is_some() && !ir_s.pred_old_defs.is_empty() && ir_s.defs.len() == 1 {
+                    if side_effect_only {
+                        // No meaningful destination: emit just the call.
+                        s_out.push_str(&format!("{}{}{};\n", indent, pred_str, value_str));
+                    } else if ir_s.pred.is_some() && !ir_s.pred_old_defs.is_empty() && ir_s.defs.len() == 1 {
                         let old_str = ctx.expr(&ir_s.pred_old_defs[0]);
                         let pred_expr = ir_s.pred.as_ref().unwrap();
                         // Predicated instruction with old value: emit ternary select.
                         let phi_tag = if self.is_pred_old_phi(ir_s, 0) { "/*phi*/" } else { "" };
                         s_out.push_str(&format!(
                             "{}{} = {} ? ({}) : {}{};\n",
-                            "  ".repeat(indent_level + 1),
+                            indent,
                             dest_str,
                             ctx.expr(pred_expr),
                             value_str,
@@ -827,22 +933,28 @@ impl<'a> Structurizer<'a> {
                             old_str
                         ));
                     } else {
-                        s_out.push_str(&format!("{}{}{} = {};\n", "  ".repeat(indent_level + 1), pred_str, dest_str, value_str));
+                        s_out.push_str(&format!("{}{}{} = {};\n", indent, pred_str, dest_str, value_str));
                     }
                 }
                 if omitted_phi_count > 0 {
                     s_out.push_str(&format!(
-                        "{}// {} phi node(s) omitted\n",
-                        "  ".repeat(indent_level + 1),
-                        omitted_phi_count
+                        "{}// {} phi node(s) omitted [BB{}]\n",
+                        indent,
+                        omitted_phi_count,
+                        block_id
                     ));
                 }
-                s_out.push_str(&format!("{}}}\n", indent));
             }
             StructuredStatement::Sequence(stmts) => {
                 for s_child in stmts {
-                    if !matches!(s_child, StructuredStatement::Empty) { // Don't print empty
-                        s_out.push_str(&self.pretty_print_with_lift(s_child, ctx, indent_level, lifted));
+                    if matches!(s_child, StructuredStatement::Empty) {
+                        continue;
+                    }
+                    s_out.push_str(&self.pretty_print_with_lift(s_child, ctx, indent_level, lifted));
+                    // If this child is (or ends with) an unconditional return,
+                    // the remaining siblings are dead code — stop emitting.
+                    if Self::ends_with_unconditional_return(s_child) {
+                        break;
                     }
                 }
             }
@@ -861,7 +973,6 @@ impl<'a> Structurizer<'a> {
                         indent_level,
                         lifted,
                     ));
-                    s_out.push_str(&format!("{}// Condition from BB{}\n", indent, condition_block_id));
                     let cond_str = self.render_condition_expr(
                         *condition_block_id,
                         &negate_condition(condition_expr.clone()),
@@ -878,7 +989,6 @@ impl<'a> Structurizer<'a> {
                         indent_level,
                         lifted,
                     ));
-                    s_out.push_str(&format!("{}// Condition from BB{}\n", indent, condition_block_id));
                     let cond_str = self.render_condition_expr(
                         *condition_block_id,
                         condition_expr,
@@ -904,9 +1014,6 @@ impl<'a> Structurizer<'a> {
                         indent_level,
                         lifted,
                     ));
-                }
-                if let Some(hid) = header_block_id {
-                    s_out.push_str(&format!("{}// Loop header BB{}\n", indent, hid));
                 }
                 match loop_type {
                     LoopType::While => {

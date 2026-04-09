@@ -20,18 +20,6 @@
 // param_2 -> arg2 (word32, confidence: low, words: {0})
 // param_3 -> arg3 (word32, confidence: low, words: {0})
 void kernel(int32_t arg0, int32_t arg1, uint32_t arg2, uint32_t arg3) {
-  bool P0;
-  bool P1;
-  bool P2;
-  float R0;
-  uint32_t R1;
-  uint32_t R2;
-  uint32_t R3;
-  uint32_t R4;
-  uint32_t R5;
-  uint32_t R7;
-  uint32_t UR4;
-  uint32_t UR5;
   uint32_t v0;
   uint32_t abi_internal_0x28; // live-in
   uint32_t v1;
@@ -65,40 +53,38 @@ void kernel(int32_t arg0, int32_t arg1, uint32_t arg2, uint32_t arg3) {
   uint32_t v20;
   uint32_t v21;
 
-  BB0 {
-    v0 = abi_internal_0x28;
-    v1 = abs(arg1);
-    u0 = arg0;
-    u1 = arg1;
-    u2 = u0 ^ u1;
-    v2 = i2f_rp(v1);
-    b0 = (int32_t)(0) <= (int32_t)(u2);
-    u3 = c[0x0][0x118];
-    u4 = ConstMem(0, 284);
-    v3 = rcp_approx(v2);
-    v4 = v3 + 268435454;
-    v5 = f2i_trunc_u32_ftz_ntz(v4);
-    v6 = 0;
-    v7 = -v5;
-    v8 = v7 * v1 + 0;
-    v9 = abs(arg0);
-    v10 = mul_hi_u32(v5, v8) + v6;
-    v11 = arg2;
-    v12 = mul_hi_u32(v10, v9);
-    v13 = -v12 + 0 + 0;
-    v14 = v1 * v13 + v9;
-    b1 = v1 > v14;
-    v15 = !b1 ? (v14 - v1) : v14;
-    v16 = !b1 ? (v12 + 1) : v12;
-    b2 = 0 != arg1;
-    b3 = v15 >= v1;
-    v17 = b3 ? (v16 + 1) : v16;
-    v18 = v17;
-    v19 = arg3;
-    v20 = !b0 ? (-v18 + 0 + 0) : v18;
-    v21 = !b2 ? (~arg1) : v20;
-    *addr64(v11, v19) = v21;
-  }
+  v0 = abi_internal_0x28;
+  v1 = abs(arg1);
+  u0 = arg0;
+  u1 = arg1;
+  u2 = u0 ^ u1;
+  v2 = i2f_rp(v1);
+  b0 = (int32_t)(0) <= (int32_t)(u2);
+  u3 = c[0x0][0x118];
+  u4 = ConstMem(0, 284);
+  v3 = rcp_approx(v2);
+  v4 = v3 + 268435454;
+  v5 = f2i_trunc_u32_ftz_ntz(v4);
+  v6 = 0;
+  v7 = -v5;
+  v8 = v7 * v1 + 0;
+  v9 = abs(arg0);
+  v10 = mul_hi_u32(v5, v8) + v6;
+  v11 = arg2;
+  v12 = mul_hi_u32(v10, v9);
+  v13 = -v12 + 0 + 0;
+  v14 = v1 * v13 + v9;
+  b1 = v1 > v14;
+  v15 = !b1 ? (v14 - v1) : v14;
+  v16 = !b1 ? (v12 + 1) : v12;
+  b2 = 0 != arg1;
+  b3 = v15 >= v1;
+  v17 = b3 ? (v16 + 1) : v16;
+  v18 = v17;
+  v19 = arg3;
+  v20 = !b0 ? (-v18 + 0 + 0) : v18;
+  v21 = !b2 ? (~arg1) : v20;
+  *addr64(v11, v19) = v21;
   return;
 }
 // --- End Structured Output ---

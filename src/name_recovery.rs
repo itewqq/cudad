@@ -48,26 +48,26 @@ pub struct NameRecoveryResult {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-struct RegBase {
+pub(crate) struct RegBase {
     class: String,
     idx: i32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-struct RegSsa {
+pub(crate) struct RegSsa {
     base: RegBase,
     ssa: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct Loc {
+pub(crate) struct Loc {
     block_id: usize,
     stmt_idx: usize,
     order_in_stmt: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum Group {
+pub(crate) enum Group {
     Data = 0,
     Uniform = 1,
     Pred = 2,
@@ -122,7 +122,7 @@ impl UnionFind {
 /// It can also be used to construct a `NameAwareDisplay` that applies
 /// name recovery during rendering rather than after.
 #[allow(clippy::type_complexity)]
-pub fn build_name_map(
+pub(crate) fn build_name_map(
     function_ir: &FunctionIR,
     config: &NameRecoveryConfig,
 ) -> (
@@ -739,8 +739,7 @@ fn append_phi_merge_comments(
         return output.to_string();
     }
 
-    let bb_re = Regex::new(r"^\s*BB(\d+)\s*\{").expect("valid regex");
-    let mut current_block: Option<usize> = None;
+    let phi_re = Regex::new(r"phi node\(s\) omitted \[BB(\d+)\]").expect("valid regex");
     let mut rendered = String::new();
 
     if !live_ins.is_empty() {
@@ -750,16 +749,12 @@ fn append_phi_merge_comments(
     }
 
     for line in output.lines() {
-        if let Some(cap) = bb_re.captures(line) {
-            if let Some(m) = cap.get(1) {
-                current_block = m.as_str().parse::<usize>().ok();
-            }
-        }
         rendered.push_str(line);
         rendered.push('\n');
 
-        if line.contains("phi node(s) omitted") {
-            if let Some(block_id) = current_block {
+        if let Some(cap) = phi_re.captures(line) {
+            if let Some(m) = cap.get(1) {
+                let block_id = m.as_str().parse::<usize>().unwrap_or(usize::MAX);
                 if let Some(merges) = by_block.get(&block_id) {
                     let indent = line
                         .chars()
@@ -1145,7 +1140,7 @@ mod tests {
             .find(|b| b.stmts.iter().any(|s| matches!(s.value, RValue::Phi(_))))
             .map(|b| b.id)
             .expect("phi block");
-        let rendered = format!("BB{} {{\n  // 1 phi node(s) omitted\n}}\n", phi_block);
+        let rendered = format!("// 1 phi node(s) omitted [BB{}]\n", phi_block);
         let out = recover_structured_output_names(
             &fir,
             &rendered,

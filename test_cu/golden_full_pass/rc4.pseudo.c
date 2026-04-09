@@ -31,41 +31,6 @@
 // param_8 -> arg8 (word32, confidence: low, words: {0})
 // param_9 -> arg9 (word32, confidence: low, words: {0})
 void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8_t* arg6_ptr, uint32_t arg8, uint32_t arg9) {
-  bool P0;
-  bool P1;
-  bool P2;
-  bool P3;
-  uint32_t R0;
-  uint32_t R1;
-  uint32_t R2;
-  uint32_t R3;
-  uintptr_t R4;
-  uintptr_t R5;
-  uint32_t R6;
-  uint32_t R7;
-  uintptr_t R8;
-  uintptr_t R9;
-  uintptr_t R10;
-  uintptr_t R11;
-  uintptr_t R12;
-  uintptr_t R13;
-  uint32_t R14;
-  uint8_t R15;
-  uint8_t R16;
-  uint32_t R17;
-  uint32_t R18;
-  uint32_t R19;
-  uint32_t R20;
-  bool UP0;
-  bool UP1;
-  uint32_t UR4;
-  uint32_t UR5;
-  uint32_t UR6;
-  uint32_t UR7;
-  uint32_t UR8;
-  uint32_t UR9;
-  uint32_t UR10;
-  uint32_t UR11;
   __shared__ uint8_t shmem_u8[256];
   uint32_t v0;
   uint32_t abi_internal_0x28; // live-in
@@ -370,292 +335,253 @@ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8_t* arg6_pt
   uint32_t v224;
   uint32_t v225;
 
-  BB0 {
-    v0 = abi_internal_0x28;
-    ctaid_x = blockIdx.x;
-    if (b0) return;
-  }
-  BB1 {
+  v0 = abi_internal_0x28;
+  ctaid_x = blockIdx.x;
+  if (b0) return;
     tid_x = threadIdx.x;
     u0 = c[0x0][0x118];
     u1 = ConstMem(0, 284);
     b1 = (int32_t)(tid_x) > (int32_t)(255);
     b2 = tid_x != 0;
-  }
-  // Condition from BB1
   if (!((int32_t)(tid_x) > (int32_t)(255))) {
     do {
-      BB2 {
-        shmem_u8[tid_x] = tid_x;
-        tid_x = tid_x + blockDimX;
-        // 2 phi node(s) omitted
-        // phi merge: v2 <- phi(v2, v2)
-        // phi merge: b1 <- phi(b1, b1)
-      }
+      shmem_u8[tid_x] = tid_x;
+      tid_x = tid_x + blockDimX;
+      // 2 phi node(s) omitted [BB2]
+      // phi merge: v2 <- phi(v2, v2)
+      // phi merge: b1 <- phi(b1, b1)
     } while(!(b1));
   }
-  BB3 {
     __syncthreads();
-  }
-  // Condition from BB3
   if (!(b2)) {
-    BB4 {
-      v3 = abs(arg2);
-      v4 = 0;
-      v5 = i2f_rp(v3);
-      v6 = rcp_approx(v5);
-      v7 = v6 + 268435454;
-      v8 = f2i_trunc_u32_ftz_ntz(v7);
-      v9 = 0;
-      v10 = -v8;
-      v11 = v10 * v3 + 0;
-      tid_x = 0;
-      v12 = mul_hi_u32(v8, v11) + v9;
-    }
+    v3 = abs(arg2);
+    v4 = 0;
+    v5 = i2f_rp(v3);
+    v6 = rcp_approx(v5);
+    v7 = v6 + 268435454;
+    v8 = f2i_trunc_u32_ftz_ntz(v7);
+    v9 = 0;
+    v10 = -v8;
+    v11 = v10 * v3 + 0;
+    tid_x = 0;
+    v12 = mul_hi_u32(v8, v11) + v9;
   }
   do {
-    BB5 {
-      v22 = abs(tid_x);
-      v23 = shmem_u8[tid_x];
-      v24 = abs(arg2);
-      b5 = (int32_t)(tid_x) >= (int32_t)(0);
-      v25 = mul_hi_u32(v12, v22);
-      v26 = i2f_rp(v24);
-      v25 = -v25;
-      v27 = v24 * v25 + v22;
-      b6 = v3 > v27;
-      v28 = rcp_approx(v26);
-      v29 = !b6 ? (v27 - v24) : v27;
-      b7 = v3 > v29;
-      v30 = v28 + 268435454;
-      v31 = f2i_trunc_u32_ftz_ntz(v30);
-      v32 = !b7 ? (v29 - v24) : v29;
-      b8 = 0 != arg2;
-      v33 = v32;
-      v34 = ~arg2;
-      if (!b5) v33 = -v33;
-      v35 = !b8 ? v34 : v33;
-      b9 = carry_u32_add3(v35, arg0_ptr.lo32, 0);
-      v36 = v35 + arg0_ptr.lo32;
-      v37 = lea_hi_x_sx32(v35, arg0_ptr.hi32, 1, b9);
-      v38 = *((uint8_t*)addr64(v36, v37));
-      v39 = -v31;
-      v40 = tid_x + 1;
-      v41 = 0;
-      v42 = v39 * v24 + 0;
-      v43 = abs(v40);
-      b10 = (int32_t)(v40) >= (int32_t)(0);
-      v12 = mul_hi_u32(v31, v42) + v41;
-      v44 = v43;
-      v45 = mul_hi_u32(v12, v44);
-      v45 = -v45;
-      v46 = v24 * v45 + v44;
-      v3 = v24;
-      b11 = v3 > v46;
-      v47 = !b11 ? (v46 - v24) : v46;
-      b12 = v3 > v47;
-      v48 = !b12 ? (v47 - v24) : v47;
-      if (!b10) v48 = -v48;
-      v49 = !b8 ? v34 : v48;
-      b13 = carry_u32_add3(v49, arg0_ptr.lo32, 0);
-      v50 = v49 + arg0_ptr.lo32;
-      v51 = lea_hi_x_sx32(v49, arg0_ptr.hi32, 1, b13);
-      v52 = *((uint8_t*)addr64(v50, v51));
-      v53 = tid_x + 2;
-      v54 = abs(v53);
-      b14 = (int32_t)(v53) >= (int32_t)(0);
-      v55 = mul_hi_u32(v12, v54);
-      v55 = -v55;
-      v56 = v24 * v55 + v54;
-      b15 = v3 > v56;
-      v57 = !b15 ? (v56 - v24) : v56;
-      b16 = v3 > v57;
-      v58 = !b16 ? (v57 - v24) : v57;
-      if (!b14) v58 = -v58;
-      v59 = !b8 ? v34 : v58;
-      b17 = carry_u32_add3(v59, arg0_ptr.lo32, 0);
-      v60 = v59 + arg0_ptr.lo32;
-      v61 = lea_hi_x_sx32(v59, arg0_ptr.hi32, 1, b17);
-      v62 = *((uint8_t*)addr64(v60, v61));
-      v63 = tid_x + 3;
-      v64 = abs(v63);
-      b18 = (int32_t)(v63) >= (int32_t)(0);
-      v65 = mul_hi_u32(v12, v64);
-      v65 = -v65;
-      v66 = v24 * v65 + v64;
-      b19 = v3 > v66;
-      v67 = !b19 ? (v66 - v24) : v66;
-      b20 = v3 > v67;
-      v68 = !b20 ? (v67 - v24) : v67;
-      if (!b18) v68 = -v68;
-      v69 = !b8 ? v34 : v68;
-      v70 = v38 + v4 + v23;
-      b21 = carry_u32_add3(v69, arg0_ptr.lo32, 0);
-      v71 = v69 + arg0_ptr.lo32;
-      v72 = (int32_t)v70 >> 31;
-      v73 = lea_hi_x_sx32(v69, arg0_ptr.hi32, 1, b21);
-      v74 = hi32(v72 + (v70 << 8));
-      v75 = *((uint8_t*)addr64(v71, v73));
-      v76 = v74 & 4294967040;
-      v77 = v70 - v76;
-      v78 = tid_x + 4;
-      v79 = shmem_u8[v77];
-      v80 = abs(v78);
-      b22 = (int32_t)(v78) >= (int32_t)(0);
-      v81 = mul_hi_u32(v12, v80);
-      v81 = -v81;
-      v82 = v24 * v81 + v80;
-      b23 = v3 > v82;
-      v83 = !b23 ? (v82 - v24) : v82;
-      b24 = v3 > v83;
-      shmem_u8[tid_x] = v79;
-      shmem_u8[v77] = v23;
-      v84 = shmem_u8[tid_x + 1];
-      v85 = !b24 ? (v83 - v24) : v83;
-      if (!b22) v85 = -v85;
-      v86 = !b8 ? v34 : v85;
-      b25 = carry_u32_add3(v86, arg0_ptr.lo32, 0);
-      v87 = v86 + arg0_ptr.lo32;
-      v88 = lea_hi_x_sx32(v86, arg0_ptr.hi32, 1, b25);
-      v89 = v52 + v77 + v84;
-      v90 = (int32_t)v89 >> 31;
-      v91 = hi32(v90 + (v89 << 8));
-      v92 = *((uint8_t*)addr64(v87, v88));
-      v93 = v91 & 4294967040;
-      v94 = v89 - v93;
-      v95 = tid_x + 5;
-      v96 = shmem_u8[v94];
-      v97 = abs(v95);
-      b26 = (int32_t)(v95) >= (int32_t)(0);
-      v98 = mul_hi_u32(v12, v97);
-      v98 = -v98;
-      v99 = v24 * v98 + v97;
-      b27 = v3 > v99;
-      v100 = !b27 ? (v99 - v24) : v99;
-      b28 = v3 > v100;
-      shmem_u8[tid_x + 1] = v96;
-      shmem_u8[v94] = v84;
-      v101 = shmem_u8[tid_x + 2];
-      v102 = !b28 ? (v100 - v24) : v100;
-      if (!b26) v102 = -v102;
-      v103 = !b8 ? v34 : v102;
-      b29 = carry_u32_add3(v103, arg0_ptr.lo32, 0);
-      v104 = v103 + arg0_ptr.lo32;
-      v105 = lea_hi_x_sx32(v103, arg0_ptr.hi32, 1, b29);
-      v106 = v62 + v94 + v101;
-      v107 = *((uint8_t*)addr64(v104, v105));
-      v108 = (int32_t)v106 >> 31;
-      v109 = hi32(v108 + (v106 << 8));
-      v110 = v109 & 4294967040;
-      v14 = v106 - v110;
-      v111 = shmem_u8[v14];
-      v112 = tid_x + 6;
-      v113 = abs(v112);
-      v114 = mul_hi_u32(v12, v113);
-      v114 = -v114;
-      v115 = v24 * v114 + v113;
-      b30 = v3 > v115;
-      shmem_u8[tid_x + 2] = v111;
-      shmem_u8[v14] = v101;
-      v13 = shmem_u8[tid_x + 3];
-      v116 = !b30 ? (v115 - v24) : v115;
-      b31 = (int32_t)(v112) >= (int32_t)(0);
-      b32 = v3 > v116;
-      v117 = !b32 ? (v116 - v24) : v116;
-      if (!b31) v117 = -v117;
-      v118 = !b8 ? v34 : v117;
-      b33 = carry_u32_add3(v118, arg0_ptr.lo32, 0);
-      v119 = v118 + arg0_ptr.lo32;
-      v120 = v75 + v14 + v13;
-      v121 = (int32_t)v120 >> 31;
-      v122 = lea_hi_x_sx32(v118, arg0_ptr.hi32, 1, b33);
-      v123 = hi32(v121 + (v120 << 8));
-      v124 = *((uint8_t*)addr64(v119, v122));
-      v125 = v123 & 4294967040;
-      v15 = v120 - v125;
-      v126 = shmem_u8[v15];
-      v127 = tid_x + 7;
-      v128 = abs(v127);
-      v129 = mul_hi_u32(v12, v128);
-      v129 = -v129;
-      v130 = v24 * v129 + v128;
-      b34 = v3 > v130;
-      shmem_u8[tid_x + 3] = v126;
-      shmem_u8[v15] = v13;
-      v131 = shmem_u8[tid_x + 4];
-      v132 = !b34 ? (v130 - v24) : v130;
-      b3 = (int32_t)(v127) >= (int32_t)(0);
-      b4 = v3 > v132;
-      v17 = !b4 ? (v132 - v24) : v132;
-      if (!b3) v17 = -v17;
-      v133 = !b8 ? v34 : v17;
-      b35 = carry_u32_add3(v133, arg0_ptr.lo32, 0);
-      v134 = v133 + arg0_ptr.lo32;
-      v135 = v92 + v15 + v131;
-      v136 = (int32_t)v135 >> 31;
-      v137 = lea_hi_x_sx32(v133, arg0_ptr.hi32, 1, b35);
-      v138 = hi32(v136 + (v135 << 8));
-      v139 = *((uint8_t*)addr64(v134, v137));
-      v140 = v138 & 4294967040;
-      v21 = v135 - v140;
-      v141 = shmem_u8[v21];
-      shmem_u8[tid_x + 4] = v141;
-      shmem_u8[v21] = v131;
-      v18 = shmem_u8[tid_x + 5];
-      v142 = v107 + v21 + v18;
-      v143 = (int32_t)v142 >> 31;
-      v144 = hi32(v143 + (v142 << 8));
-      v145 = v144 & 4294967040;
-      v6 = v142 - v145;
-      v146 = shmem_u8[v6];
-      shmem_u8[tid_x + 5] = v146;
-      shmem_u8[v6] = v18;
-      v20 = shmem_u8[tid_x + 6];
-      v147 = v124 + v6 + v20;
-      v148 = (int32_t)v147 >> 31;
-      v149 = hi32(v148 + (v147 << 8));
-      v150 = v149 & 4294967040;
-      v9 = v147 - v150;
-      v11 = shmem_u8[v9];
-      shmem_u8[tid_x + 6] = v11;
-      shmem_u8[v9] = v20;
-      v16 = shmem_u8[tid_x + 7];
-      v19 = v139 + v9 + v16;
-      v151 = (int32_t)v19 >> 31;
-      v152 = hi32(v151 + (v19 << 8));
-      v153 = v152 & 4294967040;
-      v4 = v19 - v153;
-      v8 = shmem_u8[v4];
-      shmem_u8[tid_x + 7] = v8;
-      shmem_u8[v4] = v16;
-      tid_x = tid_x + 8;
-      // 20 phi node(s) omitted
-      // phi merge: v13 <- phi(v13, v13)
-      // phi merge: v14 <- phi(v14, v14)
-      // phi merge: v15 <- phi(v15, v15)
-      // phi merge: v16 <- phi(v16, v16)
-      // phi merge: v17 <- phi(v17, v17)
-      // phi merge: v18 <- phi(v18, v18)
-      // phi merge: v19 <- phi(v19, v19)
-      // phi merge: v20 <- phi(v20, v20)
-      // phi merge: v21 <- phi(v21, v21)
-      // phi merge: v11 <- phi(v11, v11)
-      // phi merge: v6 <- phi(v6, v6)
-      // phi merge: v4 <- phi(v4, v4)
-      // phi merge: v12 <- phi(v12, v12)
-      // phi merge: v8 <- phi(v8, v8)
-      // phi merge: v9 <- phi(v9, v9)
-      // phi merge: v3 <- phi(v3, v3)
-      // phi merge: v2 <- phi(v2, v2)
-      // phi merge: b3 <- phi(b3, b3)
-      // phi merge: b4 <- phi(b4, b4)
-      // phi merge: b1 <- phi(b1, b1)
-    }
-  } while(b1);
-  BB6 {
-    __syncthreads();
-    if (b2) return;
-    // 20 phi node(s) omitted
+    v22 = abs(tid_x);
+    v23 = shmem_u8[tid_x];
+    v24 = abs(arg2);
+    b5 = (int32_t)(tid_x) >= (int32_t)(0);
+    v25 = mul_hi_u32(v12, v22);
+    v26 = i2f_rp(v24);
+    v25 = -v25;
+    v27 = v24 * v25 + v22;
+    b6 = v3 > v27;
+    v28 = rcp_approx(v26);
+    v29 = !b6 ? (v27 - v24) : v27;
+    b7 = v3 > v29;
+    v30 = v28 + 268435454;
+    v31 = f2i_trunc_u32_ftz_ntz(v30);
+    v32 = !b7 ? (v29 - v24) : v29;
+    b8 = 0 != arg2;
+    v33 = v32;
+    v34 = ~arg2;
+    if (!b5) v33 = -v33;
+    v35 = !b8 ? v34 : v33;
+    b9 = carry_u32_add3(v35, arg0_ptr.lo32, 0);
+    v36 = v35 + arg0_ptr.lo32;
+    v37 = lea_hi_x_sx32(v35, arg0_ptr.hi32, 1, b9);
+    v38 = *((uint8_t*)addr64(v36, v37));
+    v39 = -v31;
+    v40 = tid_x + 1;
+    v41 = 0;
+    v42 = v39 * v24 + 0;
+    v43 = abs(v40);
+    b10 = (int32_t)(v40) >= (int32_t)(0);
+    v12 = mul_hi_u32(v31, v42) + v41;
+    v44 = v43;
+    v45 = mul_hi_u32(v12, v44);
+    v45 = -v45;
+    v46 = v24 * v45 + v44;
+    v3 = v24;
+    b11 = v3 > v46;
+    v47 = !b11 ? (v46 - v24) : v46;
+    b12 = v3 > v47;
+    v48 = !b12 ? (v47 - v24) : v47;
+    if (!b10) v48 = -v48;
+    v49 = !b8 ? v34 : v48;
+    b13 = carry_u32_add3(v49, arg0_ptr.lo32, 0);
+    v50 = v49 + arg0_ptr.lo32;
+    v51 = lea_hi_x_sx32(v49, arg0_ptr.hi32, 1, b13);
+    v52 = *((uint8_t*)addr64(v50, v51));
+    v53 = tid_x + 2;
+    v54 = abs(v53);
+    b14 = (int32_t)(v53) >= (int32_t)(0);
+    v55 = mul_hi_u32(v12, v54);
+    v55 = -v55;
+    v56 = v24 * v55 + v54;
+    b15 = v3 > v56;
+    v57 = !b15 ? (v56 - v24) : v56;
+    b16 = v3 > v57;
+    v58 = !b16 ? (v57 - v24) : v57;
+    if (!b14) v58 = -v58;
+    v59 = !b8 ? v34 : v58;
+    b17 = carry_u32_add3(v59, arg0_ptr.lo32, 0);
+    v60 = v59 + arg0_ptr.lo32;
+    v61 = lea_hi_x_sx32(v59, arg0_ptr.hi32, 1, b17);
+    v62 = *((uint8_t*)addr64(v60, v61));
+    v63 = tid_x + 3;
+    v64 = abs(v63);
+    b18 = (int32_t)(v63) >= (int32_t)(0);
+    v65 = mul_hi_u32(v12, v64);
+    v65 = -v65;
+    v66 = v24 * v65 + v64;
+    b19 = v3 > v66;
+    v67 = !b19 ? (v66 - v24) : v66;
+    b20 = v3 > v67;
+    v68 = !b20 ? (v67 - v24) : v67;
+    if (!b18) v68 = -v68;
+    v69 = !b8 ? v34 : v68;
+    v70 = v38 + v4 + v23;
+    b21 = carry_u32_add3(v69, arg0_ptr.lo32, 0);
+    v71 = v69 + arg0_ptr.lo32;
+    v72 = (int32_t)v70 >> 31;
+    v73 = lea_hi_x_sx32(v69, arg0_ptr.hi32, 1, b21);
+    v74 = hi32(v72 + (v70 << 8));
+    v75 = *((uint8_t*)addr64(v71, v73));
+    v76 = v74 & 4294967040;
+    v77 = v70 - v76;
+    v78 = tid_x + 4;
+    v79 = shmem_u8[v77];
+    v80 = abs(v78);
+    b22 = (int32_t)(v78) >= (int32_t)(0);
+    v81 = mul_hi_u32(v12, v80);
+    v81 = -v81;
+    v82 = v24 * v81 + v80;
+    b23 = v3 > v82;
+    v83 = !b23 ? (v82 - v24) : v82;
+    b24 = v3 > v83;
+    shmem_u8[tid_x] = v79;
+    shmem_u8[v77] = v23;
+    v84 = shmem_u8[tid_x + 1];
+    v85 = !b24 ? (v83 - v24) : v83;
+    if (!b22) v85 = -v85;
+    v86 = !b8 ? v34 : v85;
+    b25 = carry_u32_add3(v86, arg0_ptr.lo32, 0);
+    v87 = v86 + arg0_ptr.lo32;
+    v88 = lea_hi_x_sx32(v86, arg0_ptr.hi32, 1, b25);
+    v89 = v52 + v77 + v84;
+    v90 = (int32_t)v89 >> 31;
+    v91 = hi32(v90 + (v89 << 8));
+    v92 = *((uint8_t*)addr64(v87, v88));
+    v93 = v91 & 4294967040;
+    v94 = v89 - v93;
+    v95 = tid_x + 5;
+    v96 = shmem_u8[v94];
+    v97 = abs(v95);
+    b26 = (int32_t)(v95) >= (int32_t)(0);
+    v98 = mul_hi_u32(v12, v97);
+    v98 = -v98;
+    v99 = v24 * v98 + v97;
+    b27 = v3 > v99;
+    v100 = !b27 ? (v99 - v24) : v99;
+    b28 = v3 > v100;
+    shmem_u8[tid_x + 1] = v96;
+    shmem_u8[v94] = v84;
+    v101 = shmem_u8[tid_x + 2];
+    v102 = !b28 ? (v100 - v24) : v100;
+    if (!b26) v102 = -v102;
+    v103 = !b8 ? v34 : v102;
+    b29 = carry_u32_add3(v103, arg0_ptr.lo32, 0);
+    v104 = v103 + arg0_ptr.lo32;
+    v105 = lea_hi_x_sx32(v103, arg0_ptr.hi32, 1, b29);
+    v106 = v62 + v94 + v101;
+    v107 = *((uint8_t*)addr64(v104, v105));
+    v108 = (int32_t)v106 >> 31;
+    v109 = hi32(v108 + (v106 << 8));
+    v110 = v109 & 4294967040;
+    v14 = v106 - v110;
+    v111 = shmem_u8[v14];
+    v112 = tid_x + 6;
+    v113 = abs(v112);
+    v114 = mul_hi_u32(v12, v113);
+    v114 = -v114;
+    v115 = v24 * v114 + v113;
+    b30 = v3 > v115;
+    shmem_u8[tid_x + 2] = v111;
+    shmem_u8[v14] = v101;
+    v13 = shmem_u8[tid_x + 3];
+    v116 = !b30 ? (v115 - v24) : v115;
+    b31 = (int32_t)(v112) >= (int32_t)(0);
+    b32 = v3 > v116;
+    v117 = !b32 ? (v116 - v24) : v116;
+    if (!b31) v117 = -v117;
+    v118 = !b8 ? v34 : v117;
+    b33 = carry_u32_add3(v118, arg0_ptr.lo32, 0);
+    v119 = v118 + arg0_ptr.lo32;
+    v120 = v75 + v14 + v13;
+    v121 = (int32_t)v120 >> 31;
+    v122 = lea_hi_x_sx32(v118, arg0_ptr.hi32, 1, b33);
+    v123 = hi32(v121 + (v120 << 8));
+    v124 = *((uint8_t*)addr64(v119, v122));
+    v125 = v123 & 4294967040;
+    v15 = v120 - v125;
+    v126 = shmem_u8[v15];
+    v127 = tid_x + 7;
+    v128 = abs(v127);
+    v129 = mul_hi_u32(v12, v128);
+    v129 = -v129;
+    v130 = v24 * v129 + v128;
+    b34 = v3 > v130;
+    shmem_u8[tid_x + 3] = v126;
+    shmem_u8[v15] = v13;
+    v131 = shmem_u8[tid_x + 4];
+    v132 = !b34 ? (v130 - v24) : v130;
+    b3 = (int32_t)(v127) >= (int32_t)(0);
+    b4 = v3 > v132;
+    v17 = !b4 ? (v132 - v24) : v132;
+    if (!b3) v17 = -v17;
+    v133 = !b8 ? v34 : v17;
+    b35 = carry_u32_add3(v133, arg0_ptr.lo32, 0);
+    v134 = v133 + arg0_ptr.lo32;
+    v135 = v92 + v15 + v131;
+    v136 = (int32_t)v135 >> 31;
+    v137 = lea_hi_x_sx32(v133, arg0_ptr.hi32, 1, b35);
+    v138 = hi32(v136 + (v135 << 8));
+    v139 = *((uint8_t*)addr64(v134, v137));
+    v140 = v138 & 4294967040;
+    v21 = v135 - v140;
+    v141 = shmem_u8[v21];
+    shmem_u8[tid_x + 4] = v141;
+    shmem_u8[v21] = v131;
+    v18 = shmem_u8[tid_x + 5];
+    v142 = v107 + v21 + v18;
+    v143 = (int32_t)v142 >> 31;
+    v144 = hi32(v143 + (v142 << 8));
+    v145 = v144 & 4294967040;
+    v6 = v142 - v145;
+    v146 = shmem_u8[v6];
+    shmem_u8[tid_x + 5] = v146;
+    shmem_u8[v6] = v18;
+    v20 = shmem_u8[tid_x + 6];
+    v147 = v124 + v6 + v20;
+    v148 = (int32_t)v147 >> 31;
+    v149 = hi32(v148 + (v147 << 8));
+    v150 = v149 & 4294967040;
+    v9 = v147 - v150;
+    v11 = shmem_u8[v9];
+    shmem_u8[tid_x + 6] = v11;
+    shmem_u8[v9] = v20;
+    v16 = shmem_u8[tid_x + 7];
+    v19 = v139 + v9 + v16;
+    v151 = (int32_t)v19 >> 31;
+    v152 = hi32(v151 + (v19 << 8));
+    v153 = v152 & 4294967040;
+    v4 = v19 - v153;
+    v8 = shmem_u8[v4];
+    shmem_u8[tid_x + 7] = v8;
+    shmem_u8[v4] = v16;
+    tid_x = tid_x + 8;
+    // 20 phi node(s) omitted [BB5]
     // phi merge: v13 <- phi(v13, v13)
     // phi merge: v14 <- phi(v14, v14)
     // phi merge: v15 <- phi(v15, v15)
@@ -676,12 +602,32 @@ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8_t* arg6_pt
     // phi merge: b3 <- phi(b3, b3)
     // phi merge: b4 <- phi(b4, b4)
     // phi merge: b1 <- phi(b1, b1)
-  }
-  BB7 {
-    v154 = arg8;
-    if (!(b36)) return;
-  }
-  BB8 {
+  } while(b1);
+  __syncthreads();
+  if (b2) return;
+  // 20 phi node(s) omitted [BB6]
+  // phi merge: v13 <- phi(v13, v13)
+  // phi merge: v14 <- phi(v14, v14)
+  // phi merge: v15 <- phi(v15, v15)
+  // phi merge: v16 <- phi(v16, v16)
+  // phi merge: v17 <- phi(v17, v17)
+  // phi merge: v18 <- phi(v18, v18)
+  // phi merge: v19 <- phi(v19, v19)
+  // phi merge: v20 <- phi(v20, v20)
+  // phi merge: v21 <- phi(v21, v21)
+  // phi merge: v11 <- phi(v11, v11)
+  // phi merge: v6 <- phi(v6, v6)
+  // phi merge: v4 <- phi(v4, v4)
+  // phi merge: v12 <- phi(v12, v12)
+  // phi merge: v8 <- phi(v8, v8)
+  // phi merge: v9 <- phi(v9, v9)
+  // phi merge: v3 <- phi(v3, v3)
+  // phi merge: v2 <- phi(v2, v2)
+  // phi merge: b3 <- phi(b3, b3)
+  // phi merge: b4 <- phi(b4, b4)
+  // phi merge: b1 <- phi(b1, b1)
+  v154 = arg8;
+  if (!(b36)) return;
     v155 = v154 - 1;
     u2 = 0;
     v156 = v154 & 3;
@@ -690,161 +636,125 @@ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8_t* arg6_pt
     v158 = 0;
     b38 = v156 != 0;
     v159 = 0;
-  }
-  // Condition from BB8
   if (v155 >= 3) {
-    BB9 {
-      v14 = ctaid_x * arg8 + 0;
-      v21 = v156 - arg8;
-      v158 = 0;
-      arg4_ptr_lo32 = arg4_ptr.lo32;
-      arg4_ptr_hi32 = arg4_ptr.hi32;
-      v6 = v14 + 3;
-      arg6_ptr_lo32 = arg6_ptr.lo32;
-      arg6_ptr_hi32 = arg6_ptr.hi32;
-      v13 = (int32_t)v14 >> 31;
-    }
+    v14 = ctaid_x * arg8 + 0;
+    v21 = v156 - arg8;
+    v158 = 0;
+    arg4_ptr_lo32 = arg4_ptr.lo32;
+    arg4_ptr_hi32 = arg4_ptr.hi32;
+    v6 = v14 + 3;
+    arg6_ptr_lo32 = arg6_ptr.lo32;
+    arg6_ptr_hi32 = arg6_ptr.hi32;
+    v13 = (int32_t)v14 >> 31;
   }
   do {
-    BB10 {
-      v162 = v6 - 3;
-      b41 = (int32_t)(v162) >= (int32_t)(v157);
-      b42 = carry_u32_add3(v14, arg4_ptr_lo32, 0);
-      v163 = v14 + arg4_ptr_lo32;
-      v164 = v13 + arg4_ptr_hi32 + (b42 ? 1 : 0);
-      if (!b41) v165 = *((uint8_t*)addr64(v163, v164));
-      u8 = u2 + 1;
-      u9 = (int32_t)u8 >> 31;
-      u10 = hi32(u9 + (u8 << 8));
-      u11 = u10 & 4294967040;
-      u12 = u8 - u11;
-      v166 = shmem_u8[u12];
-      v167 = v166 + v159;
-      v168 = (int32_t)v167 >> 31;
-      v169 = hi32(v168 + (v167 << 8));
-      v170 = v169 & 4294967040;
-      v171 = v167 - v170;
-      v172 = v6 - 2;
-      v173 = shmem_u8[v171];
-      b43 = (int32_t)(v172) >= (int32_t)(v157);
-      b3 = carry_u32_add3(v14, arg6_ptr_lo32, 0);
-      v9 = v14 + arg6_ptr_lo32;
-      shmem_u8[u12] = v173;
-      shmem_u8[v171] = v166;
-      v174 = shmem_u8[u12];
-      v175 = v166 + v174;
-      if (!b41) v176 = v175 & 255;
-      v8 = v13 + arg6_ptr_hi32 + (b3 ? 1 : 0);
-      if (!b41) v177 = shmem_u8[v176];
-      u13 = u12 + 1;
-      u14 = (int32_t)u13 >> 31;
-      u15 = hi32(u14 + (u13 << 8));
-      u16 = u15 & 4294967040;
-      if (!b41) v178 = v165 ^ v177;
-      if (!b41) *((uint8_t*)addr64(v9, v8)) = v178;
-      if (!b43) v179 = *((uint8_t*)(addr64(v163, v164) + 1));
-      u17 = u13 - u16;
-      v180 = shmem_u8[u17];
-      v181 = v171 + v180;
-      v182 = (int32_t)v181 >> 31;
-      v183 = hi32(v182 + (v181 << 8));
-      v184 = v183 & 4294967040;
-      v160 = v181 - v184;
-      v185 = shmem_u8[v160];
-      shmem_u8[u17] = v185;
-      shmem_u8[v160] = v180;
-      v186 = shmem_u8[u17];
-      v187 = v180 + v186;
-      v188 = v6 - 1;
-      if (!b43) v189 = v187 & 255;
-      b4 = (int32_t)(v188) >= (int32_t)(v157);
-      if (!b43) v190 = shmem_u8[v189];
-      u18 = u17 + 1;
-      u19 = (int32_t)u18 >> 31;
-      u20 = hi32(u19 + (u18 << 8));
-      u21 = u20 & 4294967040;
-      u22 = u18 - u21;
-      v191 = shmem_u8[u22];
-      if (!b43) v192 = v179 ^ v190;
-      if (!b43) *((uint8_t*)(addr64(v9, v8) + 1)) = v192;
-      if (!b4) v193 = *((uint8_t*)(addr64(v163, v164) + 2));
-      v194 = v160 + v191;
-      b44 = (int32_t)(v6) >= (int32_t)(v157);
-      v195 = (int32_t)v194 >> 31;
-      v196 = hi32(v195 + (v194 << 8));
-      v197 = v196 & 4294967040;
-      v161 = v194 - v197;
-      v198 = shmem_u8[v161];
-      shmem_u8[u22] = v198;
-      shmem_u8[v161] = v191;
-      v199 = shmem_u8[u22];
-      v200 = v191 + v199;
-      if (!b4) v201 = v200 & 255;
-      if (!b4) v202 = shmem_u8[v201];
-      u23 = u22 + 1;
-      u24 = (int32_t)u23 >> 31;
-      u25 = hi32(u24 + (u23 << 8));
-      u7 = u25 & 4294967040;
-      u2 = u23 - u7;
-      v19 = shmem_u8[u2];
-      if (!b4) v16 = v193 ^ v202;
-      if (!b4) *((uint8_t*)(addr64(v9, v8) + 2)) = v16;
-      if (!b44) v15 = *((uint8_t*)(addr64(v163, v164) + 3));
-      v203 = v161 + v19;
-      v21 = v21 + 4;
-      b40 = carry_u32_add3(arg6_ptr_lo32, 4, 0);
-      arg6_ptr_lo32 = arg6_ptr_lo32 + 4;
-      v158 = v158 + 4;
-      b39 = carry_u32_add3(arg4_ptr_lo32, 4, 0);
-      arg4_ptr_lo32 = arg4_ptr_lo32 + 4;
-      v204 = (int32_t)v203 >> 31;
-      arg6_ptr_hi32 = 0 + arg6_ptr_hi32 + (b40 ? 1 : 0);
-      v6 = v6 + 4;
-      arg4_ptr_hi32 = 0 + arg4_ptr_hi32 + (b39 ? 1 : 0);
-      v205 = hi32(v204 + (v203 << 8));
-      v17 = v205 & 4294967040;
-      v159 = v203 - v17;
-      v155 = shmem_u8[v159];
-      shmem_u8[u2] = v155;
-      shmem_u8[v159] = v19;
-      v206 = shmem_u8[u2];
-      v207 = v19 + v206;
-      if (!b44) v208 = v207 & 255;
-      if (!b44) v3 = shmem_u8[v208];
-      if (!b44) v18 = v15 ^ v3;
-      if (!b44) *((uint8_t*)(addr64(v9, v8) + 3)) = v18;
-      // 26 phi node(s) omitted
-      // phi merge: u4 <- phi(u4, u4)
-      // phi merge: u3 <- phi(u3, u3)
-      // phi merge: u6 <- phi(u6, u6)
-      // phi merge: u5 <- phi(u5, u5)
-      // phi merge: u7 <- phi(u7, u7)
-      // phi merge: u2 <- phi(u2, u2)
-      // phi merge: b39 <- phi(b39, b39)
-      // phi merge: b40 <- phi(b40, b40)
-      // phi merge: v160 <- phi(v160, v160)
-      // phi merge: v161 <- phi(v161, v161)
-      // phi merge: v15 <- phi(v15, v15)
-      // phi merge: v16 <- phi(v16, v16)
-      // phi merge: v17 <- phi(v17, v17)
-      // phi merge: v18 <- phi(v18, v18)
-      // phi merge: v19 <- phi(v19, v19)
-      // phi merge: v159 <- phi(v159, v159)
-      // phi merge: v21 <- phi(v21, v21)
-      // phi merge: v158 <- phi(v158, v158)
-      // phi merge: v6 <- phi(v6, v6)
-      // phi merge: v8 <- phi(v8, v8)
-      // phi merge: v9 <- phi(v9, v9)
-      // phi merge: v3 <- phi(v3, v3)
-      // phi merge: v155 <- phi(v155, v155)
-      // phi merge: b3 <- phi(b3, b3)
-      // phi merge: b4 <- phi(b4, b4)
-      // phi merge: b37 <- phi(b37, b37)
-    }
-  } while(b37);
-  BB11 {
-    if (!(b38)) return;
-    // 28 phi node(s) omitted
+    v162 = v6 - 3;
+    b41 = (int32_t)(v162) >= (int32_t)(v157);
+    b42 = carry_u32_add3(v14, arg4_ptr_lo32, 0);
+    v163 = v14 + arg4_ptr_lo32;
+    v164 = v13 + arg4_ptr_hi32 + (b42 ? 1 : 0);
+    if (!b41) v165 = *((uint8_t*)addr64(v163, v164));
+    u8 = u2 + 1;
+    u9 = (int32_t)u8 >> 31;
+    u10 = hi32(u9 + (u8 << 8));
+    u11 = u10 & 4294967040;
+    u12 = u8 - u11;
+    v166 = shmem_u8[u12];
+    v167 = v166 + v159;
+    v168 = (int32_t)v167 >> 31;
+    v169 = hi32(v168 + (v167 << 8));
+    v170 = v169 & 4294967040;
+    v171 = v167 - v170;
+    v172 = v6 - 2;
+    v173 = shmem_u8[v171];
+    b43 = (int32_t)(v172) >= (int32_t)(v157);
+    b3 = carry_u32_add3(v14, arg6_ptr_lo32, 0);
+    v9 = v14 + arg6_ptr_lo32;
+    shmem_u8[u12] = v173;
+    shmem_u8[v171] = v166;
+    v174 = shmem_u8[u12];
+    v175 = v166 + v174;
+    if (!b41) v176 = v175 & 255;
+    v8 = v13 + arg6_ptr_hi32 + (b3 ? 1 : 0);
+    if (!b41) v177 = shmem_u8[v176];
+    u13 = u12 + 1;
+    u14 = (int32_t)u13 >> 31;
+    u15 = hi32(u14 + (u13 << 8));
+    u16 = u15 & 4294967040;
+    if (!b41) v178 = v165 ^ v177;
+    if (!b41) *((uint8_t*)addr64(v9, v8)) = v178;
+    if (!b43) v179 = *((uint8_t*)(addr64(v163, v164) + 1));
+    u17 = u13 - u16;
+    v180 = shmem_u8[u17];
+    v181 = v171 + v180;
+    v182 = (int32_t)v181 >> 31;
+    v183 = hi32(v182 + (v181 << 8));
+    v184 = v183 & 4294967040;
+    v160 = v181 - v184;
+    v185 = shmem_u8[v160];
+    shmem_u8[u17] = v185;
+    shmem_u8[v160] = v180;
+    v186 = shmem_u8[u17];
+    v187 = v180 + v186;
+    v188 = v6 - 1;
+    if (!b43) v189 = v187 & 255;
+    b4 = (int32_t)(v188) >= (int32_t)(v157);
+    if (!b43) v190 = shmem_u8[v189];
+    u18 = u17 + 1;
+    u19 = (int32_t)u18 >> 31;
+    u20 = hi32(u19 + (u18 << 8));
+    u21 = u20 & 4294967040;
+    u22 = u18 - u21;
+    v191 = shmem_u8[u22];
+    if (!b43) v192 = v179 ^ v190;
+    if (!b43) *((uint8_t*)(addr64(v9, v8) + 1)) = v192;
+    if (!b4) v193 = *((uint8_t*)(addr64(v163, v164) + 2));
+    v194 = v160 + v191;
+    b44 = (int32_t)(v6) >= (int32_t)(v157);
+    v195 = (int32_t)v194 >> 31;
+    v196 = hi32(v195 + (v194 << 8));
+    v197 = v196 & 4294967040;
+    v161 = v194 - v197;
+    v198 = shmem_u8[v161];
+    shmem_u8[u22] = v198;
+    shmem_u8[v161] = v191;
+    v199 = shmem_u8[u22];
+    v200 = v191 + v199;
+    if (!b4) v201 = v200 & 255;
+    if (!b4) v202 = shmem_u8[v201];
+    u23 = u22 + 1;
+    u24 = (int32_t)u23 >> 31;
+    u25 = hi32(u24 + (u23 << 8));
+    u7 = u25 & 4294967040;
+    u2 = u23 - u7;
+    v19 = shmem_u8[u2];
+    if (!b4) v16 = v193 ^ v202;
+    if (!b4) *((uint8_t*)(addr64(v9, v8) + 2)) = v16;
+    if (!b44) v15 = *((uint8_t*)(addr64(v163, v164) + 3));
+    v203 = v161 + v19;
+    v21 = v21 + 4;
+    b40 = carry_u32_add3(arg6_ptr_lo32, 4, 0);
+    arg6_ptr_lo32 = arg6_ptr_lo32 + 4;
+    v158 = v158 + 4;
+    b39 = carry_u32_add3(arg4_ptr_lo32, 4, 0);
+    arg4_ptr_lo32 = arg4_ptr_lo32 + 4;
+    v204 = (int32_t)v203 >> 31;
+    arg6_ptr_hi32 = 0 + arg6_ptr_hi32 + (b40 ? 1 : 0);
+    v6 = v6 + 4;
+    arg4_ptr_hi32 = 0 + arg4_ptr_hi32 + (b39 ? 1 : 0);
+    v205 = hi32(v204 + (v203 << 8));
+    v17 = v205 & 4294967040;
+    v159 = v203 - v17;
+    v155 = shmem_u8[v159];
+    shmem_u8[u2] = v155;
+    shmem_u8[v159] = v19;
+    v206 = shmem_u8[u2];
+    v207 = v19 + v206;
+    if (!b44) v208 = v207 & 255;
+    if (!b44) v3 = shmem_u8[v208];
+    if (!b44) v18 = v15 ^ v3;
+    if (!b44) *((uint8_t*)(addr64(v9, v8) + 3)) = v18;
+    // 26 phi node(s) omitted [BB10]
     // phi merge: u4 <- phi(u4, u4)
     // phi merge: u3 <- phi(u3, u3)
     // phi merge: u6 <- phi(u6, u6)
@@ -855,8 +765,6 @@ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8_t* arg6_pt
     // phi merge: b40 <- phi(b40, b40)
     // phi merge: v160 <- phi(v160, v160)
     // phi merge: v161 <- phi(v161, v161)
-    // phi merge: v13 <- phi(v13, v13)
-    // phi merge: v14 <- phi(v14, v14)
     // phi merge: v15 <- phi(v15, v15)
     // phi merge: v16 <- phi(v16, v16)
     // phi merge: v17 <- phi(v17, v17)
@@ -873,72 +781,98 @@ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8_t* arg6_pt
     // phi merge: b3 <- phi(b3, b3)
     // phi merge: b4 <- phi(b4, b4)
     // phi merge: b37 <- phi(b37, b37)
-  }
-  BB12 {
-    v209 = ctaid_x * arg8 + v158;
-    b45 = carry_u32_add3(v209, arg6_ptr.lo32, 0);
-    v210 = v209 + arg6_ptr.lo32;
-    b46 = carry_u32_add3(v209, arg4_ptr.lo32, 0);
-    v211 = v209 + arg4_ptr.lo32;
-    v212 = (int32_t)v209 >> 31;
-    v213 = v212 + arg6_ptr.hi32 + (b45 ? 1 : 0);
-    v214 = v212 + arg4_ptr.hi32 + (b46 ? 1 : 0);
-  }
+  } while(b37);
+  if (!(b38)) return;
+  // 28 phi node(s) omitted [BB11]
+  // phi merge: u4 <- phi(u4, u4)
+  // phi merge: u3 <- phi(u3, u3)
+  // phi merge: u6 <- phi(u6, u6)
+  // phi merge: u5 <- phi(u5, u5)
+  // phi merge: u7 <- phi(u7, u7)
+  // phi merge: u2 <- phi(u2, u2)
+  // phi merge: b39 <- phi(b39, b39)
+  // phi merge: b40 <- phi(b40, b40)
+  // phi merge: v160 <- phi(v160, v160)
+  // phi merge: v161 <- phi(v161, v161)
+  // phi merge: v13 <- phi(v13, v13)
+  // phi merge: v14 <- phi(v14, v14)
+  // phi merge: v15 <- phi(v15, v15)
+  // phi merge: v16 <- phi(v16, v16)
+  // phi merge: v17 <- phi(v17, v17)
+  // phi merge: v18 <- phi(v18, v18)
+  // phi merge: v19 <- phi(v19, v19)
+  // phi merge: v159 <- phi(v159, v159)
+  // phi merge: v21 <- phi(v21, v21)
+  // phi merge: v158 <- phi(v158, v158)
+  // phi merge: v6 <- phi(v6, v6)
+  // phi merge: v8 <- phi(v8, v8)
+  // phi merge: v9 <- phi(v9, v9)
+  // phi merge: v3 <- phi(v3, v3)
+  // phi merge: v155 <- phi(v155, v155)
+  // phi merge: b3 <- phi(b3, b3)
+  // phi merge: b4 <- phi(b4, b4)
+  // phi merge: b37 <- phi(b37, b37)
+  v209 = ctaid_x * arg8 + v158;
+  b45 = carry_u32_add3(v209, arg6_ptr.lo32, 0);
+  v210 = v209 + arg6_ptr.lo32;
+  b46 = carry_u32_add3(v209, arg4_ptr.lo32, 0);
+  v211 = v209 + arg4_ptr.lo32;
+  v212 = (int32_t)v209 >> 31;
+  v213 = v212 + arg6_ptr.hi32 + (b45 ? 1 : 0);
+  v214 = v212 + arg4_ptr.hi32 + (b46 ? 1 : 0);
   do {
-    BB13 {
-      b47 = (int32_t)(v209) >= (int32_t)(v157);
-      if (!b47) v215 = v211;
-      if (!b47) v216 = v214;
-      if (!b47) v217 = *((uint8_t*)addr64(v215, v216));
-      u26 = u2 + 1;
-      v156 = v156 - 1;
-      b4 = carry_u32_add3(v211, 1, 0);
-      v211 = v211 + 1;
-      u27 = (int32_t)u26 >> 31;
-      v209 = v209 + 1;
-      u28 = hi32(u27 + (u26 << 8));
-      v214 = v214 + (b4 ? 1 : 0);
-      u7 = u28 & 4294967040;
-      u2 = u26 - u7;
-      v9 = shmem_u8[u2];
-      v218 = v9 + v159;
-      v219 = (int32_t)v218 >> 31;
-      v220 = hi32(v219 + (v218 << 8));
-      v221 = v220 & 4294967040;
-      v159 = v218 - v221;
-      v222 = shmem_u8[v159];
-      shmem_u8[u2] = v222;
-      shmem_u8[v159] = v9;
-      v223 = shmem_u8[u2];
-      v212 = !b47 ? (v210) : v222;
-      b46 = carry_u32_add3(v210, 1, 0);
-      v210 = v210 + 1;
-      v224 = v9 + v223;
-      if (!b47) v225 = v224 & 255;
-      if (!b47) v6 = shmem_u8[v225];
-      if (!b47) v3 = v213;
-      v213 = v213 + (b46 ? 1 : 0);
-      if (!b47) v8 = v217 ^ v6;
-      if (!b47) *((uint8_t*)addr64(v212, v3)) = v8;
-      // 17 phi node(s) omitted
-      // phi merge: u7 <- phi(u7, u7)
-      // phi merge: u2 <- phi(u2, u2)
-      // phi merge: v213 <- phi(v213, v213)
-      // phi merge: v210 <- phi(v210, v210)
-      // phi merge: v159 <- phi(v159, v159)
-      // phi merge: v214 <- phi(v214, v214)
-      // phi merge: v211 <- phi(v211, v211)
-      // phi merge: v6 <- phi(v6, v6)
-      // phi merge: v156 <- phi(v156, v156)
-      // phi merge: v8 <- phi(v8, v8)
-      // phi merge: v9 <- phi(v9, v9)
-      // phi merge: v3 <- phi(v3, v3)
-      // phi merge: v212 <- phi(v212, v212)
-      // phi merge: v209 <- phi(v209, v209)
-      // phi merge: b4 <- phi(b4, b4)
-      // phi merge: b46 <- phi(b46, b46)
-      // phi merge: b45 <- phi(b45, b45)
-    }
+    b47 = (int32_t)(v209) >= (int32_t)(v157);
+    if (!b47) v215 = v211;
+    if (!b47) v216 = v214;
+    if (!b47) v217 = *((uint8_t*)addr64(v215, v216));
+    u26 = u2 + 1;
+    v156 = v156 - 1;
+    b4 = carry_u32_add3(v211, 1, 0);
+    v211 = v211 + 1;
+    u27 = (int32_t)u26 >> 31;
+    v209 = v209 + 1;
+    u28 = hi32(u27 + (u26 << 8));
+    v214 = v214 + (b4 ? 1 : 0);
+    u7 = u28 & 4294967040;
+    u2 = u26 - u7;
+    v9 = shmem_u8[u2];
+    v218 = v9 + v159;
+    v219 = (int32_t)v218 >> 31;
+    v220 = hi32(v219 + (v218 << 8));
+    v221 = v220 & 4294967040;
+    v159 = v218 - v221;
+    v222 = shmem_u8[v159];
+    shmem_u8[u2] = v222;
+    shmem_u8[v159] = v9;
+    v223 = shmem_u8[u2];
+    v212 = !b47 ? (v210) : v222;
+    b46 = carry_u32_add3(v210, 1, 0);
+    v210 = v210 + 1;
+    v224 = v9 + v223;
+    if (!b47) v225 = v224 & 255;
+    if (!b47) v6 = shmem_u8[v225];
+    if (!b47) v3 = v213;
+    v213 = v213 + (b46 ? 1 : 0);
+    if (!b47) v8 = v217 ^ v6;
+    if (!b47) *((uint8_t*)addr64(v212, v3)) = v8;
+    // 17 phi node(s) omitted [BB13]
+    // phi merge: u7 <- phi(u7, u7)
+    // phi merge: u2 <- phi(u2, u2)
+    // phi merge: v213 <- phi(v213, v213)
+    // phi merge: v210 <- phi(v210, v210)
+    // phi merge: v159 <- phi(v159, v159)
+    // phi merge: v214 <- phi(v214, v214)
+    // phi merge: v211 <- phi(v211, v211)
+    // phi merge: v6 <- phi(v6, v6)
+    // phi merge: v156 <- phi(v156, v156)
+    // phi merge: v8 <- phi(v8, v8)
+    // phi merge: v9 <- phi(v9, v9)
+    // phi merge: v3 <- phi(v3, v3)
+    // phi merge: v212 <- phi(v212, v212)
+    // phi merge: v209 <- phi(v209, v209)
+    // phi merge: b4 <- phi(b4, b4)
+    // phi merge: b46 <- phi(b46, b46)
+    // phi merge: b45 <- phi(b45, b45)
   } while(b45);
   return;
 }

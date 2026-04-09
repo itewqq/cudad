@@ -20,10 +20,29 @@ fn render_typed_structured_output(
         format!("void kernel({})", params.join(", "))
     };
 
+    // Filter out declarations for registers that no longer appear in the
+    // code output (e.g., raw R0/P0 after name recovery renamed them).
+    let reg_name_re = Regex::new(r"\b((?:U?R|U?P)\d+)\b").expect("valid regex");
+    let used_decls: Vec<&str> = local_decls
+        .iter()
+        .filter(|d| {
+            // Extract the register name from the declaration (e.g., "uint32_t R0;" -> "R0")
+            if let Some(cap) = reg_name_re.captures(d) {
+                let reg_name = cap.get(1).unwrap().as_str();
+                // Check if this register name appears in the code body (as a word boundary match)
+                let pat = format!(r"\b{}\b", regex::escape(reg_name));
+                Regex::new(&pat).map_or(false, |re| re.is_match(code_output))
+            } else {
+                true // keep non-register declarations
+            }
+        })
+        .map(|s| s.as_str())
+        .collect();
+
     let mut out = String::new();
     out.push_str(&sig);
     out.push_str(" {\n");
-    for d in local_decls {
+    for d in &used_decls {
         out.push_str("  ");
         out.push_str(d);
         out.push('\n');
@@ -34,7 +53,7 @@ fn render_typed_structured_output(
         out.push_str(d);
         out.push('\n');
     }
-    if !local_decls.is_empty() || !extra_decls.is_empty() {
+    if !used_decls.is_empty() || !extra_decls.is_empty() {
         out.push('\n');
     }
     for line in code_output.lines() {

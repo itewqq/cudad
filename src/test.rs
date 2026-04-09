@@ -532,10 +532,27 @@ fn render_typed_structured_output_for_test(
         format!("void kernel({})", params.join(", "))
     };
 
+    // Filter out declarations for registers that no longer appear in the
+    // code output (e.g., raw R0/P0 after name recovery renamed them).
+    let reg_name_re = Regex::new(r"\b((?:U?R|U?P)\d+)\b").expect("valid regex");
+    let used_decls: Vec<&str> = local_decls
+        .iter()
+        .filter(|d| {
+            if let Some(cap) = reg_name_re.captures(d) {
+                let reg_name = cap.get(1).unwrap().as_str();
+                let pat = format!(r"\b{}\b", regex::escape(reg_name));
+                Regex::new(&pat).map_or(false, |re| re.is_match(code_output))
+            } else {
+                true
+            }
+        })
+        .map(|s| s.as_str())
+        .collect();
+
     let mut out = String::new();
     out.push_str(&sig);
     out.push_str(" {\n");
-    for d in local_decls {
+    for d in &used_decls {
         out.push_str("  ");
         out.push_str(d);
         out.push('\n');
@@ -546,7 +563,7 @@ fn render_typed_structured_output_for_test(
         out.push_str(d);
         out.push('\n');
     }
-    if !local_decls.is_empty() || !extra_decls.is_empty() {
+    if !used_decls.is_empty() || !extra_decls.is_empty() {
         out.push('\n');
     }
     for line in code_output.lines() {
@@ -1936,4 +1953,30 @@ fn dump_corpus_outputs_for_review() {
             println!("{}", out);
         }
     }
+}
+
+#[test]
+#[ignore]
+fn regen_golden_files() {
+    let inputs = ["if", "loop_constant", "if_loop", "test_div", "rc4"];
+    for name in &inputs {
+        let sass = std::fs::read_to_string(format!("test_cu/{}.sass", name)).unwrap();
+
+        // golden/ (basic structured output)
+        let out = run_structured_output(&sass);
+        std::fs::write(format!("test_cu/golden/{}.pseudo.c", name), &out).unwrap();
+
+        // golden_lifted/ (lifted)
+        let out = run_structured_output_lifted(&sass);
+        std::fs::write(format!("test_cu/golden_lifted/{}.pseudo.c", name), &out).unwrap();
+
+        // golden_lifted_named/ (lifted + named)
+        let out = run_structured_output_lifted_named(&sass);
+        std::fs::write(format!("test_cu/golden_lifted_named/{}.pseudo.c", name), &out).unwrap();
+
+        // golden_full_pass/ (full pass)
+        let out = run_structured_output_full_pass(&sass);
+        std::fs::write(format!("test_cu/golden_full_pass/{}.pseudo.c", name), &out).unwrap();
+    }
+    println!("Regenerated all golden files.");
 }
