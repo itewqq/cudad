@@ -114,11 +114,23 @@ impl UnionFind {
     }
 }
 
-pub fn recover_structured_output_names(
+/// Build the SSA-token → recovered-name mapping from the IR, without
+/// touching any rendered text.  Returns the token_map plus internal
+/// bookkeeping structures needed by the text-level post-passes.
+///
+/// This is the pure-IR portion of `recover_structured_output_names`.
+/// It can also be used to construct a `NameAwareDisplay` that applies
+/// name recovery during rendering rather than after.
+#[allow(clippy::type_complexity)]
+pub fn build_name_map(
     function_ir: &FunctionIR,
-    rendered: &str,
     config: &NameRecoveryConfig,
-) -> NameRecoveryResult {
+) -> (
+    HashMap<String, String>,
+    Vec<(Group, Loc, String, RegBase, Vec<RegSsa>)>,
+    Vec<String>,
+    BTreeMap<RegBase, usize>,
+) {
     let (tokens, first_seen, mut uf, idx_of) = collect_tokens(function_ir);
 
     // Build conservative congruence edges.
@@ -263,10 +275,6 @@ pub fn recover_structured_output_names(
     // false). Prefer mapping old-value tokens to the same recovered name as the
     // dest, but never overwrite an existing conflicting mapping: preserving a
     // stable one-to-one token map is correctness-critical.
-    //
-    // We do this as a post-map fixup rather than a Union-Find edge because
-    // unioning them would alter the global component count and shift the
-    // sequential name counters for every subsequent component.
     for block in &function_ir.blocks {
         for stmt in &block.stmts {
             if stmt.pred.is_none() || stmt.pred_old_defs.is_empty() {
@@ -289,6 +297,16 @@ pub fn recover_structured_output_names(
             }
         }
     }
+
+    (token_map, comp_rows, component_name, fam_count)
+}
+
+pub fn recover_structured_output_names(
+    function_ir: &FunctionIR,
+    rendered: &str,
+    config: &NameRecoveryConfig,
+) -> NameRecoveryResult {
+    let (token_map, comp_rows, component_name, fam_count) = build_name_map(function_ir, config);
 
     let re = Regex::new(r"\b(?:UR|UP|R|P)\d+\.\d+\b").expect("valid regex");
     let mut ssa_tokens_seen = 0usize;
@@ -957,6 +975,27 @@ fn base_group(class: &str) -> Group {
 
 fn is_immutable_reg(r: &RegId) -> bool {
     matches!(r.class.as_str(), "RZ" | "PT" | "URZ" | "UPT")
+}
+
+/// A `DisplayCtx` wrapper that applies the name recovery token map
+/// during rendering, so SSA tokens are replaced at render time rather
+/// than via post-render regex replacement.
+pub struct NameAwareDisplay<'a> {
+    inner: &'a dyn crate::ir::DisplayCtx,
+    token_map: &'a HashMap<String, String>,
+}
+
+impl<'a> NameAwareDisplay<'a> {
+    pub fn new(inner: &'a dyn crate::ir::DisplayCtx, token_map: &'a HashMap<String, String>) -> Self {
+        Self { inner, token_map }
+    }
+}
+
+impl crate::ir::DisplayCtx for NameAwareDisplay<'_> {
+    fn reg(&self, r: &RegId) -> String {
+        let raw = self.inner.reg(r);
+        self.token_map.get(&raw).cloned().unwrap_or(raw)
+    }
 }
 
 fn is_zero_expr(e: &IRExpr) -> bool {
