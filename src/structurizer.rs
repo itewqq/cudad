@@ -191,6 +191,44 @@ impl<'a> Structurizer<'a> {
         }
     }
 
+    /// Render an IR expression for decompiled output, replacing hardware-zero
+    /// and always-true predicate registers with literals ("0" and "true").
+    fn decompile_expr(ctx: &dyn DisplayCtx, e: &IRExpr) -> String {
+        match e {
+            IRExpr::Reg(r) => match r.class.as_str() {
+                "RZ" | "URZ" => "0".to_string(),
+                "PT" | "UPT" => "true".to_string(),
+                _ => ctx.expr(e),
+            },
+            IRExpr::Op { op, args } => {
+                // Recursively decompile arguments so nested RZ/PT are replaced.
+                if op == "-" && args.len() == 1 {
+                    let inner = Self::decompile_expr(ctx, &args[0]);
+                    let simple = match &args[0] {
+                        IRExpr::Reg(_) | IRExpr::ImmI(_) | IRExpr::ImmF(_) => true,
+                        IRExpr::Op { op, .. } if op == "ConstMem" => true,
+                        _ => false,
+                    };
+                    if simple {
+                        return format!("-{}", inner);
+                    }
+                    return format!("-({})", inner);
+                }
+                if op == "!" && args.len() == 1 {
+                    let inner = Self::decompile_expr(ctx, &args[0]);
+                    // !true → false, !(expr) → !(expr)
+                    if inner == "true" {
+                        return "false".to_string();
+                    }
+                    return format!("!({})", inner);
+                }
+                let list = args.iter().map(|a| Self::decompile_expr(ctx, a)).collect::<Vec<_>>().join(", ");
+                format!("{}({})", op, list)
+            }
+            _ => ctx.expr(e),
+        }
+    }
+
     /// Returns true if the instruction has memory side effects that must be preserved
     /// even when all destination registers are RZ/PT.
     fn is_memory_side_effect_opcode(value: &RValue) -> bool {
@@ -585,11 +623,11 @@ impl<'a> Structurizer<'a> {
             };
             let value_str = match &ir_s.value {
                 RValue::Op { opcode, args } => {
-                    let args_s = args.iter().map(|a| ctx.expr(a)).collect::<Vec<_>>().join(", ");
+                    let args_s = args.iter().map(|a| Self::decompile_expr(ctx, a)).collect::<Vec<_>>().join(", ");
                     format!("{}({})", opcode, args_s)
                 }
                 RValue::Phi(args) => {
-                    let args_s = args.iter().map(|a| ctx.expr(a)).collect::<Vec<_>>().join(", ");
+                    let args_s = args.iter().map(|a| Self::decompile_expr(ctx, a)).collect::<Vec<_>>().join(", ");
                     format!("phi({})", args_s)
                 }
                 RValue::ImmI(i) => format!("{}", i),
@@ -598,7 +636,7 @@ impl<'a> Structurizer<'a> {
             let pred_str = ir_s
                 .pred
                 .as_ref()
-                .map_or("".to_string(), |p| format!("if ({}) ", ctx.expr(p)));
+                .map_or("".to_string(), |p| format!("if ({}) ", Self::decompile_expr(ctx, p)));
             if side_effect_only {
                 lines.push_str(&format!(
                     "{}{}{};\n",
@@ -615,7 +653,7 @@ impl<'a> Structurizer<'a> {
                     "{}{} = {} ? ({}) : {}{};\n",
                     "  ".repeat(indent_level + 1),
                     dest_str,
-                    ctx.expr(pred_expr),
+                    Self::decompile_expr(ctx, pred_expr),
                     value_str,
                     phi_tag,
                     old_str
@@ -904,17 +942,17 @@ impl<'a> Structurizer<'a> {
                     };
                     let value_str = match &ir_s.value {
                         RValue::Op { opcode, args } => {
-                            let args_s = args.iter().map(|a| ctx.expr(a)).collect::<Vec<_>>().join(", ");
+                            let args_s = args.iter().map(|a| Self::decompile_expr(ctx, a)).collect::<Vec<_>>().join(", ");
                             format!("{}({})", opcode, args_s)
                         }
                         RValue::Phi(args) => {
-                            let args_s = args.iter().map(|a| ctx.expr(a)).collect::<Vec<_>>().join(", ");
+                            let args_s = args.iter().map(|a| Self::decompile_expr(ctx, a)).collect::<Vec<_>>().join(", ");
                             format!("phi({})", args_s)
                         }
                         RValue::ImmI(i) => format!("{}", i),
                         RValue::ImmF(f) => format!("{}", f),
                     };
-                    let pred_str = ir_s.pred.as_ref().map_or("".to_string(), |p| format!("if ({}) ", ctx.expr(p)));
+                    let pred_str = ir_s.pred.as_ref().map_or("".to_string(), |p| format!("if ({}) ", Self::decompile_expr(ctx, p)));
                     if side_effect_only {
                         // No meaningful destination: emit just the call.
                         s_out.push_str(&format!("{}{}{};\n", indent, pred_str, value_str));
@@ -927,7 +965,7 @@ impl<'a> Structurizer<'a> {
                             "{}{} = {} ? ({}) : {}{};\n",
                             indent,
                             dest_str,
-                            ctx.expr(pred_expr),
+                            Self::decompile_expr(ctx, pred_expr),
                             value_str,
                             phi_tag,
                             old_str

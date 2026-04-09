@@ -942,7 +942,8 @@ fn lifted_output_uses_infix_for_supported_patterns() {
 fn lifted_output_falls_back_to_raw_for_unmatched_opcodes() {
     let sass = include_str!("../test_cu/if_loop.sass");
     let out = run_structured_output_lifted(sass);
-    assert!(out.contains("PLOP3.LUT("));
+    // PLOP3 is now lifted to plop3_lut(...); verify it renders cleanly
+    assert!(out.contains("plop3_lut("));
 }
 
 #[test]

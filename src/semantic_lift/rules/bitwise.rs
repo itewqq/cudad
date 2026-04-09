@@ -13,6 +13,21 @@ pub(super) fn register(registry: &mut RuleRegistry) {
         }
         None
     });
+    // PLOP3: predicate logic operation (single-bit version of LOP3).
+    // Render as plop3_lut(...) intrinsic for readability.
+    registry.register("PLOP3", "plop3_lut", |sig, args, stmt_ref, config| {
+        if !sig.raw_opcode.starts_with("PLOP3.LUT") {
+            return None;
+        }
+        let rendered: Vec<String> = args
+            .iter()
+            .map(|a| crate::semantic_lift::lift_ir_expr(a, stmt_ref, config).render())
+            .collect();
+        Some(crate::semantic_lift::LiftedExpr::Raw(format!(
+            "plop3_lut({})",
+            rendered.join(", ")
+        )))
+    });
     registry.register("SHF", "shf", |sig, args, stmt_ref, config| {
         crate::semantic_lift::lift_shf(&sig.raw_opcode, args, stmt_ref, config)
     });

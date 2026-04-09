@@ -108,7 +108,6 @@ void kernel(uint32_t arg0, uint32_t arg2, uintptr_t arg4_ptr, uint32_t arg6, uin
   bool b28;
   uint32_t v54;
   uint32_t v55;
-  bool b3; // live-in
   bool b29;
   uint32_t v56;
   uint32_t v57;
@@ -116,6 +115,7 @@ void kernel(uint32_t arg0, uint32_t arg2, uintptr_t arg4_ptr, uint32_t arg6, uin
   uint32_t v58;
   bool b31;
   uint32_t v59;
+  bool b3;
   uint32_t v60;
   uint32_t v61;
   uint32_t v62;
@@ -145,9 +145,9 @@ void kernel(uint32_t arg0, uint32_t arg2, uintptr_t arg4_ptr, uint32_t arg6, uin
         v9 = -v10 + arg7;
       if ((int32_t)(v9) > (int32_t)(0)) {
           b4 = (int32_t)(v9) > (int32_t)(12);
-          b5 = PLOP3.LUT(PT, PT, PT, PT, 128, 0);
+          b5 = plop3_lut(true, true, true, true, 128, 0);
         if ((int32_t)(v9) > (int32_t)(12)) {
-          b5 = PLOP3.LUT(PT, PT, PT, PT, 8, 0);
+          b5 = plop3_lut(true, true, true, true, 8, 0);
         }
       }
     }
@@ -236,13 +236,13 @@ void kernel(uint32_t arg0, uint32_t arg2, uintptr_t arg4_ptr, uint32_t arg6, uin
     v7 = v52 * v53;
     b28 = v7 > 0.5;
     v54 = b28 ? v4 : 0.8999999761581421;
-    b5 = PLOP3.LUT(PT, PT, PT, PT, 8, 0);
+    b5 = plop3_lut(true, true, true, true, 8, 0);
     v5 = v7 * v54;
     b1 = v5 > 0.5;
     v55 = b1 ? v4 : 0.8999999761581421;
     v13 = v5 * v55;
   }
-  if (b3) {
+  if (v9 != 0 || b5) {
     v4 = 1066192077;
     // 8 phi node(s) omitted [BB10]
     // phi merge: v13 <- phi(v13, v13)
@@ -294,7 +294,7 @@ void kernel(uint32_t arg0, uint32_t arg2, uintptr_t arg4_ptr, uint32_t arg6, uin
     // phi merge: b2 <- phi(b2, b2)
   } while(b2);
   v61 = v3 + (arg4_ptr.lo32 << 2);
-  v62 = LEA.HI.X(v3, arg4_ptr.hi32, v11, 2, b2);
+  v62 = LEA.HI.X(v3, ConstMem(0, 372), v11, 2, b2);
   *addr64(v61, v62) = v13;
   // 9 phi node(s) omitted [BB15]
   // phi merge: v13 <- phi(v13, v13, v13)

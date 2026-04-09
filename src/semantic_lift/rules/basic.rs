@@ -6,7 +6,8 @@ use crate::semantic_lift::registry::RuleRegistry;
 use crate::semantic_lift::{
     lift_ffma, lift_fmnmx, lift_fsel, lift_i2f_rp, lift_iabs, lift_iadd3, lift_iadd3_x, lift_imad,
     lift_imad_hi_u32, lift_imad_iadd, lift_imad_mov, lift_imad_wide, lift_imad_x, lift_ir_expr,
-    lift_mufu_rcp, lift_unary_intrinsic, LiftedExpr, SemanticLiftConfig,
+    lift_mufu_rcp, lift_prmt, lift_unary_intrinsic, lift_viaddmnmx, lift_vimnmx, LiftedExpr,
+    SemanticLiftConfig,
 };
 
 pub(super) fn register(registry: &mut RuleRegistry) {
@@ -211,6 +212,18 @@ pub(super) fn register(registry: &mut RuleRegistry) {
         } else {
             None
         }
+    });
+    // PRMT: byte permute instruction → prmt(src0, selector, src1)
+    registry.register("PRMT", "prmt", |_, args, stmt_ref, config| {
+        lift_prmt(args, stmt_ref, config)
+    });
+    // VIMNMX: integer min/max (video instruction set)
+    registry.register("VIMNMX", "vimnmx", |_, args, stmt_ref, config| {
+        lift_vimnmx(args, stmt_ref, config)
+    });
+    // VIADDMNMX: integer add-then-min/max (video instruction set)
+    registry.register("VIADDMNMX", "viaddmnmx", |_, args, stmt_ref, config| {
+        lift_viaddmnmx(args, stmt_ref, config)
     });
 }
 

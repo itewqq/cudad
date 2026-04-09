@@ -361,6 +361,8 @@ fn lift_s2r(args: &[IRExpr]) -> Option<LiftedExpr> {
         "SR_NTID.X" => "blockDim.x",
         "SR_NTID.Y" => "blockDim.y",
         "SR_NTID.Z" => "blockDim.z",
+        "SR_LANEID" => "laneId",
+        "SR_CgaCtaId" => "cgaCtaId",
         _ => return None,
     };
     Some(LiftedExpr::Raw(sym.to_string()))
@@ -825,12 +827,9 @@ fn lift_setp_compare(
     if args.len() < 4 {
         return None;
     }
-    if config.strict && (!is_true_pred_expr(&args[0]) || !is_true_pred_expr(&args[3])) {
-        return None;
-    }
-    if config.strict && !opcode.split('.').any(|p| p == "AND") {
-        return None;
-    }
+    // Determine predicate combine mode from opcode: AND, OR, XOR
+    let combine_mode = opcode.split('.').find(|p| matches!(*p, "AND" | "OR" | "XOR"));
+
     let cmp = cmp_token_to_op(opcode)?;
 
     let mut lhs = lift_ir_expr(&args[1], stmt_ref, config);
@@ -845,11 +844,56 @@ fn lift_setp_compare(
         rhs = signed_cast(rhs);
     }
 
-    Some(LiftedExpr::Binary {
+    let compare_expr = LiftedExpr::Binary {
         op: cmp.to_string(),
         lhs: Box::new(lhs),
         rhs: Box::new(rhs),
-    })
+    };
+
+    // When args[0] (source predicate) and args[3] (combine predicate) are both PT,
+    // the combine mode doesn't matter — just return the comparison.
+    let src_pred_is_true = is_true_pred_expr(&args[0]);
+    let comb_pred_is_true = is_true_pred_expr(&args[3]);
+
+    if src_pred_is_true && comb_pred_is_true {
+        return Some(compare_expr);
+    }
+
+    // Handle combine modes: result = compare_expr {AND|OR|XOR} combine_pred
+    if src_pred_is_true {
+        let pred_expr = lift_ir_expr(&args[3], stmt_ref, config);
+        match combine_mode {
+            Some("OR") => {
+                return Some(LiftedExpr::Binary {
+                    op: "||".to_string(),
+                    lhs: Box::new(compare_expr),
+                    rhs: Box::new(pred_expr),
+                });
+            }
+            Some("AND") => {
+                return Some(LiftedExpr::Binary {
+                    op: "&&".to_string(),
+                    lhs: Box::new(compare_expr),
+                    rhs: Box::new(pred_expr),
+                });
+            }
+            Some("XOR") => {
+                return Some(LiftedExpr::Binary {
+                    op: "^".to_string(),
+                    lhs: Box::new(compare_expr),
+                    rhs: Box::new(pred_expr),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    // In strict mode, only emit when we can fully decode.
+    if config.strict {
+        return None;
+    }
+
+    Some(compare_expr)
 }
 
 fn lift_lop3_lut(
@@ -1187,6 +1231,111 @@ fn lift_sel(
     lift_fsel(args, stmt_ref, config)
 }
 
+/// PRMT: byte permute instruction.
+/// PRMT dst, src0, selector, src1 → prmt(src0, selector, src1)
+/// Renders as a readable intrinsic call rather than a raw opcode.
+fn lift_prmt(
+    args: &[IRExpr],
+    stmt_ref: StatementRef,
+    config: &SemanticLiftConfig<'_>,
+) -> Option<LiftedExpr> {
+    if args.len() < 2 {
+        return None;
+    }
+    let rendered: Vec<String> = args
+        .iter()
+        .map(|a| lift_ir_expr(a, stmt_ref, config).render())
+        .collect();
+    Some(LiftedExpr::Raw(format!(
+        "prmt({})",
+        rendered.join(", ")
+    )))
+}
+
+/// VIMNMX: 32-bit integer min/max (video instruction set).
+/// VIMNMX dst, Pd, Ps, src0, src1, Pcombine
+/// When the last predicate arg (Pcombine) is PT, this is min(src0, src1) or max(src0, src1)
+/// depending on the PT/!PT select predicate.
+fn lift_vimnmx(
+    args: &[IRExpr],
+    stmt_ref: StatementRef,
+    config: &SemanticLiftConfig<'_>,
+) -> Option<LiftedExpr> {
+    // Expected form: VIMNMX dst, Pd, Ps, src0, src1, Pcombine
+    // In the raw IR args, the predicate destinations/sources are included.
+    // Commonly: VIMNMX(PT, PT, src0, src1, PT) → 5 args
+    if args.len() < 3 {
+        return None;
+    }
+    // Find the two value operands (skip leading/trailing predicate regs)
+    // Heuristic: for 5-arg form, args[2] and args[3] are the data operands
+    if args.len() == 5 {
+        let src0 = lift_ir_expr(&args[2], stmt_ref, config);
+        let src1 = lift_ir_expr(&args[3], stmt_ref, config);
+        // The select predicate (args[4]) determines min vs max.
+        // PT → min, !PT → max (standard convention)
+        let func = if is_true_pred_expr(&args[4]) {
+            "min"
+        } else {
+            "max"
+        };
+        return Some(LiftedExpr::Raw(format!(
+            "{}({}, {})",
+            func,
+            src0.render(),
+            src1.render()
+        )));
+    }
+    // Fallback: render as vimnmx(...)
+    let rendered: Vec<String> = args
+        .iter()
+        .map(|a| lift_ir_expr(a, stmt_ref, config).render())
+        .collect();
+    Some(LiftedExpr::Raw(format!(
+        "vimnmx({})",
+        rendered.join(", ")
+    )))
+}
+
+/// VIADDMNMX: integer add-then-min/max (video instruction set).
+/// VIADDMNMX dst, src0, src1, src2, Psel
+/// Computes: Psel ? min(src0, src1 + src2) : max(src0, src1 + src2)
+fn lift_viaddmnmx(
+    args: &[IRExpr],
+    stmt_ref: StatementRef,
+    config: &SemanticLiftConfig<'_>,
+) -> Option<LiftedExpr> {
+    if args.len() < 4 {
+        return None;
+    }
+    let src0 = lift_ir_expr(&args[0], stmt_ref, config);
+    let src1 = lift_ir_expr(&args[1], stmt_ref, config);
+    let src2 = lift_ir_expr(&args[2], stmt_ref, config);
+    // args[3] is the predicate selector: PT → min, !PT → max
+    let func = if args.len() >= 4 && is_true_pred_expr(&args[3]) {
+        "min"
+    } else if args.len() >= 4 && is_negated_true_pred(&args[3]) {
+        "max"
+    } else {
+        // Unknown predicate — render generically
+        let pred = lift_ir_expr(&args[3], stmt_ref, config);
+        return Some(LiftedExpr::Raw(format!(
+            "viaddmnmx({}, {}, {}, {})",
+            src0.render(),
+            src1.render(),
+            src2.render(),
+            pred.render()
+        )));
+    };
+    let sum = add_like_expr(src1, src2);
+    Some(LiftedExpr::Raw(format!(
+        "{}({}, {})",
+        func,
+        src0.render(),
+        sum.render()
+    )))
+}
+
 fn lift_shf(
     opcode: &str,
     args: &[IRExpr],
@@ -1206,9 +1355,7 @@ fn lift_shf(
     if !is_zero_expr(&args[0]) {
         return None;
     }
-    if !matches!(args[1], IRExpr::ImmI(_)) {
-        return None;
-    }
+    // Accept both immediate and register shift amounts.
     let lhs_expr = lift_ir_expr(&args[2], stmt_ref, config);
     let rhs_expr = lift_ir_expr(&args[1], stmt_ref, config);
     let signed = opcode.split('.').any(|t| t == "S32");
@@ -1237,11 +1384,25 @@ fn lift_lea(
     if opcode.starts_with("LEA.HI") || opcode.starts_with("ULEA.HI") {
         return lift_lea_hi(opcode, args, stmt_ref, config);
     }
-    if opcode != "LEA" {
+    if opcode != "LEA" && opcode != "ULEA" {
         return None;
     }
-    // Conservative LEA low-part form:
-    // LEA dst, P?, base, off, sh  -> base + (off << sh)
+    // 3-arg form: LEA/ULEA dst, base, off, sh  -> base + (off << sh)
+    if args.len() == 3 {
+        if !matches!(args[2], IRExpr::ImmI(_)) {
+            return None;
+        }
+        let shifted = LiftedExpr::Binary {
+            op: "<<".to_string(),
+            lhs: Box::new(lift_ir_expr(&args[1], stmt_ref, config)),
+            rhs: Box::new(lift_ir_expr(&args[2], stmt_ref, config)),
+        };
+        return Some(add_like_expr(
+            lift_ir_expr(&args[0], stmt_ref, config),
+            shifted,
+        ));
+    }
+    // 4-arg form: LEA dst, P?, base, off, sh  -> base + (off << sh)
     if args.len() != 4 {
         return None;
     }
@@ -1412,6 +1573,12 @@ fn is_imm_i(e: &IRExpr, v: i64) -> bool {
 
 fn is_false_pred_expr(e: &IRExpr) -> bool {
     matches!(e, IRExpr::Op { op, args } if args.is_empty() && matches!(op.as_str(), "!PT" | "!UPT"))
+}
+
+/// Check if expression is a negated true predicate (!PT / !UPT).
+fn is_negated_true_pred(e: &IRExpr) -> bool {
+    is_false_pred_expr(e)
+        || matches!(e, IRExpr::Op { op, args } if op == "!" && args.len() == 1 && is_true_pred_expr(&args[0]))
 }
 
 fn carry_inc_expr(
@@ -2489,21 +2656,21 @@ mod tests {
 
     #[test]
     fn unsupported_opcode_is_counted_as_fallback() {
-        // PRMT (byte-permute) has no lift rule, but writes to a register,
+        // CSET (condition-code set) has no lift rule, but writes to a register,
         // so the lift loop will attempt it and count it as a fallback.
         let sass = r#"
-            /*0000*/ PRMT R5, R1, 0x5410, R3 ;
+            /*0000*/ CSET R5, CC.CF ;
             /*0010*/ EXIT ;
         "#;
         let out = run_lift(sass);
-        assert!(out.by_def.is_empty(), "PRMT should not be lifted");
+        assert!(out.by_def.is_empty(), "CSET should not be lifted");
         assert!(
             out.stats.attempted > 0,
-            "PRMT should be attempted (has defs)"
+            "CSET should be attempted (has defs)"
         );
         assert!(
             out.stats.fallback > 0,
-            "PRMT should fall through as unsupported"
+            "CSET should fall through as unsupported"
         );
         assert_eq!(
             out.stats.lifted, 0,

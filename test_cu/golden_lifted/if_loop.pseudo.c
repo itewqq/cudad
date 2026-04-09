@@ -23,9 +23,9 @@ if ((int32_t)(R2.0) >= (int32_t)(1)) {
       R6.2 = -R2.1 + ConstMem(0, 380);
     if ((int32_t)(R6.2) > (int32_t)(0)) {
         P1.1 = (int32_t)(R6.2) > (int32_t)(12);
-        P0.4 = PLOP3.LUT(PT, PT, PT, PT, 128, 0);
+        P0.4 = plop3_lut(true, true, true, true, 128, 0);
       if ((int32_t)(R6.2) > (int32_t)(12)) {
-        P0.5 = PLOP3.LUT(PT, PT, PT, PT, 8, 0);
+        P0.5 = plop3_lut(true, true, true, true, 8, 0);
       }
     }
   }
@@ -107,13 +107,13 @@ if ((int32_t)(R6.5) > (int32_t)(4)) {
   R5.23 = R4.25 * R5.22;
   P0.13 = R5.23 > 0.5;
   R4.26 = P0.13 ? R7.4 : 0.8999999761581421;
-  P0.14 = PLOP3.LUT(PT, PT, PT, PT, 8, 0);
+  P0.14 = plop3_lut(true, true, true, true, 8, 0);
   R4.27 = R5.23 * R4.26;
   P1.21 = R4.27 > 0.5;
   R9.6 = P1.21 ? R7.4 : 0.8999999761581421;
   R9.7 = R4.27 * R9.6;
 }
-if (P0.16) {
+if (R6.7 != 0 || P0.15) {
   R7.7 = 1066192077;
   // 8 phi node(s) omitted [BB10]
 }
