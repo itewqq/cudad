@@ -704,12 +704,12 @@ impl AbiProfile {
         let builtin = offset
             .checked_sub(builtin_base)
             .and_then(|rel| match rel {
-                0x0 => Some("blockDimX"),
-                0x4 => Some("blockDimY"),
-                0x8 => Some("blockDimZ"),
-                0xc => Some("gridDimX"),
-                0x10 => Some("gridDimY"),
-                0x14 => Some("gridDimZ"),
+                0x0 => Some("blockDim.x"),
+                0x4 => Some("blockDim.y"),
+                0x8 => Some("blockDim.z"),
+                0xc => Some("gridDim.x"),
+                0x10 => Some("gridDim.y"),
+                0x14 => Some("gridDim.z"),
                 _ => None,
             });
         if let Some(name) = builtin {
@@ -1321,12 +1321,12 @@ mod tests {
     fn resolves_blackwell_builtins_and_internals() {
         let p = AbiProfile::blackwell_param_380();
         // Built-in dimensions live at 0x360+.
-        assert_eq!(p.resolve_constmem(0, 0x360).unwrap().symbol, "blockDimX");
-        assert_eq!(p.resolve_constmem(0, 0x364).unwrap().symbol, "blockDimY");
-        assert_eq!(p.resolve_constmem(0, 0x368).unwrap().symbol, "blockDimZ");
-        assert_eq!(p.resolve_constmem(0, 0x36c).unwrap().symbol, "gridDimX");
-        assert_eq!(p.resolve_constmem(0, 0x370).unwrap().symbol, "gridDimY");
-        assert_eq!(p.resolve_constmem(0, 0x374).unwrap().symbol, "gridDimZ");
+        assert_eq!(p.resolve_constmem(0, 0x360).unwrap().symbol, "blockDim.x");
+        assert_eq!(p.resolve_constmem(0, 0x364).unwrap().symbol, "blockDim.y");
+        assert_eq!(p.resolve_constmem(0, 0x368).unwrap().symbol, "blockDim.z");
+        assert_eq!(p.resolve_constmem(0, 0x36c).unwrap().symbol, "gridDim.x");
+        assert_eq!(p.resolve_constmem(0, 0x370).unwrap().symbol, "gridDim.y");
+        assert_eq!(p.resolve_constmem(0, 0x374).unwrap().symbol, "gridDim.z");
         // ABI internals relocated for Blackwell.
         assert_eq!(p.resolve_constmem(0, 0x358).unwrap().symbol, "abi_internal_0x358");
         assert_eq!(p.resolve_constmem(0, 0x37c).unwrap().symbol, "abi_internal_0x37c");
@@ -1344,13 +1344,13 @@ mod tests {
     fn legacy_profile_still_resolves_builtins_at_zero() {
         // Double-check the relocation gate doesn't break older generations.
         let p = AbiProfile::modern_param_160();
-        assert_eq!(p.resolve_constmem(0, 0x0).unwrap().symbol, "blockDimX");
-        assert_eq!(p.resolve_constmem(0, 0x4).unwrap().symbol, "blockDimY");
+        assert_eq!(p.resolve_constmem(0, 0x0).unwrap().symbol, "blockDim.x");
+        assert_eq!(p.resolve_constmem(0, 0x4).unwrap().symbol, "blockDim.y");
         // Under the modern profile, 0x360 must NOT be misclassified as a
         // Blackwell built-in — it should look like a far-away param slot.
         let sym = p.resolve_constmem(0, 0x360).unwrap().symbol;
         assert!(sym.starts_with("param_"), "got {}", sym);
-        assert_ne!(sym, "blockDimX");
+        assert_ne!(sym, "blockDim.x");
     }
 
     #[test]
@@ -1372,8 +1372,8 @@ mod tests {
     #[test]
     fn resolves_user_asked_offsets_in_legacy_profile() {
         let p = AbiProfile::legacy_param_140();
-        assert_eq!(p.resolve_constmem(0, 0x0).unwrap().symbol, "blockDimX");
-        assert_eq!(p.resolve_constmem(0, 0x8).unwrap().symbol, "blockDimZ");
+        assert_eq!(p.resolve_constmem(0, 0x0).unwrap().symbol, "blockDim.x");
+        assert_eq!(p.resolve_constmem(0, 0x8).unwrap().symbol, "blockDim.z");
         assert_eq!(p.resolve_constmem(0, 0x28).unwrap().symbol, "abi_internal_0x28");
         assert_eq!(p.resolve_constmem(0, 0x44).unwrap().symbol, "abi_internal_0x44");
         // Per-word param indexing: each 4-byte word is its own param.
@@ -1619,7 +1619,7 @@ mod tests {
             for e in entries {
                 match e.semantic {
                     ConstMemSemantic::ParamWord { param_idx: 0, word_idx: 0 } => saw_param = true,
-                    ConstMemSemantic::Builtin("blockDimX") => saw_builtin = true,
+                    ConstMemSemantic::Builtin("blockDim.x") => saw_builtin = true,
                     ConstMemSemantic::AbiInternal(0x44) => saw_internal = true,
                     _ => {}
                 }

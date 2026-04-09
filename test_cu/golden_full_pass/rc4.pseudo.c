@@ -3,7 +3,7 @@
 // BB0.S0: c[0x0][0x28] -> abi_internal_0x28
 // BB0.S2: c[0x0][0x184] -> param_9
 // BB1.S1: c[0x0][0x118] -> c[0x0][0x118]
-// BB2.S3: c[0x0][0x0] -> blockDimX
+// BB2.S3: c[0x0][0x0] -> blockDim.x
 // BB4.S0: c[0x0][0x168] -> param_2
 // BB5.S22: c[0x0][0x168] -> param_2
 // BB5.S35: c[0x0][0x168] -> param_2
@@ -30,7 +30,7 @@
 // param_6 -> arg6 (ptr64, confidence: high, words: {0, 1})
 // param_8 -> arg8 (word32, confidence: low, words: {0})
 // param_9 -> arg9 (word32, confidence: low, words: {0})
-void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8_t* arg6_ptr, uint32_t arg8, uint32_t arg9) {
+__global__ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8_t* arg6_ptr, uint32_t arg8, uint32_t arg9) {
   __shared__ uint8_t shmem_u8[256];
   bool b0; // live-in
   bool b1;
@@ -69,7 +69,6 @@ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8_t* arg6_pt
   uint32_t v38;
   uint32_t v39;
   uint32_t v40;
-  uint32_t v41;
   uint32_t v42;
   uint32_t v43;
   bool b10;
@@ -339,7 +338,7 @@ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8_t* arg6_pt
   if (!((int32_t)(tid_x) > (int32_t)(255))) {
     do {
       shmem_u8[tid_x] = tid_x;
-      tid_x = tid_x + blockDimX;
+      tid_x = tid_x + blockDim.x;
       // 2 phi node(s) omitted [BB2]
       // phi merge: v2 <- phi(v2, v2)
       // phi merge: b1 <- phi(b1, b1)
@@ -386,11 +385,10 @@ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8_t* arg6_pt
     v38 = *((uint8_t*)addr64(v36, v37));
     v39 = -v31;
     v40 = tid_x + 1;
-    v41 = 0;
     v42 = v39 * v24;
     v43 = abs(v40);
     b10 = (int32_t)(v40) >= (int32_t)(0);
-    v12 = mul_hi_u32(v31, v42) + v41;
+    v12 = mul_hi_u32(v31, v42) + 0;
     v44 = v43;
     v45 = mul_hi_u32(v12, v44);
     v45 = -v45;

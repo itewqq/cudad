@@ -562,35 +562,61 @@ impl<'a> Structurizer<'a> {
                             // Predicated instruction with old value:
                             // emit `dest = pred ? rhs : [/*phi*/]old;`
                             let phi_tag = if self.is_pred_old_phi(ir_s, def_idx) { "/*phi*/" } else { "" };
-                            lines.push_str(&format!(
-                                "{}{} = {} ? ({}) : {}{};
+                            if lifted_stmt.dest == "0" || lifted_stmt.dest == "true" {
+                                lines.push_str(&format!(
+                                    "{}if ({}) {};\n",
+                                    "  ".repeat(indent_level + 1),
+                                    p.render(),
+                                    lifted_stmt.rhs.render()
+                                ));
+                            } else {
+                                lines.push_str(&format!(
+                                    "{}{} = {} ? ({}) : {}{};
 ",
-                                "  ".repeat(indent_level + 1),
-                                lifted_stmt.dest,
-                                p.render(),
-                                lifted_stmt.rhs.render(),
-                                phi_tag,
-                                old
-                            ));
+                                    "  ".repeat(indent_level + 1),
+                                    lifted_stmt.dest,
+                                    p.render(),
+                                    lifted_stmt.rhs.render(),
+                                    phi_tag,
+                                    old
+                                ));
+                            }
                         }
                         (Some(p), None) => {
                             // Predicated but no old value (e.g. store) –
                             // keep the `if (pred)` guard.
-                            lines.push_str(&format!(
-                                "{}if ({}) {} = {};\n",
-                                "  ".repeat(indent_level + 1),
-                                p.render(),
-                                lifted_stmt.dest,
-                                lifted_stmt.rhs.render()
-                            ));
+                            if lifted_stmt.dest == "0" || lifted_stmt.dest == "true" {
+                                lines.push_str(&format!(
+                                    "{}if ({}) {};\n",
+                                    "  ".repeat(indent_level + 1),
+                                    p.render(),
+                                    lifted_stmt.rhs.render()
+                                ));
+                            } else {
+                                lines.push_str(&format!(
+                                    "{}if ({}) {} = {};\n",
+                                    "  ".repeat(indent_level + 1),
+                                    p.render(),
+                                    lifted_stmt.dest,
+                                    lifted_stmt.rhs.render()
+                                ));
+                            }
                         }
                         (None, _) => {
-                            lines.push_str(&format!(
-                                "{}{} = {};\n",
-                                "  ".repeat(indent_level + 1),
-                                lifted_stmt.dest,
-                                lifted_stmt.rhs.render()
-                            ));
+                            if lifted_stmt.dest == "0" || lifted_stmt.dest == "true" {
+                                lines.push_str(&format!(
+                                    "{}{};\n",
+                                    "  ".repeat(indent_level + 1),
+                                    lifted_stmt.rhs.render()
+                                ));
+                            } else {
+                                lines.push_str(&format!(
+                                    "{}{} = {};\n",
+                                    "  ".repeat(indent_level + 1),
+                                    lifted_stmt.dest,
+                                    lifted_stmt.rhs.render()
+                                ));
+                            }
                         }
                     };
                     emitted_any = true;
@@ -883,32 +909,60 @@ impl<'a> Structurizer<'a> {
                             match (&lifted_stmt.pred, &lifted_stmt.pred_old_val) {
                                 (Some(p), Some(old)) => {
                                     let phi_tag = if self.is_pred_old_phi(ir_s, def_idx) { "/*phi*/" } else { "" };
-                                    s_out.push_str(&format!(
-                                        "{}{} = {} ? ({}) : {}{};\n",
-                                        indent,
-                                        lifted_stmt.dest,
-                                        p.render(),
-                                        lifted_stmt.rhs.render(),
-                                        phi_tag,
-                                        old
-                                    ));
+                                    // Side-effect-only (dest is RZ/PT literal): emit without assignment.
+                                    if lifted_stmt.dest == "0" || lifted_stmt.dest == "true" {
+                                        s_out.push_str(&format!(
+                                            "{}if ({}) {};\n",
+                                            indent,
+                                            p.render(),
+                                            lifted_stmt.rhs.render()
+                                        ));
+                                    } else {
+                                        s_out.push_str(&format!(
+                                            "{}{} = {} ? ({}) : {}{};\n",
+                                            indent,
+                                            lifted_stmt.dest,
+                                            p.render(),
+                                            lifted_stmt.rhs.render(),
+                                            phi_tag,
+                                            old
+                                        ));
+                                    }
                                 }
                                 (Some(p), None) => {
-                                    s_out.push_str(&format!(
-                                        "{}if ({}) {} = {};\n",
-                                        indent,
-                                        p.render(),
-                                        lifted_stmt.dest,
-                                        lifted_stmt.rhs.render()
-                                    ));
+                                    if lifted_stmt.dest == "0" || lifted_stmt.dest == "true" {
+                                        s_out.push_str(&format!(
+                                            "{}if ({}) {};\n",
+                                            indent,
+                                            p.render(),
+                                            lifted_stmt.rhs.render()
+                                        ));
+                                    } else {
+                                        s_out.push_str(&format!(
+                                            "{}if ({}) {} = {};\n",
+                                            indent,
+                                            p.render(),
+                                            lifted_stmt.dest,
+                                            lifted_stmt.rhs.render()
+                                        ));
+                                    }
                                 }
                                 (None, _) => {
-                                    s_out.push_str(&format!(
-                                        "{}{} = {};\n",
-                                        indent,
-                                        lifted_stmt.dest,
-                                        lifted_stmt.rhs.render()
-                                    ));
+                                    if lifted_stmt.dest == "0" || lifted_stmt.dest == "true" {
+                                        // Side-effect-only: emit as expression statement.
+                                        s_out.push_str(&format!(
+                                            "{}{};\n",
+                                            indent,
+                                            lifted_stmt.rhs.render()
+                                        ));
+                                    } else {
+                                        s_out.push_str(&format!(
+                                            "{}{} = {};\n",
+                                            indent,
+                                            lifted_stmt.dest,
+                                            lifted_stmt.rhs.render()
+                                        ));
+                                    }
                                 }
                             };
                             emitted_any = true;

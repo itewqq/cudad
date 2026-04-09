@@ -23,9 +23,9 @@ if ((int32_t)(R2.0) >= (int32_t)(1)) {
       R6.2 = -R2.1 + c[0x0][0x17c];
     if ((int32_t)(R6.2) > (int32_t)(0)) {
         P1.1 = (int32_t)(R6.2) > (int32_t)(12);
-        P0.4 = plop3_lut(true, true, true, true, 128, 0);
+        P0.4 = false;
       if ((int32_t)(R6.2) > (int32_t)(12)) {
-        P0.5 = plop3_lut(true, true, true, true, 8, 0);
+        P0.5 = false;
       }
     }
   }
@@ -107,7 +107,7 @@ if ((int32_t)(R6.5) > (int32_t)(4)) {
   R5.23 = R4.25 * R5.22;
   P0.13 = R5.23 > 0.5;
   R4.26 = P0.13 ? R7.4 : 0.8999999761581421;
-  P0.14 = plop3_lut(true, true, true, true, 8, 0);
+  P0.14 = false;
   R4.27 = R5.23 * R4.26;
   P1.21 = R4.27 > 0.5;
   R9.6 = P1.21 ? R7.4 : 0.8999999761581421;

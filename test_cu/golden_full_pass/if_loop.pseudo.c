@@ -1,7 +1,7 @@
 // --- Structured Output ---
 // ABI const-memory mapping (sample):
 // BB0.S0: c[0x0][0x28] -> abi_internal_0x28
-// BB0.S3: c[0x0][0x0] -> blockDimX
+// BB0.S3: c[0x0][0x0] -> blockDim.x
 // BB0.S4: c[0x0][0x178] -> param_6
 // BB1.S1: c[0x0][0x118] -> c[0x0][0x118]
 // BB1.S2: c[0x0][0x160] -> param_0
@@ -22,7 +22,7 @@
 // param_4 -> arg4 (ptr64, confidence: high, words: {0, 1})
 // param_6 -> arg6 (word32, confidence: low, words: {0})
 // param_7 -> arg7 (word32, confidence: low, words: {0})
-void kernel(uint32_t arg0, uint32_t arg2, uintptr_t arg4_ptr, uint32_t arg6, uint32_t arg7) {
+__global__ void kernel(uint32_t arg0, uint32_t arg2, uintptr_t arg4_ptr, uint32_t arg6, uint32_t arg7) {
   uint32_t v3;
   bool b0; // live-in
   uint32_t v4;
@@ -118,7 +118,7 @@ void kernel(uint32_t arg0, uint32_t arg2, uintptr_t arg4_ptr, uint32_t arg6, uin
 
   ctaid_x = blockIdx.x;
   tid_x = threadIdx.x;
-  v3 = ctaid_x * blockDimX + tid_x;
+  v3 = ctaid_x * blockDim.x + tid_x;
   if (b0) return;
     v4 = 4;
     v5 = v3 * v4 + arg0;
@@ -138,9 +138,9 @@ void kernel(uint32_t arg0, uint32_t arg2, uintptr_t arg4_ptr, uint32_t arg6, uin
         v9 = -v10 + arg7;
       if ((int32_t)(v9) > (int32_t)(0)) {
           b4 = (int32_t)(v9) > (int32_t)(12);
-          b5 = plop3_lut(true, true, true, true, 128, 0);
+          b5 = false;
         if ((int32_t)(v9) > (int32_t)(12)) {
-          b5 = plop3_lut(true, true, true, true, 8, 0);
+          b5 = false;
         }
       }
     }
@@ -229,7 +229,7 @@ void kernel(uint32_t arg0, uint32_t arg2, uintptr_t arg4_ptr, uint32_t arg6, uin
     v7 = v52 * v53;
     b28 = v7 > 0.5;
     v54 = b28 ? v4 : 0.8999999761581421;
-    b5 = plop3_lut(true, true, true, true, 8, 0);
+    b5 = false;
     v5 = v7 * v54;
     b1 = v5 > 0.5;
     v55 = b1 ? v4 : 0.8999999761581421;

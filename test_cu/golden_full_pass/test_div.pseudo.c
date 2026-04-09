@@ -19,7 +19,7 @@
 // param_1 -> arg1 (word32, confidence: low, words: {0})
 // param_2 -> arg2 (word32, confidence: low, words: {0})
 // param_3 -> arg3 (word32, confidence: low, words: {0})
-void kernel(int32_t arg0, int32_t arg1, uint32_t arg2, uint32_t arg3) {
+__global__ void kernel(int32_t arg0, int32_t arg1, uint32_t arg2, uint32_t arg3) {
   uint32_t v1;
   uint32_t u0;
   uint32_t u1;
@@ -29,7 +29,6 @@ void kernel(int32_t arg0, int32_t arg1, uint32_t arg2, uint32_t arg3) {
   uint32_t v3;
   uint32_t v4;
   uint32_t v5;
-  uint32_t v6;
   uint32_t v7;
   uint32_t v8;
   uint32_t v9;
@@ -58,11 +57,10 @@ void kernel(int32_t arg0, int32_t arg1, uint32_t arg2, uint32_t arg3) {
   v3 = rcp_approx(v2);
   v4 = v3 + 268435454;
   v5 = f2i_trunc_u32_ftz_ntz(v4);
-  v6 = 0;
   v7 = -v5;
   v8 = v7 * v1;
   v9 = abs(arg0);
-  v10 = mul_hi_u32(v5, v8) + v6;
+  v10 = mul_hi_u32(v5, v8) + 0;
   v11 = arg2;
   v12 = mul_hi_u32(v10, v9);
   v13 = -v12;

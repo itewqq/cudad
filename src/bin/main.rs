@@ -15,9 +15,9 @@ fn render_typed_structured_output(
         .map(|a| a.render_typed_param_list())
         .unwrap_or_default();
     let sig = if params.is_empty() {
-        "void kernel(void)".to_string()
+        "__global__ void kernel(void)".to_string()
     } else {
-        format!("void kernel({})", params.join(", "))
+        format!("__global__ void kernel({})", params.join(", "))
     };
 
     // Filter out declarations for registers that no longer appear in the
@@ -72,7 +72,7 @@ fn infer_self_contained_locals(
 ) -> Vec<String> {
     let ident_re = Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").expect("valid regex");
     let temp_re = Regex::new(
-        r"\b(?:v\d+|u\d+|b\d+|abi_internal_0x[0-9A-Fa-f]+|arg\d+_(?:ptr_)?(?:lo32|hi32|word\d+)(?:_\d+)?|tid_[xyz](?:_\d+)?|ctaid_[xyz](?:_\d+)?|param_\d+)\b",
+        r"\b(?:v\d+|u\d+|b\d+|abi_internal_0x[0-9A-Fa-f]+|arg\d+_(?:ptr_)?(?:lo32|hi32|word\d+)(?:_\d+)?|tid_[xyz](?:_\d+)?|ctaid_[xyz](?:_\d+)?|param_\d+|block_dim_[xyz](?:_\d+)?|grid_dim_[xyz](?:_\d+)?|lane_id(?:_\d+)?|cga_cta_id(?:_\d+)?)\b",
     )
     .expect("valid regex");
     let assign_re = Regex::new(
@@ -412,7 +412,7 @@ fn emit_empty_stub(output: Option<&str>) {
     let stub = "\
 // Warning: no parseable SASS instruction lines were found.\n\
 // Returning an empty stub to keep the pipeline non-fatal.\n\
-void kernel(void) {\n\
+__global__ void kernel(void) {\n\
 }\n";
     println!("// --- Structured Output ---");
     emit_output(stub, output);

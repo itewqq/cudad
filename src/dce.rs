@@ -18,6 +18,8 @@ pub fn eliminate_dead_code(input: &str) -> String {
     let mut text = input.to_string();
     // CSE: unify redundant loads of the same pure expression.
     text = eliminate_common_subexpressions(&text);
+    // Constant propagation: inline trivial integer/boolean constants.
+    text = propagate_constants(&text);
     // Iterate to fixpoint — removing one line may make another variable dead.
     loop {
         let next = dce_one_pass(&text);
@@ -187,7 +189,7 @@ fn eliminate_common_subexpressions(input: &str) -> String {
 
     // These RHS patterns are guaranteed kernel-constant (same value throughout).
     let constant_rhs_re = Regex::new(
-        r"^(?:threadIdx\.[xyz]|blockIdx\.[xyz]|blockDimX|blockDimY|blockDimZ|gridDimX|gridDimY|gridDimZ|cgaCtaId|laneId|abi_internal_0x[0-9A-Fa-f]+|c\[0x[0-9a-f]+\]\[0x[0-9a-f]+\]|arg\d+_ptr\.(?:lo32|hi32)|arg\d+_word\d+\.(?:lo32|hi32)|arg\d+|param_\d+)$",
+        r"^(?:threadIdx\.[xyz]|blockIdx\.[xyz]|blockDim\.[xyz]|gridDim\.[xyz]|cgaCtaId|laneId|abi_internal_0x[0-9A-Fa-f]+|c\[0x[0-9a-f]+\]\[0x[0-9a-f]+\]|arg\d+_ptr\.(?:lo32|hi32)|arg\d+_word\d+\.(?:lo32|hi32)|arg\d+|param_\d+)$",
     )
     .expect("valid regex");
 
@@ -253,6 +255,82 @@ fn eliminate_common_subexpressions(input: &str) -> String {
             let name = caps.get(1).unwrap().as_str();
             if let Some(replacement) = rename_map.get(name) {
                 replacement.clone()
+            } else {
+                name.to_string()
+            }
+        });
+        result.push(new_line.into_owned());
+    }
+
+    result.join("\n")
+}
+
+/// Text-level constant propagation.
+///
+/// When `X = <small_literal>;` (integer literal, true, false) and X is
+/// defined exactly once, replace all uses of X with the literal and remove
+/// the assignment line.
+///
+/// Only propagates constants that are "small" (≤ 10 chars) to avoid bloating
+/// the output — large hex constants are better left in named variables.
+fn propagate_constants(input: &str) -> String {
+    let assign_re =
+        Regex::new(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+);$").expect("valid regex");
+    let ident_re = Regex::new(r"\b([A-Za-z_][A-Za-z0-9_]*)\b").expect("valid regex");
+
+    // A "small literal" is a number (possibly negative), true, or false.
+    let literal_re = Regex::new(r"^-?\d+$|^true$|^false$|^0x[0-9A-Fa-f]+$").expect("valid regex");
+
+    let lines: Vec<&str> = input.lines().collect();
+
+    // Count how many times each variable appears as LHS of an assignment.
+    let mut lhs_count: HashMap<String, usize> = HashMap::new();
+    for &line in &lines {
+        let trimmed = line.trim();
+        if let Some(caps) = assign_re.captures(trimmed) {
+            let lhs = caps.get(1).unwrap().as_str().to_string();
+            *lhs_count.entry(lhs).or_insert(0) += 1;
+        }
+    }
+
+    // Find single-def assignments of small literals.
+    let mut const_map: HashMap<String, String> = HashMap::new();
+    let mut lines_to_remove: BTreeSet<usize> = BTreeSet::new();
+
+    for (line_idx, &line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if let Some(caps) = assign_re.captures(trimmed) {
+            let lhs = caps.get(1).unwrap().as_str().to_string();
+            let rhs = caps.get(2).unwrap().as_str().trim().to_string();
+
+            // Only propagate if:
+            // 1. Single definition
+            // 2. RHS is a small literal
+            // 3. Literal is short enough to inline (≤ 10 chars)
+            if lhs_count.get(&lhs).copied().unwrap_or(0) == 1
+                && literal_re.is_match(&rhs)
+                && rhs.len() <= 10
+            {
+                const_map.insert(lhs, rhs);
+                lines_to_remove.insert(line_idx);
+            }
+        }
+    }
+
+    if const_map.is_empty() {
+        return input.to_string();
+    }
+
+    // Apply the constant map and remove assignment lines.
+    let mut result = Vec::with_capacity(lines.len());
+    for (line_idx, &line) in lines.iter().enumerate() {
+        if lines_to_remove.contains(&line_idx) {
+            continue;
+        }
+        let new_line = ident_re.replace_all(line, |caps: &regex::Captures| {
+            let name = caps.get(1).unwrap().as_str();
+            if let Some(literal) = const_map.get(name) {
+                literal.clone()
             } else {
                 name.to_string()
             }
@@ -335,8 +413,9 @@ mod tests {
     fn preserves_memory_stores() {
         let input = "  v0 = 42;\n  *addr64(v0, v1) = 0;\n  return;";
         let output = eliminate_dead_code(input);
-        assert!(output.contains("v0 = 42"), "v0 used in store");
-        assert!(output.contains("*addr64"));
+        // v0 = 42 is a single-def constant — it gets propagated into the store.
+        assert!(output.contains("*addr64(42, v1)"), "constant should be inlined into store");
+        assert!(!output.contains("v0 = 42"), "v0 assignment should be removed after propagation");
     }
 
     #[test]
@@ -356,10 +435,10 @@ mod tests {
 
     #[test]
     fn does_not_remove_used_variables() {
-        let input = "  v0 = threadIdx.x;\n  v1 = v0 * blockDimX;\n  *ptr = v1;\n  return;";
+        let input = "  v0 = threadIdx.x;\n  v1 = v0 * blockDim.x;\n  *ptr = v1;\n  return;";
         let output = eliminate_dead_code(input);
         assert!(output.contains("v0 = threadIdx.x"));
-        assert!(output.contains("v1 = v0 * blockDimX"));
+        assert!(output.contains("v1 = v0 * blockDim.x"));
         assert!(output.contains("*ptr = v1"));
     }
 
@@ -369,8 +448,10 @@ mod tests {
         let output = eliminate_dead_code(input);
         assert!(!output.contains("b = 2"), "b is dead");
         assert!(!output.contains("c = 3"), "c is dead");
-        assert!(output.contains("a = 1"), "a is used by d");
-        assert!(output.contains("d = a + 1"), "d is used in store");
+        // a=1 is const-propagated into d, so a=1 is removed.
+        assert!(!output.contains("a = 1"), "a should be propagated into d");
+        assert!(output.contains("d = 1 + 1"), "d should have a inlined");
+        assert!(output.contains("*ptr = d"), "d is used in store");
     }
 
     #[test]
@@ -394,19 +475,46 @@ mod tests {
 
     #[test]
     fn cse_unifies_redundant_blockdimx() {
-        let input = "  u5 = blockDimX;\n  v15 = blockDimX;\n  v1 = u5 + v15;\n  *ptr = v1;";
+        let input = "  u5 = blockDim.x;\n  v15 = blockDim.x;\n  v1 = u5 + v15;\n  *ptr = v1;";
         let output = eliminate_dead_code(input);
         // v15 should be renamed to u5.
         assert!(!output.contains("v15"), "v15 should be unified with u5");
-        assert!(output.contains("u5 = blockDimX"));
+        assert!(output.contains("u5 = blockDim.x"));
         assert!(output.contains("v1 = u5 + u5"));
     }
 
     #[test]
     fn cse_does_not_unify_reassigned_var() {
-        let input = "  x = blockDimX;\n  x = 42;\n  y = blockDimX;\n  *ptr = y;";
+        let input = "  x = blockDim.x;\n  x = 42;\n  y = blockDim.x;\n  *ptr = y;";
         let output = eliminate_dead_code(input);
         // x is reassigned, so y should NOT be renamed to x.
-        assert!(output.contains("y = blockDimX"), "y must remain since x is reassigned");
+        assert!(output.contains("y = blockDim.x"), "y must remain since x is reassigned");
+    }
+
+    #[test]
+    fn const_prop_inlines_small_literals() {
+        let input = "  v0 = 0;\n  v1 = 1;\n  *ptr = v0;\n  *ptr2 = v1;";
+        let output = eliminate_dead_code(input);
+        assert!(!output.contains("v0 = 0"), "v0 should be propagated");
+        assert!(!output.contains("v1 = 1"), "v1 should be propagated");
+        assert!(output.contains("*ptr = 0"), "v0 inlined to 0");
+        assert!(output.contains("*ptr2 = 1"), "v1 inlined to 1");
+    }
+
+    #[test]
+    fn const_prop_does_not_inline_multi_def() {
+        // v0 is assigned twice — should NOT be propagated.
+        let input = "  v0 = 0;\n  *ptr = v0;\n  v0 = 1;\n  *ptr2 = v0;";
+        let output = eliminate_dead_code(input);
+        assert!(output.contains("v0 = 0"), "v0 multi-def should not be propagated");
+        assert!(output.contains("v0 = 1"), "v0 multi-def should not be propagated");
+    }
+
+    #[test]
+    fn const_prop_does_not_inline_expressions() {
+        // "v0 + 1" is not a literal — should not be propagated.
+        let input = "  x = v0 + 1;\n  *ptr = x;";
+        let output = eliminate_dead_code(input);
+        assert!(output.contains("x = v0 + 1"), "expression should not be propagated");
     }
 }

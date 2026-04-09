@@ -1736,7 +1736,7 @@ fn render_shared_u8_ref(
 }
 
 /// Render a shared memory reference (any width).  Returns `shmem[addr]`.
-fn render_shared_ref(
+pub(crate) fn render_shared_ref(
     mem_expr: &IRExpr,
     stmt_ref: StatementRef,
     config: &SemanticLiftConfig<'_>,
@@ -2646,10 +2646,10 @@ mod tests {
         let modern = crate::abi::AbiProfile::modern_param_160();
         let blackwell = crate::abi::AbiProfile::blackwell_param_380();
         let cases: &[(&str, &str, crate::abi::AbiProfile)] = &[
-            ("ULDC UR5, c[0x0][0x0]", "blockDimX", modern),      // SM 89 builtin (uniform)
-            ("LDC R5, c[0x0][0x0]", "blockDimX", modern),        // SM 89 builtin (non-uniform)
-            ("LDCU UR5, c[0x0][0x360]", "blockDimX", blackwell), // SM 100 builtin
-            ("LDC R1, c[0x0][0x360]", "blockDimX", blackwell),   // SM 100 builtin (non-uniform)
+            ("ULDC UR5, c[0x0][0x0]", "blockDim.x", modern),      // SM 89 builtin (uniform)
+            ("LDC R5, c[0x0][0x0]", "blockDim.x", modern),        // SM 89 builtin (non-uniform)
+            ("LDCU UR5, c[0x0][0x360]", "blockDim.x", blackwell), // SM 100 builtin
+            ("LDC R1, c[0x0][0x360]", "blockDim.x", blackwell),   // SM 100 builtin (non-uniform)
             ("LDCU UR4, c[0x0][0x390]", "param_4", blackwell),   // SM 100 param
             ("LDC R4, c[0x0][0x390]", "param_4", blackwell),     // SM 100 param (non-uniform)
         ];

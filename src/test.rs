@@ -527,9 +527,9 @@ fn render_typed_structured_output_for_test(
         .map(|a| a.render_typed_param_list())
         .unwrap_or_default();
     let sig = if params.is_empty() {
-        "void kernel(void)".to_string()
+        "__global__ void kernel(void)".to_string()
     } else {
-        format!("void kernel({})", params.join(", "))
+        format!("__global__ void kernel({})", params.join(", "))
     };
 
     // Filter out declarations for registers that no longer appear in the
@@ -813,7 +813,7 @@ fn test_structured_output_with_abi_display_symbols_constmem() {
     let out = fir.to_dot(&cfg, &display);
 
     assert!(out.contains("param_0"));
-    assert!(out.contains("blockDimX"));
+    assert!(out.contains("blockDim.x"));
 }
 
 #[test]
@@ -945,8 +945,12 @@ fn lifted_output_uses_infix_for_supported_patterns() {
 fn lifted_output_falls_back_to_raw_for_unmatched_opcodes() {
     let sass = include_str!("../test_cu/if_loop.sass");
     let out = run_structured_output_lifted(sass);
-    // PLOP3 is now lifted to plop3_lut(...); verify it renders cleanly
-    assert!(out.contains("plop3_lut("));
+    // PLOP3 with all-constant inputs is now constant-folded (no plop3_lut call).
+    // The if_loop fixture's PLOP3 instructions all have PT,PT,PT,PT inputs,
+    // so they should fold to true/false constants.
+    assert!(!out.contains("plop3_lut("), "all-constant PLOP3 should be folded");
+    // Verify some opcodes still fall back to raw rendering (not all are lifted).
+    assert!(out.contains("LEA.HI.X(") || out.contains("ConstMem("));
 }
 
 #[test]
@@ -1733,12 +1737,12 @@ fn corpus_sm100_resolves_blackwell_builtins() {
     for (file, _name, out) in &outputs {
         let entry = per_file.entry((*file).to_string()).or_insert((0, 0));
         entry.0 += 1;
-        let has_builtin = out.contains("blockDimX")
-            || out.contains("blockDimY")
-            || out.contains("blockDimZ")
-            || out.contains("gridDimX")
-            || out.contains("gridDimY")
-            || out.contains("gridDimZ");
+        let has_builtin = out.contains("blockDim.x")
+            || out.contains("blockDim.y")
+            || out.contains("blockDim.z")
+            || out.contains("gridDim.x")
+            || out.contains("gridDim.y")
+            || out.contains("gridDim.z");
         if has_builtin {
             bound += 1;
             entry.1 += 1;
