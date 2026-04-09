@@ -127,7 +127,7 @@ void kernel(uint32_t arg0, uint32_t arg2, uintptr_t arg4_ptr, uint32_t arg6, uin
   if (b0) return;
     v4 = 4;
     u0 = c[0x0][0x118];
-    u1 = ConstMem(0, 284);
+    u1 = c[0x0][0x11c];
     v5 = v3 * v4 + arg0;
     v6 = v3 * v4 + arg2;
     v7 = *addr64(v5, v8);

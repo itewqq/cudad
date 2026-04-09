@@ -1,16 +1,16 @@
-R1.0 = ConstMem(0, 40);
+R1.0 = c[0x0][0x28];
 R0.0 = blockIdx.x;
 R3.0 = threadIdx.x;
-R0.1 = R0.0 * ConstMem(0, 0) + R3.0;
+R0.1 = R0.0 * c[0x0][0x0] + R3.0;
 if (P0.0) return;
   R7.0 = 4;
-  UR4.0 = ConstMem(0, 280);
-  UR5.0 = ConstMem(0, 284);
-  R4.0 = R0.1 * R7.0 + ConstMem(0, 352);
-  R6.0 = R0.1 * R7.0 + ConstMem(0, 360);
+  UR4.0 = c[0x0][0x118];
+  UR5.0 = c[0x0][0x11c];
+  R4.0 = R0.1 * R7.0 + c[0x0][0x160];
+  R6.0 = R0.1 * R7.0 + c[0x0][0x168];
   R5.1 = *addr64(R4.0, R5.0);
   R6.1 = *addr64(R6.0, R7.0);
-  R2.0 = ConstMem(0, 380);
+  R2.0 = c[0x0][0x17c];
   R3.1 = (int32_t)R0.1 >> 31;
   P1.0 = (int32_t)(R2.0) >= (int32_t)(1);
   R9.0 = R6.1 + R5.1;
@@ -20,7 +20,7 @@ if ((int32_t)(R2.0) >= (int32_t)(1)) {
     R4.1 = R2.0 - 1;
     R2.1 = R2.0 & 3;
   if (R4.1 >= 3) {
-      R6.2 = -R2.1 + ConstMem(0, 380);
+      R6.2 = -R2.1 + c[0x0][0x17c];
     if ((int32_t)(R6.2) > (int32_t)(0)) {
         P1.1 = (int32_t)(R6.2) > (int32_t)(12);
         P0.4 = plop3_lut(true, true, true, true, 128, 0);
@@ -145,7 +145,7 @@ do {
   R9.15 = R4.37 * R9.14;
   // 5 phi node(s) omitted [BB14]
 } while(P0.26);
-R2.5 = R0.1 + (ConstMem(0, 368) << 2);
+R2.5 = R0.1 + (c[0x0][0x170] << 2);
 R3.2 = LEA.HI.X(R0.1, ConstMem(0, 372), R3.1, 2, P0.27);
 *addr64(R2.5, R3.2) = R9.16;
 // 9 phi node(s) omitted [BB15]

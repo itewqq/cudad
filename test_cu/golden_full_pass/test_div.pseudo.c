@@ -61,7 +61,7 @@ void kernel(int32_t arg0, int32_t arg1, uint32_t arg2, uint32_t arg3) {
   v2 = i2f_rp(v1);
   b0 = (int32_t)(0) <= (int32_t)(u2);
   u3 = c[0x0][0x118];
-  u4 = ConstMem(0, 284);
+  u4 = c[0x0][0x11c];
   v3 = rcp_approx(v2);
   v4 = v3 + 268435454;
   v5 = f2i_trunc_u32_ftz_ntz(v4);

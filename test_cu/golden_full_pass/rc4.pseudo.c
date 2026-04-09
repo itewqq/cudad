@@ -340,7 +340,7 @@ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8_t* arg6_pt
   if (b0) return;
     tid_x = threadIdx.x;
     u0 = c[0x0][0x118];
-    u1 = ConstMem(0, 284);
+    u1 = c[0x0][0x11c];
     b1 = (int32_t)(tid_x) > (int32_t)(255);
     b2 = tid_x != 0;
   if (!((int32_t)(tid_x) > (int32_t)(255))) {

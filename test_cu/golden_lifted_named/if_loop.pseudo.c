@@ -1,16 +1,16 @@
-v0 = ConstMem(0, 40);
+v0 = c[0x0][0x28];
 v1 = blockIdx.x;
 v2 = threadIdx.x;
-v3 = v1 * ConstMem(0, 0) + v2;
+v3 = v1 * c[0x0][0x0] + v2;
 if (b0) return;
   v4 = 4;
-  u0 = ConstMem(0, 280);
-  u1 = ConstMem(0, 284);
-  v5 = v3 * v4 + ConstMem(0, 352);
-  v6 = v3 * v4 + ConstMem(0, 360);
+  u0 = c[0x0][0x118];
+  u1 = c[0x0][0x11c];
+  v5 = v3 * v4 + c[0x0][0x160];
+  v6 = v3 * v4 + c[0x0][0x168];
   v7 = *addr64(v5, v8);
   v9 = *addr64(v6, v4);
-  v10 = ConstMem(0, 380);
+  v10 = c[0x0][0x17c];
   v11 = (int32_t)v3 >> 31;
   b1 = (int32_t)(v10) >= (int32_t)(1);
   v12 = v9 + v7;
@@ -20,7 +20,7 @@ if ((int32_t)(v10) >= (int32_t)(1)) {
     v5 = v10 - 1;
     v10 = v10 & 3;
   if (v5 >= 3) {
-      v9 = -v10 + ConstMem(0, 380);
+      v9 = -v10 + c[0x0][0x17c];
     if ((int32_t)(v9) > (int32_t)(0)) {
         b4 = (int32_t)(v9) > (int32_t)(12);
         b5 = plop3_lut(true, true, true, true, 128, 0);
@@ -145,7 +145,7 @@ do {
   v13 = v5 * v13;
   // 5 phi node(s) omitted [BB14]
 } while(b2);
-v61 = v3 + (ConstMem(0, 368) << 2);
+v61 = v3 + (c[0x0][0x170] << 2);
 v62 = LEA.HI.X(v3, ConstMem(0, 372), v11, 2, b2);
 *addr64(v61, v62) = v13;
 // 9 phi node(s) omitted [BB15]

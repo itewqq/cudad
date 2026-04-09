@@ -1,21 +1,21 @@
-v0 = ConstMem(0, 40);
+v0 = c[0x0][0x28];
 v1 = blockIdx.x;
 if (b0) return;
   v2 = threadIdx.x;
-  u0 = ConstMem(0, 280);
-  u1 = ConstMem(0, 284);
+  u0 = c[0x0][0x118];
+  u1 = c[0x0][0x11c];
   b1 = (int32_t)(v2) > (int32_t)(255);
   b2 = v2 != 0;
 if (!((int32_t)(v2) > (int32_t)(255))) {
   do {
     shmem_u8[v2] = v2;
-    v2 = v2 + ConstMem(0, 0);
+    v2 = v2 + c[0x0][0x0];
     // 2 phi node(s) omitted [BB2]
   } while(!(b1));
 }
   __syncthreads();
 if (!(b2)) {
-  v3 = abs(ConstMem(0, 360));
+  v3 = abs(c[0x0][0x168]);
   v4 = 0;
   v5 = i2f_rp(v3);
   v6 = rcp_approx(v5);
@@ -30,7 +30,7 @@ if (!(b2)) {
 do {
   v22 = abs(v2);
   v23 = shmem_u8[v2];
-  v24 = abs(ConstMem(0, 360));
+  v24 = abs(c[0x0][0x168]);
   b5 = (int32_t)(v2) >= (int32_t)(0);
   v25 = mul_hi_u32(v12, v22);
   v26 = i2f_rp(v24);
@@ -43,14 +43,14 @@ do {
   v30 = v28 + 268435454;
   v31 = f2i_trunc_u32_ftz_ntz(v30);
   v32 = !b7 ? (v29 - v24) : v29;
-  b8 = 0 != ConstMem(0, 360);
+  b8 = 0 != c[0x0][0x168];
   v33 = v32;
-  v34 = ~ConstMem(0, 360);
+  v34 = ~c[0x0][0x168];
   if (!b5) v33 = -v33;
   v35 = !b8 ? v34 : v33;
-  b9 = carry_u32_add3(v35, ConstMem(0, 352), 0);
-  v36 = v35 + ConstMem(0, 352);
-  v37 = lea_hi_x_sx32(v35, ConstMem(0, 356), 1, b9);
+  b9 = carry_u32_add3(v35, c[0x0][0x160], 0);
+  v36 = v35 + c[0x0][0x160];
+  v37 = lea_hi_x_sx32(v35, c[0x0][0x164], 1, b9);
   v38 = *((uint8_t*)addr64(v36, v37));
   v39 = -v31;
   v40 = v2 + 1;
@@ -70,9 +70,9 @@ do {
   v48 = !b12 ? (v47 - v24) : v47;
   if (!b10) v48 = -v48;
   v49 = !b8 ? v34 : v48;
-  b13 = carry_u32_add3(v49, ConstMem(0, 352), 0);
-  v50 = v49 + ConstMem(0, 352);
-  v51 = lea_hi_x_sx32(v49, ConstMem(0, 356), 1, b13);
+  b13 = carry_u32_add3(v49, c[0x0][0x160], 0);
+  v50 = v49 + c[0x0][0x160];
+  v51 = lea_hi_x_sx32(v49, c[0x0][0x164], 1, b13);
   v52 = *((uint8_t*)addr64(v50, v51));
   v53 = v2 + 2;
   v54 = abs(v53);
@@ -86,9 +86,9 @@ do {
   v58 = !b16 ? (v57 - v24) : v57;
   if (!b14) v58 = -v58;
   v59 = !b8 ? v34 : v58;
-  b17 = carry_u32_add3(v59, ConstMem(0, 352), 0);
-  v60 = v59 + ConstMem(0, 352);
-  v61 = lea_hi_x_sx32(v59, ConstMem(0, 356), 1, b17);
+  b17 = carry_u32_add3(v59, c[0x0][0x160], 0);
+  v60 = v59 + c[0x0][0x160];
+  v61 = lea_hi_x_sx32(v59, c[0x0][0x164], 1, b17);
   v62 = *((uint8_t*)addr64(v60, v61));
   v63 = v2 + 3;
   v64 = abs(v63);
@@ -103,10 +103,10 @@ do {
   if (!b18) v68 = -v68;
   v69 = !b8 ? v34 : v68;
   v70 = v38 + v4 + v23;
-  b21 = carry_u32_add3(v69, ConstMem(0, 352), 0);
-  v71 = v69 + ConstMem(0, 352);
+  b21 = carry_u32_add3(v69, c[0x0][0x160], 0);
+  v71 = v69 + c[0x0][0x160];
   v72 = (int32_t)v70 >> 31;
-  v73 = lea_hi_x_sx32(v69, ConstMem(0, 356), 1, b21);
+  v73 = lea_hi_x_sx32(v69, c[0x0][0x164], 1, b21);
   v74 = hi32(v72 + (v70 << 8));
   v75 = *((uint8_t*)addr64(v71, v73));
   v76 = v74 & 4294967040;
@@ -127,9 +127,9 @@ do {
   v85 = !b24 ? (v83 - v24) : v83;
   if (!b22) v85 = -v85;
   v86 = !b8 ? v34 : v85;
-  b25 = carry_u32_add3(v86, ConstMem(0, 352), 0);
-  v87 = v86 + ConstMem(0, 352);
-  v88 = lea_hi_x_sx32(v86, ConstMem(0, 356), 1, b25);
+  b25 = carry_u32_add3(v86, c[0x0][0x160], 0);
+  v87 = v86 + c[0x0][0x160];
+  v88 = lea_hi_x_sx32(v86, c[0x0][0x164], 1, b25);
   v89 = v52 + v77 + v84;
   v90 = (int32_t)v89 >> 31;
   v91 = hi32(v90 + (v89 << 8));
@@ -152,9 +152,9 @@ do {
   v102 = !b28 ? (v100 - v24) : v100;
   if (!b26) v102 = -v102;
   v103 = !b8 ? v34 : v102;
-  b29 = carry_u32_add3(v103, ConstMem(0, 352), 0);
-  v104 = v103 + ConstMem(0, 352);
-  v105 = lea_hi_x_sx32(v103, ConstMem(0, 356), 1, b29);
+  b29 = carry_u32_add3(v103, c[0x0][0x160], 0);
+  v104 = v103 + c[0x0][0x160];
+  v105 = lea_hi_x_sx32(v103, c[0x0][0x164], 1, b29);
   v106 = v62 + v94 + v101;
   v107 = *((uint8_t*)addr64(v104, v105));
   v108 = (int32_t)v106 >> 31;
@@ -177,11 +177,11 @@ do {
   v117 = !b32 ? (v116 - v24) : v116;
   if (!b31) v117 = -v117;
   v118 = !b8 ? v34 : v117;
-  b33 = carry_u32_add3(v118, ConstMem(0, 352), 0);
-  v119 = v118 + ConstMem(0, 352);
+  b33 = carry_u32_add3(v118, c[0x0][0x160], 0);
+  v119 = v118 + c[0x0][0x160];
   v120 = v75 + v14 + v13;
   v121 = (int32_t)v120 >> 31;
-  v122 = lea_hi_x_sx32(v118, ConstMem(0, 356), 1, b33);
+  v122 = lea_hi_x_sx32(v118, c[0x0][0x164], 1, b33);
   v123 = hi32(v121 + (v120 << 8));
   v124 = *((uint8_t*)addr64(v119, v122));
   v125 = v123 & 4294967040;
@@ -202,11 +202,11 @@ do {
   v17 = !b4 ? (v132 - v24) : v132;
   if (!b3) v17 = -v17;
   v133 = !b8 ? v34 : v17;
-  b35 = carry_u32_add3(v133, ConstMem(0, 352), 0);
-  v134 = v133 + ConstMem(0, 352);
+  b35 = carry_u32_add3(v133, c[0x0][0x160], 0);
+  v134 = v133 + c[0x0][0x160];
   v135 = v92 + v15 + v131;
   v136 = (int32_t)v135 >> 31;
-  v137 = lea_hi_x_sx32(v133, ConstMem(0, 356), 1, b35);
+  v137 = lea_hi_x_sx32(v133, c[0x0][0x164], 1, b35);
   v138 = hi32(v136 + (v135 << 8));
   v139 = *((uint8_t*)addr64(v134, v137));
   v140 = v138 & 4294967040;
@@ -247,25 +247,25 @@ do {
 __syncthreads();
 if (b2) return;
 // 20 phi node(s) omitted [BB6]
-v154 = ConstMem(0, 384);
+v154 = c[0x0][0x180];
 if (!(b36)) return;
   v155 = v154 - 1;
   u2 = 0;
   v156 = v154 & 3;
-  v157 = v154 * ConstMem(0, 388);
+  v157 = v154 * c[0x0][0x184];
   b37 = v155 >= 3;
   v158 = 0;
   b38 = v156 != 0;
   v159 = 0;
 if (v155 >= 3) {
-  v14 = v1 * ConstMem(0, 384);
+  v14 = v1 * c[0x0][0x180];
   v21 = v156 - ConstMem(0, 384);
   v158 = 0;
-  u3 = ConstMem(0, 368);
-  u4 = ConstMem(0, 372);
+  u3 = c[0x0][0x170];
+  u4 = c[0x0][0x174];
   v6 = v14 + 3;
-  u5 = ConstMem(0, 376);
-  u6 = ConstMem(0, 380);
+  u5 = c[0x0][0x178];
+  u6 = c[0x0][0x17c];
   v13 = (int32_t)v14 >> 31;
 }
 do {
@@ -379,14 +379,14 @@ do {
 } while(b37);
 if (!(b38)) return;
 // 28 phi node(s) omitted [BB11]
-v209 = v1 * ConstMem(0, 384) + v158;
-b45 = carry_u32_add3(v209, ConstMem(0, 376), 0);
-v210 = v209 + ConstMem(0, 376);
-b46 = carry_u32_add3(v209, ConstMem(0, 368), 0);
-v211 = v209 + ConstMem(0, 368);
+v209 = v1 * c[0x0][0x180] + v158;
+b45 = carry_u32_add3(v209, c[0x0][0x178], 0);
+v210 = v209 + c[0x0][0x178];
+b46 = carry_u32_add3(v209, c[0x0][0x170], 0);
+v211 = v209 + c[0x0][0x170];
 v212 = (int32_t)v209 >> 31;
-v213 = v212 + ConstMem(0, 380) + (b45 ? 1 : 0);
-v214 = v212 + ConstMem(0, 372) + (b46 ? 1 : 0);
+v213 = v212 + c[0x0][0x17c] + (b45 ? 1 : 0);
+v214 = v212 + c[0x0][0x174] + (b46 ? 1 : 0);
 do {
   b47 = (int32_t)(v209) >= (int32_t)(v157);
   if (!b47) v215 = v211;

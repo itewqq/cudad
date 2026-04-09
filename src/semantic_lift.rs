@@ -1762,6 +1762,8 @@ fn lift_ir_expr(expr: &IRExpr, stmt_ref: StatementRef, config: &SemanticLiftConf
                     if let Some(sym) = resolve_constmem_symbol(stmt_ref, bank, offset, config) {
                         return LiftedExpr::Raw(sym);
                     }
+                    // Render unresolved constant memory in hex (SASS convention).
+                    return LiftedExpr::Raw(format!("c[0x{:x}][0x{:x}]", bank, offset));
                 }
             }
             LiftedExpr::Raw(render_expr_raw(expr, stmt_ref, config))
@@ -2163,7 +2165,7 @@ mod tests {
                 def_idx: 0,
             })
             .expect("expected lifted IMAD.WIDE");
-        assert_eq!(lifted.rhs.render(), "R27.0 * R2.0 + ConstMem(0, 360)");
+        assert_eq!(lifted.rhs.render(), "R27.0 * R2.0 + c[0x0][0x168]");
     }
 
     #[test]
@@ -2181,7 +2183,7 @@ mod tests {
                 def_idx: 0,
             })
             .expect("expected lifted LEA");
-        assert_eq!(lifted.rhs.render(), "R0.0 + (ConstMem(0, 368) << 2)");
+        assert_eq!(lifted.rhs.render(), "R0.0 + (c[0x0][0x170] << 2)");
     }
 
     #[test]
@@ -2237,7 +2239,7 @@ mod tests {
             .expect("expected lifted LEA.HI.X");
         assert_eq!(
             lifted.rhs.render(),
-            "lea_hi_x_sx32(R6.0, ConstMem(0, 356), 1, P2.0)"
+            "lea_hi_x_sx32(R6.0, c[0x0][0x164], 1, P2.0)"
         );
     }
 
@@ -2491,7 +2493,7 @@ mod tests {
                 def_idx: 0,
             })
             .expect("expected lifted ULDC.64");
-        assert_eq!(lifted_lo.rhs.render(), "ConstMem(0, 280)");
+        assert_eq!(lifted_lo.rhs.render(), "c[0x0][0x118]");
         let lifted_hi = out
             .by_def
             .get(&DefRef {
@@ -2500,7 +2502,7 @@ mod tests {
                 def_idx: 1,
             })
             .expect("expected lifted ULDC.64 high half");
-        assert_eq!(lifted_hi.rhs.render(), "ConstMem(0, 284)");
+        assert_eq!(lifted_hi.rhs.render(), "c[0x0][0x11c]");
     }
 
     #[test]
@@ -2520,7 +2522,7 @@ mod tests {
                 def_idx: 0,
             })
             .expect("expected lifted LDCU.64 low half");
-        assert_eq!(lifted_lo.rhs.render(), "ConstMem(0, 856)"); // 0x358
+        assert_eq!(lifted_lo.rhs.render(), "c[0x0][0x358]");
         let lifted_hi = out
             .by_def
             .get(&DefRef {
@@ -2529,7 +2531,7 @@ mod tests {
                 def_idx: 1,
             })
             .expect("expected lifted LDCU.64 high half");
-        assert_eq!(lifted_hi.rhs.render(), "ConstMem(0, 860)"); // 0x35c
+        assert_eq!(lifted_hi.rhs.render(), "c[0x0][0x35c]");
     }
 
     #[test]
@@ -2544,10 +2546,10 @@ mod tests {
         "#;
         let out = run_lift(sass);
         let expected = [
-            (0, "ConstMem(0, 896)"),  // 0x380
-            (1, "ConstMem(0, 900)"),  // 0x384
-            (2, "ConstMem(0, 904)"),  // 0x388
-            (3, "ConstMem(0, 908)"),  // 0x38c
+            (0, "c[0x0][0x380]"),
+            (1, "c[0x0][0x384]"),
+            (2, "c[0x0][0x388]"),
+            (3, "c[0x0][0x38c]"),
         ];
         for (def_idx, want) in expected {
             let lifted = out
