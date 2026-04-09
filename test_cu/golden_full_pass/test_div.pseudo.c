@@ -67,12 +67,12 @@ void kernel(int32_t arg0, int32_t arg1, uint32_t arg2, uint32_t arg3) {
   v5 = f2i_trunc_u32_ftz_ntz(v4);
   v6 = 0;
   v7 = -v5;
-  v8 = v7 * v1 + 0;
+  v8 = v7 * v1;
   v9 = abs(arg0);
   v10 = mul_hi_u32(v5, v8) + v6;
   v11 = arg2;
   v12 = mul_hi_u32(v10, v9);
-  v13 = -v12 + 0 + 0;
+  v13 = -v12;
   v14 = v1 * v13 + v9;
   b1 = v1 > v14;
   v15 = !b1 ? (v14 - v1) : v14;
@@ -82,7 +82,7 @@ void kernel(int32_t arg0, int32_t arg1, uint32_t arg2, uint32_t arg3) {
   v17 = b3 ? (v16 + 1) : v16;
   v18 = v17;
   v19 = arg3;
-  v20 = !b0 ? (-v18 + 0 + 0) : v18;
+  v20 = !b0 ? (-v18) : v18;
   v21 = !b2 ? (~arg1) : v20;
   *addr64(v11, v19) = v21;
   return;

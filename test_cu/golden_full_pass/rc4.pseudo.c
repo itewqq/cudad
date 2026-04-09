@@ -362,7 +362,7 @@ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8_t* arg6_pt
     v8 = f2i_trunc_u32_ftz_ntz(v7);
     v9 = 0;
     v10 = -v8;
-    v11 = v10 * v3 + 0;
+    v11 = v10 * v3;
     tid_x = 0;
     v12 = mul_hi_u32(v8, v11) + v9;
   }
@@ -394,7 +394,7 @@ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8_t* arg6_pt
     v39 = -v31;
     v40 = tid_x + 1;
     v41 = 0;
-    v42 = v39 * v24 + 0;
+    v42 = v39 * v24;
     v43 = abs(v40);
     b10 = (int32_t)(v40) >= (int32_t)(0);
     v12 = mul_hi_u32(v31, v42) + v41;
@@ -631,13 +631,13 @@ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8_t* arg6_pt
     v155 = v154 - 1;
     u2 = 0;
     v156 = v154 & 3;
-    v157 = v154 * arg9 + 0;
+    v157 = v154 * arg9;
     b37 = v155 >= 3;
     v158 = 0;
     b38 = v156 != 0;
     v159 = 0;
   if (v155 >= 3) {
-    v14 = ctaid_x * arg8 + 0;
+    v14 = ctaid_x * arg8;
     v21 = v156 - arg8;
     v158 = 0;
     arg4_ptr_lo32 = arg4_ptr.lo32;
@@ -739,9 +739,9 @@ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8_t* arg6_pt
     b39 = carry_u32_add3(arg4_ptr_lo32, 4, 0);
     arg4_ptr_lo32 = arg4_ptr_lo32 + 4;
     v204 = (int32_t)v203 >> 31;
-    arg6_ptr_hi32 = 0 + arg6_ptr_hi32 + (b40 ? 1 : 0);
+    arg6_ptr_hi32 = arg6_ptr_hi32 + (b40 ? 1 : 0);
     v6 = v6 + 4;
-    arg4_ptr_hi32 = 0 + arg4_ptr_hi32 + (b39 ? 1 : 0);
+    arg4_ptr_hi32 = arg4_ptr_hi32 + (b39 ? 1 : 0);
     v205 = hi32(v204 + (v203 << 8));
     v17 = v205 & 4294967040;
     v159 = v203 - v17;

@@ -285,7 +285,8 @@ fn emit_struct_code(cfg: &ControlFlowGraph, args: &Args, abi_profile: Option<Abi
     if args.abi_map {
         print_abi_summary(&abi_annotations, &abi_aliases);
     }
-    if args.typed_decls {
+    // Only print typed signature summary if --abi-map didn't already print the aliases.
+    if args.typed_decls && !args.abi_map {
         if let Some(aliases) = &abi_aliases {
             if !aliases.is_empty() {
                 println!("// Typed signature inferred from ABI aliases:");

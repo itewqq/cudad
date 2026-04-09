@@ -1512,6 +1512,13 @@ fn signed_cast(expr: LiftedExpr) -> LiftedExpr {
 }
 
 fn add_like_expr(lhs: LiftedExpr, rhs: LiftedExpr) -> LiftedExpr {
+    // Fold `x + 0` → `x` and `0 + x` → `x`.
+    if matches!(&rhs, LiftedExpr::Imm(s) if s == "0") {
+        return lhs;
+    }
+    if matches!(&lhs, LiftedExpr::Imm(s) if s == "0") {
+        return rhs;
+    }
     if let Some((is_neg, mag)) = rhs_signed_imm(&rhs) {
         if is_neg {
             return LiftedExpr::Binary {
@@ -1541,6 +1548,18 @@ fn rhs_signed_imm(rhs: &LiftedExpr) -> Option<(bool, String)> {
     };
     if let Some(rest) = text.strip_prefix('-') {
         return Some((true, rest.to_string()));
+    }
+    // Detect large unsigned values that represent negative 32-bit integers.
+    // If the value fits in i64 and its low 32 bits are negative when interpreted
+    // as i32, display as subtraction (e.g., 4294966784 → -512).
+    if let Ok(v) = text.parse::<i64>() {
+        let as_u32 = v as u32;
+        let as_i32 = as_u32 as i32;
+        if v == as_u32 as i64 && as_i32 < 0 && as_i32 > i32::MIN / 2 {
+            // The value is the unsigned representation of a small negative number.
+            let mag = (-(as_i32 as i64)).to_string();
+            return Some((true, mag));
+        }
     }
     Some((false, text.clone()))
 }
