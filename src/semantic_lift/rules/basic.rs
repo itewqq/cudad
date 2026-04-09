@@ -43,7 +43,7 @@ pub(super) fn register(registry: &mut RuleRegistry) {
         None
     });
     registry.register("IMAD", "imad_generic", |sig, args, stmt_ref, config| {
-        if sig.raw_opcode == "IMAD" {
+        if sig.raw_opcode == "IMAD" || sig.raw_opcode == "IMAD.U32" {
             return lift_imad(args, stmt_ref, config);
         }
         None
@@ -75,17 +75,21 @@ pub(super) fn register(registry: &mut RuleRegistry) {
     registry.register("IABS", "iabs", |_, args, stmt_ref, config| {
         lift_iabs(args, stmt_ref, config)
     });
-    registry.register("I2F", "i2f_rp", |sig, args, stmt_ref, config| {
-        if sig.raw_opcode.starts_with("I2F.RP") {
-            return lift_i2f_rp(args, stmt_ref, config);
-        }
-        None
+    registry.register("I2F", "i2f", |sig, args, stmt_ref, config| {
+        // I2F converts integer to float.  Any variant gets a (float) cast.
+        lift_unary_intrinsic("(float)", args, stmt_ref, config)
     });
-    registry.register("F2I", "f2i_trunc_u32_ftz_ntz", |sig, args, stmt_ref, config| {
-        if sig.raw_opcode.starts_with("F2I.FTZ.U32.TRUNC.NTZ") {
-            return lift_unary_intrinsic("f2i_trunc_u32_ftz_ntz", args, stmt_ref, config);
+    registry.register("I2FP", "i2fp", |sig, args, stmt_ref, config| {
+        // I2FP is the SM100+ variant of I2F.
+        lift_unary_intrinsic("(float)", args, stmt_ref, config)
+    });
+    registry.register("F2I", "f2i", |sig, args, stmt_ref, config| {
+        // F2I converts float to integer.  Render as (uint32_t) or (int32_t) cast.
+        if sig.raw_opcode.contains(".U32") {
+            lift_unary_intrinsic("(uint32_t)", args, stmt_ref, config)
+        } else {
+            lift_unary_intrinsic("(int32_t)", args, stmt_ref, config)
         }
-        None
     });
     registry.register("MUFU", "mufu_rcp", |sig, args, stmt_ref, config| {
         if sig.raw_opcode.starts_with("MUFU.RCP") {

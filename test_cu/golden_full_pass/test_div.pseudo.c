@@ -52,11 +52,11 @@ __global__ void kernel(int32_t arg0, int32_t arg1, uint32_t arg2, uint32_t arg3)
   u0 = arg0;
   u1 = arg1;
   u2 = u0 ^ u1;
-  v2 = i2f_rp(v1);
+  v2 = (float)(v1);
   b0 = (int32_t)(0) <= (int32_t)(u2);
   v3 = rcp_approx(v2);
   v4 = v3 + 268435454;
-  v5 = f2i_trunc_u32_ftz_ntz(v4);
+  v5 = (uint32_t)(v4);
   v7 = -v5;
   v8 = v7 * v1;
   v9 = abs(arg0);

@@ -17,10 +17,10 @@ if (!((int32_t)(v2) > (int32_t)(255))) {
 if (!(b2)) {
   v3 = abs(c[0x0][0x168]);
   v4 = 0;
-  v5 = i2f_rp(v3);
+  v5 = (float)(v3);
   v6 = rcp_approx(v5);
   v7 = v6 + 268435454;
-  v8 = f2i_trunc_u32_ftz_ntz(v7);
+  v8 = (uint32_t)(v7);
   v9 = 0;
   v10 = -v8;
   v11 = v10 * v3;
@@ -33,7 +33,7 @@ do {
   v24 = abs(c[0x0][0x168]);
   b5 = (int32_t)(v2) >= (int32_t)(0);
   v25 = mul_hi_u32(v12, v22);
-  v26 = i2f_rp(v24);
+  v26 = (float)(v24);
   v25 = -v25;
   v27 = v24 * v25 + v22;
   b6 = v3 > v27;
@@ -41,7 +41,7 @@ do {
   v29 = !b6 ? (v27 - v24) : v27;
   b7 = v3 > v29;
   v30 = v28 + 268435454;
-  v31 = f2i_trunc_u32_ftz_ntz(v30);
+  v31 = (uint32_t)(v30);
   v32 = !b7 ? (v29 - v24) : v29;
   b8 = 0 != c[0x0][0x168];
   v33 = v32;

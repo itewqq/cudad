@@ -1483,12 +1483,12 @@ fn lift_lea_hi(
 fn cmp_token_to_op(opcode: &str) -> Option<&'static str> {
     for tok in opcode.split('.') {
         let op = match tok {
-            "EQ" => "==",
-            "NE" => "!=",
-            "LT" => "<",
-            "LE" => "<=",
-            "GT" => ">",
-            "GE" => ">=",
+            "EQ" | "EQU" => "==",
+            "NE" | "NEU" => "!=",
+            "LT" | "LTU" => "<",
+            "LE" | "LEU" => "<=",
+            "GT" | "GTU" => ">",
+            "GE" | "GEU" => ">=",
             _ => continue,
         };
         return Some(op);
@@ -2462,7 +2462,7 @@ mod tests {
                 def_idx: 0,
             })
             .expect("expected lifted I2F.RP");
-        assert_eq!(lifted.rhs.render(), "i2f_rp(R3.0)");
+        assert_eq!(lifted.rhs.render(), "(float)(R3.0)");
     }
 
     #[test]
@@ -2480,7 +2480,7 @@ mod tests {
                 def_idx: 0,
             })
             .expect("expected lifted F2I.FTZ.U32.TRUNC.NTZ");
-        assert_eq!(lifted.rhs.render(), "f2i_trunc_u32_ftz_ntz(R7.0)");
+        assert_eq!(lifted.rhs.render(), "(uint32_t)(R7.0)");
     }
 
     #[test]
