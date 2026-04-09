@@ -72,7 +72,7 @@ fn infer_self_contained_locals(
 ) -> Vec<String> {
     let ident_re = Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").expect("valid regex");
     let temp_re = Regex::new(
-        r"\b(?:v\d+|u\d+|b\d+|abi_internal_0x[0-9A-Fa-f]+|arg\d+_(?:ptr_)?(?:lo32|hi32|word\d+)(?:_\d+)?|tid_[xyz](?:_\d+)?|ctaid_[xyz](?:_\d+)?)\b",
+        r"\b(?:v\d+|u\d+|b\d+|abi_internal_0x[0-9A-Fa-f]+|arg\d+_(?:ptr_)?(?:lo32|hi32|word\d+)(?:_\d+)?|tid_[xyz](?:_\d+)?|ctaid_[xyz](?:_\d+)?|param_\d+)\b",
     )
     .expect("valid regex");
     let assign_re = Regex::new(
@@ -134,6 +134,9 @@ fn infer_self_contained_locals(
     let mut out = Vec::<String>::new();
     if code_output.contains("shmem_u8[") && !declared.contains("shmem_u8") {
         out.push("__shared__ uint8_t shmem_u8[256];".to_string());
+    }
+    if code_output.contains("shmem[") && !declared.contains("shmem") {
+        out.push("__shared__ uint32_t shmem[];".to_string());
     }
     for name in ordered {
         let is_bool = name.starts_with('b')
