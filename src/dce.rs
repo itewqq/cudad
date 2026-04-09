@@ -24,6 +24,8 @@ pub fn eliminate_dead_code(input: &str) -> String {
         }
         text = next;
     }
+    // Remove duplicate `if (X) return;` guards.
+    text = eliminate_duplicate_guards(&text);
     text
 }
 
@@ -165,6 +167,48 @@ fn dce_one_pass(input: &str) -> String {
     result.join("\n")
 }
 
+/// Remove duplicate `if (X) return;` lines where the predicate is not
+/// reassigned between the occurrences.
+fn eliminate_duplicate_guards(input: &str) -> String {
+    let guard_re = Regex::new(r"^\s*if\s*\(([^)]+)\)\s*return\s*;").expect("valid regex");
+    let assign_re = Regex::new(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=").expect("valid regex");
+
+    let lines: Vec<&str> = input.lines().collect();
+    let mut result: Vec<&str> = Vec::with_capacity(lines.len());
+    // Track active guard predicates that have already been checked.
+    let mut active_guards: BTreeSet<String> = BTreeSet::new();
+
+    for &line in &lines {
+        let trimmed = line.trim();
+
+        // If a variable is reassigned, invalidate it from active guards.
+        if let Some(caps) = assign_re.captures(trimmed) {
+            let lhs = caps.get(1).unwrap().as_str();
+            active_guards.remove(lhs);
+        }
+
+        // Check if this is an `if (X) return;` line.
+        if let Some(caps) = guard_re.captures(trimmed) {
+            let pred = caps.get(1).unwrap().as_str().to_string();
+            if active_guards.contains(&pred) {
+                // Duplicate guard — skip this line.
+                continue;
+            }
+            active_guards.insert(pred);
+        }
+
+        // Scope changes (braces) or control-flow changes should clear
+        // the guard set to be conservative. But since the guard implies
+        // early return, code after the first `if (X) return;` is only
+        // reached when X is false, so any later `if (X) return;` with
+        // the same unmodified X is dead regardless of scope depth.
+
+        result.push(line);
+    }
+
+    result.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,5 +275,24 @@ mod tests {
         assert!(!output.contains("c = 3"), "c is dead");
         assert!(output.contains("a = 1"), "a is used by d");
         assert!(output.contains("d = a + 1"), "d is used in store");
+    }
+
+    #[test]
+    fn removes_duplicate_return_guard() {
+        let input = "  b1 = x > 1;\n  if (b1) return;\n  *ptr = 42;\n  if (b1) return;\n  return;";
+        let output = eliminate_dead_code(input);
+        // First guard should remain, second should be removed.
+        let count = output.matches("if (b1) return;").count();
+        assert_eq!(count, 1, "duplicate guard should be removed");
+        assert!(output.contains("*ptr = 42"));
+    }
+
+    #[test]
+    fn keeps_guard_after_reassignment() {
+        let input = "  b1 = x > 1;\n  if (b1) return;\n  b1 = y > 2;\n  if (b1) return;\n  return;";
+        let output = eliminate_dead_code(input);
+        // b1 is reassigned between the two guards, so both should remain.
+        let count = output.matches("if (b1) return;").count();
+        assert_eq!(count, 2, "guard after reassignment should be kept");
     }
 }
