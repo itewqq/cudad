@@ -347,7 +347,9 @@ fn emit_struct_code(cfg: &ControlFlowGraph, args: &Args, abi_profile: Option<Abi
             emit_phi_merge_comments: args.phi_merge_comments,
             semantic_symbolization: args.semantic_symbolize,
         };
-        recover_structured_output_names(&fir, &code_output, &recover_cfg).output
+        let raw = recover_structured_output_names(&fir, &code_output, &recover_cfg).output;
+        // Dead-code elimination: remove assignments whose LHS is never used.
+        eliminate_dead_code(&raw)
     } else {
         code_output
     };

@@ -23,13 +23,9 @@
 // param_6 -> arg6 (word32, confidence: low, words: {0})
 // param_7 -> arg7 (word32, confidence: low, words: {0})
 void kernel(uint32_t arg0, uint32_t arg2, uintptr_t arg4_ptr, uint32_t arg6, uint32_t arg7) {
-  uint32_t v0;
-  uint32_t abi_internal_0x28; // live-in
   uint32_t v3;
   bool b0; // live-in
   uint32_t v4;
-  uint32_t u0;
-  uint32_t u1;
   uint32_t v5;
   uint32_t v6;
   uint32_t v7;
@@ -120,14 +116,11 @@ void kernel(uint32_t arg0, uint32_t arg2, uintptr_t arg4_ptr, uint32_t arg6, uin
   uint32_t v61;
   uint32_t v62;
 
-  v0 = abi_internal_0x28;
   ctaid_x = blockIdx.x;
   tid_x = threadIdx.x;
   v3 = ctaid_x * blockDimX + tid_x;
   if (b0) return;
     v4 = 4;
-    u0 = c[0x0][0x118];
-    u1 = c[0x0][0x11c];
     v5 = v3 * v4 + arg0;
     v6 = v3 * v4 + arg2;
     v7 = *addr64(v5, v8);

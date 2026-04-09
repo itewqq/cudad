@@ -20,16 +20,12 @@
 // param_2 -> arg2 (word32, confidence: low, words: {0})
 // param_3 -> arg3 (word32, confidence: low, words: {0})
 void kernel(int32_t arg0, int32_t arg1, uint32_t arg2, uint32_t arg3) {
-  uint32_t v0;
-  uint32_t abi_internal_0x28; // live-in
   uint32_t v1;
   uint32_t u0;
   uint32_t u1;
   uint32_t u2;
   uint32_t v2;
   bool b0;
-  uint32_t u3;
-  uint32_t u4;
   uint32_t v3;
   uint32_t v4;
   uint32_t v5;
@@ -53,15 +49,12 @@ void kernel(int32_t arg0, int32_t arg1, uint32_t arg2, uint32_t arg3) {
   uint32_t v20;
   uint32_t v21;
 
-  v0 = abi_internal_0x28;
   v1 = abs(arg1);
   u0 = arg0;
   u1 = arg1;
   u2 = u0 ^ u1;
   v2 = i2f_rp(v1);
   b0 = (int32_t)(0) <= (int32_t)(u2);
-  u3 = c[0x0][0x118];
-  u4 = c[0x0][0x11c];
   v3 = rcp_approx(v2);
   v4 = v3 + 268435454;
   v5 = f2i_trunc_u32_ftz_ntz(v4);

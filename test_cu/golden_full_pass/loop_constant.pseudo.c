@@ -10,22 +10,12 @@
 // param_9 -> arg9 (word32, confidence: low, words: {0})
 void kernel(uint32_t arg9) {
   __shared__ uint8_t shmem_u8[256];
-  uint32_t v0;
-  uint32_t abi_internal_0x28; // live-in
   bool b0; // live-in
-  uint32_t u0;
-  uint32_t u1;
   bool b1;
-  bool b2;
 
-  v0 = abi_internal_0x28;
-  ctaid_x = blockIdx.x;
   if (b0) return;
     tid_x = threadIdx.x;
-    u0 = c[0x0][0x118];
-    u1 = c[0x0][0x11c];
     b1 = (int32_t)(tid_x) > (int32_t)(255);
-    b2 = tid_x != 0;
   if (!((int32_t)(tid_x) > (int32_t)(255))) {
     do {
       shmem_u8[tid_x] = tid_x;

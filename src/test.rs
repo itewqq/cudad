@@ -739,17 +739,20 @@ fn run_structured_output_full_pass(sass: &str) -> String {
         };
         let lifted = lift_function_ir(&fir, &lift_cfg);
         let code_output = structurizer.pretty_print_with_lift(&tree, display_ctx, 0, Some(&lifted));
-        let recovered_output = recover_structured_output_names(
-            &fir,
-            &code_output,
-            &NameRecoveryConfig {
-                style: NameStyle::Temp,
-                rewrite_control_predicates: true,
-                emit_phi_merge_comments: true,
-                semantic_symbolization: true,
-            },
-        )
-        .output;
+        let recovered_output = {
+            let raw = recover_structured_output_names(
+                &fir,
+                &code_output,
+                &NameRecoveryConfig {
+                    style: NameStyle::Temp,
+                    rewrite_control_predicates: true,
+                    emit_phi_merge_comments: true,
+                    semantic_symbolization: true,
+                },
+            )
+            .output;
+            eliminate_dead_code(&raw)
+        };
         let final_output = render_typed_structured_output_for_test(
             &recovered_output,
             abi_aliases.as_ref(),

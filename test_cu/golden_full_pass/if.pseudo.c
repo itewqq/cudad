@@ -14,7 +14,6 @@ void kernel(uint32_t arg2) {
   uint32_t v3; // live-in
 
     v0 = abi_internal_0x28;
-    tid_x = threadIdx.x;
   if (b0) {
     v0 = v0 + 1;
   } else {
