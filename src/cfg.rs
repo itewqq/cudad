@@ -63,7 +63,7 @@ pub fn build_cfg(mut instrs: Vec<Instruction>) -> ControlFlowGraph {
 
     // -- build graph nodes --
     let mut g: ControlFlowGraph = Graph::new();
-    let mut addr2node = std::collections::HashMap::<u32, NodeIndex>::new();
+    let mut addr2node = std::collections::BTreeMap::<u32, NodeIndex>::new();
     for bb in blocks { let idx = g.add_node(bb); addr2node.insert(g[idx].start, idx); }
 
     // -- edges --
@@ -91,7 +91,8 @@ pub fn build_cfg(mut instrs: Vec<Instruction>) -> ControlFlowGraph {
         let unconditional_term = matches!(last.opcode.as_str(), "RET" | "EXIT") && last.pred.is_none();
         let unconditional_jump = matches!(last.opcode.as_str(), "BRA" | "JMP" | "JMPP") && last.pred.is_none();
         if !(unconditional_term || unconditional_jump) {
-            if let Some((&_next_addr, &nidx)) = addr2node.iter().filter(|(&a, _)| a > bb_start).min_by_key(|(&a, _)| a) {
+            use std::ops::Bound::{Excluded, Unbounded};
+            if let Some((&_next_addr, &nidx)) = addr2node.range((Excluded(bb_start), Unbounded)).next() {
                 if g.find_edge(idx, nidx).is_none() {
                     g.update_edge(idx, nidx, EdgeKind::FallThrough);
                 }
