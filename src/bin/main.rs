@@ -399,7 +399,18 @@ void kernel(void) {\n\
 // ---------------------------------------------------------------------------
 
 fn main() {
-    let args = Args::parse();
+    let mut args = Args::parse();
+
+    // Default to full decompilation when no mode flag is given.
+    if !args.cfg_dot && !args.ssa_dot && !args.struct_code {
+        args.struct_code = true;
+        args.abi_map = true;
+        args.semantic_lift = true;
+        args.typed_decls = true;
+        args.recover_names = true;
+        args.semantic_symbolize = true;
+    }
+
     let sass = load_sass(args.input.as_deref());
     let instrs = parse_sass(&sass);
     let sm_version = parse_sm_version(&sass);
