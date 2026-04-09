@@ -72,7 +72,7 @@ fn infer_self_contained_locals(
 ) -> Vec<String> {
     let ident_re = Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").expect("valid regex");
     let temp_re = Regex::new(
-        r"\b(?:v\d+|u\d+|b\d+|abi_internal_0x[0-9A-Fa-f]+|arg\d+_ptr_(?:lo32|hi32)|arg\d+_word\d+)\b",
+        r"\b(?:v\d+|u\d+|b\d+|abi_internal_0x[0-9A-Fa-f]+|arg\d+_(?:ptr_)?(?:lo32|hi32|word\d+)(?:_\d+)?|tid_[xyz](?:_\d+)?|ctaid_[xyz](?:_\d+)?)\b",
     )
     .expect("valid regex");
     let assign_re = Regex::new(
