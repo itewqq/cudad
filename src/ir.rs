@@ -750,11 +750,11 @@ fn compute_df(cfg:&ControlFlowGraph,idom:&BTreeMap<NodeIndex,NodeIndex>, root: N
     {
         if let Some(ch)=child.get(&n){ for &c in ch{ up(c,child,df,idom); } }
         for &c in child.get(&n).unwrap_or(&Vec::new()){
-            let set=df.entry(c).or_default().clone();
-            for w in set{
-                if idom.get(&w).copied()!=Some(n){
-                    df.entry(n).or_default().insert(w);
-                }
+            let propagate: Vec<NodeIndex> = df.get(&c)
+                .map(|s| s.iter().copied().filter(|w| idom.get(w).copied() != Some(n)).collect())
+                .unwrap_or_default();
+            for w in propagate {
+                df.entry(n).or_default().insert(w);
             }
         }
     }
