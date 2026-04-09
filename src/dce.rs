@@ -16,6 +16,8 @@ use std::collections::{BTreeSet, HashMap};
 /// Returns the cleaned output with dead assignments removed.
 pub fn eliminate_dead_code(input: &str) -> String {
     let mut text = input.to_string();
+    // CSE: unify redundant loads of the same pure expression.
+    text = eliminate_common_subexpressions(&text);
     // Iterate to fixpoint — removing one line may make another variable dead.
     loop {
         let next = dce_one_pass(&text);
@@ -167,6 +169,100 @@ fn dce_one_pass(input: &str) -> String {
     result.join("\n")
 }
 
+/// Text-level common-subexpression elimination.
+///
+/// When `X = <pure_rhs>;` and later `Y = <pure_rhs>;` appear (same RHS string),
+/// and X has not been reassigned between the two, replace all uses of Y with X
+/// and remove the Y assignment.
+///
+/// Only applies to "kernel-constant" RHS expressions:
+/// - Special registers: `threadIdx.x`, `blockIdx.x`, `blockDimX`, `cgaCtaId`
+/// - ABI constants: `abi_internal_0x*`, `c[0x*][0x*]`
+/// - Argument components: `arg*_ptr.lo32`, `arg*_ptr.hi32`, `arg*`
+/// - Explicit parameters: `param_*`
+fn eliminate_common_subexpressions(input: &str) -> String {
+    let assign_re =
+        Regex::new(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+);$").expect("valid regex");
+    let ident_re = Regex::new(r"\b([A-Za-z_][A-Za-z0-9_]*)\b").expect("valid regex");
+
+    // These RHS patterns are guaranteed kernel-constant (same value throughout).
+    let constant_rhs_re = Regex::new(
+        r"^(?:threadIdx\.[xyz]|blockIdx\.[xyz]|blockDimX|blockDimY|blockDimZ|gridDimX|gridDimY|gridDimZ|cgaCtaId|laneId|abi_internal_0x[0-9A-Fa-f]+|c\[0x[0-9a-f]+\]\[0x[0-9a-f]+\]|arg\d+_ptr\.(?:lo32|hi32)|arg\d+_word\d+\.(?:lo32|hi32)|arg\d+|param_\d+)$",
+    )
+    .expect("valid regex");
+
+    let lines: Vec<&str> = input.lines().collect();
+
+    // First pass: count how many times each variable appears as an LHS.
+    let mut lhs_count: HashMap<String, usize> = HashMap::new();
+    for &line in &lines {
+        let trimmed = line.trim();
+        if let Some(caps) = assign_re.captures(trimmed) {
+            let lhs = caps.get(1).unwrap().as_str().to_string();
+            *lhs_count.entry(lhs).or_insert(0) += 1;
+        }
+    }
+
+    // Second pass: find all assignments of constant RHS and build a rename map.
+    // For each constant RHS, keep the first variable that was assigned to it.
+    let mut rhs_to_first_var: HashMap<String, String> = HashMap::new();
+    // Map from variable name to what it should be renamed to.
+    let mut rename_map: HashMap<String, String> = HashMap::new();
+    // Track lines to remove (index).
+    let mut lines_to_remove: BTreeSet<usize> = BTreeSet::new();
+
+    for (line_idx, &line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+
+        if let Some(caps) = assign_re.captures(trimmed) {
+            let lhs = caps.get(1).unwrap().as_str().to_string();
+            let rhs = caps.get(2).unwrap().as_str().trim().to_string();
+
+            if constant_rhs_re.is_match(&rhs) {
+                // Only CSE if:
+                // 1. The anchor variable (first_var) is never reassigned
+                // 2. The variable being renamed (lhs) is never reassigned
+                let lhs_is_single_def = lhs_count.get(&lhs).copied().unwrap_or(0) == 1;
+                if let Some(first_var) = rhs_to_first_var.get(&rhs) {
+                    let anchor_is_single_def =
+                        lhs_count.get(first_var).copied().unwrap_or(0) == 1;
+                    if anchor_is_single_def && lhs_is_single_def && lhs != *first_var {
+                        rename_map.insert(lhs.clone(), first_var.clone());
+                        lines_to_remove.insert(line_idx);
+                        continue;
+                    }
+                } else if lhs_is_single_def {
+                    rhs_to_first_var.insert(rhs, lhs.clone());
+                }
+            }
+        }
+    }
+
+    if rename_map.is_empty() {
+        return input.to_string();
+    }
+
+    // Second pass: apply the rename map and remove redundant lines.
+    let mut result = Vec::with_capacity(lines.len());
+    for (line_idx, &line) in lines.iter().enumerate() {
+        if lines_to_remove.contains(&line_idx) {
+            continue;
+        }
+        // Apply renames in this line.
+        let new_line = ident_re.replace_all(line, |caps: &regex::Captures| {
+            let name = caps.get(1).unwrap().as_str();
+            if let Some(replacement) = rename_map.get(name) {
+                replacement.clone()
+            } else {
+                name.to_string()
+            }
+        });
+        result.push(new_line.into_owned());
+    }
+
+    result.join("\n")
+}
+
 /// Remove duplicate `if (X) return;` lines where the predicate is not
 /// reassigned between the occurrences.
 fn eliminate_duplicate_guards(input: &str) -> String {
@@ -294,5 +390,23 @@ mod tests {
         // b1 is reassigned between the two guards, so both should remain.
         let count = output.matches("if (b1) return;").count();
         assert_eq!(count, 2, "guard after reassignment should be kept");
+    }
+
+    #[test]
+    fn cse_unifies_redundant_blockdimx() {
+        let input = "  u5 = blockDimX;\n  v15 = blockDimX;\n  v1 = u5 + v15;\n  *ptr = v1;";
+        let output = eliminate_dead_code(input);
+        // v15 should be renamed to u5.
+        assert!(!output.contains("v15"), "v15 should be unified with u5");
+        assert!(output.contains("u5 = blockDimX"));
+        assert!(output.contains("v1 = u5 + u5"));
+    }
+
+    #[test]
+    fn cse_does_not_unify_reassigned_var() {
+        let input = "  x = blockDimX;\n  x = 42;\n  y = blockDimX;\n  *ptr = y;";
+        let output = eliminate_dead_code(input);
+        // x is reassigned, so y should NOT be renamed to x.
+        assert!(output.contains("y = blockDimX"), "y must remain since x is reassigned");
     }
 }
