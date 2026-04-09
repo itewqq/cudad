@@ -10,9 +10,10 @@ It currently emphasizes:
 
 - stable parse/CFG/SSA construction,
 - conservative structurization,
-- optional semantic lifting and name recovery,
-- ABI-aware display/declaration inference,
-- golden-based regression testing.
+- semantic lifting with a rule-registry pattern for SASS opcodes,
+- name recovery, ABI-aware typed declarations, and semantic symbolization,
+- post-rendering optimization passes (DCE, CSE, constant propagation),
+- golden-based regression testing across four fixture directories.
 
 It does **not** yet aim for broad architecture/version coverage or production-grade decompilation quality.
 
@@ -44,8 +45,9 @@ So this project focuses on SASS as the more robust target when PTX is missing.
 
 ### Current machine/version coverage
 
-- Current fixture coverage is primarily one SASS family/style: mostly `sm_89` with `code version = [1,7]`-style dumps.
-- Coverage across older/newer SM targets and different disassembly formats is still limited.
+- Primary fixture coverage: `sm_89` with `code version = [1,7]`-style dumps.
+- SM 100 (Blackwell) corpus: 11 kernel files in `test_cu/corpus_sm100/` covering arithmetic, branching, control flow, crypto, data processing, FFT, image processing, linear algebra, ML, sorting, and stencil kernels.
+- Coverage across older SM targets and different disassembly formats is still limited.
 
 ## Quick showcase
 
@@ -70,33 +72,45 @@ So this project focuses on SASS as the more robust target when PTX is missing.
 ...
 ```
 
-### Example output (`golden_full_pass/rc4.pseudo.c`, abridged)
+### Example output (abridged)
+
+By default, running `cargo run -- -i test_cu/rc4.sass` produces full decompilation (structured code + semantic lift + name recovery + typed declarations + ABI mapping + semantic symbolization):
 
 ```c
-...
-void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8_t* arg6_ptr, uint32_t arg8, uint32_t arg9) {
-   BB0 {
-      v0 = abi_internal_0x28;
-      ctaid_x = blockIdx.x;
-   }
-   if (!((int32_t)(ctaid_x) >= (int32_t)(arg9))) {
-      BB1 {
-         tid_x = threadIdx.x;
-         b1 = (int32_t)(tid_x) > (int32_t)(255);
-         b2 = tid_x != 0;
-      }
-      if (!((int32_t)(tid_x) > (int32_t)(255))) {
-         while (!((int32_t)(tid_x) >= (int32_t)(256))) {
-            shmem_u8[tid_x] = tid_x;
-            tid_x = tid_x + blockDimX;
-         }
-      }
-   }
+__global__ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr,
+                       uint8_t* arg6_ptr, uint32_t arg8, uint32_t arg9) {
+  __shared__ uint8_t shmem_u8[256];
+  uint32_t ctaid_x;
+  uint32_t tid_x;
+  ...
+  ctaid_x = blockIdx.x;
+  if (b0) return;
+    tid_x = threadIdx.x;
+    b1 = (int32_t)(tid_x) > (int32_t)(255);
+    b2 = tid_x != 0;
+  if (!((int32_t)(tid_x) > (int32_t)(255))) {
+    do {
+      shmem_u8[tid_x] = tid_x;
+      tid_x = tid_x + blockDim.x;
+    } while(!(b1));
+  }
+    __syncthreads();
+  if (!(b2)) {
+    v3 = abs(arg2);
+    v5 = (float)(v3);
+    v6 = rcp_approx(v5);
+    ...
+  }
+  do {
+    v22 = abs(tid_x);
+    v23 = shmem_u8[tid_x];
+    ...
+  } while(!(b26));
+  ...
 }
-...
 ```
 
-This is the style of transformation the project targets: low-level SASS blocks/predicates into conservative structured pseudocode with optional naming and ABI hints.
+This is the style of transformation the project targets: low-level SASS blocks/predicates into conservative structured pseudocode with CUDA-style types, ABI-inferred arguments, shared memory notation, and semantic intrinsic names.
 
 ---
 
@@ -115,18 +129,27 @@ This is the style of transformation the project targets: low-level SASS blocks/p
 5. **Render structured pseudocode**  
    `Structurizer::pretty_print` in `src/structurizer.rs`
 
-### Optional stages (used in lifted/full-pass outputs)
+### Semantic lifting and name recovery
 
 1. **Semantic lifting** (expression-level cleanup)  
-   `lift_function_ir` in `src/semantic_lift.rs`
+   `lift_function_ir` in `src/semantic_lift.rs` — uses a rule-registry pattern (`src/semantic_lift/rules/`) to map SASS opcodes to C-like expressions. Rules cover arithmetic (`IMAD`, `IADD3`, `FFMA`), memory (`LDG`, `LDS`, `STG`, `STS`, `ULDC`, `ATOMS`), comparisons (`ISETP`, `FSETP`), bitwise (`LOP3`, `SHF`, `PLOP3`), and type conversions (`I2F`, `F2I`).
 2. **Name recovery + post-render cleanup**  
    `recover_structured_output_names` in `src/name_recovery.rs`
 3. **ABI-aware typing/display pass**  
-   ABI profile detection, const-memory annotation, arg aliasing and typed signatures in `src/abi.rs`
+   ABI profile detection, const-memory annotation, arg aliasing and typed signatures in `src/abi.rs`. Builtins render as CUDA C notation: `blockDim.x`, `gridDim.y`, `threadIdx.z`, etc.
+
+### Post-rendering optimization passes
+
+Applied as text-level transformations after structured rendering:
+
+1. **Common Subexpression Elimination (CSE)** — deduplicates repeated `threadIdx.x`, `blockIdx.x`, `blockDim.x`, `gridDim.x`, and `ConstMem(...)` loads.
+2. **Constant propagation** — inlines single-definition small literal constants into their use sites and removes the defining assignment.
+3. **Dead Code Elimination (DCE)** — removes unused variable assignments in a fixpoint loop.
+4. **Duplicate guard elimination** — collapses identical `if (pred) return;` guards.
 
 ### Full-pass test/golden pipeline
 
-`src/test.rs` composes CFG + SSA + structurizer + lift + name recovery + ABI rendering, then compares against fixtures in:
+`src/test.rs` composes CFG + SSA + structurizer + lift + name recovery + ABI rendering + post-rendering optimization, then compares against fixtures in:
 
 - `test_cu/golden/`
 - `test_cu/golden_lifted/`
@@ -140,40 +163,45 @@ This is the style of transformation the project targets: low-level SASS blocks/p
 ### What is working well
 
 - End-to-end parse → CFG → SSA → structured output is stable.
-- Semantic lifting reduces raw opcode noise while preserving conservative fallbacks.
+- Semantic lifting via rule registry covers most common SASS opcodes, including arithmetic, memory, comparisons, bitwise, atomics (`atomicAdd`, `atomicInc`, etc.), and type casts (`(float)`, `(uint32_t)`).
+- Post-rendering passes (CSE, constant propagation, DCE, duplicate guard elimination) significantly reduce variable count and noise.
 - Name recovery deterministically rewrites SSA tokens to C-like names.
-- ABI profile/alias inference provides typed signatures and more readable const-memory semantics.
-- Predication cleanup has improved, especially for predicated-only temporary handling and fake-merge ternary patterns.
+- ABI profile/alias inference provides `__global__` qualified typed signatures with pointer/scalar arg inference.
+- Shared memory accesses render as `shmem_u8[addr]` / `shmem_u32[addr]` notation.
+- CUDA builtins use standard dot notation: `blockDim.x`, `gridDim.y`, `threadIdx.z`.
+- NOP instructions, dead code after `return`, BB labels, and zero-register writes are suppressed.
+- PLOP3.LUT constant folding evaluates boolean LUT when predicate inputs are known.
+- Default CLI (`cargo run -- -i file.sass`) runs full decompilation with all passes enabled.
 
 ### Regression status
 
-- Golden fixtures are synchronized with current behavior.
-- Test suite currently passes (`cargo test`): **145 passed, 0 failed**.
+- Golden fixtures are synchronized with current behavior across all four directories.
+- Test suite currently passes (`cargo test`): **226 passed, 0 failed**.
 
 ---
 
 ## Next steps
 
-1. **Push predication cleanup earlier in pipeline**  
-   Move more predication semantics from post-render text rewriting into IR/structurizer-level representation.
+1. **64-bit pointer reconstruction**  
+   Replace `addr64(lo, hi)` patterns with typed pointer expressions (`*(uint32_t*)(ptr + offset)`).
 
-2. **Reduce variable reuse ambiguity**  
-   Improve naming/SSA presentation so reused temps (e.g. `v3`) are less likely to look semantically conflated.
+2. **Parameter name resolution**  
+   Map `param_0`/`param_1` through constant-memory loads to resolve kernel argument names in expressions.
 
-3. **Control-flow recovery expansion**  
-   Improve structurizer handling for harder loop/branch shapes and reduce fallback `goto` usage.
+3. **Phi node lowering**  
+   Improve rendering of SSA phi nodes — currently shown as comments or omitted; lower to explicit variable assignments at merge points.
 
-4. **Switch/multi-way branch support**  
+4. **Variable naming improvements**  
+   Use semantic seeds more aggressively (e.g., name variables based on their defining operation) and reduce live-in/undefined variable noise.
+
+5. **Switch/multi-way branch support**  
    Add normalization for branch tables / multi-way control flow.
 
-5. **Richer type propagation**  
+6. **Richer type propagation**  
    Strengthen inferred local/argument typing and pointer/value distinction beyond current heuristics.
 
-6. **Golden/test quality gates**  
-   Add more fixture coverage for predication corner cases and loop-carried dataflow.
-
 7. **Cross-version/cross-arch validation**  
-   Expand test corpus across multiple SM targets and SASS dump formats.
+   Expand test corpus across additional SM targets and SASS dump formats beyond sm_89 and sm_100.
 
 ---
 
@@ -205,10 +233,18 @@ dot -Tsvg ssa.dot -o ssa.svg
 cargo run --bin main -- --input test_cu/if_loop.sass --struct-code
 ```
 
-#### 4) Generate lifted + named + typed output
+#### 4) Generate lifted + named + typed output (full decompilation)
+
+This is now the **default** when using `-i` with no other flags:
 
 ```bash
-cargo run --bin main -- --input test_cu/if_loop.sass --struct-code --semantic-lift --recover-names --typed-decls --abi-map
+cargo run -- -i test_cu/if_loop.sass
+```
+
+Equivalent to explicitly specifying all passes:
+
+```bash
+cargo run -- -i test_cu/if_loop.sass --struct-code --semantic-lift --recover-names --typed-decls --abi-map --semantic-symbolize
 ```
 
 #### 5) Inspect phi/live-in hints (closest thing to def-use visibility today)
@@ -224,18 +260,20 @@ Notes:
 
 ### Basic usage (CLI)
 
-Use the binary on a SASS file:
+Use the binary on a SASS file (defaults to full decompilation):
 
 ```bash
-cargo run --bin main -- --input test_cu/if_loop.sass --struct-code
+cargo run -- -i test_cu/if_loop.sass
 ```
 
-Useful options (can be combined):
+Individual passes can be enabled selectively with:
 
+- `--struct-code`
 - `--semantic-lift`
 - `--recover-names`
 - `--typed-decls`
 - `--abi-map`
+- `--semantic-symbolize`
 - `--abi-profile auto|legacy140|modern160`
 
 ### Run tests
@@ -247,7 +285,7 @@ cargo test
 ### Regenerate all goldens
 
 ```bash
-cargo run --example regen_goldens
+REGEN_GOLDEN=1 cargo test regen_golden_files -- --ignored
 ```
 
 ### Key docs

@@ -10,15 +10,20 @@ The canonical path for this project is:
 4. `Structurizer::structure_function` (`src/structurizer.rs`)
 5. `Structurizer::pretty_print` (C-like pseudocode, default path)
 
-Optional (opt-in) structured rendering stage:
+Semantic lifting stage:
 
 1. `lift_function_ir` (`src/semantic_lift.rs`) computes conservative
    expression rewrites keyed by `StatementRef`.
-2. `Structurizer::pretty_print_with_lift` renders lifted expressions when
+2. Lift rules are organized via a **rule registry** (`src/semantic_lift/rules/`):
+   - `basic.rs` — arithmetic (`IMAD`, `IADD3`, `FFMA`, `FMUL`, `FADD`), moves (`MOV`, `UMOV`), type casts (`I2F`, `I2FP`, `F2I`), math intrinsics (`MUFU.*`), select/min-max (`SEL`, `FSEL`, `FMNMX`, `VIMNMX`, `VIADDMNMX`), byte permute (`PRMT`), special registers (`S2R`, `S2UR`).
+   - `memory.rs` — loads (`LDG`, `LDS`, `LDC`, `ULDC`, `LDCU`), atomic operations (`ATOMS`, `ATOM`, `RED` → CUDA `atomicXxx()` calls).
+   - `bitwise.rs` — shifts (`SHF`), logical (`LOP3`, `PLOP3.LUT` with constant folding), `LEA.HI`.
+   - `comparison.rs` — integer/float comparisons (`ISETP`, `FSETP`, `UISETP`) including unordered float variants (`GEU`, `GTU`, `LEU`, `LTU`, `EQU`, `NEU`).
+3. `Structurizer::pretty_print_with_lift` renders lifted expressions when
    available, and falls back to current opcode-style rendering otherwise.
-3. CLI control: `--semantic-lift` (effective with `--struct-code`).
+4. CLI control: `--semantic-lift` (effective with `--struct-code`).
 
-Optional (opt-in) name recovery stage:
+Name recovery stage:
 
 1. `recover_structured_output_names` (`src/name_recovery.rs`) rewrites SSA-style
    register tokens in rendered structured output into stable C-like names.
@@ -29,7 +34,7 @@ Optional (opt-in) name recovery stage:
    - `--name-style temp|reg` (default `temp`)
    - `--phi-merge-comments` (comment-only merge/live-in annotations)
 
-Optional declaration stage (opt-in):
+Declaration stage:
 
 1. `AbiArgAliases::render_typed_arg_declarations` (`src/abi.rs`) emits
    heuristic typed argument declarations from ABI alias inference.
@@ -40,7 +45,24 @@ Optional declaration stage (opt-in):
    - `--typed-decls` can infer ABI aliases for declarations even when
      `--abi-map` display mapping is not enabled.
    - With `--typed-decls`, structured output is wrapped as
-     `void kernel(<typed args>) { ... }` and locals are emitted inside.
+     `__global__ void kernel(<typed args>) { ... }` and locals are emitted inside.
+
+Post-rendering optimization passes (`src/dce.rs`):
+
+Applied as text-level transformations after structured rendering:
+
+1. **Common Subexpression Elimination (CSE)** — deduplicates repeated
+   `threadIdx.x`, `blockIdx.x`, `blockDim.x`, `gridDim.x`, and `ConstMem(...)` loads
+   across the function body.
+2. **Constant propagation** — finds single-definition small literal assignments
+   (e.g., `v67 = 1;`) and inlines the literal into all use sites, then removes
+   the defining line.
+3. **Dead Code Elimination (DCE)** — removes unused variable assignments in a
+   fixpoint loop until no further eliminations are possible.
+4. **Duplicate guard elimination** — collapses identical `if (pred) return;` guards
+   that appear consecutively.
+
+Pipeline order: CSE → constant propagation → DCE fixpoint → duplicate guard elimination.
 
 Experimental modules are intentionally not part of this critical path.
 
@@ -50,7 +72,7 @@ Experimental modules are intentionally not part of this critical path.
 
 1. `AbiProfile::detect` infers a profile from observed parameter windows (e.g. `0x140` vs `0x160` bases).
    - `AbiProfile::detect_with_sm` can also use parsed SM metadata from `.headerflags` / `.target sm_xx` as fallback.
-2. `AbiProfile::resolve_constmem` maps known built-ins (`blockDim*`, `gridDim*`) and parameter words (`param_i[j]`).
+2. `AbiProfile::resolve_constmem` maps known built-ins (`blockDim.x`, `gridDim.y`, etc.) and parameter words (`param_i[j]`).
 3. `AbiDisplay` is an optional `DisplayCtx` that renders symbolic ABI names in DOT/pseudocode output.
    - CLI controls: `--abi-map` and `--abi-profile auto|legacy140|modern160`.
 4. `annotate_function_ir_constmem` creates typed annotations (`ConstMemSemantic`) over SSA statements.
@@ -84,6 +106,17 @@ Unknown offsets remain explicit raw `ConstMem(...)` values or `abi_internal_0x..
 
 This order intentionally prefers high-level constructs first and preserves output totality
 by falling back to goto when recognition is uncertain.
+
+## Rendering Cleanup (Structurizer)
+
+The structurizer's `pretty_print_with_lift` applies several cleanup rules during rendering:
+
+1. **BB label suppression**: Basic block labels (`BB0 { ... }`) are not emitted; statements render directly at the current indentation level.
+2. **NOP suppression**: `NOP` instructions are skipped.
+3. **Dead code after return**: After an unconditional `RET`/`EXIT`, remaining statements in the block are not rendered.
+4. **RZ/PT-destination suppression**: Writes to the zero register (`RZ`) or always-true predicate (`PT`) that have no memory side effect are skipped. When the dest is `RZ` but the expression has a side effect (e.g., `atomicInc(...)`), it is rendered as an expression statement without an assignment.
+5. **Convergence barrier suppression**: `BSYNC`/`BSSY`/`WARPSYNC`/`BAR.SYNC` instructions are suppressed in lifted mode (except `BAR.SYNC` which renders as `__syncthreads()`).
+6. **Internal comment suppression**: `// Condition from BB{N}` and `// Loop header BB{N}` comments are not emitted.
 
 ## Known Unsupported / Partial Cases
 
