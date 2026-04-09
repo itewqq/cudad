@@ -56,18 +56,48 @@ impl CFGAnalysis {
         out
     }
 
-    /// 后支配树：对 **反向图** 计算支配即可
+    /// 后支配树：对 **反向图** 计算支配即可。
+    /// When the CFG has multiple exit nodes (nodes with no successors),
+    /// a virtual unique-exit node is temporarily added so all exits are
+    /// reachable in the reversed graph.
     fn compute_postdom(cfg: &ControlFlowGraph) -> BTreeMap<NodeIndex, NodeIndex> {
-        let exit = cfg
+        let exits: Vec<NodeIndex> = cfg
             .node_indices()
-            .find(|&n| cfg.neighbors_directed(n, Direction::Outgoing).next().is_none())
-            .unwrap_or(NodeIndex::new(0));
-        let rev = petgraph::visit::Reversed(cfg);
-        let doms = simple_fast(&rev, exit);
+            .filter(|&n| cfg.neighbors_directed(n, Direction::Outgoing).next().is_none())
+            .collect();
+
+        if exits.len() <= 1 {
+            // Single exit (or none) — original algorithm is correct.
+            let exit = exits.first().copied().unwrap_or(NodeIndex::new(0));
+            let rev = petgraph::visit::Reversed(cfg);
+            let doms = simple_fast(&rev, exit);
+            let mut out = BTreeMap::new();
+            for n in cfg.node_indices() {
+                if let Some(i) = doms.immediate_dominator(n) {
+                    out.insert(n, i);
+                }
+            }
+            return out;
+        }
+
+        // Multiple exits: clone CFG, add virtual unique-exit node.
+        let mut aug = cfg.clone();
+        let virtual_exit = aug.add_node(crate::cfg::BasicBlock {
+            id: usize::MAX,
+            start: u32::MAX,
+            instrs: Vec::new(),
+        });
+        for &exit in &exits {
+            aug.add_edge(exit, virtual_exit, crate::cfg::EdgeKind::FallThrough);
+        }
+        let rev = petgraph::visit::Reversed(&aug);
+        let doms = simple_fast(&rev, virtual_exit);
         let mut out = BTreeMap::new();
         for n in cfg.node_indices() {
             if let Some(i) = doms.immediate_dominator(n) {
-                out.insert(n, i);
+                if i != virtual_exit {
+                    out.insert(n, i);
+                }
             }
         }
         out
