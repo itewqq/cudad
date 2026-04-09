@@ -378,10 +378,11 @@ fn lift_store_stmt(
         return None;
     }
     if opcode.starts_with("STS") {
-        if !opcode.contains(".U8") {
-            return None;
-        }
-        let dest = render_shared_u8_ref(&args[0], stmt_ref, config)?;
+        let dest = if opcode.contains(".U8") {
+            render_shared_u8_ref(&args[0], stmt_ref, config)?
+        } else {
+            render_shared_ref(&args[0], stmt_ref, config)?
+        };
         let rhs = lift_ir_expr(&args[1], stmt_ref, config);
         return Some((dest, rhs));
     }
@@ -715,7 +716,8 @@ fn lift_binary_add_like(
     ))
 }
 
-fn lift_lds_expr(
+pub(crate) fn lift_lds_expr(
+    opcode: &str,
     args: &[IRExpr],
     stmt_ref: StatementRef,
     config: &SemanticLiftConfig<'_>,
@@ -723,7 +725,11 @@ fn lift_lds_expr(
     if args.len() != 1 {
         return None;
     }
-    let shared = render_shared_u8_ref(&args[0], stmt_ref, config)?;
+    let shared = if opcode.contains(".U8") {
+        render_shared_u8_ref(&args[0], stmt_ref, config)?
+    } else {
+        render_shared_ref(&args[0], stmt_ref, config)?
+    };
     Some(LiftedExpr::Raw(shared))
 }
 
@@ -1727,6 +1733,23 @@ fn render_shared_u8_ref(
         idx.push_str(&render_expr_raw(off, stmt_ref, config));
     }
     Some(format!("shmem_u8[{}]", idx))
+}
+
+/// Render a shared memory reference (any width).  Returns `shmem[addr]`.
+fn render_shared_ref(
+    mem_expr: &IRExpr,
+    stmt_ref: StatementRef,
+    config: &SemanticLiftConfig<'_>,
+) -> Option<String> {
+    let IRExpr::Mem { base, offset, .. } = mem_expr else {
+        return None;
+    };
+    let mut idx = render_expr_raw(base, stmt_ref, config);
+    if let Some(off) = offset {
+        idx.push_str(" + ");
+        idx.push_str(&render_expr_raw(off, stmt_ref, config));
+    }
+    Some(format!("shmem[{}]", idx))
 }
 
 fn lift_ir_expr(expr: &IRExpr, stmt_ref: StatementRef, config: &SemanticLiftConfig<'_>) -> LiftedExpr {
