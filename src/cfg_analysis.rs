@@ -2,7 +2,7 @@
 //! 1. 直接/后支配树
 //! 2. 回边 + 自然循环 + 出口
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::cfg::ControlFlowGraph;
 use petgraph::{algo::dominators::simple_fast, graph::NodeIndex, Direction};
@@ -22,6 +22,8 @@ pub struct CFGAnalysis {
     pub idom: BTreeMap<NodeIndex, NodeIndex>,
     pub ipdom: BTreeMap<NodeIndex, NodeIndex>,
     pub loops: Vec<NaturalLoop>,
+    /// Maps each node to the index of the (first) loop it belongs to.
+    node_to_loop: HashMap<NodeIndex, usize>,
 }
 
 impl CFGAnalysis {
@@ -30,7 +32,14 @@ impl CFGAnalysis {
         let ipdom = Self::compute_postdom(cfg);
         let loops = Self::compute_loops(cfg, &idom);
 
-        Self { idom, ipdom, loops }
+        let mut node_to_loop = HashMap::new();
+        for (i, lp) in loops.iter().enumerate() {
+            for &n in &lp.body {
+                node_to_loop.entry(n).or_insert(i);
+            }
+        }
+
+        Self { idom, ipdom, loops, node_to_loop }
     }
 
     /* ---------- 基本算法 ---------- */
@@ -133,6 +142,6 @@ impl CFGAnalysis {
     /* ---------- 查询辅助 ---------- */
 
     pub fn loop_of(&self, n: NodeIndex) -> Option<&NaturalLoop> {
-        self.loops.iter().find(|lp| lp.body.contains(&n))
+        self.node_to_loop.get(&n).map(|&i| &self.loops[i])
     }
 }
