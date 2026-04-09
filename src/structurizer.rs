@@ -90,6 +90,8 @@ pub struct Structurizer<'a> {
     function_ir: &'a FunctionIR,
     dom: Dominators<NodeIndex>,
     addr_to_node_index: HashMap<u32, NodeIndex>,
+    /// Maps IRBlock.id → index into function_ir.blocks for O(1) lookup.
+    block_id_to_idx: HashMap<usize, usize>,
     /// Registers defined by phi nodes — used to detect loop-carried live-in
     /// old values in predicated ternaries.
     phi_defined_regs: HashSet<RegId>,
@@ -255,6 +257,14 @@ impl<'a> Structurizer<'a> {
             addr_to_node_index.insert(summary.start, node_idx);
         }
 
+        // Pre-compute block.id → index for O(1) lookup.
+        let block_id_to_idx: HashMap<usize, usize> = function_ir
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (b.id, i))
+            .collect();
+
         // Pre-compute the set of registers defined by phi nodes.
         let mut phi_defined_regs = HashSet::new();
         for block in &function_ir.blocks {
@@ -274,6 +284,7 @@ impl<'a> Structurizer<'a> {
             function_ir,
             dom,
             addr_to_node_index,
+            block_id_to_idx,
             phi_defined_regs,
         }
     }
@@ -301,9 +312,15 @@ impl<'a> Structurizer<'a> {
 
 
     fn get_ir_block_by_cfg_node(&self, cfg_node: NodeIndex) -> Option<&'a IRBlock> {
-        self.cfg.node_weight(cfg_node).and_then(|summary| {
-            self.function_ir.blocks.iter().find(|b| b.id == summary.id)
-        })
+        let summary = self.cfg.node_weight(cfg_node)?;
+        let &idx = self.block_id_to_idx.get(&summary.id)?;
+        Some(&self.function_ir.blocks[idx])
+    }
+
+    /// O(1) IR block lookup by block id.
+    fn get_ir_block(&self, block_id: usize) -> Option<&'a IRBlock> {
+        let &idx = self.block_id_to_idx.get(&block_id)?;
+        Some(&self.function_ir.blocks[idx])
     }
 
     fn extract_if_targets_and_condition(
@@ -365,7 +382,7 @@ impl<'a> Structurizer<'a> {
         indent_level: usize,
         lifted: Option<&SemanticLiftResult>,
     ) -> String {
-        let Some(block) = self.function_ir.blocks.iter().find(|b| b.id == block_id) else {
+        let Some(block) = self.get_ir_block(block_id) else {
             return String::new();
         };
 
@@ -586,7 +603,7 @@ impl<'a> Structurizer<'a> {
         // Only inline predicate conditions when the defining compare is in the same
         // condition block. Cross-block expansion can be stale once SSA names are
         // recovered into mutable temporaries.
-        let block = self.function_ir.blocks.iter().find(|b| b.id == block_id)?;
+        let block = self.get_ir_block(block_id)?;
         for (stmt_idx, stmt) in block.stmts.iter().enumerate().rev() {
             let is_setp = matches!(
                 &stmt.value,
@@ -639,7 +656,7 @@ impl<'a> Structurizer<'a> {
             StructuredStatement::BasicBlock { block_id, stmts } => {
                 s_out.push_str(&format!("{}BB{} {{\n", indent, block_id));
                 let mut omitted_phi_count = 0usize;
-                let fir_block = self.function_ir.blocks.iter().find(|b| b.id == *block_id);
+                let fir_block = self.get_ir_block(*block_id);
                 let mut fir_search_from = 0usize;
                 let control_pred_regs: Vec<RegId> = fir_block
                     .map(|b| {
@@ -1663,7 +1680,7 @@ mod collapse {
         };
 
         // Build statement.
-        let ir_block = match s.function_ir.blocks.iter().find(|b| b.id == head_block_id) {
+        let ir_block = match s.get_ir_block(head_block_id) {
             Some(b) => b,
             None => return false,
         };
@@ -1802,7 +1819,7 @@ mod collapse {
         let merge = if negate { t } else { f };
         let other_arm_idx = if negate { true_idx } else { false_idx };
 
-        let ir_block = match s.function_ir.blocks.iter().find(|b| b.id == head_block_id) {
+        let ir_block = match s.get_ir_block(head_block_id) {
             Some(b) => b,
             None => return false,
         };
@@ -1894,7 +1911,7 @@ mod collapse {
             _ => return false,
         };
 
-        let ir_block = match s.function_ir.blocks.iter().find(|b| b.id == head_block_id) {
+        let ir_block = match s.get_ir_block(head_block_id) {
             Some(b) => b,
             None => return false,
         };
@@ -2011,7 +2028,7 @@ mod collapse {
             return false;
         };
 
-        let ir_block = match s.function_ir.blocks.iter().find(|b| b.id == head_block_id) {
+        let ir_block = match s.get_ir_block(head_block_id) {
             Some(b) => b,
             None => return false,
         };
@@ -2106,7 +2123,7 @@ mod collapse {
         // The condition expression lives on the *tail* basic block (the one
         // whose irdst spawned this 2-way branch). Look it up by primary id.
         let tail_bid = primary_block_id_of(graph, r);
-        let ir_block = match s.function_ir.blocks.iter().find(|b| b.id == tail_bid) {
+        let ir_block = match s.get_ir_block(tail_bid) {
             Some(b) => b,
             None => return false,
         };
@@ -2256,7 +2273,7 @@ mod collapse {
     ) -> Option<IRExpr> {
         let arm = cond_arm?;
         let bid = primary_block_id_of(graph, from);
-        let ir_block = s.function_ir.blocks.iter().find(|b| b.id == bid)?;
+        let ir_block = s.get_ir_block(bid)?;
         let (cond_expr, _, _) = s.extract_if_targets_and_condition(ir_block)?;
         Some(if arm { cond_expr } else { negate_condition(cond_expr) })
     }
