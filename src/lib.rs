@@ -13,6 +13,7 @@ pub mod op_semantics;
 pub mod dce;
 pub mod ir_dce;
 pub mod ir_constprop;
+pub mod ir_cse;
 
 #[cfg(test)]
 mod test;
@@ -32,3 +33,4 @@ pub use op_semantics::*;
 pub use dce::*;
 pub use ir_dce::*;
 pub use ir_constprop::*;
+pub use ir_cse::*;

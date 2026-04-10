@@ -250,7 +250,13 @@ fn resolve_abi_profile(
 
 /// Emit an SSA DOT graph to `--output` or stdout.
 fn emit_ssa_dot(cfg: &ControlFlowGraph, abi_profile: Option<AbiProfile>, output: Option<&str>) {
-    let fir = ir_dce(&ir_constprop(&ir_dce(&build_ssa(cfg))));
+    let fir = {
+        let ssa = build_ssa(cfg);
+        let dce1 = ir_dce(&ssa);
+        let cp = ir_constprop(&dce1);
+        let cse = ir_cse(&cp, cfg);
+        ir_dce(&cse)
+    };
     let default_display = DefaultDisplay;
     let abi_display = abi_profile.map(|profile| {
         let anns = annotate_function_ir_constmem(&fir, profile);
@@ -267,7 +273,13 @@ fn emit_ssa_dot(cfg: &ControlFlowGraph, abi_profile: Option<AbiProfile>, output:
 
 /// Run the full structured-code pipeline: SSA → structurize → lift → name → typed output.
 fn emit_struct_code(cfg: &ControlFlowGraph, args: &Args, abi_profile: Option<AbiProfile>) {
-    let fir = ir_dce(&ir_constprop(&ir_dce(&build_ssa(cfg))));
+    let fir = {
+        let ssa = build_ssa(cfg);
+        let dce1 = ir_dce(&ssa);
+        let cp = ir_constprop(&dce1);
+        let cse = ir_cse(&cp, cfg);
+        ir_dce(&cse)
+    };
 
     // Resolve ABI annotations & aliases (needed for --abi-map, --typed-decls, --semantic-lift).
     let inferred = AbiProfile::detect_with_sm(&[], None);
