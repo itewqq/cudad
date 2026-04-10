@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use regex::Regex;
 
 use crate::ir::{FunctionIR, IRCond, IRExpr, RValue, RegId};
+use crate::semantic_propagation::{propagate_semantic_labels, SsaRegKey};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NameStyle {
@@ -349,7 +350,7 @@ pub fn recover_structured_output_names(
     }
 
     if config.semantic_symbolization {
-        output = rewrite_semantic_seed_names(&output);
+        output = rewrite_semantic_seed_names_ir(function_ir, &output, &token_map, &comp_rows, &component_name);
     }
 
     if config.emit_phi_merge_comments {
@@ -374,6 +375,86 @@ pub fn recover_structured_output_names(
     }
 }
 
+/// SSA-graph-based semantic symbolization.
+///
+/// Uses `propagate_semantic_labels` to find SSA registers with well-known
+/// meanings (tid_x, ctaid_y, etc.) and renames the corresponding recovered
+/// temp names (v0, v1, …) to their semantic names.  Falls back to the
+/// text-level `rewrite_semantic_seed_names` for any labels the IR pass
+/// might miss (e.g. ABI parameter patterns).
+fn rewrite_semantic_seed_names_ir(
+    function_ir: &FunctionIR,
+    output: &str,
+    token_map: &HashMap<String, String>,
+    comp_rows: &[(Group, Loc, String, RegBase, Vec<RegSsa>)],
+    component_name: &[String],
+) -> String {
+    let ir_labels = propagate_semantic_labels(function_ir);
+
+    // Build a reverse map: recovered temp name → semantic label.
+    // For each component (row), check if any SSA member has an IR-level label.
+    // If all labeled members agree on the same label, use it.
+    let ident_re = Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").expect("valid regex");
+    let mut used = BTreeSet::<String>::new();
+    for m in ident_re.find_iter(output) {
+        used.insert(m.as_str().to_string());
+    }
+
+    let mut rename = HashMap::<String, String>::new();
+    for (row_idx, row) in comp_rows.iter().enumerate() {
+        let temp_name = &component_name[row_idx];
+        // Skip names that are already semantic (from a previous pass or manual)
+        if !temp_name.starts_with('v') && !temp_name.starts_with('u') {
+            continue;
+        }
+        // Check if any SSA member of this component has an IR-level label
+        let mut label: Option<&str> = None;
+        let mut conflict = false;
+        for member in &row.4 {
+            let key = SsaRegKey {
+                class: member.base.class.clone(),
+                idx: member.base.idx,
+                ssa: Some(member.ssa),
+            };
+            if let Some(l) = ir_labels.get(&key) {
+                match label {
+                    None => label = Some(l.as_str()),
+                    Some(prev) if prev == l.as_str() => {}
+                    Some(_) => {
+                        conflict = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if conflict || label.is_none() {
+            continue;
+        }
+        let sem = label.unwrap().to_string();
+        if rename.contains_key(temp_name) {
+            continue;
+        }
+        let unique = alloc_unique_name(sem.clone(), &mut used);
+        rename.insert(temp_name.clone(), unique);
+    }
+
+    // Apply IR-level renames
+    let mut result = output.to_string();
+    if !rename.is_empty() {
+        for (from, to) in &rename {
+            let pat =
+                Regex::new(&format!(r"\b{}\b", regex::escape(from))).expect("valid regex");
+            result = pat.replace_all(&result, to.as_str()).into_owned();
+        }
+    }
+
+    // Fall back to text-level for any patterns the IR pass doesn't cover
+    // (e.g. ABI parameter aliases like "arg0_ptr.lo32")
+    result = rewrite_semantic_seed_names(&result);
+
+    result
+}
+
 fn rewrite_semantic_seed_names(output: &str) -> String {
     let assign_re = Regex::new(
         r"^\s*(?P<lhs>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<rhs>[A-Za-z_][A-Za-z0-9_.]*)\s*;\s*$",
@@ -396,6 +477,11 @@ fn rewrite_semantic_seed_names(output: &str) -> String {
             continue;
         };
         if rename.contains_key(&lhs) {
+            continue;
+        }
+        // If the LHS is already the desired semantic name (or a suffixed
+        // variant like "tid_x_1"), skip — the IR-level pass already did it.
+        if lhs == seed || lhs.starts_with(&format!("{}_", seed)) {
             continue;
         }
         let unique = alloc_unique_name(seed, &mut used);
