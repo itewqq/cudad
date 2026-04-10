@@ -10,7 +10,7 @@ __global__ void kernel(uint32_t arg2) {
   uint32_t v0;
   uint32_t abi_internal_0x28; // live-in
   bool b0; // live-in
-  uint32_t v2; // live-in
+  uint32_t v2;
   uint32_t v3; // live-in
 
     v0 = abi_internal_0x28;

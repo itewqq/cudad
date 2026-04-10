@@ -10,6 +10,7 @@ fn render_typed_structured_output(
     code_output: &str,
     aliases: Option<&AbiArgAliases>,
     local_decls: &[String],
+    name_type_map: &std::collections::HashMap<String, &str>,
 ) -> String {
     let params = aliases
         .map(|a| a.render_typed_param_list())
@@ -47,7 +48,7 @@ fn render_typed_structured_output(
         out.push_str(d);
         out.push('\n');
     }
-    let extra_decls = infer_self_contained_locals(code_output, aliases, local_decls);
+    let extra_decls = infer_self_contained_locals(code_output, aliases, local_decls, name_type_map);
     for d in &extra_decls {
         out.push_str("  ");
         out.push_str(d);
@@ -69,6 +70,7 @@ fn infer_self_contained_locals(
     code_output: &str,
     aliases: Option<&AbiArgAliases>,
     local_decls: &[String],
+    name_type_map: &std::collections::HashMap<String, &str>,
 ) -> Vec<String> {
     let ident_re = Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").expect("valid regex");
     let temp_re = Regex::new(
@@ -108,6 +110,7 @@ fn infer_self_contained_locals(
             c.get(1)
                 .map(|m| (m.as_str().to_string(), m.start(), m.end()))
         });
+        // Collect RHS uses of temp variables.
         for m in temp_re.find_iter(line) {
             let t = m.as_str();
             let is_lhs = lhs_span
@@ -115,7 +118,14 @@ fn infer_self_contained_locals(
                 .map(|(_, s, e)| m.start() == *s && m.end() == *e)
                 .unwrap_or(false);
             if !is_lhs && !defined.contains(t) {
-                live_ins.insert(t.to_string());
+                // Only mark as live-in if this use is NOT on a line that also
+                // defines this same variable (i.e. self-referential assignments
+                // like `v21 = -v21` are really loop-carried phi definitions,
+                // not genuine live-in reads).
+                let lhs_name = lhs_span.as_ref().map(|(n, _, _)| n.as_str());
+                if lhs_name != Some(t) {
+                    live_ins.insert(t.to_string());
+                }
             }
             if declared.contains(t) {
                 continue;
@@ -142,18 +152,18 @@ fn infer_self_contained_locals(
         let is_bool = name.starts_with('b')
             && name[1..].chars().all(|c| c.is_ascii_digit());
         let is_live_in = live_ins.contains(&name);
-        if is_bool {
-            if is_live_in {
-                out.push(format!("bool {}; // live-in", name));
-            } else {
-                out.push(format!("bool {};", name));
-            }
+        // Use IR-level type inference if available for this recovered name.
+        let ty = if is_bool {
+            "bool"
+        } else if let Some(inferred) = name_type_map.get(name.as_str()) {
+            inferred
         } else {
-            if is_live_in {
-                out.push(format!("uint32_t {}; // live-in", name));
-            } else {
-                out.push(format!("uint32_t {};", name));
-            }
+            "uint32_t"
+        };
+        if is_live_in {
+            out.push(format!("{} {}; // live-in", ty, name));
+        } else {
+            out.push(format!("{} {};", ty, name));
         }
     }
     out
@@ -351,7 +361,7 @@ fn emit_struct_code(cfg: &ControlFlowGraph, args: &Args, abi_profile: Option<Abi
         0,
         lift_result.as_ref(),
     );
-    let recovered_output = if args.recover_names {
+    let (recovered_output, name_to_reg_base) = if args.recover_names {
         let style = match args.name_style {
             NameStyleMode::Temp => NameStyle::Temp,
             NameStyleMode::Reg => NameStyle::RegisterFamily,
@@ -362,11 +372,12 @@ fn emit_struct_code(cfg: &ControlFlowGraph, args: &Args, abi_profile: Option<Abi
             emit_phi_merge_comments: args.phi_merge_comments,
             semantic_symbolization: args.semantic_symbolize,
         };
-        let raw = recover_structured_output_names(&fir, &code_output, &recover_cfg).output;
+        let result = recover_structured_output_names(&fir, &code_output, &recover_cfg);
         // Dead-code elimination: remove assignments whose LHS is never used.
-        eliminate_dead_code(&raw)
+        let output = eliminate_dead_code(&result.output);
+        (output, result.name_to_reg_base)
     } else {
-        code_output
+        (code_output, std::collections::HashMap::new())
     };
     let local_decls = if args.typed_decls {
         infer_local_typed_declarations_with_abi(
@@ -378,7 +389,16 @@ fn emit_struct_code(cfg: &ControlFlowGraph, args: &Args, abi_profile: Option<Abi
         Vec::new()
     };
     let final_output = if args.typed_decls {
-        render_typed_structured_output(&recovered_output, abi_aliases.as_ref(), &local_decls)
+        // Build a type map from recovered names to C type strings using
+        // the name→register mapping from name recovery + IR type inference.
+        let df_types = type_inference::infer_types(&fir);
+        let name_type_map: std::collections::HashMap<String, &str> = name_to_reg_base
+            .iter()
+            .filter_map(|(name, key)| {
+                df_types.get(key).map(|t| (name.clone(), t.to_c_type()))
+            })
+            .collect();
+        render_typed_structured_output(&recovered_output, abi_aliases.as_ref(), &local_decls, &name_type_map)
     } else {
         recovered_output
     };

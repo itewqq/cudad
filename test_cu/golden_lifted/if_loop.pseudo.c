@@ -146,7 +146,7 @@ do {
   // 5 phi node(s) omitted [BB14]
 } while(P0.26);
 R2.5 = R0.1 + (c[0x0][0x170] << 2);
-R3.2 = LEA.HI.X(R0.1, ConstMem(0, 372), R3.1, 2, P0.27);
+R3.2 = lea_hi_x(R0.1, c[0x0][0x174], 2, P0.27);
 *addr64(R2.5, R3.2) = R9.16;
 // 9 phi node(s) omitted [BB15]
 return;

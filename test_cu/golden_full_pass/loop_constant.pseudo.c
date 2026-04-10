@@ -20,13 +20,7 @@ __global__ void kernel(uint32_t arg9) {
     do {
       shmem_u8[tid_x] = tid_x;
       tid_x = tid_x + blockDim.x;
-      // 2 phi node(s) omitted [BB2]
-      // phi merge: v2 <- phi(v2, v2)
-      // phi merge: b1 <- phi(b1, b1)
     } while(!(b1));
   }
-  // 2 phi node(s) omitted [BB3]
-  // phi merge: v2 <- phi(v2, v2)
-  // phi merge: b1 <- phi(b1, b1)
 }
 // --- End Structured Output ---

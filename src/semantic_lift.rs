@@ -1435,48 +1435,65 @@ fn lift_lea_hi(
     stmt_ref: StatementRef,
     config: &SemanticLiftConfig<'_>,
 ) -> Option<LiftedExpr> {
-    if args.len() != 4 {
+    // 4-arg common form: LEA.HI dst, base, off, sh
+    if args.len() == 4 {
+        // Conservative render: hi32(base + (off << sh))
+        if matches!(args[3], IRExpr::ImmI(_)) {
+            if config.strict && !is_zero_expr(&args[2]) {
+                return None;
+            }
+            let shifted = LiftedExpr::Binary {
+                op: "<<".to_string(),
+                lhs: Box::new(lift_ir_expr(&args[1], stmt_ref, config)),
+                rhs: Box::new(lift_ir_expr(&args[3], stmt_ref, config)),
+            };
+            let mut inner = add_like_expr(lift_ir_expr(&args[0], stmt_ref, config), shifted);
+            if !is_zero_expr(&args[2]) {
+                inner = add_like_expr(inner, lift_ir_expr(&args[2], stmt_ref, config));
+            }
+            return Some(hi32_expr(inner));
+        }
+
+        // Carry form: LEA.HI.X.* dst, base, off, sh, Pcarry
+        // IR keeps 4 args (base, off, sh, Pcarry).
+        if matches!(args[2], IRExpr::ImmI(_)) && is_pred_reg_expr(&args[3]) {
+            let helper = if opcode.contains(".SX32") {
+                "lea_hi_x_sx32"
+            } else {
+                "lea_hi_x"
+            };
+            let base = lift_ir_expr(&args[0], stmt_ref, config).render();
+            let off = lift_ir_expr(&args[1], stmt_ref, config).render();
+            let sh = lift_ir_expr(&args[2], stmt_ref, config).render();
+            let carry = lift_ir_expr(&args[3], stmt_ref, config).render();
+            return Some(LiftedExpr::Raw(format!(
+                "{}({}, {}, {}, {})",
+                helper, base, off, sh, carry
+            )));
+        }
         return None;
     }
-    // Common form:
-    //   LEA.HI dst, base, off, sh
-    // Conservative render: hi32(base + (off << sh))
-    if matches!(args[3], IRExpr::ImmI(_)) {
-        if config.strict && !is_zero_expr(&args[2]) {
-            return None;
-        }
-        let shifted = LiftedExpr::Binary {
-            op: "<<".to_string(),
-            lhs: Box::new(lift_ir_expr(&args[1], stmt_ref, config)),
-            rhs: Box::new(lift_ir_expr(&args[3], stmt_ref, config)),
-        };
-        let mut inner = add_like_expr(lift_ir_expr(&args[0], stmt_ref, config), shifted);
-        if !is_zero_expr(&args[2]) {
-            inner = add_like_expr(inner, lift_ir_expr(&args[2], stmt_ref, config));
-        }
-        return Some(hi32_expr(inner));
-    }
 
-    // Carry form commonly emitted as:
-    //   LEA.HI.X.* dst, base, off, sh, Pcarry
-    // IR keeps 4 args (base, off, sh, Pcarry).
-    if matches!(args[2], IRExpr::ImmI(_)) && is_pred_reg_expr(&args[3]) {
-        // LEA.HI.X semantics vary by signedness/scale/addressing mode; avoid
-        // over-claiming with a potentially wrong algebraic expansion.
+    // 5-arg form: LEA.HI.X dst, offset, hi_base, accum, shift, carry
+    // IR gets 5 args: (offset, hi_base, accum, shift_imm, carry_pred).
+    // Semantics: hi32(offset << shift) + hi_base + carry
+    // (accum is the prior hi-word value in multi-precision chains)
+    if args.len() == 5 && matches!(args[3], IRExpr::ImmI(_)) && is_pred_reg_expr(&args[4]) {
         let helper = if opcode.contains(".SX32") {
             "lea_hi_x_sx32"
         } else {
             "lea_hi_x"
         };
-        let base = lift_ir_expr(&args[0], stmt_ref, config).render();
-        let off = lift_ir_expr(&args[1], stmt_ref, config).render();
-        let sh = lift_ir_expr(&args[2], stmt_ref, config).render();
-        let carry = lift_ir_expr(&args[3], stmt_ref, config).render();
+        let offset = lift_ir_expr(&args[0], stmt_ref, config).render();
+        let hi_base = lift_ir_expr(&args[1], stmt_ref, config).render();
+        let sh = lift_ir_expr(&args[3], stmt_ref, config).render();
+        let carry = lift_ir_expr(&args[4], stmt_ref, config).render();
         return Some(LiftedExpr::Raw(format!(
             "{}({}, {}, {}, {})",
-            helper, base, off, sh, carry
+            helper, offset, hi_base, sh, carry
         )));
     }
+
     None
 }
 

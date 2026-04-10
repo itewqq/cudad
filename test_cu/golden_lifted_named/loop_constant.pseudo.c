@@ -10,7 +10,5 @@ if (!((int32_t)(v2) > (int32_t)(255))) {
   do {
     shmem_u8[v2] = v2;
     v2 = v2 + c[0x0][0x0];
-    // 2 phi node(s) omitted [BB2]
   } while(!(b1));
 }
-// 2 phi node(s) omitted [BB3]

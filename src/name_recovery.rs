@@ -46,6 +46,10 @@ pub struct NameRecoveryStats {
 pub struct NameRecoveryResult {
     pub output: String,
     pub stats: NameRecoveryStats,
+    /// Map from recovered variable name (e.g., "v0") to the IR register base
+    /// class (e.g., ("R", 0)).  This lets callers look up type-inference data
+    /// for each recovered name.
+    pub name_to_reg_base: HashMap<String, (String, i32)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -160,7 +164,14 @@ pub(crate) fn build_name_map(
                     }
                 } else if let RValue::Op { opcode, args } = &stmt.value {
                     if let Some(src_key) = conservative_copy_source(opcode, args) {
-                        if src_key.base == dest_key.base {
+                        // For true copy instructions (MOV, IMAD.MOV) we can
+                        // safely unify across different register bases since
+                        // the value is identical.  For other ops we keep the
+                        // same-base restriction as a safety measure.
+                        let is_true_copy = opcode.starts_with("MOV")
+                            || opcode.starts_with("UMOV")
+                            || opcode.starts_with("IMAD.MOV");
+                        if is_true_copy || src_key.base == dest_key.base {
                             if let Some(src_idx) = idx_of.get(&src_key).copied() {
                                 uf.union(dest_uf_idx, src_idx);
                             }
@@ -357,6 +368,18 @@ pub fn recover_structured_output_names(
         output = append_phi_merge_comments(function_ir, &output, &token_map);
     }
 
+    // Strip "// N phi node(s) omitted [BBx]" summary lines — they are structurizer
+    // bookkeeping noise that should never appear in the final pseudocode output.
+    {
+        let phi_summary_re = Regex::new(r"^\s*//\s*\d+ phi node\(s\) omitted \[BB\d+\]$").expect("valid regex");
+        output = output
+            .lines()
+            .filter(|line| !phi_summary_re.is_match(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        output.push('\n');
+    }
+
     let split_components = fam_count
         .values()
         .copied()
@@ -372,6 +395,11 @@ pub fn recover_structured_output_names(
             output_vars: component_name.len(),
             split_components,
         },
+        name_to_reg_base: comp_rows
+            .iter()
+            .zip(component_name.iter())
+            .map(|(row, name)| (name.clone(), (row.3.class.clone(), row.3.idx)))
+            .collect(),
     }
 }
 
@@ -816,6 +844,22 @@ fn append_phi_merge_comments(
             }
             merges.push(format!("phi merge: {} <- phi({})", dst_name, arg_names.join(", ")));
         }
+        // Filter out trivial phis where all args are identical to the dest.
+        // e.g. "phi merge: v13 <- phi(v13, v13)" is pure noise.
+        merges.retain(|m| {
+            // Parse "phi merge: DST <- phi(A, B, ...)"
+            if let Some(rest) = m.strip_prefix("phi merge: ") {
+                if let Some(arrow_pos) = rest.find(" <- phi(") {
+                    let dst = &rest[..arrow_pos];
+                    let args_str = &rest[arrow_pos + 8..]; // skip " <- phi("
+                    if let Some(args_str) = args_str.strip_suffix(')') {
+                        let all_same = args_str.split(", ").all(|a| a == dst);
+                        return !all_same; // keep only non-trivial phis
+                    }
+                }
+            }
+            true
+        });
         if !merges.is_empty() {
             by_block.insert(block.id, merges);
         }
@@ -835,25 +879,34 @@ fn append_phi_merge_comments(
     }
 
     for line in output.lines() {
-        rendered.push_str(line);
-        rendered.push('\n');
-
         if let Some(cap) = phi_re.captures(line) {
             if let Some(m) = cap.get(1) {
                 let block_id = m.as_str().parse::<usize>().unwrap_or(usize::MAX);
                 if let Some(merges) = by_block.get(&block_id) {
-                    let indent = line
-                        .chars()
-                        .take_while(|c| c.is_ascii_whitespace())
-                        .collect::<String>();
-                    for m in merges {
-                        rendered.push_str(&indent);
-                        rendered.push_str("// ");
-                        rendered.push_str(m);
-                        rendered.push('\n');
+                    if !merges.is_empty() {
+                        // Emit only the individual phi merge comments, not the summary count line.
+                        let indent = line
+                            .chars()
+                            .take_while(|c| c.is_ascii_whitespace())
+                            .collect::<String>();
+                        for m in merges {
+                            rendered.push_str(&indent);
+                            rendered.push_str("// ");
+                            rendered.push_str(m);
+                            rendered.push('\n');
+                        }
                     }
+                    // else: all phis were trivial — suppress entirely
+                } else {
+                    // No merges for this block at all — suppress the summary line
                 }
+            } else {
+                rendered.push_str(line);
+                rendered.push('\n');
             }
+        } else {
+            rendered.push_str(line);
+            rendered.push('\n');
         }
     }
     rendered
@@ -1237,9 +1290,11 @@ mod tests {
                 semantic_symbolization: false,
             },
         );
-        assert!(out.output.contains("phi merge:"));
-        // live-ins summary is emitted only when cross-name phi inputs exist.
-        // Keep phi-merge comments as the strict opt-in contract here.
+        // All phi args map to the same recovered name (same union-find
+        // component), so the merge is trivial and gets suppressed.
+        assert!(!out.output.contains("phi merge:"));
+        // The summary count line should also be stripped.
+        assert!(!out.output.contains("phi node(s) omitted"));
     }
 
     #[test]

@@ -82,7 +82,6 @@ do {
   b4 = v5 > 0.5;
   v42 = b4 ? v4 : 0.8999999761581421;
   v13 = v5 * v42;
-  // 7 phi node(s) omitted [BB6]
 } while(b6);
 if ((int32_t)(v9) > (int32_t)(4)) {
   v4 = 1066192077;
@@ -115,7 +114,6 @@ if ((int32_t)(v9) > (int32_t)(4)) {
 }
 if (v9 != 0 || b5) {
   v4 = 1066192077;
-  // 8 phi node(s) omitted [BB10]
 }
 do {
   b29 = v13 > 0.5;
@@ -132,7 +130,6 @@ do {
   b1 = v5 > 0.5;
   v60 = b1 ? v4 : 0.8999999761581421;
   v13 = v5 * v60;
-  // 6 phi node(s) omitted [BB11]
 } while(b3);
 if (v10 != 0) {
   v7 = 1066192077;
@@ -143,10 +140,8 @@ do {
   b2 = v10 != 0;
   v5 = b1 ? v7 : 0.8999999761581421;
   v13 = v5 * v13;
-  // 5 phi node(s) omitted [BB14]
 } while(b2);
 v61 = v3 + (c[0x0][0x170] << 2);
-v62 = LEA.HI.X(v3, ConstMem(0, 372), v11, 2, b2);
+v62 = lea_hi_x(v3, c[0x0][0x174], 2, b2);
 *addr64(v61, v62) = v13;
-// 9 phi node(s) omitted [BB15]
 return;

@@ -150,7 +150,12 @@ fn infer_self_contained_locals(
                 .map(|(_, s, e)| m.start() == *s && m.end() == *e)
                 .unwrap_or(false);
             if !is_lhs && !defined.contains(t) {
-                live_ins.insert(t.to_string());
+                // Self-referential assignments (v21 = -v21) are loop-carried
+                // phi defs, not genuine live-in reads.
+                let lhs_name = lhs_span.as_ref().map(|(n, _, _)| n.as_str());
+                if lhs_name != Some(t) {
+                    live_ins.insert(t.to_string());
+                }
             }
             if declared.contains(t) {
                 continue;

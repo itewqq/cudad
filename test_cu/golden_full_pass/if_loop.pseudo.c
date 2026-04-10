@@ -32,7 +32,6 @@ __global__ void kernel(uint32_t arg0, uint32_t arg2, uintptr_t arg4_ptr, uint32_
   uint32_t v8; // live-in
   uint32_t v9;
   uint32_t v10;
-  uint32_t v11;
   bool b1;
   uint32_t v12;
   bool b2;
@@ -126,7 +125,6 @@ __global__ void kernel(uint32_t arg0, uint32_t arg2, uintptr_t arg4_ptr, uint32_
     v7 = *addr64(v5, v8);
     v9 = *addr64(v6, v4);
     v10 = arg7;
-    v11 = (int32_t)v3 >> 31;
     b1 = (int32_t)(v10) >= (int32_t)(1);
     v12 = v9 + v7;
     b2 = v12 > 1;
@@ -197,14 +195,6 @@ __global__ void kernel(uint32_t arg0, uint32_t arg2, uintptr_t arg4_ptr, uint32_
     b4 = v5 > 0.5;
     v42 = b4 ? v4 : 0.8999999761581421;
     v13 = v5 * v42;
-    // 7 phi node(s) omitted [BB6]
-    // phi merge: v13 <- phi(v13, v13)
-    // phi merge: v4 <- phi(v4, v4)
-    // phi merge: v9 <- phi(v9, v9)
-    // phi merge: v7 <- phi(v7, v7)
-    // phi merge: v5 <- phi(v5, v5)
-    // phi merge: b6 <- phi(b6, b6)
-    // phi merge: b4 <- phi(b4, b4)
   } while(b6);
   if ((int32_t)(v9) > (int32_t)(4)) {
     v4 = 1066192077;
@@ -237,15 +227,6 @@ __global__ void kernel(uint32_t arg0, uint32_t arg2, uintptr_t arg4_ptr, uint32_
   }
   if (v9 != 0 || b5) {
     v4 = 1066192077;
-    // 8 phi node(s) omitted [BB10]
-    // phi merge: v13 <- phi(v13, v13)
-    // phi merge: v4 <- phi(v4, v4)
-    // phi merge: v9 <- phi(v9, v9)
-    // phi merge: v7 <- phi(v7, v7)
-    // phi merge: v5 <- phi(v5, v5)
-    // phi merge: b6 <- phi(b6, b6)
-    // phi merge: b1 <- phi(b1, b1)
-    // phi merge: b3 <- phi(b3, b3)
   }
   do {
     b29 = v13 > 0.5;
@@ -262,13 +243,6 @@ __global__ void kernel(uint32_t arg0, uint32_t arg2, uintptr_t arg4_ptr, uint32_
     b1 = v5 > 0.5;
     v60 = b1 ? v4 : 0.8999999761581421;
     v13 = v5 * v60;
-    // 6 phi node(s) omitted [BB11]
-    // phi merge: v13 <- phi(v13, v13)
-    // phi merge: v9 <- phi(v9, v9)
-    // phi merge: v7 <- phi(v7, v7)
-    // phi merge: v5 <- phi(v5, v5)
-    // phi merge: b1 <- phi(b1, b1)
-    // phi merge: b3 <- phi(b3, b3)
   } while(b3);
   if (v10 != 0) {
     v7 = 1066192077;
@@ -279,26 +253,10 @@ __global__ void kernel(uint32_t arg0, uint32_t arg2, uintptr_t arg4_ptr, uint32_
     b2 = v10 != 0;
     v5 = b1 ? v7 : 0.8999999761581421;
     v13 = v5 * v13;
-    // 5 phi node(s) omitted [BB14]
-    // phi merge: v13 <- phi(v13, v13)
-    // phi merge: v5 <- phi(v5, v5)
-    // phi merge: v10 <- phi(v10, v10)
-    // phi merge: b1 <- phi(b1, b1)
-    // phi merge: b2 <- phi(b2, b2)
   } while(b2);
   v61 = v3 + (arg4_ptr.lo32 << 2);
-  v62 = LEA.HI.X(v3, ConstMem(0, 372), v11, 2, b2);
+  v62 = lea_hi_x(v3, arg4_ptr.hi32, 2, b2);
   *addr64(v61, v62) = v13;
-  // 9 phi node(s) omitted [BB15]
-  // phi merge: v13 <- phi(v13, v13, v13)
-  // phi merge: v4 <- phi(v4, v4, v4)
-  // phi merge: v9 <- phi(v9, v9, v9)
-  // phi merge: v7 <- phi(v7, v7, v7)
-  // phi merge: v5 <- phi(v5, v5, v5)
-  // phi merge: v10 <- phi(v10, v10, v10)
-  // phi merge: b6 <- phi(b6, b6, b6)
-  // phi merge: b1 <- phi(b1, b1, b1)
-  // phi merge: b2 <- phi(b2, b2, b2)
   return;
 }
 // --- End Structured Output ---
