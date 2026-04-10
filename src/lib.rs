@@ -14,6 +14,7 @@ pub mod dce;
 pub mod ir_dce;
 pub mod ir_constprop;
 pub mod ir_cse;
+pub mod type_inference;
 
 #[cfg(test)]
 mod test;
@@ -34,3 +35,4 @@ pub use dce::*;
 pub use ir_dce::*;
 pub use ir_constprop::*;
 pub use ir_cse::*;
+pub use type_inference::*;

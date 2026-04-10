@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ir::{DisplayCtx, FunctionIR, IRExpr, IRStatement, RegId, RValue};
 use crate::parser::{Instruction, Operand};
+use crate::type_inference::{infer_types, InferredType};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AbiGeneration {
@@ -346,12 +347,26 @@ pub fn infer_local_typed_declarations_with_abi(
         }
     }
 
+    // Use dataflow-based type inference as an additional signal.
+    let df_types = infer_types(function_ir);
+
     regs.into_iter()
         .map(|(class, idx)| {
             if class == "P" || class == "UP" {
                 format!("bool {}{};", class, idx)
             } else {
-                let ty = select_local_decl_type(hints.get(&(class.clone(), idx)));
+                let key = (class.clone(), idx);
+                let hint_ty = select_local_decl_type(hints.get(&key));
+                // If per-statement hints produced a non-default type, prefer them
+                // (they already account for ABI pointer annotations).
+                // Otherwise, use the dataflow inference result.
+                let ty = if hint_ty != "uint32_t" {
+                    hint_ty
+                } else if let Some(df) = df_types.get(&key) {
+                    df.to_c_type()
+                } else {
+                    hint_ty
+                };
                 format!("{} {}{};", ty, class, idx)
             }
         })
