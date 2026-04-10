@@ -25,7 +25,7 @@ pub enum EdgeKind {
 
 pub type ControlFlowGraph = Graph<BasicBlock, EdgeKind>;
 
-fn is_branch(op: &str) -> bool { matches!(op, "BRA" | "JMP" | "JMPP" | "RET" | "EXIT") }
+fn is_branch(op: &str) -> bool { matches!(op, "BRA" | "JMP" | "JMPP" | "BRX" | "RET" | "EXIT") }
 
 pub fn build_cfg(mut instrs: Vec<Instruction>) -> ControlFlowGraph {
     instrs.sort_by_key(|i| i.addr);

@@ -47,6 +47,17 @@ pub enum StructuredStatement {
         to_block_id: usize,
         condition: Option<IRExpr>,
     },
+    /// Multi-way branch (switch/case), recognized from nodes with >2
+    /// outgoing edges (e.g. branch table / cascaded if-else chains).
+    Switch {
+        header_block_id: usize,
+        /// The expression being switched on (if recoverable).
+        discriminant: Option<IRExpr>,
+        /// Each case arm: (case label/index, body).
+        cases: Vec<(usize, StructuredStatement)>,
+        /// Optional default arm.
+        default: Option<Box<StructuredStatement>>,
+    },
     Empty,
 }
 
@@ -77,6 +88,11 @@ impl fmt::Display for StructuredStatement {
             StructuredStatement::Return(_) => write!(f, "Return"),
             StructuredStatement::UnstructuredJump { from_block_id, to_block_id, .. } => {
                 write!(f, "Goto(BB{}->BB{})", from_block_id, to_block_id)
+            }
+            StructuredStatement::Switch { header_block_id, cases, default, .. } => {
+                write!(f, "Switch(BB{}, {} cases", header_block_id, cases.len())?;
+                if default.is_some() { write!(f, " +default")?; }
+                write!(f, ")")
             }
             StructuredStatement::Empty => write!(f, "Empty"),
         }
@@ -1145,11 +1161,33 @@ impl<'a> Structurizer<'a> {
                 }
             }
             StructuredStatement::UnstructuredJump { from_block_id, to_block_id, condition } => {
-                 if let Some(cond_expr_val) = condition { 
+                 if let Some(cond_expr_val) = condition {
                     s_out.push_str(&format!("{}if ({}) goto BB{}; // from BB{}\n", indent, ctx.expr(cond_expr_val), to_block_id, from_block_id));
                  } else {
                     s_out.push_str(&format!("{}goto BB{}; // from BB{}\n", indent, to_block_id, from_block_id));
                  }
+            }
+            StructuredStatement::Switch { header_block_id, discriminant, cases, default } => {
+                // Render header block statements (the code leading up to the switch).
+                s_out.push_str(&self.render_condition_prelude_for_block(*header_block_id, ctx, indent_level, lifted));
+                let disc_str = discriminant
+                    .as_ref()
+                    .map(|e| ctx.expr(e))
+                    .unwrap_or_else(|| format!("/* BB{} discriminant */", header_block_id));
+                let case_indent = "  ".repeat(indent_level + 1);
+                let case_body_indent = "  ".repeat(indent_level + 2);
+                s_out.push_str(&format!("{}switch ({}) {{\n", indent, disc_str));
+                for (case_idx, case_body) in cases {
+                    s_out.push_str(&format!("{}case {}:\n", case_indent, case_idx));
+                    s_out.push_str(&self.pretty_print_with_lift(case_body, ctx, indent_level + 2, lifted));
+                    s_out.push_str(&format!("{}break;\n", case_body_indent));
+                }
+                if let Some(def) = default {
+                    s_out.push_str(&format!("{}default:\n", case_indent));
+                    s_out.push_str(&self.pretty_print_with_lift(def, ctx, indent_level + 2, lifted));
+                    s_out.push_str(&format!("{}break;\n", case_body_indent));
+                }
+                s_out.push_str(&format!("{}}}\n", indent));
             }
             StructuredStatement::Empty => {}
         }
@@ -2403,6 +2441,104 @@ mod collapse {
         true
     }
 
+    // ------------- switch recognition -------------
+
+    /// Try to fold a node with 3+ outgoing edges into a Switch statement.
+    ///
+    /// A switch candidate is a region with ≥3 live successors (from a branch
+    /// table or cascaded conditional pattern), where all successors converge
+    /// to a common post-dominator. Each successor becomes a case arm.
+    ///
+    /// This is intentionally conservative: it only fires when ALL case arms
+    /// are leaf nodes (no further control flow) that converge to the same
+    /// merge point, avoiding complex nesting issues.
+    fn try_switch(graph: &mut RegionGraph, head: RegionId, s: &Structurizer<'_>) -> bool {
+        let succs = graph.live_succs(head);
+        if succs.len() < 3 {
+            return false;
+        }
+
+        // Check that all successors are leaves: each has at most 1 successor,
+        // and all share the same single successor (the merge point).
+        let mut merge_target: Option<RegionId> = None;
+        let mut leaf_succs: Vec<(RegionId, usize)> = Vec::new(); // (succ_id, edge_idx)
+
+        for (ei, e) in &succs {
+            let succ_succs = graph.live_succs(e.to);
+            if succ_succs.len() > 1 {
+                return false; // case arm has branches — too complex
+            }
+            if succ_succs.len() == 1 {
+                let merge = succ_succs[0].1.to;
+                match merge_target {
+                    None => merge_target = Some(merge),
+                    Some(m) if m == merge => {}
+                    Some(_) => return false, // different merge points
+                }
+            }
+            // succ_succs.len() == 0 means terminal (return/exit) — allowed
+            leaf_succs.push((e.to, *ei));
+        }
+
+        // At least one arm must have a merge target (otherwise they're all terminals,
+        // which wouldn't benefit from switch folding).
+        // Actually, even all-terminal is fine for a switch — we just don't need a merge.
+
+        // Build the switch statement.
+        let header_bid = primary_block_id_of(graph, head);
+        let head_stmt = stmt_for_region(graph, head, s);
+
+        let mut cases = Vec::new();
+        for (idx, (succ_rid, _edge_idx)) in leaf_succs.iter().enumerate() {
+            let case_body = stmt_for_region(graph, *succ_rid, s);
+            cases.push((idx, case_body));
+        }
+
+        let switch_stmt = StructuredStatement::Switch {
+            header_block_id: header_bid,
+            discriminant: None, // Could be extracted from BRX operand in future
+            cases,
+            default: None,
+        };
+
+        // If there's a head statement (prelude code), wrap it in a sequence.
+        let final_stmt = match head_stmt {
+            StructuredStatement::Empty => switch_stmt,
+            _ => StructuredStatement::Sequence(vec![head_stmt, switch_stmt]),
+        };
+
+        // Replace head with the switch composite.
+        graph.regions[head.0] = RegionKind::Composite {
+            stmt: final_stmt,
+            primary_block_id: header_bid,
+        };
+
+        // Remove all edges from head to succs
+        for (ei, _) in &succs {
+            graph.remove_edge(*ei);
+        }
+
+        // Tombstone all case-arm regions
+        for (succ_rid, _) in &leaf_succs {
+            // Remove outgoing edges from the case arm to the merge target
+            for (sei, _) in graph.live_succs(*succ_rid) {
+                graph.remove_edge(sei);
+            }
+            // Remove incoming edges to the case arm
+            for (pei, _) in graph.live_preds(*succ_rid) {
+                graph.remove_edge(pei);
+            }
+            graph.tombstone(*succ_rid);
+        }
+
+        // If there's a merge target, add an edge from head to merge
+        if let Some(merge) = merge_target {
+            graph.add_edge(head, merge, None, false);
+        }
+
+        true
+    }
+
     // ------------- node splitting for irreducible CFG -------------
 
     /// Maximum IR statements in a Basic region that we're willing to duplicate.
@@ -2623,6 +2759,10 @@ mod collapse {
                     break;
                 }
                 if try_self_loop(graph, rid, s) {
+                    changed = true;
+                    break;
+                }
+                if try_switch(graph, rid, s) {
                     changed = true;
                     break;
                 }
