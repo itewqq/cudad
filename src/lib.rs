@@ -11,6 +11,7 @@ pub mod semantic_lift;
 pub mod name_recovery;
 pub mod op_semantics;
 pub mod dce;
+pub mod ir_dce;
 
 #[cfg(test)]
 mod test;
@@ -28,3 +29,4 @@ pub use semantic_lift::*;
 pub use name_recovery::*;
 pub use op_semantics::*;
 pub use dce::*;
+pub use ir_dce::*;

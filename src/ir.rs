@@ -103,6 +103,25 @@ pub enum IRExpr{
 impl IRExpr{
     pub fn get_reg(&self)->Option<&RegId>{ if let IRExpr::Reg(r)=self{Some(r)}else{None}}
     pub fn get_reg_mut(&mut self)->Option<&mut RegId>{ if let IRExpr::Reg(r)=self{Some(r)}else{None}}
+
+    /// Collect all register references reachable from this expression.
+    pub fn collect_reg_uses(&self, out: &mut Vec<RegId>) {
+        match self {
+            IRExpr::Reg(r) => out.push(r.clone()),
+            IRExpr::Mem { base, offset, .. } => {
+                base.collect_reg_uses(out);
+                if let Some(off) = offset {
+                    off.collect_reg_uses(out);
+                }
+            }
+            IRExpr::Op { args, .. } => {
+                for a in args {
+                    a.collect_reg_uses(out);
+                }
+            }
+            IRExpr::ImmI(_) | IRExpr::ImmF(_) => {}
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -124,6 +143,75 @@ pub struct IRStatement{
     /// is false).  Populated during SSA renaming so the renderer can emit
     /// `dest = pred ? rhs : old;` instead of `if (pred) dest = rhs;`.
     pub pred_old_defs:Vec<IRExpr>,
+}
+
+impl IRStatement {
+    /// Collect all register references *used* by this statement (arguments,
+    /// predicates, memory address args, pred_old_defs — but NOT the def LHS).
+    pub fn collect_all_uses(&self) -> Vec<RegId> {
+        let mut out = Vec::new();
+        if let Some(p) = &self.pred {
+            p.collect_reg_uses(&mut out);
+        }
+        match &self.value {
+            RValue::Op { args, .. } => {
+                for a in args {
+                    a.collect_reg_uses(&mut out);
+                }
+            }
+            RValue::Phi(args) => {
+                for a in args {
+                    a.collect_reg_uses(&mut out);
+                }
+            }
+            RValue::ImmI(_) | RValue::ImmF(_) => {}
+        }
+        if let Some(mem) = &self.mem_addr_args {
+            for a in mem {
+                a.collect_reg_uses(&mut out);
+            }
+        }
+        for old in &self.pred_old_defs {
+            old.collect_reg_uses(&mut out);
+        }
+        out
+    }
+
+    /// Returns true if this statement has observable side effects beyond
+    /// defining registers (memory stores, barriers, atomics, etc.).
+    pub fn is_side_effectful(&self) -> bool {
+        match &self.value {
+            RValue::Op { opcode, .. } => {
+                let mnem = opcode.split('.').next().unwrap_or(opcode);
+                // Memory stores
+                if opcode.starts_with("ST")   // STG, STS, STL, ST
+                    || opcode.starts_with("RED")   // Reduction
+                    || mnem == "MEMBAR"
+                    || mnem == "DEPBAR"
+                    || mnem == "FENCE"
+                    || mnem == "BAR"
+                    || mnem == "WARPSYNC"
+                {
+                    return true;
+                }
+                // Atomics (ATOM, ATOMS, ATOMG, etc.)
+                if mnem.starts_with("ATOM") {
+                    return true;
+                }
+                // EXIT / RET / BRA / BRX — control flow
+                if matches!(mnem, "EXIT" | "RET" | "BRA" | "BRX" | "BREAK" | "CONT"
+                    | "BSSY" | "BSYNC" | "SSY" | "SYNC" | "CALL" | "VOTE") {
+                    return true;
+                }
+                // If has memory address args for stores, it's side-effectful
+                if self.mem_addr_args.is_some() && opcode.starts_with("ST") {
+                    return true;
+                }
+                false
+            }
+            RValue::Phi(_) | RValue::ImmI(_) | RValue::ImmF(_) => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
