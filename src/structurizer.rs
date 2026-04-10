@@ -2403,6 +2403,106 @@ mod collapse {
         true
     }
 
+    // ------------- node splitting for irreducible CFG -------------
+
+    /// Maximum IR statements in a Basic region that we're willing to duplicate.
+    const SPLIT_MAX_STMTS: usize = 8;
+    /// Maximum number of node splits per structurization to avoid blowup.
+    const SPLIT_BUDGET: usize = 12;
+
+    /// Try to make the region graph reducible by splitting a small node that
+    /// has multiple non-back-edge predecessors.
+    ///
+    /// An irreducible region typically has a node reachable via two different
+    /// forward paths — it has >1 non-back-edge predecessor from distinct
+    /// regions. By duplicating the target and redirecting one predecessor to
+    /// the copy, the region becomes reducible and the normal fold rules can
+    /// proceed.
+    ///
+    /// We only split Basic regions with ≤ `SPLIT_MAX_STMTS` IR statements to
+    /// keep the output compact. Returns true if a split happened.
+    fn try_split_for_reducibility(
+        graph: &mut RegionGraph,
+        s: &Structurizer<'_>,
+        split_count: &mut usize,
+    ) -> bool {
+        if *split_count >= SPLIT_BUDGET {
+            return false;
+        }
+
+        // Find a candidate: a live region with ≥2 non-back-edge, non-goto predecessors.
+        let mut best: Option<(RegionId, Vec<(usize, RegionEdge)>)> = None;
+        for rid in graph.active_ids() {
+            if rid == graph.entry() {
+                continue; // never split the entry node
+            }
+            let preds = graph.live_preds(rid);
+            let non_back: Vec<_> = preds
+                .into_iter()
+                .filter(|(_, e)| !e.is_back_edge && !e.is_goto)
+                .collect();
+            if non_back.len() < 2 {
+                continue;
+            }
+            // Only split small Basic regions.
+            let stmt_count = match graph.region(rid) {
+                RegionKind::Basic { block_id } => {
+                    s.function_ir
+                        .blocks
+                        .iter()
+                        .find(|b| b.id == *block_id)
+                        .map(|b| b.stmts.len())
+                        .unwrap_or(usize::MAX)
+                }
+                _ => usize::MAX,
+            };
+            if stmt_count > SPLIT_MAX_STMTS {
+                continue;
+            }
+            // Prefer the candidate with the smallest region id (deterministic).
+            if best.as_ref().map_or(true, |(cur, _)| rid.0 < cur.0) {
+                best = Some((rid, non_back));
+            }
+        }
+
+        let Some((target, non_back_preds)) = best else {
+            return false;
+        };
+
+        // Split: duplicate the target region.
+        let new_kind = graph.region(target).clone();
+        let copy = graph.add_region(new_kind);
+
+        // Duplicate all outgoing edges from `target` to `copy`.
+        let out_edges: Vec<(RegionId, Option<bool>, bool)> = graph
+            .live_succs(target)
+            .into_iter()
+            .map(|(_, e)| (e.to, e.cond_arm, e.is_back_edge))
+            .collect();
+        for (to, arm, be) in out_edges {
+            graph.add_edge(copy, to, arm, be);
+        }
+
+        // Redirect one of the non-back-edge predecessors to point to the copy
+        // instead of the original. Pick the one with the largest from-region-id
+        // (deterministic, and avoids touching the entry-side path).
+        let redirect_pred = non_back_preds
+            .iter()
+            .max_by_key(|(_, e)| e.from.0)
+            .map(|(ei, _)| *ei);
+        if let Some(ei) = redirect_pred {
+            if let Some(edge) = graph.edges[ei].as_mut() {
+                // Remove old in-edge association
+                graph.in_edges[target.0].retain(|&x| x != ei);
+                edge.to = copy;
+                graph.in_edges[copy.0].push(ei);
+            }
+        }
+
+        *split_count += 1;
+        true
+    }
+
     // ------------- goto fallback -------------
 
     /// Minimal Phase A fallback: if the collapse loop stalled, walk the graph
@@ -2483,6 +2583,7 @@ mod collapse {
         let initial = graph.active_count().max(1);
         let max_iter = 4 * initial * initial + 100;
         let mut iter = 0usize;
+        let mut split_count = 0usize;
         loop {
             iter += 1;
             if iter > max_iter {
@@ -2531,6 +2632,10 @@ mod collapse {
             }
             if graph.active_count() <= 1 {
                 break;
+            }
+            // Before resorting to goto, try node splitting for irreducible CFG.
+            if try_split_for_reducibility(graph, s, &mut split_count) {
+                continue;
             }
             if !select_goto_edge(graph, s) {
                 break;
