@@ -12,6 +12,7 @@ pub mod name_recovery;
 pub mod op_semantics;
 pub mod dce;
 pub mod ir_dce;
+pub mod ir_constprop;
 
 #[cfg(test)]
 mod test;
@@ -30,3 +31,4 @@ pub use name_recovery::*;
 pub use op_semantics::*;
 pub use dce::*;
 pub use ir_dce::*;
+pub use ir_constprop::*;
