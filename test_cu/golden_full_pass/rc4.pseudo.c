@@ -388,7 +388,7 @@ __global__ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8
     v42 = v39 * v24;
     v43 = abs(v40);
     b10 = (int32_t)(v40) >= (int32_t)(0);
-    v12 = mul_hi_u32(v31, v42) + 0;
+    v12 = mul_hi_u32(v31, v42);
     v44 = v43;
     v45 = mul_hi_u32(v12, v44);
     v45 = -v45;

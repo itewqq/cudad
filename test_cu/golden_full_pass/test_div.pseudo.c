@@ -60,7 +60,7 @@ __global__ void kernel(int32_t arg0, int32_t arg1, uint32_t arg2, uint32_t arg3)
   v7 = -v5;
   v8 = v7 * v1;
   v9 = abs(arg0);
-  v10 = mul_hi_u32(v5, v8) + 0;
+  v10 = mul_hi_u32(v5, v8);
   v11 = arg2;
   v12 = mul_hi_u32(v10, v9);
   v13 = -v12;

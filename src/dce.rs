@@ -20,6 +20,8 @@ pub fn eliminate_dead_code(input: &str) -> String {
     text = eliminate_common_subexpressions(&text);
     // Constant propagation: inline trivial integer/boolean constants.
     text = propagate_constants(&text);
+    // Algebraic simplification: fold X+0, 0+X, X*1, etc.
+    text = simplify_algebra(&text);
     // Iterate to fixpoint — removing one line may make another variable dead.
     loop {
         let next = dce_one_pass(&text);
@@ -341,6 +343,60 @@ fn propagate_constants(input: &str) -> String {
     result.join("\n")
 }
 
+/// Text-level algebraic simplification.
+///
+/// Folds trivial identity patterns in rendered expressions:
+///   - `<expr> + 0` → `<expr>`
+///   - `0 + <expr>` → `<expr>`
+///   - `<expr> - 0` → `<expr>`
+///   - `<expr> * 1` → `<expr>`
+///   - `1 * <expr>` → `<expr>`
+fn simplify_algebra(input: &str) -> String {
+    let mut text = input.to_string();
+    loop {
+        let prev = text.clone();
+        // Process line-by-line so regex context stays narrow.
+        let lines: Vec<String> = text
+            .lines()
+            .map(|line| simplify_algebra_line(line))
+            .collect();
+        text = lines.join("\n");
+        if text == prev {
+            break;
+        }
+    }
+    text
+}
+
+fn simplify_algebra_line(line: &str) -> String {
+    let mut s = line.to_string();
+
+    // We use manual replacement to avoid the need for look-ahead/look-behind
+    // which the Rust regex crate doesn't support.
+
+    // X + 0  →  X   (where 0 is a standalone token: followed by ; ) , space or EOL)
+    let plus_zero = Regex::new(r" \+ 0([;),\s]|$)").unwrap();
+    s = plus_zero.replace_all(&s, "$1").into_owned();
+
+    // 0 + X  →  X
+    let zero_plus = Regex::new(r"\b0 \+ ").unwrap();
+    s = zero_plus.replace_all(&s, "").into_owned();
+
+    // X - 0  →  X
+    let minus_zero = Regex::new(r" - 0([;),\s]|$)").unwrap();
+    s = minus_zero.replace_all(&s, "$1").into_owned();
+
+    // X * 1  →  X   (where 1 is standalone: not followed by digit/letter)
+    let times_one = Regex::new(r" \* 1([;),\s]|$)").unwrap();
+    s = times_one.replace_all(&s, "$1").into_owned();
+
+    // 1 * X  →  X   (where 1 is standalone: preceded by word boundary)
+    let one_times = Regex::new(r"\b1 \* ").unwrap();
+    s = one_times.replace_all(&s, "").into_owned();
+
+    s
+}
+
 /// Remove duplicate `if (X) return;` lines where the predicate is not
 /// reassigned between the occurrences.
 fn eliminate_duplicate_guards(input: &str) -> String {
@@ -516,5 +572,35 @@ mod tests {
         let input = "  x = v0 + 1;\n  *ptr = x;";
         let output = eliminate_dead_code(input);
         assert!(output.contains("x = v0 + 1"), "expression should not be propagated");
+    }
+
+    #[test]
+    fn algebra_folds_plus_zero() {
+        let input = "  v10 = mul_hi_u32(v5, v8) + 0;\n  *ptr = v10;";
+        let output = eliminate_dead_code(input);
+        assert!(output.contains("mul_hi_u32(v5, v8)"), "should contain the call");
+        assert!(!output.contains("+ 0"), "+ 0 should be folded away");
+    }
+
+    #[test]
+    fn algebra_folds_zero_plus() {
+        let input = "  v1 = 0 + v0;\n  *ptr = v1;";
+        let output = eliminate_dead_code(input);
+        assert!(!output.contains("0 + "), "0 + should be folded away");
+    }
+
+    #[test]
+    fn algebra_folds_times_one() {
+        let input = "  v1 = v0 * 1;\n  *ptr = v1;";
+        let output = eliminate_dead_code(input);
+        assert!(!output.contains("* 1"), "* 1 should be folded away");
+    }
+
+    #[test]
+    fn algebra_does_not_fold_times_ten() {
+        // "* 10" should NOT match the "* 1" rule.
+        let input = "  v1 = v0 * 10;\n  *ptr = v1;";
+        let output = eliminate_dead_code(input);
+        assert!(output.contains("v0 * 10"), "* 10 must not be folded");
     }
 }
