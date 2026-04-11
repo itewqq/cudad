@@ -18,9 +18,9 @@
 //! | `IMAD(x, 1, 0)` | copy x |
 //! | `IMAD(1, x, 0)` | copy x |
 //! | `SHF.*(x, 0, _)` | copy x (shift by 0) |
-//! | `LOP3.LUT(x, ?, ?, 0xFC)` | copy x (identity: output = A) |
-//! | `LOP3.LUT(?, x, ?, 0xF0)` | copy x (identity: output = B) |
-//! | `LOP3.LUT(?, ?, x, 0xCC)` | copy x (identity: output = C, but not standard) |
+//! | `LOP3.LUT(x, ?, ?, 0xF0)` | copy x (identity: output = A) |
+//! | `LOP3.LUT(?, x, ?, 0xCC)` | copy x (identity: output = B) |
+//! | `LOP3.LUT(?, ?, x, 0xAA)` | copy x (identity: output = C) |
 //!
 //! After this pass, a subsequent `ir_copyprop` + `ir_dce` pass will remove
 //! the now-trivial copies.
@@ -97,12 +97,19 @@ fn try_simplify(opcode: &str, args: &[IRExpr]) -> Option<RValue> {
         // this doesn't simplify further; leave it alone).
     }
 
-    // ------- IMAD / IMAD.* : multiply-add -------
-    // IMAD(a, b, c) = a*b + c
+    // ------- IMAD (plain 32×32→32 truncated multiply-add) -------
+    // IMAD(a, b, c) = lo32(a*b) + c
     // If a==0 or b==0 → result = c (copy)
     // If a==1 and c==0 → result = b (copy)
     // If b==1 and c==0 → result = a (copy)
-    if opcode.starts_with("IMAD") && !opcode.starts_with("IMAD.MOV") && args.len() >= 3 {
+    //
+    // IMPORTANT: These identities only hold for the plain truncated IMAD.
+    // - IMAD.HI computes hi32(a*b)+c, so hi32(x*1)=0, NOT x.
+    // - IMAD.WIDE computes the full 64-bit result, different semantics.
+    // - IMAD.MOV is handled elsewhere (copy propagation).
+    // We match only exact "IMAD" or "IMAD.U32" / "IMAD.S32" (signedness
+    // suffixes don't affect the truncated low-32 result).
+    if is_plain_imad(opcode) && args.len() >= 3 {
         let a = &args[0];
         let b = &args[1];
         let c = &args[2];
@@ -135,21 +142,25 @@ fn try_simplify(opcode: &str, args: &[IRExpr]) -> Option<RValue> {
 
     // ------- LOP3.LUT: 3-input logic with truth table -------
     // LOP3.LUT(a, b, c, lut) where lut encodes the truth table.
-    // Identity patterns:
-    //   lut = 0xFC (252) → output = A (first input)
-    //   lut = 0xF0 (240) → output = B (second input)  (actually 0xF0 = B in NVIDIA's ABC ordering)
-    //   lut = 0xCC (204) → output = C (third input)
-    //   lut = 0xAA (170) → output = A (alternate encoding)
+    //
+    // NVIDIA's standard 3-variable truth table encoding:
+    //   The 8-bit LUT encodes f(A,B,C) for all 8 combinations of ABC.
+    //   A = 0xF0 (11110000), B = 0xCC (11001100), C = 0xAA (10101010)
+    //
+    // Identity patterns (output = single input):
+    //   lut = 0xF0 (240) → output = A (first input)
+    //   lut = 0xCC (204) → output = B (second input)
+    //   lut = 0xAA (170) → output = C (third input)
     //   lut = 0x00 (0)   → output = 0
     //   lut = 0xFF (255) → output = ~0 = -1
     if opcode.starts_with("LOP3") && args.len() >= 4 {
         if let IRExpr::ImmI(lut) = &args[3] {
             match *lut {
-                0xFC | 0xAA => return Some(make_copy(&args[0])), // output = A
-                0xF0 => return Some(make_copy(&args[1])),        // output = B
-                0xCC => return Some(make_copy(&args[2])),        // output = C
-                0x00 => return Some(RValue::ImmI(0)),            // output = 0
-                0xFF => return Some(RValue::ImmI(-1)),           // output = all-ones
+                0xF0 => return Some(make_copy(&args[0])), // output = A
+                0xCC => return Some(make_copy(&args[1])), // output = B
+                0xAA => return Some(make_copy(&args[2])), // output = C
+                0x00 => return Some(RValue::ImmI(0)),     // output = 0
+                0xFF => return Some(RValue::ImmI(-1)),    // output = all-ones
                 _ => {}
             }
         }
@@ -189,6 +200,22 @@ fn is_one_expr(e: &IRExpr) -> bool {
         IRExpr::ImmF(f) => *f == 1.0,
         _ => false,
     }
+}
+
+/// Returns true for plain truncated IMAD (lo32(a*b)+c).
+/// Excludes IMAD.MOV (copy idiom), IMAD.HI (hi32), and IMAD.WIDE (64-bit).
+fn is_plain_imad(opcode: &str) -> bool {
+    if !opcode.starts_with("IMAD") {
+        return false;
+    }
+    // Reject IMAD.MOV, IMAD.HI, IMAD.WIDE — their semantics differ.
+    if opcode.starts_with("IMAD.MOV")
+        || opcode.contains(".HI")
+        || opcode.contains(".WIDE")
+    {
+        return false;
+    }
+    true
 }
 
 #[cfg(test)]

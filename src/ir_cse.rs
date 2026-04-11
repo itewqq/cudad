@@ -95,9 +95,17 @@ fn stmt_to_key(stmt: &IRStatement) -> Option<ExprKey> {
 }
 
 /// Fully commutative: all operands are interchangeable.
+///
+/// Note: LOP3 is NOT commutative — permuting operands A,B,C requires
+/// adjusting the LUT truth table to get the same result.
+/// IADD3 is fully commutative ONLY when not using carry (.X suffix).
 fn is_fully_commutative(opcode: &str) -> bool {
     let mnem = opcode.split('.').next().unwrap_or(opcode);
-    matches!(mnem, "IADD3" | "UIADD3" | "FADD" | "FMUL" | "LOP3")
+    // IADD3.X has carry semantics on the third operand — exclude it.
+    if mnem == "IADD3" || mnem == "UIADD3" {
+        return !opcode.contains(".X");
+    }
+    matches!(mnem, "FADD" | "FMUL")
 }
 
 /// Partially commutative: first two operands are commutative (multiply).
