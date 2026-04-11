@@ -3,11 +3,77 @@
 //! it rewrites variable tokens in rendered output only.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::OnceLock;
 
 use regex::Regex;
 
 use crate::ir::{FunctionIR, IRCond, IRExpr, RValue, RegId};
 use crate::semantic_propagation::{propagate_semantic_labels, SsaRegKey};
+
+// ---------------------------------------------------------------------------
+// Cached regex objects — compiled once, reused across all calls.
+// ---------------------------------------------------------------------------
+
+fn ssa_token_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\b(?:UR|UP|R|P)\d+\.\d+\b").unwrap())
+}
+
+fn nr_ident_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").unwrap())
+}
+
+fn nr_ident_word_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\b[A-Za-z_][A-Za-z0-9_]*\b").unwrap())
+}
+
+fn nr_assign_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"^\s*(?P<lhs>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<rhs>[A-Za-z_][A-Za-z0-9_.]*)\s*;\s*$").unwrap()
+    })
+}
+
+fn nr_ternary_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"^(\s*)(\S+) = (.+?) \? \((.*)\) : (/\*phi\*/)?(\S+);$").unwrap()
+    })
+}
+
+fn nr_if_assign_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"^\s*if \((.+)\)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=.*;$").unwrap()
+    })
+}
+
+fn nr_plain_assign_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=.*;$").unwrap())
+}
+
+fn nr_pred_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\b(?:P|UP)\d+\b").unwrap())
+}
+
+fn nr_phi_summary_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^\s*//\s*\d+ phi node\(s\) omitted \[BB\d+\]$").unwrap())
+}
+
+fn nr_phi_block_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"phi node\(s\) omitted \[BB(\d+)\]").unwrap())
+}
+
+fn nr_arg_ptr_lane_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^arg(?P<idx>\d+)_ptr\.(?P<lane>lo32|hi32)$").unwrap())
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NameStyle {
@@ -320,7 +386,7 @@ pub fn recover_structured_output_names(
 ) -> NameRecoveryResult {
     let (token_map, comp_rows, component_name, fam_count) = build_name_map(function_ir, config);
 
-    let re = Regex::new(r"\b(?:UR|UP|R|P)\d+\.\d+\b").expect("valid regex");
+    let re = ssa_token_re();
     let mut ssa_tokens_seen = 0usize;
     let mut rewritten_tokens = 0usize;
     let mut output = re
@@ -371,10 +437,10 @@ pub fn recover_structured_output_names(
     // Strip "// N phi node(s) omitted [BBx]" summary lines — they are structurizer
     // bookkeeping noise that should never appear in the final pseudocode output.
     {
-        let phi_summary_re = Regex::new(r"^\s*//\s*\d+ phi node\(s\) omitted \[BB\d+\]$").expect("valid regex");
+        let phi_summary = nr_phi_summary_re();
         output = output
             .lines()
-            .filter(|line| !phi_summary_re.is_match(line))
+            .filter(|line| !phi_summary.is_match(line))
             .collect::<Vec<_>>()
             .join("\n");
         output.push('\n');
@@ -422,9 +488,9 @@ fn rewrite_semantic_seed_names_ir(
     // Build a reverse map: recovered temp name → semantic label.
     // For each component (row), check if any SSA member has an IR-level label.
     // If all labeled members agree on the same label, use it.
-    let ident_re = Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").expect("valid regex");
+    let ident = nr_ident_re();
     let mut used = BTreeSet::<String>::new();
-    for m in ident_re.find_iter(output) {
+    for m in ident.find_iter(output) {
         used.insert(m.as_str().to_string());
     }
 
@@ -484,19 +550,16 @@ fn rewrite_semantic_seed_names_ir(
 }
 
 fn rewrite_semantic_seed_names(output: &str) -> String {
-    let assign_re = Regex::new(
-        r"^\s*(?P<lhs>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<rhs>[A-Za-z_][A-Za-z0-9_.]*)\s*;\s*$",
-    )
-    .expect("valid regex");
-    let ident_re = Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").expect("valid regex");
+    let assign = nr_assign_re();
+    let ident = nr_ident_re();
     let mut used = BTreeSet::<String>::new();
-    for m in ident_re.find_iter(output) {
+    for m in ident.find_iter(output) {
         used.insert(m.as_str().to_string());
     }
 
     let mut rename = HashMap::<String, String>::new();
     for line in output.lines() {
-        let Some(cap) = assign_re.captures(line) else {
+        let Some(cap) = assign.captures(line) else {
             continue;
         };
         let lhs = cap.name("lhs").expect("lhs").as_str().to_string();
@@ -560,8 +623,8 @@ fn semantic_name_seed(rhs: &str) -> Option<String> {
     if let Some(name) = fixed {
         return Some(name.to_string());
     }
-    let arg_ptr_lane_re = Regex::new(r"^arg(?P<idx>\d+)_ptr\.(?P<lane>lo32|hi32)$").expect("valid regex");
-    if let Some(cap) = arg_ptr_lane_re.captures(rhs) {
+    let arg_ptr_lane = nr_arg_ptr_lane_re();
+    if let Some(cap) = arg_ptr_lane.captures(rhs) {
         return Some(format!(
             "arg{}_ptr_{}",
             cap.name("idx").expect("idx").as_str(),
@@ -593,24 +656,10 @@ fn simplify_predicated_ternaries(output: &str) -> String {
 }
 
 fn simplify_predicated_ternaries_primary(output: &str) -> String {
-    // Match ternaries, optionally with a /*phi*/ tag before the old-value.
-    //
-    // Capture groups:
-    //  1 – leading whitespace (indent)
-    //  2 – dest variable name
-    //  3 – predicate expression
-    //  4 – RHS expression (inside the outermost parens after `?`)
-    //  5 – optional `/*phi*/` marker (ignored for rewrite legality)
-    //  6 – old-value variable name
-    let re = Regex::new(
-        r"^(\s*)(\S+) = (.+?) \? \((.*)\) : (/\*phi\*/)?(\S+);$"
-    ).expect("valid regex");
-    let if_assign_re = Regex::new(
-        r"^\s*if \((.+)\)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=.*;$",
-    )
-    .expect("valid regex");
-    let plain_assign_re = Regex::new(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=.*;$").expect("valid regex");
-    let ident_re = Regex::new(r"\b[A-Za-z_][A-Za-z0-9_]*\b").expect("valid regex");
+    let re = nr_ternary_re();
+    let if_assign = nr_if_assign_re();
+    let plain_assign = nr_plain_assign_re();
+    let ident = nr_ident_word_re();
 
     // Track variables that are currently known to be conditionally assigned on
     // a specific predicate guard (`if (pred) v = ...;`).
@@ -636,12 +685,12 @@ fn simplify_predicated_ternaries_primary(output: &str) -> String {
                 .get(old)
                 .map_or(false, |p| p == &pred_norm);
             let old_is_cond_defined_any = conditional_assign_pred.contains_key(old);
-            let rhs_uses_cond_defined_same_pred = ident_re.find_iter(rhs).any(|m| {
+            let rhs_uses_cond_defined_same_pred = ident.find_iter(rhs).any(|m| {
                 conditional_assign_pred
                     .get(m.as_str())
                     .map_or(false, |p| p == &pred_norm)
             });
-            let rhs_uses_cond_defined_any = ident_re
+            let rhs_uses_cond_defined_any = ident
                 .find_iter(rhs)
                 .any(|m| conditional_assign_pred.contains_key(m.as_str()));
 
@@ -665,11 +714,11 @@ fn simplify_predicated_ternaries_primary(output: &str) -> String {
             conditional_assign_pred.remove(dest);
         }
 
-        if let Some(caps) = if_assign_re.captures(line) {
+        if let Some(caps) = if_assign.captures(line) {
             let pred_norm = normalize_predicate_text(caps.get(1).expect("pred").as_str());
             let dest = caps.get(2).expect("dest").as_str().to_string();
             conditional_assign_pred.insert(dest, pred_norm);
-        } else if let Some(caps) = plain_assign_re.captures(line) {
+        } else if let Some(caps) = plain_assign.captures(line) {
             let dest = caps.get(1).expect("dest").as_str();
             conditional_assign_pred.remove(dest);
         }
@@ -690,19 +739,15 @@ fn simplify_predicated_only_ternaries_with_gated_uses(output: &str) -> String {
         return output.to_string();
     }
 
-    let ternary_re = Regex::new(r"^(\s*)(\S+) = (.+?) \? \((.*)\) : (/\*phi\*/)?(\S+);$")
-        .expect("valid regex");
-    let if_assign_re = Regex::new(
-        r"^\s*if \((.+)\)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=.*;$",
-    )
-    .expect("valid regex");
-    let plain_assign_re = Regex::new(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=.*;$").expect("valid regex");
-    let ident_re = Regex::new(r"\b[A-Za-z_][A-Za-z0-9_]*\b").expect("valid regex");
+    let ternary = nr_ternary_re();
+    let if_assign = nr_if_assign_re();
+    let plain_assign = nr_plain_assign_re();
+    let ident = nr_ident_word_re();
 
     let mut rewrite_line = vec![false; lines.len()];
 
     for i in 0..lines.len() {
-        let Some(caps) = ternary_re.captures(lines[i]) else {
+        let Some(caps) = ternary.captures(lines[i]) else {
             continue;
         };
         let dest = caps.get(2).expect("dest").as_str();
@@ -712,26 +757,26 @@ fn simplify_predicated_only_ternaries_with_gated_uses(output: &str) -> String {
         let mut only_gated_uses = true;
 
         for line in lines.iter().skip(i + 1) {
-            if let Some(c) = if_assign_re.captures(line) {
+            if let Some(c) = if_assign.captures(line) {
                 if c.get(2).expect("dest").as_str() == dest {
                     break;
                 }
-            } else if let Some(c) = plain_assign_re.captures(line) {
+            } else if let Some(c) = plain_assign.captures(line) {
                 if c.get(1).expect("dest").as_str() == dest {
                     break;
                 }
             }
 
-            let uses_dest = ident_re.find_iter(line).any(|m| m.as_str() == dest);
+            let uses_dest = ident.find_iter(line).any(|m| m.as_str() == dest);
             if !uses_dest {
                 continue;
             }
             saw_use = true;
 
-            let gated_by_same_pred_if = if_assign_re.captures(line).map_or(false, |c| {
+            let gated_by_same_pred_if = if_assign.captures(line).map_or(false, |c| {
                 normalize_predicate_text(c.get(1).expect("pred").as_str()) == pred_norm
             });
-            let gated_by_same_pred_ternary = ternary_re.captures(line).map_or(false, |c| {
+            let gated_by_same_pred_ternary = ternary.captures(line).map_or(false, |c| {
                 normalize_predicate_text(c.get(3).expect("pred").as_str()) == pred_norm
             });
 
@@ -749,7 +794,7 @@ fn simplify_predicated_only_ternaries_with_gated_uses(output: &str) -> String {
     let mut out = String::with_capacity(output.len());
     for (i, line) in lines.iter().enumerate() {
         if rewrite_line[i] {
-            if let Some(caps) = ternary_re.captures(line) {
+            if let Some(caps) = ternary.captures(line) {
                 let indent = caps.get(1).expect("indent").as_str();
                 let dest = caps.get(2).expect("dest").as_str();
                 let pred = caps.get(3).expect("pred").as_str();
@@ -792,12 +837,12 @@ fn merge_pred_old_token_mapping(
 }
 
 fn rewrite_control_guard_predicates(output: &str, pred_map: &HashMap<String, String>) -> String {
-    let pred_re = Regex::new(r"\b(?:P|UP)\d+\b").expect("valid regex");
+    let pred = nr_pred_re();
     let mut out = String::new();
     for line in output.lines() {
         let trimmed = line.trim_start();
         if trimmed.starts_with("if (") || trimmed.starts_with("while (") {
-            let replaced = pred_re.replace_all(line, |caps: &regex::Captures<'_>| {
+            let replaced = pred.replace_all(line, |caps: &regex::Captures<'_>| {
                 let t = caps.get(0).expect("match").as_str();
                 pred_map.get(t).cloned().unwrap_or_else(|| t.to_string())
             });
@@ -869,7 +914,7 @@ fn append_phi_merge_comments(
         return output.to_string();
     }
 
-    let phi_re = Regex::new(r"phi node\(s\) omitted \[BB(\d+)\]").expect("valid regex");
+    let phi_block = nr_phi_block_re();
     let mut rendered = String::new();
 
     if !live_ins.is_empty() {
@@ -879,7 +924,7 @@ fn append_phi_merge_comments(
     }
 
     for line in output.lines() {
-        if let Some(cap) = phi_re.captures(line) {
+        if let Some(cap) = phi_block.captures(line) {
             if let Some(m) = cap.get(1) {
                 let block_id = m.as_str().parse::<usize>().unwrap_or(usize::MAX);
                 if let Some(merges) = by_block.get(&block_id) {

@@ -1682,10 +1682,7 @@ mod collapse {
         match graph.region(r) {
             RegionKind::Basic { block_id, .. } => {
                 let stmts = s
-                    .function_ir
-                    .blocks
-                    .iter()
-                    .find(|b| b.id == *block_id)
+                    .get_ir_block(*block_id)
                     .map(|b| b.stmts.clone())
                     .unwrap_or_default();
                 StructuredStatement::BasicBlock {

@@ -4,7 +4,9 @@
 //! starting from instruction-level seeds (e.g., FADD → float, ISETP → int,
 //! IMAD.WIDE → pointer) and flowing through phi nodes and copies.
 //!
-//! The type lattice is: `Bottom < {U8, U16, U32, I32, F32, U64, Ptr64} < Top`
+//! The type lattice is:
+//!   `Bottom < {U8, U16, U32, I32, F16, F32} < AnyInt/AnyFloat < Top`
+//!   `Bottom < {U64, Ptr64} < Top`
 //! Phi nodes take the join (least upper bound) of their inputs.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -23,28 +25,47 @@ pub enum InferredType {
     F16,
     U64,
     Ptr64,
+    /// Any integer type (U8, U16, U32, I32 merged). Renders as "uint32_t".
+    AnyInt,
+    /// Any float type (F16, F32 merged). Renders as "float".
+    AnyFloat,
     Top,
 }
 
 impl InferredType {
     /// Least upper bound in the type lattice.
     pub fn join(self, other: Self) -> Self {
+        use InferredType::*;
         if self == other { return self; }
-        if self == InferredType::Bottom { return other; }
-        if other == InferredType::Bottom { return self; }
-        // Different concrete types → Top (ambiguous)
-        InferredType::Top
+        if self == Bottom { return other; }
+        if other == Bottom { return self; }
+        if self == Top || other == Top { return Top; }
+
+        // Check if both are in the integer family.
+        let is_int = |t: InferredType| matches!(t, U8 | U16 | U32 | I32 | AnyInt);
+        // Check if both are in the float family.
+        let is_float = |t: InferredType| matches!(t, F16 | F32 | AnyFloat);
+
+        if is_int(self) && is_int(other) {
+            return AnyInt;
+        }
+        if is_float(self) && is_float(other) {
+            return AnyFloat;
+        }
+
+        // Different families (int vs float, int vs ptr, etc.) → Top
+        Top
     }
 
     /// Convert to a C type string for declarations.
     pub fn to_c_type(self) -> &'static str {
         match self {
-            InferredType::Bottom | InferredType::Top => "uint32_t",
+            InferredType::Bottom | InferredType::Top | InferredType::AnyInt => "uint32_t",
             InferredType::U8 => "uint8_t",
             InferredType::U16 => "uint16_t",
             InferredType::U32 => "uint32_t",
             InferredType::I32 => "int32_t",
-            InferredType::F32 => "float",
+            InferredType::F32 | InferredType::AnyFloat => "float",
             InferredType::F16 => "__half",
             InferredType::U64 => "uint64_t",
             InferredType::Ptr64 => "uintptr_t",

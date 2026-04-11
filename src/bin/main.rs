@@ -2,9 +2,41 @@ use cudad::*;
 use clap::Parser;
 use regex::Regex;
 use std::fs;
+use std::sync::OnceLock;
 
 /// Embedded demo SASS for quick testing without --input.
 const SAMPLE_SASS: &str = include_str!("../../test_cu/sample_verify_kernel.sass");
+
+// ---------------------------------------------------------------------------
+// Cached regex objects
+// ---------------------------------------------------------------------------
+
+fn main_reg_name_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\b((?:U?R|U?P)\d+)\b").unwrap())
+}
+
+fn main_ident_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").unwrap())
+}
+
+fn main_temp_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"\b(?:v\d+|u\d+|b\d+|abi_internal_0x[0-9A-Fa-f]+|arg\d+_(?:ptr_)?(?:lo32|hi32|word\d+)(?:_\d+)?|tid_[xyz](?:_\d+)?|ctaid_[xyz](?:_\d+)?|param_\d+|block_dim_[xyz](?:_\d+)?|grid_dim_[xyz](?:_\d+)?|lane_id(?:_\d+)?|cga_cta_id(?:_\d+)?)\b",
+        )
+        .unwrap()
+    })
+}
+
+fn main_assign_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"^\s*(?:if\s*\([^)]*\)\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*=").unwrap()
+    })
+}
 
 fn render_typed_structured_output(
     code_output: &str,
@@ -23,12 +55,11 @@ fn render_typed_structured_output(
 
     // Filter out declarations for registers that no longer appear in the
     // code output (e.g., raw R0/P0 after name recovery renamed them).
-    let reg_name_re = Regex::new(r"\b((?:U?R|U?P)\d+)\b").expect("valid regex");
+    let reg_name = main_reg_name_re();
     let used_decls: Vec<&str> = local_decls
         .iter()
         .filter(|d| {
-            // Extract the register name from the declaration (e.g., "uint32_t R0;" -> "R0")
-            if let Some(cap) = reg_name_re.captures(d) {
+            if let Some(cap) = reg_name.captures(d) {
                 let reg_name = cap.get(1).unwrap().as_str();
                 // Check if this register name appears in the code body (as a word boundary match)
                 let pat = format!(r"\b{}\b", regex::escape(reg_name));
@@ -72,24 +103,18 @@ fn infer_self_contained_locals(
     local_decls: &[String],
     name_type_map: &std::collections::HashMap<String, &str>,
 ) -> Vec<String> {
-    let ident_re = Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").expect("valid regex");
-    let temp_re = Regex::new(
-        r"\b(?:v\d+|u\d+|b\d+|abi_internal_0x[0-9A-Fa-f]+|arg\d+_(?:ptr_)?(?:lo32|hi32|word\d+)(?:_\d+)?|tid_[xyz](?:_\d+)?|ctaid_[xyz](?:_\d+)?|param_\d+|block_dim_[xyz](?:_\d+)?|grid_dim_[xyz](?:_\d+)?|lane_id(?:_\d+)?|cga_cta_id(?:_\d+)?)\b",
-    )
-    .expect("valid regex");
-    let assign_re = Regex::new(
-        r"^\s*(?:if\s*\([^)]*\)\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*=",
-    )
-    .expect("valid regex");
+    let ident = main_ident_re();
+    let temp = main_temp_re();
+    let assign = main_assign_re();
     let mut declared = std::collections::BTreeSet::<String>::new();
     for d in local_decls {
-        for m in ident_re.find_iter(d) {
+        for m in ident.find_iter(d) {
             declared.insert(m.as_str().to_string());
         }
     }
     if let Some(a) = aliases {
         for p in a.render_typed_param_list() {
-            for m in ident_re.find_iter(&p) {
+            for m in ident.find_iter(&p) {
                 declared.insert(m.as_str().to_string());
             }
         }
@@ -101,7 +126,7 @@ fn infer_self_contained_locals(
     let mut live_ins = std::collections::BTreeSet::<String>::new();
     for raw_line in code_output.lines() {
         let line = raw_line.split("//").next().unwrap_or("");
-        let lhs_span = assign_re.captures(line).and_then(|c| {
+        let lhs_span = assign.captures(line).and_then(|c| {
             let whole = c.get(0)?;
             let after_eq = line.get(whole.end()..).unwrap_or("").trim_start();
             if after_eq.starts_with('=') {
@@ -111,7 +136,7 @@ fn infer_self_contained_locals(
                 .map(|m| (m.as_str().to_string(), m.start(), m.end()))
         });
         // Collect RHS uses of temp variables.
-        for m in temp_re.find_iter(line) {
+        for m in temp.find_iter(line) {
             let t = m.as_str();
             let is_lhs = lhs_span
                 .as_ref()
@@ -135,7 +160,7 @@ fn infer_self_contained_locals(
             }
         }
         if let Some((lhs, _, _)) = lhs_span {
-            if temp_re.is_match(&lhs) {
+            if temp.is_match(&lhs) {
                 defined.insert(lhs);
             }
         }

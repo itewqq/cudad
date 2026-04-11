@@ -1,6 +1,32 @@
 use pretty_assertions::assert_eq;
 use regex::Regex;
+use std::sync::OnceLock;
 use crate::*;
+
+// Cached regexes for test helpers.
+fn test_reg_name_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\b((?:U?R|U?P)\d+)\b").unwrap())
+}
+fn test_ident_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").unwrap())
+}
+fn test_temp_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"\b(?:v\d+|u\d+|b\d+|abi_internal_0x[0-9A-Fa-f]+|arg\d+_ptr_(?:lo32|hi32)|arg\d+_word\d+)\b",
+        )
+        .unwrap()
+    })
+}
+fn test_assign_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"^\s*(?:if\s*\([^)]*\)\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*=").unwrap()
+    })
+}
 
 const SAMPLE_SASS: &str = r#"
         /*0000*/                   IMAD.MOV.U32 R1, RZ, RZ, c[0x0][0x28] ;  /* 0x ... */
@@ -534,11 +560,11 @@ fn render_typed_structured_output_for_test(
 
     // Filter out declarations for registers that no longer appear in the
     // code output (e.g., raw R0/P0 after name recovery renamed them).
-    let reg_name_re = Regex::new(r"\b((?:U?R|U?P)\d+)\b").expect("valid regex");
+    let reg_name = test_reg_name_re();
     let used_decls: Vec<&str> = local_decls
         .iter()
         .filter(|d| {
-            if let Some(cap) = reg_name_re.captures(d) {
+            if let Some(cap) = reg_name.captures(d) {
                 let reg_name = cap.get(1).unwrap().as_str();
                 let pat = format!(r"\b{}\b", regex::escape(reg_name));
                 Regex::new(&pat).map_or(false, |re| re.is_match(code_output))
@@ -580,24 +606,18 @@ fn infer_self_contained_locals_for_test(
     aliases: Option<&AbiArgAliases>,
     local_decls: &[String],
 ) -> Vec<String> {
-    let ident_re = Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").expect("valid regex");
-    let temp_re = Regex::new(
-        r"\b(?:v\d+|u\d+|b\d+|abi_internal_0x[0-9A-Fa-f]+|arg\d+_ptr_(?:lo32|hi32)|arg\d+_word\d+)\b",
-    )
-    .expect("valid regex");
-    let assign_re = Regex::new(
-        r"^\s*(?:if\s*\([^)]*\)\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*=",
-    )
-    .expect("valid regex");
+    let ident = test_ident_re();
+    let temp = test_temp_re();
+    let assign = test_assign_re();
     let mut declared = std::collections::BTreeSet::<String>::new();
     for d in local_decls {
-        for m in ident_re.find_iter(d) {
+        for m in ident.find_iter(d) {
             declared.insert(m.as_str().to_string());
         }
     }
     if let Some(a) = aliases {
         for p in a.render_typed_param_list() {
-            for m in ident_re.find_iter(&p) {
+            for m in ident.find_iter(&p) {
                 declared.insert(m.as_str().to_string());
             }
         }
@@ -609,7 +629,7 @@ fn infer_self_contained_locals_for_test(
     let mut live_ins = std::collections::BTreeSet::<String>::new();
     for raw_line in code_output.lines() {
         let line = raw_line.split("//").next().unwrap_or("");
-        let lhs_span = assign_re.captures(line).and_then(|c| {
+        let lhs_span = assign.captures(line).and_then(|c| {
             let whole = c.get(0)?;
             let after_eq = line.get(whole.end()..).unwrap_or("").trim_start();
             if after_eq.starts_with('=') {
@@ -618,7 +638,7 @@ fn infer_self_contained_locals_for_test(
             c.get(1)
                 .map(|m| (m.as_str().to_string(), m.start(), m.end()))
         });
-        for m in temp_re.find_iter(line) {
+        for m in temp.find_iter(line) {
             let t = m.as_str();
             let is_lhs = lhs_span
                 .as_ref()
@@ -640,7 +660,7 @@ fn infer_self_contained_locals_for_test(
             }
         }
         if let Some((lhs, _, _)) = lhs_span {
-            if temp_re.is_match(&lhs) {
+            if temp.is_match(&lhs) {
                 defined.insert(lhs);
             }
         }

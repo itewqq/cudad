@@ -10,6 +10,81 @@
 
 use regex::Regex;
 use std::collections::{BTreeSet, HashMap};
+use std::sync::OnceLock;
+
+// ---------------------------------------------------------------------------
+// Cached regex objects — compiled once, reused across all calls.
+// ---------------------------------------------------------------------------
+
+fn assign_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+);$").unwrap())
+}
+
+fn assign_lhs_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=").unwrap())
+}
+
+fn ident_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\b([A-Za-z_][A-Za-z0-9_]*)\b").unwrap())
+}
+
+fn side_effect_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?:__syncthreads|ATOMS|STS|STG|STS\.U|STG\.E|RED|ATOM|BAR|MEMBAR|DEPBAR|FENCE)",
+        )
+        .unwrap()
+    })
+}
+
+fn constant_rhs_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"^(?:threadIdx\.[xyz]|blockIdx\.[xyz]|blockDim\.[xyz]|gridDim\.[xyz]|cgaCtaId|laneId|abi_internal_0x[0-9A-Fa-f]+|c\[0x[0-9a-f]+\]\[0x[0-9a-f]+\]|arg\d+_ptr\.(?:lo32|hi32)|arg\d+_word\d+\.(?:lo32|hi32)|arg\d+|param_\d+)$",
+        )
+        .unwrap()
+    })
+}
+
+fn literal_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^-?\d+$|^true$|^false$|^0x[0-9A-Fa-f]+$").unwrap())
+}
+
+fn guard_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^\s*if\s*\(([^)]+)\)\s*return\s*;").unwrap())
+}
+
+fn plus_zero_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r" \+ 0([;),\s]|$)").unwrap())
+}
+
+fn zero_plus_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\b0 \+ ").unwrap())
+}
+
+fn minus_zero_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r" - 0([;),\s]|$)").unwrap())
+}
+
+fn times_one_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r" \* 1([;),\s]|$)").unwrap())
+}
+
+fn one_times_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\b1 \* ").unwrap())
+}
 
 /// Run text-level dead-code elimination on `input`.
 ///
@@ -37,30 +112,11 @@ pub fn eliminate_dead_code(input: &str) -> String {
 
 /// One round of DCE.  Returns the text with dead assignments removed.
 fn dce_one_pass(input: &str) -> String {
-    // Regex to detect simple assignment lines:
-    //   <indent> <ident> = <expr>;
-    // We must NOT remove:
-    //   - Lines with side effects: memory stores (*addr = ...), function calls
-    //     that have effects (__syncthreads, ATOMS, STS, etc.)
-    //   - Conditional assignments: if (...) <ident> = ...
-    //   - Control flow: return, if, do, while, break, continue
-    //   - Lines that are purely comments
-    //   - Memory dereference LHS: *addr64(...) = ...
-    let assign_re =
-        Regex::new(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+);$").expect("valid regex");
-
-    // Side-effect function patterns — never remove these even if LHS looks dead.
-    let side_effect_re = Regex::new(
-        r"(?:__syncthreads|ATOMS|STS|STG|STS\.U|STG\.E|RED|ATOM|BAR|MEMBAR|DEPBAR|FENCE)",
-    )
-    .expect("valid regex");
+    let assign = assign_re();
+    let side_effect = side_effect_re();
+    let ident = ident_re();
 
     let lines: Vec<&str> = input.lines().collect();
-
-    // First pass: collect all identifiers and count their non-LHS occurrences.
-    // An identifier is "used" if it appears anywhere other than as the LHS of
-    // its own assignment.
-    let ident_re = Regex::new(r"\b([A-Za-z_][A-Za-z0-9_]*)\b").expect("valid regex");
 
     // Count how many times each identifier appears as a non-LHS reference.
     // We'll build: for each line, what is the LHS identifier (if pure assignment)?
@@ -101,12 +157,12 @@ fn dce_one_pass(input: &str) -> String {
             continue;
         }
 
-        if let Some(caps) = assign_re.captures(trimmed) {
+        if let Some(caps) = assign.captures(trimmed) {
             let lhs_name = caps.get(1).unwrap().as_str().to_string();
             let rhs = caps.get(2).unwrap().as_str();
 
             // Don't remove if RHS has side effects
-            let has_side_effect = side_effect_re.is_match(rhs)
+            let has_side_effect = side_effect.is_match(rhs)
                 || rhs.contains("__syncthreads")
                 || rhs.contains("atomicInc")
                 || rhs.contains("atomicAdd");
@@ -125,7 +181,7 @@ fn dce_one_pass(input: &str) -> String {
     // Count all identifier occurrences across the entire text.
     let mut total_count: HashMap<String, usize> = HashMap::new();
     for info in &line_infos {
-        for m in ident_re.find_iter(info.text) {
+        for m in ident.find_iter(info.text) {
             *total_count.entry(m.as_str().to_string()).or_insert(0) += 1;
         }
     }
@@ -185,15 +241,9 @@ fn dce_one_pass(input: &str) -> String {
 /// - Argument components: `arg*_ptr.lo32`, `arg*_ptr.hi32`, `arg*`
 /// - Explicit parameters: `param_*`
 fn eliminate_common_subexpressions(input: &str) -> String {
-    let assign_re =
-        Regex::new(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+);$").expect("valid regex");
-    let ident_re = Regex::new(r"\b([A-Za-z_][A-Za-z0-9_]*)\b").expect("valid regex");
-
-    // These RHS patterns are guaranteed kernel-constant (same value throughout).
-    let constant_rhs_re = Regex::new(
-        r"^(?:threadIdx\.[xyz]|blockIdx\.[xyz]|blockDim\.[xyz]|gridDim\.[xyz]|cgaCtaId|laneId|abi_internal_0x[0-9A-Fa-f]+|c\[0x[0-9a-f]+\]\[0x[0-9a-f]+\]|arg\d+_ptr\.(?:lo32|hi32)|arg\d+_word\d+\.(?:lo32|hi32)|arg\d+|param_\d+)$",
-    )
-    .expect("valid regex");
+    let assign = assign_re();
+    let ident = ident_re();
+    let constant_rhs = constant_rhs_re();
 
     let lines: Vec<&str> = input.lines().collect();
 
@@ -201,7 +251,7 @@ fn eliminate_common_subexpressions(input: &str) -> String {
     let mut lhs_count: HashMap<String, usize> = HashMap::new();
     for &line in &lines {
         let trimmed = line.trim();
-        if let Some(caps) = assign_re.captures(trimmed) {
+        if let Some(caps) = assign.captures(trimmed) {
             let lhs = caps.get(1).unwrap().as_str().to_string();
             *lhs_count.entry(lhs).or_insert(0) += 1;
         }
@@ -218,11 +268,11 @@ fn eliminate_common_subexpressions(input: &str) -> String {
     for (line_idx, &line) in lines.iter().enumerate() {
         let trimmed = line.trim();
 
-        if let Some(caps) = assign_re.captures(trimmed) {
+        if let Some(caps) = assign.captures(trimmed) {
             let lhs = caps.get(1).unwrap().as_str().to_string();
             let rhs = caps.get(2).unwrap().as_str().trim().to_string();
 
-            if constant_rhs_re.is_match(&rhs) {
+            if constant_rhs.is_match(&rhs) {
                 // Only CSE if:
                 // 1. The anchor variable (first_var) is never reassigned
                 // 2. The variable being renamed (lhs) is never reassigned
@@ -253,7 +303,7 @@ fn eliminate_common_subexpressions(input: &str) -> String {
             continue;
         }
         // Apply renames in this line.
-        let new_line = ident_re.replace_all(line, |caps: &regex::Captures| {
+        let new_line = ident.replace_all(line, |caps: &regex::Captures| {
             let name = caps.get(1).unwrap().as_str();
             if let Some(replacement) = rename_map.get(name) {
                 replacement.clone()
@@ -276,12 +326,9 @@ fn eliminate_common_subexpressions(input: &str) -> String {
 /// Only propagates constants that are "small" (≤ 10 chars) to avoid bloating
 /// the output — large hex constants are better left in named variables.
 fn propagate_constants(input: &str) -> String {
-    let assign_re =
-        Regex::new(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+);$").expect("valid regex");
-    let ident_re = Regex::new(r"\b([A-Za-z_][A-Za-z0-9_]*)\b").expect("valid regex");
-
-    // A "small literal" is a number (possibly negative), true, or false.
-    let literal_re = Regex::new(r"^-?\d+$|^true$|^false$|^0x[0-9A-Fa-f]+$").expect("valid regex");
+    let assign = assign_re();
+    let ident = ident_re();
+    let literal = literal_re();
 
     let lines: Vec<&str> = input.lines().collect();
 
@@ -289,7 +336,7 @@ fn propagate_constants(input: &str) -> String {
     let mut lhs_count: HashMap<String, usize> = HashMap::new();
     for &line in &lines {
         let trimmed = line.trim();
-        if let Some(caps) = assign_re.captures(trimmed) {
+        if let Some(caps) = assign.captures(trimmed) {
             let lhs = caps.get(1).unwrap().as_str().to_string();
             *lhs_count.entry(lhs).or_insert(0) += 1;
         }
@@ -301,7 +348,7 @@ fn propagate_constants(input: &str) -> String {
 
     for (line_idx, &line) in lines.iter().enumerate() {
         let trimmed = line.trim();
-        if let Some(caps) = assign_re.captures(trimmed) {
+        if let Some(caps) = assign.captures(trimmed) {
             let lhs = caps.get(1).unwrap().as_str().to_string();
             let rhs = caps.get(2).unwrap().as_str().trim().to_string();
 
@@ -310,7 +357,7 @@ fn propagate_constants(input: &str) -> String {
             // 2. RHS is a small literal
             // 3. Literal is short enough to inline (≤ 10 chars)
             if lhs_count.get(&lhs).copied().unwrap_or(0) == 1
-                && literal_re.is_match(&rhs)
+                && literal.is_match(&rhs)
                 && rhs.len() <= 10
             {
                 const_map.insert(lhs, rhs);
@@ -329,7 +376,7 @@ fn propagate_constants(input: &str) -> String {
         if lines_to_remove.contains(&line_idx) {
             continue;
         }
-        let new_line = ident_re.replace_all(line, |caps: &regex::Captures| {
+        let new_line = ident.replace_all(line, |caps: &regex::Captures| {
             let name = caps.get(1).unwrap().as_str();
             if let Some(literal) = const_map.get(name) {
                 literal.clone()
@@ -371,28 +418,11 @@ fn simplify_algebra(input: &str) -> String {
 fn simplify_algebra_line(line: &str) -> String {
     let mut s = line.to_string();
 
-    // We use manual replacement to avoid the need for look-ahead/look-behind
-    // which the Rust regex crate doesn't support.
-
-    // X + 0  →  X   (where 0 is a standalone token: followed by ; ) , space or EOL)
-    let plus_zero = Regex::new(r" \+ 0([;),\s]|$)").unwrap();
-    s = plus_zero.replace_all(&s, "$1").into_owned();
-
-    // 0 + X  →  X
-    let zero_plus = Regex::new(r"\b0 \+ ").unwrap();
-    s = zero_plus.replace_all(&s, "").into_owned();
-
-    // X - 0  →  X
-    let minus_zero = Regex::new(r" - 0([;),\s]|$)").unwrap();
-    s = minus_zero.replace_all(&s, "$1").into_owned();
-
-    // X * 1  →  X   (where 1 is standalone: not followed by digit/letter)
-    let times_one = Regex::new(r" \* 1([;),\s]|$)").unwrap();
-    s = times_one.replace_all(&s, "$1").into_owned();
-
-    // 1 * X  →  X   (where 1 is standalone: preceded by word boundary)
-    let one_times = Regex::new(r"\b1 \* ").unwrap();
-    s = one_times.replace_all(&s, "").into_owned();
+    s = plus_zero_re().replace_all(&s, "$1").into_owned();
+    s = zero_plus_re().replace_all(&s, "").into_owned();
+    s = minus_zero_re().replace_all(&s, "$1").into_owned();
+    s = times_one_re().replace_all(&s, "$1").into_owned();
+    s = one_times_re().replace_all(&s, "").into_owned();
 
     s
 }
@@ -400,8 +430,8 @@ fn simplify_algebra_line(line: &str) -> String {
 /// Remove duplicate `if (X) return;` lines where the predicate is not
 /// reassigned between the occurrences.
 fn eliminate_duplicate_guards(input: &str) -> String {
-    let guard_re = Regex::new(r"^\s*if\s*\(([^)]+)\)\s*return\s*;").expect("valid regex");
-    let assign_re = Regex::new(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=").expect("valid regex");
+    let guard = guard_re();
+    let assign = assign_lhs_re();
 
     let lines: Vec<&str> = input.lines().collect();
     let mut result: Vec<&str> = Vec::with_capacity(lines.len());
@@ -412,13 +442,13 @@ fn eliminate_duplicate_guards(input: &str) -> String {
         let trimmed = line.trim();
 
         // If a variable is reassigned, invalidate it from active guards.
-        if let Some(caps) = assign_re.captures(trimmed) {
+        if let Some(caps) = assign.captures(trimmed) {
             let lhs = caps.get(1).unwrap().as_str();
             active_guards.remove(lhs);
         }
 
         // Check if this is an `if (X) return;` line.
-        if let Some(caps) = guard_re.captures(trimmed) {
+        if let Some(caps) = guard.captures(trimmed) {
             let pred = caps.get(1).unwrap().as_str().to_string();
             if active_guards.contains(&pred) {
                 // Duplicate guard — skip this line.
