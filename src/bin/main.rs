@@ -289,7 +289,8 @@ fn emit_ssa_dot(cfg: &ControlFlowGraph, abi_profile: Option<AbiProfile>, output:
         let ssa = build_ssa(cfg);
         let dce1 = ir_dce(&ssa);
         let cp = ir_constprop(&dce1);
-        let cse = ir_cse(&cp, cfg);
+        let alg = ir_algebra(&cp);
+        let cse = ir_cse(&alg, cfg);
         let copyprop = ir_copyprop(&cse);
         ir_dce(&copyprop)
     };
@@ -313,7 +314,8 @@ fn emit_struct_code(cfg: &ControlFlowGraph, args: &Args, abi_profile: Option<Abi
         let ssa = build_ssa(cfg);
         let dce1 = ir_dce(&ssa);
         let cp = ir_constprop(&dce1);
-        let cse = ir_cse(&cp, cfg);
+        let alg = ir_algebra(&cp);
+        let cse = ir_cse(&alg, cfg);
         let copyprop = ir_copyprop(&cse);
         ir_dce(&copyprop)
     };

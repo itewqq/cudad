@@ -217,7 +217,12 @@ fn subst_in_cond(
                 sign: reg.sign.abs(),
                 ssa: reg.ssa,
             };
-            let new_reg = subst.get(&lookup).cloned().unwrap_or_else(|| reg.clone());
+            let mut new_reg = subst.get(&lookup).cloned().unwrap_or_else(|| reg.clone());
+            // Compose signs: if the original use had a negative sign,
+            // flip the replacement's sign (consistent with subst_in_expr).
+            if reg.sign < 0 {
+                new_reg.sign = -new_reg.sign;
+            }
             crate::ir::IRCond::Pred {
                 reg: new_reg,
                 sense: *sense,
@@ -227,7 +232,7 @@ fn subst_in_cond(
 }
 
 /// Check if all phi args refer to the same SSA register (ignoring sign).
-/// Returns the canonical (positive-sign) register if so.
+/// Returns the canonical register if so (preserving sign).
 fn all_same_reg(args: &[IRExpr]) -> Option<RegId> {
     let mut canonical: Option<RegId> = None;
     for arg in args {
@@ -240,17 +245,22 @@ fn all_same_reg(args: &[IRExpr]) -> Option<RegId> {
             // canonical value.
             continue;
         }
+        // Preserve sign so φ(-R5, R5) is correctly rejected as non-trivial.
         let normalized = RegId {
             class: r.class.clone(),
             idx: r.idx,
-            sign: 1,
+            sign: r.sign,
             ssa: r.ssa,
         };
         match &canonical {
             None => canonical = Some(normalized),
             Some(c) => {
-                if !same_ssa_reg(c, &normalized) {
-                    return None; // Different registers — non-trivial phi.
+                if c.class != normalized.class
+                    || c.idx != normalized.idx
+                    || c.ssa != normalized.ssa
+                    || c.sign != normalized.sign
+                {
+                    return None; // Different registers or different signs — non-trivial phi.
                 }
             }
         }
