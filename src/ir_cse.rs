@@ -28,7 +28,7 @@ enum ExprKey {
 }
 
 /// A hashable representation of an IRExpr leaf or sub-expression.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum ExprAtom {
     Reg { class: String, idx: i32, sign: i32, ssa: Option<usize> },
     ImmI(i64),
@@ -71,13 +71,39 @@ fn stmt_to_key(stmt: &IRStatement) -> Option<ExprKey> {
             if stmt.is_side_effectful() || is_memory_load(opcode) {
                 return None;
             }
+            let mut atoms: Vec<ExprAtom> = args.iter().map(expr_to_atom).collect();
+            // Canonicalize commutative operations: sort operands so that
+            // IADD3(R0, 0x5, RZ) and IADD3(0x5, R0, RZ) get the same key.
+            if is_fully_commutative(opcode) {
+                atoms.sort();
+            } else if is_partially_commutative(opcode) {
+                // IMAD: a*b+c — first two args (multiplicands) are commutative,
+                // third (addend) stays in place.
+                if atoms.len() >= 2 {
+                    if atoms[0] > atoms[1] {
+                        atoms.swap(0, 1);
+                    }
+                }
+            }
             Some(ExprKey::Op {
                 opcode: opcode.clone(),
-                args: args.iter().map(expr_to_atom).collect(),
+                args: atoms,
             })
         }
         _ => None,
     }
+}
+
+/// Fully commutative: all operands are interchangeable.
+fn is_fully_commutative(opcode: &str) -> bool {
+    let mnem = opcode.split('.').next().unwrap_or(opcode);
+    matches!(mnem, "IADD3" | "UIADD3" | "FADD" | "FMUL" | "LOP3")
+}
+
+/// Partially commutative: first two operands are commutative (multiply).
+fn is_partially_commutative(opcode: &str) -> bool {
+    let mnem = opcode.split('.').next().unwrap_or(opcode);
+    matches!(mnem, "IMAD" | "FFMA")
 }
 
 fn is_memory_load(opcode: &str) -> bool {
@@ -258,5 +284,35 @@ mod tests {
             .filter(|s| matches!(&s.value, RValue::Op { opcode, .. } if opcode.starts_with("LDG")))
             .count();
         assert_eq!(load_count, 2, "loads should not be CSE'd");
+    }
+
+    #[test]
+    fn cse_canonicalizes_commutative_operands() {
+        // IADD3 R1, R0, 0x5, RZ  and  IADD3 R2, 0x5, R0, RZ
+        // are the same computation (IADD3 is commutative).
+        // CSE should recognize them as identical after canonicalization.
+        let sass = r#"
+            /*0000*/ IADD3 R1, R0, 0x5, RZ ;
+            /*0010*/ IADD3 R2, 0x5, R0, RZ ;
+            /*0020*/ IADD3 R3, R1, R2, RZ ;
+            /*0030*/ EXIT ;
+        "#;
+        let cfg = build_cfg(parse_sass(sass));
+        let fir = build_ssa(&cfg);
+        let cse_fir = ir_cse(&fir, &cfg);
+
+        // After CSE, R2's computation should be replaced with a copy of R1
+        let copy_count = cse_fir.blocks.iter()
+            .flat_map(|b| &b.stmts)
+            .filter(|s| {
+                matches!(&s.value, RValue::Op { opcode, .. }
+                    if opcode == "IMAD.MOV.U32")
+            })
+            .count();
+        assert!(
+            copy_count >= 1,
+            "CSE should eliminate one commutative duplicate, found {} copies",
+            copy_count
+        );
     }
 }
