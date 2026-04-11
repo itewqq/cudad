@@ -86,6 +86,49 @@ fn one_times_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"\b1 \* ").unwrap())
 }
 
+// addr64 collapsing regexes
+fn addr64_use_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"addr64\(([A-Za-z_]\w*),\s*([A-Za-z_]\w*)\)").unwrap())
+}
+
+fn lo_add_def_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        // Match: vLO = OFFSET + PTR.lo32;  or  vLO = OFFSET + PTR_lo32;
+        Regex::new(r"^\s*([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\s*\+\s*([A-Za-z_]\w*[._]lo32)\s*;")
+            .unwrap()
+    })
+}
+
+fn lea_hi_def_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"^\s*([A-Za-z_]\w*)\s*=\s*lea_hi_x(?:_sx32)?\(([A-Za-z_]\w*),\s*([A-Za-z_]\w*[._]hi32),\s*\d+,\s*([A-Za-z_]\w*)\)\s*;")
+            .unwrap()
+    })
+}
+
+/// Match: vHI = EXPR + PTR.hi32 + (bN ? 1 : 0);
+/// or:    vHI = EXPR + PTR_hi32 + (bN ? 1 : 0);
+/// This is the non-lea_hi alternative for the hi-part of addr64 construction.
+fn hi_add_carry_def_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"^\s*([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\s*\+\s*([A-Za-z_]\w*[._]hi32)\s*\+\s*\(([A-Za-z_]\w*)\s*\?\s*1\s*:\s*0\)\s*;")
+            .unwrap()
+    })
+}
+
+fn carry_def_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        // Match: bN = carry_u32_add3(OFFSET, PTR.lo32, 0);  or  PTR_lo32
+        Regex::new(r"^\s*([A-Za-z_]\w*)\s*=\s*carry_u32_add3\(([A-Za-z_]\w*),\s*([A-Za-z_]\w*[._]lo32),\s*0\)\s*;")
+            .unwrap()
+    })
+}
+
 /// Run text-level dead-code elimination on `input`.
 ///
 /// Returns the cleaned output with dead assignments removed.
@@ -97,6 +140,8 @@ pub fn eliminate_dead_code(input: &str) -> String {
     text = propagate_constants(&text);
     // Algebraic simplification: fold X+0, 0+X, X*1, etc.
     text = simplify_algebra(&text);
+    // Collapse addr64(lo, hi) patterns into typed pointer expressions.
+    text = collapse_addr64_patterns(&text);
     // Iterate to fixpoint — removing one line may make another variable dead.
     loop {
         let next = dce_one_pass(&text);
@@ -469,6 +514,204 @@ fn eliminate_duplicate_guards(input: &str) -> String {
     result.join("\n")
 }
 
+/// Collapse addr64(lo, hi) pointer arithmetic patterns into typed pointer
+/// expressions.
+///
+/// Recognizes the stereotyped SASS pointer construction pattern:
+/// ```text
+///   bN = carry_u32_add3(OFFSET, PTR.lo32, 0);
+///   vLO = OFFSET + PTR.lo32;
+///   vHI = lea_hi_x_sx32(OFFSET, PTR.hi32, SCALE, bN);
+///   ... = *((TYPE*)addr64(vLO, vHI));
+/// ```
+/// and rewrites `addr64(vLO, vHI)` → `(PTR + (int64_t)OFFSET)`.
+///
+/// The carry/lo/hi intermediate assignments become dead and are removed by
+/// the subsequent DCE fixpoint.
+/// Extract base pointer name from a lo32/hi32 qualified name.
+/// Handles both dot notation ("arg0_ptr.lo32" → "arg0_ptr")
+/// and underscore notation ("arg4_ptr_lo32" → "arg4_ptr").
+fn strip_ptr_suffix(name: &str, suffix_dot: &str, suffix_underscore: &str) -> Option<String> {
+    if let Some(base) = name.strip_suffix(suffix_dot) {
+        return Some(base.to_string());
+    }
+    if let Some(base) = name.strip_suffix(suffix_underscore) {
+        return Some(base.to_string());
+    }
+    None
+}
+
+fn collapse_addr64_patterns(input: &str) -> String {
+    let addr64 = addr64_use_re();
+    let lo_add = lo_add_def_re();
+    let lea_hi = lea_hi_def_re();
+    let hi_add_carry = hi_add_carry_def_re();
+    let carry = carry_def_re();
+
+    // Quick check: if no addr64 in the text, skip entirely.
+    if !input.contains("addr64(") {
+        return input.to_string();
+    }
+
+    let lines: Vec<&str> = input.lines().collect();
+
+    // Phase 1: Collect definitions of the form we recognize.
+    //
+    // lo_defs: var → (offset_var, ptr_lo32_name)
+    //   e.g. "v33" → ("v32", "arg0_ptr.lo32")
+    //
+    // lea_hi_defs: var → (offset_var, ptr_hi32_name, carry_var)
+    //   Pattern: vHI = lea_hi_x_sx32(OFFSET, PTR.hi32, SCALE, bN);
+    //   e.g. "v34" → ("v32", "arg0_ptr.hi32", "b9")
+    //
+    // add_carry_hi_defs: var → (hi_offset_var, ptr_hi32_name, carry_var)
+    //   Pattern: vHI = EXPR + PTR.hi32 + (bN ? 1 : 0);
+    //   e.g. "v159" → ("v12", "arg4_ptr_hi32", "b42")
+    //
+    // carry_defs: var → (offset_var, ptr_lo32_name)
+    //   e.g. "b9" → ("v32", "arg0_ptr.lo32")
+    let mut lo_defs: HashMap<String, (String, String)> = HashMap::new();
+    let mut lea_hi_defs: HashMap<String, (String, String, String)> = HashMap::new();
+    let mut add_carry_hi_defs: HashMap<String, (String, String, String)> = HashMap::new();
+    let mut carry_defs: HashMap<String, (String, String)> = HashMap::new();
+
+    for &line in &lines {
+        let trimmed = line.trim();
+        if let Some(caps) = lo_add.captures(trimmed) {
+            let dest = caps.get(1).unwrap().as_str().to_string();
+            let offset = caps.get(2).unwrap().as_str().to_string();
+            let ptr_lo = caps.get(3).unwrap().as_str().to_string();
+            lo_defs.insert(dest, (offset, ptr_lo));
+        }
+        if let Some(caps) = lea_hi.captures(trimmed) {
+            let dest = caps.get(1).unwrap().as_str().to_string();
+            let offset = caps.get(2).unwrap().as_str().to_string();
+            let ptr_hi = caps.get(3).unwrap().as_str().to_string();
+            let carry_var = caps.get(4).unwrap().as_str().to_string();
+            lea_hi_defs.insert(dest, (offset, ptr_hi, carry_var));
+        }
+        if let Some(caps) = hi_add_carry.captures(trimmed) {
+            let dest = caps.get(1).unwrap().as_str().to_string();
+            let hi_offset = caps.get(2).unwrap().as_str().to_string();
+            let ptr_hi = caps.get(3).unwrap().as_str().to_string();
+            let carry_var = caps.get(4).unwrap().as_str().to_string();
+            add_carry_hi_defs.insert(dest, (hi_offset, ptr_hi, carry_var));
+        }
+        if let Some(caps) = carry.captures(trimmed) {
+            let dest = caps.get(1).unwrap().as_str().to_string();
+            let offset = caps.get(2).unwrap().as_str().to_string();
+            let ptr_lo = caps.get(3).unwrap().as_str().to_string();
+            carry_defs.insert(dest, (offset, ptr_lo));
+        }
+    }
+
+    // Phase 2: For each addr64(vLO, vHI), check if vLO and vHI match a
+    // consistent pointer pattern.
+    // Build a replacement map: "addr64(vLO, vHI)" → "(PTR + (int64_t)OFFSET)"
+    let mut replacements: HashMap<String, String> = HashMap::new();
+
+    // Scan for addr64 occurrences
+    for &line in &lines {
+        for caps in addr64.captures_iter(line) {
+            let lo_var = caps.get(1).unwrap().as_str();
+            let hi_var = caps.get(2).unwrap().as_str();
+            let key = format!("addr64({}, {})", lo_var, hi_var);
+
+            if replacements.contains_key(&key) {
+                continue;
+            }
+
+            // We need a lo-part definition.
+            let lo_info = match lo_defs.get(lo_var) {
+                Some(info) => info,
+                None => continue,
+            };
+            let (lo_offset, ptr_lo) = lo_info;
+
+            // Extract base pointer from lo32 name.
+            let base_lo = match strip_ptr_suffix(ptr_lo, ".lo32", "_lo32") {
+                Some(b) => b,
+                None => continue,
+            };
+
+            // Try to match hi-part: first lea_hi, then add_carry_hi.
+            let hi_match = if let Some((hi_offset, ptr_hi, carry_var)) =
+                lea_hi_defs.get(hi_var)
+            {
+                // Pattern 1: lea_hi_x_sx32(OFFSET, PTR.hi32, SCALE, bN)
+                // The offset in lea_hi must match the lo offset.
+                if hi_offset == lo_offset {
+                    Some((ptr_hi.clone(), carry_var.clone(), lo_offset.clone()))
+                } else {
+                    None
+                }
+            } else if let Some((hi_offset_var, ptr_hi, carry_var)) =
+                add_carry_hi_defs.get(hi_var)
+            {
+                // Pattern 2: EXPR + PTR.hi32 + (bN ? 1 : 0)
+                // The carry variable tells us the real lo-offset.
+                // The hi_offset_var might be a sign extension of lo_offset
+                // (e.g., v12 = (int32_t)v13 >> 31), or it might equal lo_offset.
+                // We trust the carry_var to identify the true offset.
+                if let Some((carry_offset, _)) = carry_defs.get(carry_var) {
+                    if carry_offset == lo_offset {
+                        Some((ptr_hi.clone(), carry_var.clone(), lo_offset.clone()))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let (ptr_hi, carry_var, offset) = match hi_match {
+                Some(m) => m,
+                None => continue,
+            };
+
+            // Extract base pointer from hi32 name and verify consistency.
+            let base_hi = match strip_ptr_suffix(&ptr_hi, ".hi32", "_hi32") {
+                Some(b) => b,
+                None => continue,
+            };
+
+            if base_lo != base_hi {
+                continue;
+            }
+
+            // Verify carry variable consistency (optional — if carry exists)
+            if let Some((carry_offset, carry_ptr_lo)) = carry_defs.get(&carry_var) {
+                if carry_offset != &offset || carry_ptr_lo != ptr_lo {
+                    continue;
+                }
+            }
+
+            // Match! Build the replacement expression.
+            replacements.insert(key, format!("({} + (int64_t){})", base_lo, offset));
+        }
+    }
+
+    if replacements.is_empty() {
+        return input.to_string();
+    }
+
+    // Phase 3: Apply replacements to all lines.
+    let mut result = Vec::with_capacity(lines.len());
+    for &line in &lines {
+        let mut new_line = line.to_string();
+        for (from, to) in &replacements {
+            if new_line.contains(from.as_str()) {
+                new_line = new_line.replace(from.as_str(), to.as_str());
+            }
+        }
+        result.push(new_line);
+    }
+
+    result.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -632,5 +875,71 @@ mod tests {
         let input = "  v1 = v0 * 10;\n  *ptr = v1;";
         let output = eliminate_dead_code(input);
         assert!(output.contains("v0 * 10"), "* 10 must not be folded");
+    }
+
+    #[test]
+    fn collapses_addr64_lea_hi_pattern() {
+        // Pattern 1: carry + add + lea_hi_x_sx32 + addr64 → typed pointer
+        let input = "\
+  b9 = carry_u32_add3(v32, arg0_ptr.lo32, 0);
+  v33 = v32 + arg0_ptr.lo32;
+  v34 = lea_hi_x_sx32(v32, arg0_ptr.hi32, 1, b9);
+  v35 = *((uint8_t*)addr64(v33, v34));
+  return v35;";
+        let output = eliminate_dead_code(input);
+        assert!(
+            output.contains("(arg0_ptr + (int64_t)v32)"),
+            "addr64 should be collapsed to typed pointer: {}", output
+        );
+        assert!(!output.contains("addr64("), "no addr64 should remain");
+        // carry/add/lea_hi intermediates should be DCE'd
+        assert!(!output.contains("lea_hi_x_sx32("), "lea_hi_x_sx32 should be DCE'd");
+    }
+
+    #[test]
+    fn collapses_addr64_hi_add_carry_pattern() {
+        // Pattern 2: carry + add + hi_add_carry + addr64 → typed pointer
+        let input = "\
+  b42 = carry_u32_add3(v13, arg4_ptr_lo32, 0);
+  v158 = v13 + arg4_ptr_lo32;
+  v159 = v12 + arg4_ptr_hi32 + (b42 ? 1 : 0);
+  v160 = *((uint8_t*)addr64(v158, v159));
+  return v160;";
+        let output = eliminate_dead_code(input);
+        assert!(
+            output.contains("(arg4_ptr + (int64_t)v13)"),
+            "addr64 should be collapsed to typed pointer: {}", output
+        );
+        assert!(!output.contains("addr64("), "no addr64 should remain");
+    }
+
+    #[test]
+    fn collapses_addr64_with_dot_suffix() {
+        // Pattern using .lo32/.hi32 suffix (dot notation)
+        let input = "\
+  b1 = carry_u32_add3(v5, arg2_ptr.lo32, 0);
+  v6 = v5 + arg2_ptr.lo32;
+  v7 = v4 + arg2_ptr.hi32 + (b1 ? 1 : 0);
+  *((uint32_t*)addr64(v6, v7)) = v8;";
+        let output = eliminate_dead_code(input);
+        assert!(
+            output.contains("(arg2_ptr + (int64_t)v5)"),
+            "addr64 should be collapsed with dot suffix: {}", output
+        );
+    }
+
+    #[test]
+    fn addr64_collapse_preserves_unmatched_patterns() {
+        // addr64 where lo/hi don't follow recognized patterns should remain
+        let input = "\
+  v10 = v3 * 4 + v1;
+  v11 = v2 + v4;
+  v12 = *addr64(v10, v11);
+  return v12;";
+        let output = eliminate_dead_code(input);
+        assert!(
+            output.contains("addr64(v10, v11)"),
+            "unrecognized addr64 should be preserved: {}", output
+        );
     }
 }

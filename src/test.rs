@@ -1227,17 +1227,26 @@ fn full_pass_rc4_keeps_thread0_gate_as_predicate_guard() {
 }
 
 #[test]
-fn full_pass_rc4_avoids_overclaimed_lea_hi_x_pointer_formula() {
+fn full_pass_rc4_addr64_collapsed_to_typed_pointer() {
     let out = run_structured_output_full_pass(include_str!("../test_cu/rc4.sass"));
-    assert!(out.contains("lea_hi_x_sx32("));
+    // After addr64 collapse, carry/lea_hi patterns are replaced with typed pointer
+    // expressions. No addr64() calls should remain in the rc4 output.
+    assert!(!out.contains("addr64("), "all addr64 patterns should be collapsed to typed pointers");
+    // The collapsed output should contain typed pointer arithmetic with arg0_ptr.
+    assert!(out.contains("(arg0_ptr + (int64_t)"), "arg0_ptr pointer expressions expected");
+    // No raw lea_hi_x_sx32 should remain (DCE removes dead intermediates).
+    assert!(!out.contains("lea_hi_x_sx32("), "lea_hi_x_sx32 should be DCE'd after collapse");
+    // Negative checks from the old test still apply.
     assert!(!out.contains("arg0_ptr.hi32 << 1"));
     assert!(!out.contains("ConstMem(0, 356) << 1"));
 }
 
 #[test]
-fn full_pass_rc4_global_u8_accesses_use_addr64_pairs() {
+fn full_pass_rc4_global_u8_accesses_use_typed_pointers() {
     let out = run_structured_output_full_pass(include_str!("../test_cu/rc4.sass"));
-    assert!(out.contains("((uint8_t*)addr64("));
+    // After addr64 collapse, global u8 accesses use typed pointer expressions
+    // instead of addr64 pairs.
+    assert!(out.contains("((uint8_t*)(arg0_ptr + (int64_t)"));
 }
 
 #[test]
@@ -1247,21 +1256,14 @@ fn full_pass_rc4_key_sel_uses_ssa_predicate_not_raw_p1() {
 }
 
 #[test]
-fn full_pass_rc4_lea_hi_x_uses_add_carry_predicates() {
+fn full_pass_rc4_pointer_arithmetic_uses_typed_expressions() {
     let out = run_structured_output_full_pass(include_str!("../test_cu/rc4.sass"));
-    let carry_defs = Regex::new(r"(b\d+)\s*=\s*carry_u32_add3\(").expect("valid regex");
-    let mut found_lea_using_carry = false;
-    for cap in carry_defs.captures_iter(&out) {
-        let b = cap.get(1).expect("capture 1").as_str();
-        let needle = format!(", {})", b);
-        if out.contains("lea_hi_x_sx32(") && out.contains(&needle) {
-            found_lea_using_carry = true;
-            break;
-        }
-    }
+    // After addr64 collapse, the carry + lea_hi + addr64 pattern is collapsed
+    // into typed pointer expressions. Verify that arg4_ptr and arg6_ptr patterns
+    // are also collapsed.
     assert!(
-        found_lea_using_carry,
-        "expected at least one lea_hi_x_sx32(..., bN) to use carry_u32_add3-derived predicate"
+        out.contains("(arg4_ptr + (int64_t)") || out.contains("(arg6_ptr + (int64_t)"),
+        "expected collapsed pointer expressions for arg4_ptr or arg6_ptr"
     );
 }
 
