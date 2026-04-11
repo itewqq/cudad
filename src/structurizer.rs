@@ -1146,7 +1146,16 @@ impl<'a> Structurizer<'a> {
                 let printable_body = Self::without_redundant_loop_tail_continue(body);
                 s_out.push_str(&self.pretty_print_with_lift(&printable_body, ctx, indent_level + 1, lifted));
                 if *loop_type == LoopType::DoWhile {
-                     s_out.push_str(&format!("{}}} while({});\n", indent, condition_expr.as_ref().map_or("true".to_string(), |e| ctx.expr(e))));
+                    let cond_str = condition_expr
+                        .as_ref()
+                        .map_or("true".to_string(), |e| {
+                            if let Some(hid) = header_block_id {
+                                self.render_condition_expr(*hid, e, ctx, lifted)
+                            } else {
+                                ctx.expr(e)
+                            }
+                        });
+                     s_out.push_str(&format!("{}}} while({});\n", indent, cond_str));
                 } else {
                      s_out.push_str(&format!("{}}}\n", indent));
                 }
@@ -2375,7 +2384,7 @@ mod collapse {
         let body_stmt = stmt_for_region(graph, r, s);
         let loop_stmt = StructuredStatement::Loop {
             loop_type: LoopType::DoWhile,
-            header_block_id: None,
+            header_block_id: Some(tail_bid),
             condition_expr: Some(cond_oriented),
             body: Box::new(body_stmt),
         };

@@ -9,15 +9,16 @@
 __global__ void kernel(uint32_t arg9) {
   __shared__ uint8_t shmem_u8[256];
   bool b0; // live-in
-  bool b1; // live-in
 
   if (b0) return;
     tid_x = threadIdx.x;
   if (!((int32_t)(tid_x) > (int32_t)(255))) {
+      shmem_u8[tid_x] = tid_x;
+      tid_x = tid_x + blockDim.x;
     do {
       shmem_u8[tid_x] = tid_x;
       tid_x = tid_x + blockDim.x;
-    } while(!(b1));
+    } while(!((int32_t)(tid_x) >= (int32_t)(256)));
   }
 }
 // --- End Structured Output ---
