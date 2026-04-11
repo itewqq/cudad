@@ -699,7 +699,14 @@ fn run_structured_output_full_pass(sass: &str) -> String {
     }
     let sm = parse_sm_version(sass);
     let inferred_profile = AbiProfile::detect_with_sm(&instrs, sm);
-    let fir = build_ssa(&cfg);
+    let fir = {
+        let ssa = build_ssa(&cfg);
+        let dce1 = ir_dce(&ssa);
+        let cp = ir_constprop(&dce1);
+        let cse = ir_cse(&cp, &cfg);
+        let copyprop = ir_copyprop(&cse);
+        ir_dce(&copyprop)
+    };
     let analysis_abi_profile = Some(inferred_profile);
     let abi_annotations = analysis_abi_profile.map(|p| annotate_function_ir_constmem(&fir, p));
     let abi_aliases = match (analysis_abi_profile, abi_annotations.as_ref()) {

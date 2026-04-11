@@ -21,6 +21,15 @@ fn assign_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+);$").unwrap())
 }
 
+/// Matches self-assignments: `X = X;` or `if (...) X = X;`
+fn self_assign_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"^\s*(?:if\s*\([^)]*\)\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*;$")
+            .unwrap()
+    })
+}
+
 fn assign_lhs_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=").unwrap())
@@ -140,6 +149,10 @@ pub fn eliminate_dead_code(input: &str) -> String {
     text = propagate_constants(&text);
     // Algebraic simplification: fold X+0, 0+X, X*1, etc.
     text = simplify_algebra(&text);
+    // Self-assignment elimination: remove `X = X;` and `if (...) X = X;`.
+    // Run after algebra/constprop since those may simplify expressions
+    // into self-assignments.
+    text = eliminate_self_assignments(&text);
     // Collapse addr64(lo, hi) patterns into typed pointer expressions.
     text = collapse_addr64_patterns(&text);
     // Iterate to fixpoint — removing one line may make another variable dead.
@@ -153,6 +166,25 @@ pub fn eliminate_dead_code(input: &str) -> String {
     // Remove duplicate `if (X) return;` guards.
     text = eliminate_duplicate_guards(&text);
     text
+}
+
+/// Remove self-assignments: lines of the form `X = X;` or `if (...) X = X;`
+/// where the LHS identifier is identical to the RHS.  These are no-ops that
+/// arise from SSA phi nodes where name recovery gives both sides the same name.
+fn eliminate_self_assignments(input: &str) -> String {
+    let re = self_assign_re();
+    let mut out = Vec::new();
+    for line in input.lines() {
+        if let Some(caps) = re.captures(line) {
+            let lhs = caps.get(1).unwrap().as_str();
+            let rhs = caps.get(2).unwrap().as_str();
+            if lhs == rhs {
+                continue; // skip self-assignment
+            }
+        }
+        out.push(line);
+    }
+    out.join("\n")
 }
 
 /// One round of DCE.  Returns the text with dead assignments removed.
@@ -940,6 +972,34 @@ mod tests {
         assert!(
             output.contains("addr64(v10, v11)"),
             "unrecognized addr64 should be preserved: {}", output
+        );
+    }
+
+    #[test]
+    fn eliminates_self_assignment() {
+        let input = "  v16 = v16;\n  v17 = v16 + 1;\n  return v17;";
+        let output = eliminate_dead_code(input);
+        assert!(
+            !output.contains("v16 = v16"),
+            "self-assignment should be removed: {}", output
+        );
+        assert!(
+            output.contains("v17 = v16 + 1"),
+            "non-self-assignment should be preserved: {}", output
+        );
+    }
+
+    #[test]
+    fn eliminates_predicated_self_assignment() {
+        let input = "  if (!b47) v206 = v206;\n  v207 = v206 + 1;\n  return v207;";
+        let output = eliminate_dead_code(input);
+        assert!(
+            !output.contains("v206 = v206"),
+            "predicated self-assignment should be removed: {}", output
+        );
+        assert!(
+            output.contains("v207 = v206 + 1"),
+            "non-self-assignment should be preserved: {}", output
         );
     }
 }

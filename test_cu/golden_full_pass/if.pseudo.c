@@ -1,23 +1,9 @@
 // --- Structured Output ---
-// ABI const-memory mapping (sample):
-// BB0.S0: c[0x0][0x28] -> abi_internal_0x28
-// BB2.S0: c[0x0][0x168] -> param_2
-// ABI arg aliases (heuristic):
-// param_2 -> arg2 (word32, confidence: low, words: {0})
-// Typed signature inferred from ABI aliases:
-// param_2 -> arg2 (word32, confidence: low, words: {0})
-__global__ void kernel(uint32_t arg2) {
-  uint32_t v0;
-  uint32_t abi_internal_0x28; // live-in
+__global__ void kernel(void) {
   bool b0; // live-in
-  uint32_t v2;
-  uint32_t v3; // live-in
 
-    v0 = abi_internal_0x28;
   if (b0) {
-    v0 = v0 + 1;
   } else {
-    v2 = v3 * v2 + arg2;
   }
   return;
 }

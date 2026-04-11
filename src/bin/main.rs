@@ -290,7 +290,8 @@ fn emit_ssa_dot(cfg: &ControlFlowGraph, abi_profile: Option<AbiProfile>, output:
         let dce1 = ir_dce(&ssa);
         let cp = ir_constprop(&dce1);
         let cse = ir_cse(&cp, cfg);
-        ir_dce(&cse)
+        let copyprop = ir_copyprop(&cse);
+        ir_dce(&copyprop)
     };
     let default_display = DefaultDisplay;
     let abi_display = abi_profile.map(|profile| {
@@ -313,7 +314,8 @@ fn emit_struct_code(cfg: &ControlFlowGraph, args: &Args, abi_profile: Option<Abi
         let dce1 = ir_dce(&ssa);
         let cp = ir_constprop(&dce1);
         let cse = ir_cse(&cp, cfg);
-        ir_dce(&cse)
+        let copyprop = ir_copyprop(&cse);
+        ir_dce(&copyprop)
     };
 
     // Resolve ABI annotations & aliases (needed for --abi-map, --typed-decls, --semantic-lift).
