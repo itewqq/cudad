@@ -203,15 +203,17 @@ fn is_one_expr(e: &IRExpr) -> bool {
 }
 
 /// Returns true for plain truncated IMAD (lo32(a*b)+c).
-/// Excludes IMAD.MOV (copy idiom), IMAD.HI (hi32), and IMAD.WIDE (64-bit).
+/// Excludes IMAD.MOV (copy idiom), IMAD.HI (hi32), IMAD.WIDE (64-bit),
+/// and IMAD.X (carry-in: lo32(a*b)+c+carry ≠ c when a*b=0).
 fn is_plain_imad(opcode: &str) -> bool {
     if !opcode.starts_with("IMAD") {
         return false;
     }
-    // Reject IMAD.MOV, IMAD.HI, IMAD.WIDE — their semantics differ.
+    // Reject variants with different semantics.
     if opcode.starts_with("IMAD.MOV")
         || opcode.contains(".HI")
         || opcode.contains(".WIDE")
+        || opcode.contains(".X")
     {
         return false;
     }

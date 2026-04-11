@@ -237,7 +237,9 @@ __global__ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8
   uint32_t v173;
   bool b45;
   uint32_t v174;
+  bool b46;
   uint32_t v175;
+  uint32_t v176;
   bool b47;
   uint32_t v177;
   uint32_t u16;
@@ -739,9 +741,11 @@ __global__ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8
   v173 = ctaid_x * arg8 + v128;
   b45 = carry_u32_add3(v173, arg6_ptr.lo32, 0);
   v174 = v173 + arg6_ptr.lo32;
+  b46 = carry_u32_add3(v173, arg4_ptr.lo32, 0);
   v175 = v173 + arg4_ptr.lo32;
   v174 = (int32_t)v173 >> 31;
   v2 = v174 + arg6_ptr.hi32 + (b45 ? 1 : 0);
+  v176 = v174 + arg4_ptr.hi32 + (b46 ? 1 : 0);
     b47 = (int32_t)(v173) >= (int32_t)(v127);
     if (!b47) v177 = *((uint8_t*)(arg4_ptr + (int64_t)v173));
     u16 = u0 + 1;
@@ -749,6 +753,7 @@ __global__ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8
     b4 = carry_u32_add3(v175, 1, 0);
     v175 = v175 + 1;
     v173 = v173 + 1;
+    v176 = v176 + (b4 ? 1 : 0);
     u0 = u16 - u5;
     v17 = shmem_u8[u0];
     v178 = v17 + v131;
@@ -761,10 +766,12 @@ __global__ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8
     shmem_u8[v131] = v17;
     v183 = shmem_u8[u0];
     v174 = !b47 ? (v174) : v182;
+    b46 = carry_u32_add3(v174, 1, 0);
     v174 = v174 + 1;
     v184 = v17 + v183;
     if (!b47) v185 = v184 & 255;
     if (!b47) v14 = shmem_u8[v185];
+    v2 = v2 + (b46 ? 1 : 0);
     if (!b47) v16 = v177 ^ v14;
     if (!b47) *((uint8_t*)(arg6_ptr + (int64_t)v173)) = v16;
   do {
@@ -775,6 +782,7 @@ __global__ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8
     b4 = carry_u32_add3(v175, 1, 0);
     v175 = v175 + 1;
     v173 = v173 + 1;
+    v176 = v176 + (b4 ? 1 : 0);
     u0 = u16 - u5;
     v17 = shmem_u8[u0];
     v178 = v17 + v131;
@@ -787,10 +795,12 @@ __global__ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8
     shmem_u8[v131] = v17;
     v183 = shmem_u8[u0];
     v174 = !b47 ? (v174) : v182;
+    b46 = carry_u32_add3(v174, 1, 0);
     v174 = v174 + 1;
     v184 = v17 + v183;
     if (!b47) v185 = v184 & 255;
     if (!b47) v14 = shmem_u8[v185];
+    v2 = v2 + (b46 ? 1 : 0);
     if (!b47) v16 = v177 ^ v14;
     if (!b47) *((uint8_t*)(arg6_ptr + (int64_t)v173)) = v16;
   } while(v126 != 0);
