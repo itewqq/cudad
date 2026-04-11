@@ -1115,13 +1115,18 @@ impl<'a> Structurizer<'a> {
                 }
             }
             StructuredStatement::Loop { loop_type, header_block_id, condition_expr, body } => {
-                if let Some(hid) = header_block_id {
-                    s_out.push_str(&self.render_condition_prelude_for_block(
-                        *hid,
-                        ctx,
-                        indent_level,
-                        lifted,
-                    ));
+                // Render header block prelude for While loops (statements before
+                // the loop keyword). Skip for DoWhile — the "header" is actually
+                // the tail block whose statements are already in the body.
+                if *loop_type != LoopType::DoWhile {
+                    if let Some(hid) = header_block_id {
+                        s_out.push_str(&self.render_condition_prelude_for_block(
+                            *hid,
+                            ctx,
+                            indent_level,
+                            lifted,
+                        ));
+                    }
                 }
                 match loop_type {
                     LoopType::While => {

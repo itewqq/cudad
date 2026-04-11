@@ -7,8 +7,6 @@ if (b0) return;
   b1 = (int32_t)(v2) > (int32_t)(255);
   b2 = v2 != 0;
 if (!((int32_t)(v2) > (int32_t)(255))) {
-    shmem_u8[v2] = v2;
-    v2 = v2 + c[0x0][0x0];
   do {
     shmem_u8[v2] = v2;
     v2 = v2 + c[0x0][0x0];
