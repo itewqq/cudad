@@ -176,7 +176,85 @@ Applied as text-level transformations after structured rendering:
 ### Regression status
 
 - Golden fixtures are synchronized with current behavior across all four directories.
-- Test suite currently passes (`cargo test`): **226 passed, 0 failed**.
+- Test suite currently passes (`cargo test`): **251 passed, 0 failed**.
+
+---
+
+## Running on real-world CUDA kernels
+
+### Step 1: Extract SASS from a CUDA binary
+
+You need a CUDA binary (`.cubin`, `.fatbin`, or executable with embedded CUDA). Use NVIDIA's `cuobjdump` to extract SASS disassembly:
+
+```bash
+# For a .cubin or .fatbin file:
+cuobjdump -sass my_kernel.cubin > my_kernel.sass
+
+# For an executable with embedded CUDA:
+cuobjdump -sass my_program > all_kernels.sass
+
+# To list available kernels first:
+cuobjdump -symbols my_kernel.cubin
+```
+
+Alternatively, use `nvdisasm`:
+
+```bash
+nvdisasm my_kernel.cubin > my_kernel.sass
+```
+
+### Step 2: Isolate a single kernel (if needed)
+
+If the binary contains multiple kernels, the SASS dump will contain all of them. You can either:
+
+- Pass the full file — `cudad` processes all instructions as one function (suitable for single-kernel binaries).
+- Manually extract the section for one kernel (look for `Function :` headers in the dump).
+
+### Step 3: Run the decompiler
+
+```bash
+# Full decompilation (default — all passes enabled):
+cargo run -- -i my_kernel.sass
+
+# Save output to a file:
+cargo run -- -i my_kernel.sass -o my_kernel.pseudo.c
+
+# Just structured code without lifting/naming:
+cargo run -- -i my_kernel.sass --struct-code
+```
+
+### Step 4: Understand the output
+
+The decompiler produces pseudo-C with:
+- **`__global__ void kernel(...)`** — inferred typed signature from ABI const-memory patterns
+- **`__shared__` arrays** — detected shared memory usage
+- **CUDA builtins** — `threadIdx.x`, `blockDim.x`, `blockIdx.x`, etc.
+- **Structured control flow** — `if/else`, `do/while`, `while` loops recovered from SASS branches
+
+### Supported architectures
+
+| SM Target | Status |
+|-----------|--------|
+| sm_89 (Ada Lovelace) | Primary testing, best coverage |
+| sm_100 (Blackwell) | Corpus tested (11 kernels), good coverage |
+| sm_75–sm_86 | Should work (similar SASS format), limited testing |
+| sm_50–sm_70 | May work with `--abi-profile legacy140` |
+
+### Example end-to-end
+
+```bash
+# 1. Compile a CUDA source to cubin
+nvcc -arch=sm_89 -cubin my_kernel.cu -o my_kernel.cubin
+
+# 2. Extract SASS
+cuobjdump -sass my_kernel.cubin > my_kernel.sass
+
+# 3. Decompile
+cargo run -- -i my_kernel.sass -o my_kernel.pseudo.c
+
+# 4. View result
+cat my_kernel.pseudo.c
+```
 
 ---
 
@@ -188,19 +266,7 @@ Applied as text-level transformations after structured rendering:
 2. **Parameter name resolution**  
    Map `param_0`/`param_1` through constant-memory loads to resolve kernel argument names in expressions.
 
-3. **Phi node lowering**  
-   Improve rendering of SSA phi nodes — currently shown as comments or omitted; lower to explicit variable assignments at merge points.
-
-4. **Variable naming improvements**  
-   Use semantic seeds more aggressively (e.g., name variables based on their defining operation) and reduce live-in/undefined variable noise.
-
-5. **Switch/multi-way branch support**  
-   Add normalization for branch tables / multi-way control flow.
-
-6. **Richer type propagation**  
-   Strengthen inferred local/argument typing and pointer/value distinction beyond current heuristics.
-
-7. **Cross-version/cross-arch validation**  
+3. **Cross-version/cross-arch validation**  
    Expand test corpus across additional SM targets and SASS dump formats beyond sm_89 and sm_100.
 
 ---
