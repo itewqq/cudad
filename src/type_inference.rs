@@ -377,12 +377,22 @@ fn infer_arg_types_from_opcode(opcode: &str, num_args: usize) -> Vec<Option<Infe
     }
 
     // ---- ISETP: integer set-predicate (comparison) ----
-    // ISETP.<cmp>.<logic>       → signed comparison (inputs are I32)
-    // ISETP.<cmp>.U32.<logic>   → unsigned comparison (inputs are U32)
+    // Only ordered comparisons (.LT, .LE, .GT, .GE) imply signedness:
+    //   ISETP.<ord>.<logic>       → signed (inputs are I32)
+    //   ISETP.<ord>.U32.<logic>   → unsigned (inputs are U32)
+    // Equality comparisons (.EQ, .NE) are signedness-agnostic — skip them.
     // Note: The arg layout from the parser may include predicate operands
-    // (e.g., PT) as uses. We seed ALL args with the comparison type;
-    // predicate/immutable registers will be filtered out by the caller.
+    // (e.g., PT) as uses. We seed ALL non-predicate args with the comparison
+    // type; predicate/immutable registers will be filtered out by the caller.
     if opcode.starts_with("ISETP") {
+        let is_ordered = opcode.contains(".LT")
+            || opcode.contains(".LE")
+            || opcode.contains(".GT")
+            || opcode.contains(".GE");
+        if !is_ordered {
+            // .EQ / .NE — signedness-agnostic, no constraint
+            return result;
+        }
         let input_ty = if opcode.contains(".U32") {
             InferredType::U32
         } else {
@@ -397,6 +407,8 @@ fn infer_arg_types_from_opcode(opcode: &str, num_args: usize) -> Vec<Option<Infe
     // ---- I2F / I2FP: integer-to-float conversion ----
     // The source integer arg inherits signedness from the opcode suffix.
     // I2F.U16 → source is U16;  I2FP.F32.S32 → source is I32
+    // Note: starts_with("I2F") deliberately matches both I2F and I2FP —
+    // they use the same suffix scheme (.S32, .U32, .U16, etc.).
     if opcode.starts_with("I2F") {
         let src_ty = if opcode.contains(".S32") {
             InferredType::I32
@@ -462,19 +474,28 @@ fn infer_arg_types_from_opcode(opcode: &str, num_args: usize) -> Vec<Option<Infe
         return result;
     }
 
-    // ---- IMAD.HI.U32 / IMAD.U32 / IMAD.SHL.U32: unsigned multiply-add ----
-    // IMAD without U32 suffix → signed multiply-add
+    // ---- IMAD with explicit signedness suffix ----
+    // Plain IMAD performs truncated 32×32→32 multiply-add where the low 32
+    // bits are identical regardless of signedness — no constraint.
+    // Only IMAD.HI (which produces the *high* 32 bits) is signedness-sensitive:
+    //   IMAD.HI.U32 → unsigned;  IMAD.HI (no U32) → signed.
+    // IMAD.U32 / IMAD.SHL.U32 also explicitly mark unsigned.
     if opcode.starts_with("IMAD") && !opcode.starts_with("IMAD.MOV") && !opcode.starts_with("IMAD.WIDE") {
-        let input_ty = if opcode.contains(".U32") {
-            InferredType::U32
-        } else {
-            // IMAD without U32 → signed by default in NVIDIA ISA
-            InferredType::I32
-        };
-        // First two args are multiplicands; third is addend (same type)
-        for slot in result.iter_mut() {
-            *slot = Some(input_ty);
+        // Only infer signedness when the opcode has an explicit signedness marker
+        let has_hi = opcode.contains(".HI");
+        let has_u32 = opcode.contains(".U32");
+        if has_hi || has_u32 {
+            let input_ty = if has_u32 {
+                InferredType::U32
+            } else {
+                // .HI without .U32 → signed
+                InferredType::I32
+            };
+            for slot in result.iter_mut() {
+                *slot = Some(input_ty);
+            }
         }
+        // Plain IMAD without .HI or .U32 → no signedness constraint
         return result;
     }
 
@@ -625,6 +646,24 @@ mod tests {
         let r1_ty = types.get(&("R".to_string(), 1)).copied().unwrap_or(InferredType::Bottom);
         assert_eq!(r0_ty, InferredType::U32, "ISETP.GT.U32 input R0 should be U32");
         assert_eq!(r1_ty, InferredType::U32, "ISETP.GT.U32 input R1 should be U32");
+    }
+
+    #[test]
+    fn isetp_eq_ne_does_not_seed_signedness() {
+        // ISETP.NE.AND is an equality comparison — signedness-agnostic.
+        // Inputs should NOT be seeded with any type.
+        let sass = r#"
+            /*0000*/ ISETP.NE.AND P0, PT, R0, R1, PT ;
+            /*0010*/ EXIT ;
+        "#;
+        let cfg = build_cfg(parse_sass(sass));
+        let fir = build_ssa(&cfg);
+        let types = infer_types(&fir);
+
+        let r0_ty = types.get(&("R".to_string(), 0)).copied().unwrap_or(InferredType::Bottom);
+        let r1_ty = types.get(&("R".to_string(), 1)).copied().unwrap_or(InferredType::Bottom);
+        assert_eq!(r0_ty, InferredType::Bottom, "ISETP.NE should not seed signedness on R0");
+        assert_eq!(r1_ty, InferredType::Bottom, "ISETP.NE should not seed signedness on R1");
     }
 
     #[test]
