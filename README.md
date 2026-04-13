@@ -2,370 +2,286 @@
 
 `cudad` is an experimental CUDA SASS decompiler.
 
-> ⚠️ **Warning**
->
-> This project is heavily vibe-coded and experimental. Do **not** rely on it for production reverse engineering, security decisions, or correctness-critical workflows.
+It takes `.sass` text dumps from NVIDIA tooling (`cuobjdump` / `nvdisasm`) and turns them into conservative, typed pseudo-C that is easier to inspect than raw SASS.
 
-It currently emphasizes:
+This is a reverse-engineering and compiler-internals project, not a production decompiler. The code is actively refactored, the output is intentionally conservative, and some kernels still degrade to temp-heavy code or explicit `goto BB...` fallbacks. That said, the current pipeline is real, end-to-end, and usable for inspection work.
 
-- stable parse/CFG/SSA construction,
-- conservative structurization,
-- semantic lifting with a rule-registry pattern for SASS opcodes,
-- name recovery, ABI-aware typed declarations, and semantic symbolization,
-- structural AST cleanup and typed rendering on the canonical backend,
-- golden-based regression testing across the curated fixture directories.
+## What it does today
 
-It does **not** yet aim for broad architecture/version coverage or production-grade decompilation quality.
+- decodes real SASS instruction lines into typed instruction/operand records
+- builds CFG + SSA and runs optimization passes before lifting
+- structurizes recoverable control flow into `if` / loop-shaped pseudocode
+- infers CUDA builtins and ABI-backed kernel arguments from constant-memory usage
+- emits typed pseudo-C with shared-memory declarations and stable recovered names
+- regression-tests the full pipeline on curated fixtures plus multi-kernel corpora for SM 89 / SM 100 / SM 120
 
-## Why this project exists
+## What the output looks like
 
-Yes, there is already nice prior work on CUDA SASS reversing/decompilation (for example: [Jeb's SASS decompiler](https://www.pnfsoftware.com/blog/reversing-nvidia-cuda-sass-code/)).
-
-This project exists mostly because:
-
-- it is fun,
-- it is a hands-on learning exercise for compiler/decompiler internals,
-- it is an experiment to probe LLM ability and limits on graph-heavy tasks (CFG, dominators, SSA, structurization).
-
-So the goal here is not to compete with mature tools; it is to learn by building and iterating.
-
-## Input source expectation
-
-The `.sass` input used by this project is expected to be disassembly text produced by NVIDIA CUDA Toolkit tools (for example `cuobjdump` / `nvdisasm`).
-
-Current parsing/testing is primarily aligned with `cuobjdump`-style text dumps seen in the fixtures.
-
-### Why SASS instead of PTX?
-
-PTX is usually easier to read and reverse than SASS.
-
-However, PTX can be stripped from CUDA binaries, while SASS machine code is what must exist for execution.
-
-So this project focuses on SASS as the more robust target when PTX is missing.
-
-### Current machine/version coverage
-
-- Primary fixture coverage: `sm_89` with `code version = [1,7]`-style dumps.
-- SM 100 (Blackwell) corpus: 11 kernel files in `test_cu/corpus_sm100/` covering arithmetic, branching, control flow, crypto, data processing, FFT, image processing, linear algebra, ML, sorting, and stencil kernels.
-- Coverage across older SM targets and different disassembly formats is still limited.
-
-## Quick showcase
-
-### Example input (`test_cu/rc4.sass`, abridged)
-
-```sass
-...
-/*0000*/ IMAD.MOV.U32 R1, RZ, RZ, c[0x0][0x28] ;
-/*0010*/ S2R R0, SR_CTAID.X ;
-/*0020*/ ISETP.GE.AND P0, PT, R0, c[0x0][0x184], PT ;
-/*0030*/ @P0 EXIT ;
-/*0040*/ S2R R2, SR_TID.X ;
-/*0050*/ ULDC.64 UR6, c[0x0][0x118] ;
-/*0060*/ BSSY B0, 0xf0 ;
-/*0070*/ ISETP.GT.AND P1, PT, R2, 0xff, PT ;
-/*0080*/ ISETP.NE.AND P0, PT, R2, RZ, PT ;
-/*0090*/ @P1 BRA 0xe0 ;
-/*00a0*/ STS.U8 [R2], R2 ;
-/*00b0*/ IADD3 R2, R2, c[0x0][0x0], RZ ;
-/*00c0*/ ISETP.GE.AND P1, PT, R2, 0x100, PT ;
-/*00d0*/ @!P1 BRA 0xa0 ;
-...
-```
-
-### Example output (abridged)
-
-By default, running `cargo run -- -i test_cu/rc4.sass` produces full decompilation (structured code + semantic lift + name recovery + typed declarations + ABI mapping + semantic symbolization):
+For `test_cu/test_div.sass`, the canonical output looks like this:
 
 ```c
-__global__ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr,
-                       uint8_t* arg6_ptr, uint32_t arg8, uint32_t arg9) {
-  __shared__ uint8_t shmem_u8[256];
-  uint32_t ctaid_x;
-  uint32_t tid_x;
+__global__ void kernel(int32_t arg0, int32_t arg1, uint32_t arg2, uint32_t arg3) {
+  uint32_t v0;
+  int32_t u0;
+  uint32_t u1;
+  int32_t u2;
+  uint32_t v1;
+  bool b0;
+  uint32_t v2;
+  uint32_t v3;
   ...
-  ctaid_x = blockIdx.x;
-  if (b0) return;
-    tid_x = threadIdx.x;
-    b1 = (int32_t)(tid_x) > (int32_t)(255);
-    b2 = tid_x != 0;
-  if (!((int32_t)(tid_x) > (int32_t)(255))) {
-    do {
-      shmem_u8[tid_x] = tid_x;
-      tid_x = tid_x + blockDim.x;
-    } while(!(b1));
-  }
-    __syncthreads();
-  if (!(b2)) {
-    v3 = abs(arg2);
-    v5 = (float)(v3);
-    v6 = rcp_approx(v5);
-    ...
-  }
-  do {
-    v22 = abs(tid_x);
-    v23 = shmem_u8[tid_x];
-    ...
-  } while(!(b26));
+
+  v0 = abs(arg1);
+  u0 = arg0;
+  u1 = arg1;
+  u2 = u0 ^ u1;
+  v1 = (float)(v0);
+  b0 = (int32_t)(0) <= (int32_t)(u2);
   ...
+  *addr64(v9, v15) = v16;
+  return;
 }
 ```
 
-This is the style of transformation the project targets: low-level SASS blocks/predicates into conservative structured pseudocode with CUDA-style types, ABI-inferred arguments, shared memory notation, and semantic intrinsic names.
+That is representative of the current backend:
+- signatures are inferred heuristically from ABI usage
+- locals are typed, but names are still generic (`vN`, `bN`, `uN`) unless stronger recovery exists
+- semantic lift recovers helpers such as `abs`, `rcp_approx`, `mul_hi_u32`, CUDA builtins, and shared-memory access
+- pointer reconstruction is partial, so `addr64(lo, hi)` still appears in many kernels
 
----
+For concrete snapshots, see `test_cu/golden_full_pass/`.
 
-## Current decompiler pipeline
+## Quick start
 
-### Core path
-
-1. **Decode SASS**  
-   `decode_sass` in `src/parser.rs`
-2. **Build CFG**  
-   `build_cfg` in `src/cfg.rs`
-3. **Build SSA IR**  
-   `build_ssa` in `src/ir.rs`
-4. **Structurize control flow**  
-   `Structurizer::structure_function` in `src/structurizer.rs`
-5. **Render structured pseudocode**  
-   `Structurizer::pretty_print_with_lift_cleanup_and_names` in `src/structurizer.rs`
-
-### Semantic lifting, naming, and final rendering
-
-1. **Semantic lifting**  
-   `lift_function_ir` in `src/semantic_lift.rs` maps SSA ops to typed AST expressions.
-2. **Structural AST cleanup**  
-   `src/ast_passes.rs` handles structural simplification, predicate cleanup, and `addr64` folding before final formatting.
-3. **Structural name recovery**  
-   `plan_structured_name_recovery_with_lift` in `src/name_recovery.rs` computes SSA-to-symbol mappings that are applied on the AST path, not by post-render regex surgery.
-4. **ABI-aware typing/display pass**  
-   `src/abi.rs` and `src/typed_output.rs` produce typed signatures, declarations, and CUDA builtin names such as `blockDim.x`, `gridDim.y`, and `threadIdx.z`.
-
-### Full-pass test/golden pipeline
-
-`src/test.rs` and `examples/regen_goldens.rs` keep curated snapshots for the canonical full-pass backend in:
-
-- `test_cu/golden_full_pass/`
-
----
-
-## Current progress
-
-### What is working well
-
-- End-to-end parse → CFG → SSA → structured output is stable.
-- Semantic lifting via rule registry covers most common SASS opcodes, including arithmetic, memory, comparisons, bitwise, atomics (`atomicAdd`, `atomicInc`, etc.), and type casts (`(float)`, `(uint32_t)`).
-- Structural AST cleanup and typed rendering now handle the final output cleanup on the canonical backend.
-- Name recovery deterministically maps SSA values onto stable C-like symbols before the final render.
-- ABI profile/alias inference provides `__global__` qualified typed signatures with pointer/scalar arg inference.
-- Shared memory accesses render as `shmem_u8[addr]` / `shmem_u32[addr]` notation.
-- CUDA builtins use standard dot notation: `blockDim.x`, `gridDim.y`, `threadIdx.z`.
-- NOP instructions, dead code after `return`, BB labels, and zero-register writes are suppressed.
-- PLOP3.LUT constant folding evaluates boolean LUT when predicate inputs are known.
-- Default CLI (`cargo run -- -i file.sass`) runs full decompilation with all passes enabled.
-
-### Regression status
-
-- Golden fixtures are synchronized with the curated full-pass snapshot set.
-- Test suite currently passes locally with `cargo test`.
-
----
-
-## Running on real-world CUDA kernels
-
-### Step 1: Extract SASS from a CUDA binary
-
-You need a CUDA binary (`.cubin`, `.fatbin`, or executable with embedded CUDA). Use NVIDIA's `cuobjdump` to extract SASS disassembly:
+### 1. Build and run on a bundled fixture
 
 ```bash
-# For a .cubin or .fatbin file:
-cuobjdump -sass my_kernel.cubin > my_kernel.sass
-
-# For an executable with embedded CUDA:
-cuobjdump -sass my_program > all_kernels.sass
-
-# To list available kernels first:
-cuobjdump -symbols my_kernel.cubin
+cargo run -- -i test_cu/test_div.sass
 ```
 
-Alternatively, use `nvdisasm`:
+A few more useful examples:
 
 ```bash
-nvdisasm my_kernel.cubin > my_kernel.sass
-```
-
-### Step 2: Isolate a single kernel (if needed)
-
-If the binary contains multiple kernels, the SASS dump will contain all of them. You can either:
-
-- Pass the full file — `cudad` processes all instructions as one function (suitable for single-kernel binaries).
-- Manually extract the section for one kernel (look for `Function :` headers in the dump).
-
-### Step 3: Run the decompiler
-
-```bash
-# Full decompilation (canonical full-pass backend):
-cargo run -- -i my_kernel.sass
-
-# Save output to a file:
-cargo run -- -i my_kernel.sass -o my_kernel.pseudo.c
-
-# Debug CFG only:
-cargo run -- -i my_kernel.sass --cfg-dot
-```
-
-### Step 4: Understand the output
-
-The decompiler produces pseudo-C with:
-- **`__global__ void kernel(...)`** — inferred typed signature from ABI const-memory patterns
-- **`__shared__` arrays** — detected shared memory usage
-- **CUDA builtins** — `threadIdx.x`, `blockDim.x`, `blockIdx.x`, etc.
-- **Structured control flow** — `if/else`, `do/while`, `while` loops recovered from SASS branches
-
-### Great usage examples
-
-```bash
-# 1. Decompile one kernel with the canonical pipeline
-cargo run -- -i test_cu/if_loop.sass
-
-# 2. Save canonical output for side-by-side source comparison
+# Decompile a larger fixture and save the pseudo-C
 cargo run -- -i test_cu/rc4.sass -o /tmp/rc4.pseudo.c
 
-# 3. Force an older ABI profile when testing pre-Ampere style dumps
-cargo run -- -i old_kernel.sass --abi-profile legacy140
-
-# 4. Inspect CFG shape when structurization looks suspicious
+# Inspect CFG structure
 cargo run -- -i test_cu/if_loop.sass --cfg-dot > /tmp/if_loop.cfg.dot
 
-# 5. Inspect optimized SSA when debugging lifting/name-recovery issues
-cargo run -- -i test_cu/if_loop.sass --ssa-dot > /tmp/if_loop.ssa.dot
+# Inspect optimized SSA
+cargo run -- -i test_cu/if_loop.sass --ssa-dot -o /tmp/if_loop.ssa.dot
 
-# 6. Refresh curated full-pass snapshots after intentional backend changes
+# Compare ABI interpretations when a dump is ambiguous
+cargo run -- -i old_kernel.sass --abi-profile legacy140
+cargo run -- -i old_kernel.sass --abi-profile modern160
+```
+
+If you omit `-i`, the binary uses the embedded demo file `test_cu/sample_verify_kernel.sass`.
+
+### 2. Run the test suite
+
+```bash
+cargo test --quiet
+```
+
+### 3. Regenerate curated golden snapshots after an intentional backend change
+
+```bash
 cargo run --example regen_goldens
 ```
 
-A practical review loop for real kernels is usually:
+## Getting input from a real CUDA binary
 
-1. extract one kernel with `cuobjdump -sass` or `nvdisasm`
-2. run `cargo run -- -i kernel.sass -o kernel.pseudo.c`
-3. diff the result against source or expected semantics
-4. if the output shape looks wrong, inspect `--cfg-dot` first, then `--ssa-dot`
+`cudad` expects SASS disassembly text, not a `.cu` file and not a `.cubin` directly.
 
-### Supported architectures
-
-| SM Target | Status |
-|-----------|--------|
-| sm_89 (Ada Lovelace) | Primary testing, best coverage |
-| sm_100 (Blackwell) | Corpus tested (11 kernels), good coverage |
-| sm_75–sm_86 | Should work (similar SASS format), limited testing |
-| sm_50–sm_70 | May work with `--abi-profile legacy140` |
-
-### Example end-to-end
+Typical workflow:
 
 ```bash
-# 1. Compile a CUDA source to cubin
+# Compile CUDA source to cubin
 nvcc -arch=sm_89 -cubin my_kernel.cu -o my_kernel.cubin
 
-# 2. Extract SASS
-cuobjdump -sass my_kernel.cubin > my_kernel.sass
+# Dump SASS with cuobjdump
+cuobjdump --dump-sass my_kernel.cubin > my_kernel.sass
 
-# 3. Decompile
+# Or with nvdisasm
+nvdisasm my_kernel.cubin > my_kernel.sass
+
+# Decompile
 cargo run -- -i my_kernel.sass -o my_kernel.pseudo.c
-
-# 4. View result
-cat my_kernel.pseudo.c
 ```
 
----
+### Important current limitation: one function per CLI input
 
-## Next steps
+The CLI currently runs the canonical pipeline on one instruction stream. If your dump contains multiple `Function : ...` sections, either:
 
-1. **64-bit pointer reconstruction**  
-   Replace `addr64(lo, hi)` patterns with typed pointer expressions (`*(uint32_t*)(ptr + offset)`).
+- extract the single kernel you care about into its own `.sass` file, or
+- use the library helper `split_decoded_functions()` and run functions one by one
 
-2. **Parameter name resolution**  
-   Map `param_0`/`param_1` through constant-memory loads to resolve kernel argument names in expressions.
+The test corpus uses `split_decoded_functions()` for multi-kernel dumps, but the public CLI does not yet expose a `--function <name>` selector.
 
-3. **Cross-version/cross-arch validation**  
-   Expand test corpus across additional SM targets and SASS dump formats beyond sm_89 and sm_100.
+## CLI reference
 
----
+Current `main` options:
 
-## Developer workflow
-
-### Common use cases
-
-#### 1) Generate a CFG graph (DOT)
-
-```bash
-cargo run --bin main -- --input test_cu/if_loop.sass --cfg-dot > cfg.dot
-```
-
-#### 2) Generate an SSA graph (DOT)
-
-```bash
-cargo run --bin main -- --input test_cu/if_loop.sass --ssa-dot --output ssa.dot
-```
-
-If you have Graphviz installed, render to SVG:
-
-```bash
-dot -Tsvg ssa.dot -o ssa.svg
-```
-
-#### 3) Generate canonical full-pass decompilation
-
-This is now the **default** when using `-i` with no other flags:
-
-```bash
-cargo run -- -i test_cu/if_loop.sass
-```
-
-#### 4) Inspect the canonical structured output
-
-```bash
-cargo run --bin main -- --input test_cu/if_loop.sass
+```text
+-i, --input <INPUT>              Input SASS file (if not given, use SAMPLE_SASS)
+-o, --output <OUTPUT>            Output file for structured output or SSA DOT
+    --cfg-dot                    Dump CFG as DOT to stdout
+    --ssa-dot                    Dump optimized SSA IR as DOT
+    --abi-profile <ABI_PROFILE>  Force ABI profile (`auto|legacy140|modern160`)
 ```
 
 Notes:
+- default mode is the full decompiler pipeline
+- `--cfg-dot` writes DOT to stdout; redirect it with `>`
+- `--ssa-dot` can print to stdout or write via `-o`
+- on the decompile path, `-o` writes the final pseudo-C file while stdout still prints a small status banner
 
-- We do **not** currently provide a first-class standalone def-use chain dump CLI yet.
-- Def-use information exists internally in SSA and lifting passes, but the canonical renderer no longer emits legacy phi/live-in comment scaffolding.
+## Canonical pipeline
 
-### Basic usage (CLI)
+The active backend is architecture-first and canonical-only. The main path is:
 
-Use the binary on a SASS file (defaults to full decompilation):
+1. `decode_sass` in `src/parser.rs`
+2. `build_cfg` in `src/cfg.rs`
+3. `build_ssa` in `src/ir.rs`
+4. IR optimization passes in `src/ir_dce.rs`, `src/ir_constprop.rs`, `src/ir_algebra.rs`, `src/ir_cse.rs`, and `src/ir_copyprop.rs`
+5. control-flow structurization in `src/structurizer.rs`
+6. semantic lift in `src/semantic_lift.rs`
+7. ABI annotation + argument aliasing in `src/abi.rs`
+8. structural name recovery in `src/name_recovery.rs`
+9. AST cleanup in `src/ast_passes.rs`
+10. typed final rendering in `src/typed_output.rs`
 
-```bash
-cargo run -- -i test_cu/if_loop.sass
-```
+The default binary already drives that full pass. There is no separate "legacy pretty-printer mode" exposed as the normal CLI path.
 
-The CLI now exposes the canonical full-pass decompiler by default.
+## Practical workflows
 
-Debug outputs still exist for lower layers:
-
-- `--cfg-dot`
-- `--ssa-dot`
-- `--abi-profile auto|legacy140|modern160`
-
-### Run tests
-
-```bash
-cargo test
-```
-
-### Regenerate all goldens
+### Review a kernel quickly
 
 ```bash
-REGEN_GOLDEN=1 cargo test regen_golden_files -- --ignored
+cargo run -- -i kernel.sass -o /tmp/kernel.pseudo.c
 ```
 
-### Key docs
+Then compare the pseudocode against source, PTX, or your own notes.
 
-- Design notes: `docs/dev/decompiler_design.MD`
-- Instruction notes: `docs/dev/insts.MD`
+### Debug bad control flow
 
----
+```bash
+cargo run -- -i kernel.sass --cfg-dot > /tmp/kernel.cfg.dot
+```
 
-## Project status
+If the CFG is wrong, structurization will also be wrong.
 
-This project is in active development. It is best viewed as a learning and experimentation codebase that prioritizes conservative behavior over aggressive prettification.
+### Debug lifting / naming issues
+
+```bash
+cargo run -- -i kernel.sass --ssa-dot -o /tmp/kernel.ssa.dot
+```
+
+Use this when the output still contains low-level value plumbing and you need to see what SSA the lifter actually received.
+
+### Refresh the canonical snapshots
+
+```bash
+cargo run --example regen_goldens
+```
+
+This updates `test_cu/golden_full_pass/` from the current backend.
+
+## Library usage
+
+`cudad` is also usable as a Rust library.
+
+Minimal example:
+
+```rust
+use cudad::{build_cfg, build_ssa, decode_sass, split_decoded_functions};
+
+fn main() {
+    let sass = std::fs::read_to_string("kernel.sass").unwrap();
+
+    let functions = split_decoded_functions(&sass);
+    if functions.is_empty() {
+        let cfg = build_cfg(decode_sass(&sass));
+        let ssa = build_ssa(&cfg);
+        println!("single function: {} SSA blocks", ssa.blocks.len());
+    } else {
+        for func in functions {
+            let cfg = build_cfg(func.instrs.clone());
+            println!("{} -> {} CFG nodes", func.name, cfg.node_count());
+        }
+    }
+}
+```
+
+Useful public entry points include:
+- `decode_instruction_line`, `decode_sass`, `split_decoded_functions`
+- `build_cfg`
+- `build_ssa`
+- `lift_function_ir`
+- ABI helpers in `src/abi.rs`
+
+## Repository layout
+
+- `src/parser.rs` — decoded SASS front-end
+- `src/cfg.rs` — basic-block and CFG construction
+- `src/ir.rs` — SSA IR builder
+- `src/semantic_lift.rs` — opcode-to-expression lift rules
+- `src/structurizer.rs` — control-flow recovery
+- `src/abi.rs` — ABI slot decoding and argument alias inference
+- `src/name_recovery.rs` — structural symbol assignment
+- `src/typed_output.rs` — typed final render
+- `test_cu/` — fixtures, corpora, and golden outputs
+- `docs/dev/decompiler_design.MD` — current backend design notes
+
+## Test coverage
+
+The repo keeps two kinds of regression coverage:
+
+- curated full-pass snapshots in `test_cu/golden_full_pass/`
+- invariant-based corpus tests across themed multi-kernel dumps in:
+  - `test_cu/corpus/`
+  - `test_cu/corpus_sm100/`
+  - `test_cu/corpus_sm120/`
+
+Those tests currently check things such as:
+- deterministic output
+- non-empty decompilation for every corpus function
+- no leaked raw convergence barrier mnemonics
+- no leaked SSA suffix tokens in named output
+- bounded `goto BB...` counts on representative corpora
+- SM 120 scheduling annotations stripped from final output
+
+## Current strengths
+
+- robust decoded front-end for operands, predicates, terminators, and scheduling-annotated dumps
+- CFG/SSA construction is stable enough to support whole-corpus regression tests
+- good coverage for arithmetic, compares, loads/stores, atomics, special registers, and common CUDA builtins
+- ABI-aware rendering works on the curated SM 89 / SM 100 / SM 120 corpora
+- the output is deterministic and snapshot-tested
+
+## Current limitations
+
+- output is pseudocode, not recompilable CUDA C
+- pointer reconstruction is still incomplete; `addr64(...)` is not fully eliminated
+- some kernels still produce too many temporaries or generic names
+- structurization still falls back to `goto BB...` on harder multi-exit / irreducible shapes
+- `switch` recovery is not implemented
+- CLI does not yet select a function from a multi-function dump
+- coverage outside the tested dump formats and architectures is limited
+
+## Non-goals
+
+Right now this project does not try to be:
+- a verified decompiler
+- a source-recovering pretty-printer
+- a complete CUDA architecture database
+- a drop-in replacement for mature commercial reversing tools
+
+## Related reading
+
+- [PNF Software: Reversing NVIDIA CUDA SASS code](https://www.pnfsoftware.com/blog/reversing-nvidia-cuda-sass-code/)
+
+## License
+
+See `LICENSE`.
