@@ -1,145 +1,160 @@
-# Decompiler Design Notes (Stabilization Pass)
+# Decompiler Design Notes
 
-## Pipeline
+This file describes the current canonical backend, not historical experiments.
+The public CLI and the regression suite both target the same end-to-end path.
 
-The canonical path for this project is:
+## Canonical pipeline
 
-1. `decode_sass` (`src/parser.rs`)
-2. `build_cfg` (`src/cfg.rs`)
-3. `build_ssa` (`src/ir.rs`)
-4. `Structurizer::structure_function` (`src/structurizer.rs`)
-5. `Structurizer::pretty_print_with_lift_cleanup_and_names` (canonical structured render)
-6. `render_typed_structured_output` (`src/typed_output.rs`)
+The active decompiler flow is:
 
-Semantic lifting stage:
+1. `decode_sass` in `src/parser.rs`
+2. `build_cfg` in `src/cfg.rs`
+3. `build_ssa` in `src/ir.rs`
+4. IR cleanup/optimization passes:
+   - `ir_dce`
+   - `ir_constprop`
+   - `ir_algebra`
+   - `ir_cse`
+   - `ir_copyprop`
+5. `Structurizer::structure_function` in `src/structurizer.rs`
+6. `lift_function_ir` in `src/semantic_lift.rs`
+7. ABI annotation / alias inference in `src/abi.rs`
+8. structural name recovery in `src/name_recovery.rs`
+9. AST cleanup passes in `src/ast_passes.rs`
+10. typed final render in `src/typed_output.rs`
 
-1. `lift_function_ir` (`src/semantic_lift.rs`) computes conservative
-   expression rewrites keyed by `StatementRef`.
-2. Lift rules are organized via a **rule registry** (`src/semantic_lift/rules/`):
-   - `basic.rs` — arithmetic (`IMAD`, `IADD3`, `FFMA`, `FMUL`, `FADD`), moves (`MOV`, `UMOV`), type casts (`I2F`, `I2FP`, `F2I`), math intrinsics (`MUFU.*`), select/min-max (`SEL`, `FSEL`, `FMNMX`, `VIMNMX`, `VIADDMNMX`), byte permute (`PRMT`), special registers (`S2R`, `S2UR`).
-   - `memory.rs` — loads (`LDG`, `LDS`, `LDC`, `ULDC`, `LDCU`), atomic operations (`ATOMS`, `ATOM`, `RED` → CUDA `atomicXxx()` calls).
-   - `bitwise.rs` — shifts (`SHF`), logical (`LOP3`, `PLOP3.LUT` with constant folding), `LEA.HI`.
-   - `comparison.rs` — integer/float comparisons (`ISETP`, `FSETP`, `UISETP`) including unordered float variants (`GEU`, `GTU`, `LEU`, `LTU`, `EQU`, `NEU`).
-3. The active backend always feeds lifted expressions into the canonical AST/render path; there is no separate CLI-exposed partial lift mode anymore.
+The CLI in `src/bin/main.rs` already drives that full pass by default. The only public debug side exits are `--cfg-dot` and `--ssa-dot`.
 
-Name recovery stage:
+## Front-end model
 
-1. `plan_structured_name_recovery_with_lift` (`src/name_recovery.rs`) computes
-   SSA-to-symbol mappings before final rendering.
-2. Merging is conservative: only phi/copy-congruent SSA versions are merged;
-   reused register families can split into multiple recovered names.
-3. Name recovery is part of the default CLI path; the style is currently fixed to stable temp-style names in the binary.
+The parser is no longer a raw text splitter. The canonical front-end decodes SASS into typed records:
 
-Declaration stage:
+- `DecodedFunction`
+- `DecodedInstruction`
+- `DecodedOperand`
+- `Predicate`
+- `SchedulingInfo`
+- `TerminatorKind`
 
-1. `AbiArgAliases::render_typed_arg_declarations` (`src/abi.rs`) emits
-   heuristic typed argument declarations from ABI alias inference.
-2. `infer_local_typed_declarations` (`src/abi.rs`) emits heuristic local
-   declarations from SSA destinations and opcode usage hints
-   (`float`, `uint8_t`, `uintptr_t`, etc.).
-3. Typed declarations are part of the default CLI path; structured output is wrapped as `__global__ void kernel(<typed args>) { ... }` with inferred locals.
+Important front-end properties:
 
-Structural cleanup stage (`src/ast_passes.rs`):
+- operand parsing is tokenization-aware; nested brackets and descriptors are handled structurally
+- terminators are decoded explicitly instead of reconstructed later from opcode string heuristics
+- scheduling annotations in newer dumps are stripped before tokenization but preserved as metadata on the decoded instruction
+- multi-function dumps are split with `split_decoded_functions`, which is what the corpus tests use
 
-Applied on the typed AST before final rendering:
+## CFG and SSA boundaries
 
-1. `ast_dce` removes dead pure assignments while preserving stores, returns, and side effects.
-2. `ast_predicate_cleanup` drops duplicate return guards and other redundant predicate scaffolding.
-3. `ast_addr64_fold` structurally recovers pointer expressions from low/high helper chains.
-4. `ast_simplify` normalizes the final statement tree before rendering.
+`build_cfg` consumes decoded instructions and explicit terminators.
 
-Experimental modules are intentionally not part of this critical path.
+The control-flow layer depends on a few invariants:
 
-## ABI Profile Layer
+1. basic-block leaders come from entry, jump targets, and fallthrough boundaries
+2. successor edges are derived from `TerminatorKind`, not ad hoc opcode matching
+3. CFG node payloads carry decoded instructions all the way into SSA construction
+4. pseudo-register sentinels such as `RZ`, `PT`, `URZ`, and `UPT` are never treated as normal SSA definition targets
 
-`src/abi.rs` adds an architecture-aware mapping layer for `c[bank][offset]`:
+`build_ssa` then creates the mid-end IR used by optimization, lifting, naming, and typing passes.
 
-1. `AbiProfile::detect` infers a profile from observed parameter windows (e.g. `0x140` vs `0x160` bases).
-   - `AbiProfile::detect_with_sm` can also use parsed SM metadata from `.headerflags` / `.target sm_xx` as fallback.
-2. `AbiProfile::resolve_constmem` maps known built-ins (`blockDim.x`, `gridDim.y`, etc.) and parameter words (`param_i[j]`).
-3. `AbiDisplay` renders symbolic ABI names in DOT/pseudocode output.
-   - CLI control: `--abi-profile auto|legacy140|modern160`.
-4. `annotate_function_ir_constmem` creates typed annotations (`ConstMemSemantic`) over SSA statements.
-   - This pass is non-invasive and keeps SSA algorithm/output semantics intact.
-   - It is intended as the bridge for future structurizer/HL passes that need ABI meaning, not raw offsets.
-5. `infer_arg_aliases` derives argument-oriented alias names from typed annotations:
-   - Example renderings: `arg0_ptr.lo32`, `arg0_ptr.hi32`, `arg2_u64.lo32`.
-   - Emits heuristic confidence (`high|medium|low`) based on usage patterns.
+## Semantic lift and naming
 
-This layer is display-oriented and does not change SSA construction semantics.
-Unknown offsets remain explicit raw `ConstMem(...)` values or `abi_internal_0x..` slots.
+The lifting layer is still rule-based, but it is now part of the default backend rather than a side pipeline.
 
-## IR Invariants Required by Structurizer
+Key pieces:
 
-1. `IRBlock::id` must match the CFG basic-block `id`.
-2. `IRBlock::start_addr` must match CFG block `start` for address->node mapping.
-3. `IRBlock::irdst` must represent outgoing control edges with conditions:
-   - `IRCond::True` for unconditional edges.
-   - `IRCond::Pred` for predicate-conditioned edges.
-4. Predicate conditions should be explicit and stable after SSA renaming.
-5. Immutable pseudo-registers (`RZ`, `PT`, `URZ`, `UPT`) are not SSA definition targets.
+- `lift_function_ir` rewrites SSA statements into higher-level expressions
+- rules live under `src/semantic_lift/rules/`
+- current rule coverage includes arithmetic, comparisons, loads/stores, special registers, atomics, bitwise helpers, and common math intrinsics
+- `plan_structured_name_recovery_with_lift` assigns stable temp-style names before final rendering
 
-## Structurizer Pattern Order
+The name recovery pass is intentionally conservative:
 
-`structure_region_recursive` processes patterns in this order:
+- only congruent SSA values are merged
+- reused hardware registers can still split into multiple recovered symbols
+- when semantic recovery is weak, the output falls back to deterministic generic names such as `vN`, `bN`, and `uN`
 
-1. Loop recovery (`try_structure_loop`)
-2. If / if-else recovery (`try_structure_if`)
-3. Sequence extension (single successor)
-4. Fallback to `UnstructuredJump` (`goto`) for unsupported branch shapes
+## ABI and typed rendering
 
-This order intentionally prefers high-level constructs first and preserves output totality
-by falling back to goto when recognition is uncertain.
+`src/abi.rs` resolves constant-memory accesses into CUDA-facing meaning where possible.
 
-## Rendering Cleanup (Structurizer)
+That layer is responsible for:
 
-The structurizer's canonical render path applies several cleanup rules during rendering:
+- detecting an ABI profile (`auto`, `legacy140`, `modern160`)
+- mapping known builtins such as `blockDim.x`, `gridDim.y`, `threadIdx.x`, and `blockIdx.x`
+- inferring argument aliases from parameter-window accesses
+- feeding typed declarations and signature hints into the final render
 
-1. **BB label suppression**: Basic block labels (`BB0 { ... }`) are not emitted; statements render directly at the current indentation level.
-2. **NOP suppression**: `NOP` instructions are skipped.
-3. **Dead code after return**: After an unconditional `RET`/`EXIT`, remaining statements in the block are not rendered.
-4. **RZ/PT-destination suppression**: Writes to the zero register (`RZ`) or always-true predicate (`PT`) that have no memory side effect are skipped. When the dest is `RZ` but the expression has a side effect (e.g., `atomicInc(...)`), it is rendered as an expression statement without an assignment.
-5. **Convergence barrier suppression**: `BSYNC`/`BSSY`/`WARPSYNC`/`BAR.SYNC` instructions are suppressed in lifted mode (except `BAR.SYNC` which renders as `__syncthreads()`).
-6. **Internal comment suppression**: `// Condition from BB{N}` and `// Loop header BB{N}` comments are not emitted.
+The typed output pass in `src/typed_output.rs` is the last step that turns structured output into the emitted pseudo-C function.
 
-## Known Unsupported / Partial Cases
+## Current regression model
 
-1. Complex nested branch reconstruction inside loop bodies is still partial,
-   but simple branch diamonds inside loop bodies are now recovered as `if`
-   instead of unconditional goto fallback when merge structure is clear.
-2. Multi-way branch normalization to `switch` is not implemented.
-3. Some loop exits still degrade to goto fallback depending on CFG shape.
+The repo uses two complementary regression strategies:
 
-These cases should not panic; they should emit explicit goto-based pseudocode.
+1. curated snapshots in `test_cu/golden_full_pass/`
+2. invariant-based whole-corpus tests in `src/test.rs`
 
-## Debug Checkpoints
+The corpus runner feeds every function from:
 
-Suggested instrumentation points when debugging structurization:
+- `test_cu/corpus/`
+- `test_cu/corpus_sm100/`
+- `test_cu/corpus_sm120/`
 
-1. Start of `structure_region_recursive` loop for active node transitions.
-2. Entry/exit of `try_structure_if` with detected merge node.
-3. Entry/exit of `try_structure_loop` with computed loop body and exits.
-4. `structure_loop_body_recursive` successor classification (`break`, `continue`, fallback goto).
+through the real full-pass backend and checks properties such as:
 
-Use these checkpoints to correlate CFG nodes, `irdst`, and final pseudocode shape.
+- non-empty output
+- determinism across repeated runs
+- no leaked convergence barrier mnemonics
+- no leaked SSA suffix tokens in named output
+- bounded `goto BB...` counts
+- Blackwell builtin resolution on the SM 100 corpus
+- scheduling annotation stripping on the SM 120 corpus
 
-## Practical Recipes
+This is the best "real backend" test in the repo; it is deliberately stronger than byte-for-byte golden comparisons alone.
 
-A few high-signal workflows for development and regression work:
+## Practical debugging recipes
 
-1. **Canonical decompile smoke test**
-   - `cargo run -- -i test_cu/if_loop.sass`
-   - Verifies the real public path: decode -> CFG -> SSA -> optimize -> structurize -> lift -> name -> typed render.
-2. **CFG-first debugging**
-   - `cargo run -- -i test_cu/if_loop.sass --cfg-dot > /tmp/if_loop.cfg.dot`
-   - Use when recovered control flow looks wrong; inspect leader splits and successor edges before touching the structurizer.
-3. **SSA/lift debugging**
-   - `cargo run -- -i test_cu/if_loop.sass --ssa-dot > /tmp/if_loop.ssa.dot`
-   - Use when compare lifting, pointer recovery, or predicate cleanup looks wrong.
-4. **Architecture-specific ABI checks**
-   - `cargo run -- -i kernel.sass --abi-profile legacy140`
-   - `cargo run -- -i kernel.sass --abi-profile modern160`
-   - Useful when a dump lacks trustworthy SM metadata and you need to compare inferred signatures.
-5. **Snapshot refresh after intentional backend changes**
-   - `cargo run --example regen_goldens`
-   - Only do this after `cargo test` is green and the canonical output change is intentional.
+### Canonical smoke test
+
+```bash
+cargo run -- -i test_cu/if_loop.sass
+```
+
+### Inspect CFG structure first
+
+```bash
+cargo run -- -i test_cu/if_loop.sass --cfg-dot > /tmp/if_loop.cfg.dot
+```
+
+Use this when control flow looks wrong. If the CFG is wrong, structurization and lifting will also be wrong.
+
+### Inspect optimized SSA
+
+```bash
+cargo run -- -i test_cu/if_loop.sass --ssa-dot -o /tmp/if_loop.ssa.dot
+```
+
+Use this when value flow, comparisons, pointer reconstruction, or naming looks suspicious.
+
+### Refresh canonical snapshots
+
+```bash
+cargo run --example regen_goldens
+```
+
+Do this only after `cargo test --quiet` is green and the output change is intentional.
+
+## Known limitations
+
+These are current backend limits, not aspirational future behavior:
+
+- output is pseudocode, not recompilable CUDA C
+- `addr64(...)` recovery is still incomplete
+- some kernels still overproduce temporaries
+- harder multi-exit or irreducible regions still degrade to explicit `goto BB...`
+- `switch` recovery is not implemented
+- the CLI currently expects a single function stream, even though the library and corpus runner support multi-function dumps via `split_decoded_functions`
+
+## Non-canonical / experimental work
+
+There are still internal experiments and utility modules in the tree, but they are not the contract surface for the CLI.
+When documenting behavior, prefer the pipeline and tests described above over historical notes or abandoned intermediate paths.
