@@ -37,11 +37,7 @@ pub fn ir_algebra(fir: &FunctionIR) -> FunctionIR {
             id: block.id,
             start_addr: block.start_addr,
             irdst: block.irdst.clone(),
-            stmts: block
-                .stmts
-                .iter()
-                .map(|stmt| simplify_stmt(stmt))
-                .collect(),
+            stmts: block.stmts.iter().map(|stmt| simplify_stmt(stmt)).collect(),
         })
         .collect();
     FunctionIR { blocks: new_blocks }
@@ -223,7 +219,7 @@ fn is_plain_imad(opcode: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{build_cfg, build_ssa, ir_constprop, ir_copyprop, ir_dce, parse_sass};
+    use crate::{build_cfg, build_ssa, ir_constprop, ir_copyprop, ir_dce, decode_sass};
 
     #[test]
     fn iadd3_x_0_0_simplifies_to_copy() {
@@ -232,7 +228,7 @@ mod tests {
             /*0010*/ IADD3 R3, R2, 0x1, RZ ;
             /*0020*/ EXIT ;
         "#;
-        let cfg = build_cfg(parse_sass(sass));
+        let cfg = build_cfg(decode_sass(sass));
         let fir = build_ssa(&cfg);
         let cp = ir_constprop(&fir);
         let simplified = ir_algebra(&cp);
@@ -269,7 +265,7 @@ mod tests {
             /*0000*/ IADD3 R2, RZ, RZ, RZ ;
             /*0010*/ EXIT ;
         "#;
-        let cfg = build_cfg(parse_sass(sass));
+        let cfg = build_cfg(decode_sass(sass));
         let fir = build_ssa(&cfg);
         let simplified = ir_algebra(&fir);
 
@@ -300,7 +296,7 @@ mod tests {
             /*0010*/ IADD3 R4, R3, 0x1, RZ ;
             /*0020*/ EXIT ;
         "#;
-        let cfg = build_cfg(parse_sass(sass));
+        let cfg = build_cfg(decode_sass(sass));
         let fir = build_ssa(&cfg);
         let simplified = ir_algebra(&fir);
 
@@ -338,7 +334,7 @@ mod tests {
             /*0020*/ STG.E [R4.64], R3 ;
             /*0030*/ EXIT ;
         "#;
-        let cfg = build_cfg(parse_sass(sass));
+        let cfg = build_cfg(decode_sass(sass));
         let fir = build_ssa(&cfg);
         let cp = ir_constprop(&fir);
         let alg = ir_algebra(&cp);
@@ -351,9 +347,7 @@ mod tests {
             .blocks
             .iter()
             .flat_map(|b| &b.stmts)
-            .find(|s| {
-                matches!(&s.value, RValue::Op { opcode, .. } if opcode == "IADD3")
-            })
+            .find(|s| matches!(&s.value, RValue::Op { opcode, .. } if opcode == "IADD3"))
             .expect("expected IADD3 statement");
         if let RValue::Op { args, .. } = &r3_stmt.value {
             if let Some(r) = args[0].get_reg() {

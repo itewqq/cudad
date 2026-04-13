@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 
-use crate::ir::{FunctionIR, IRExpr, IRBlock, IRStatement, RValue, RegId};
+use crate::ir::{FunctionIR, IRBlock, IRExpr, IRStatement, RValue, RegId};
 
 /// Run sparse constant propagation on `fir`, returning a new `FunctionIR`
 /// with constant uses inlined.
@@ -98,9 +98,15 @@ fn propagate_in_stmt(stmt: &IRStatement, const_map: &HashMap<RegId, IRExpr>) -> 
         value: propagate_in_rvalue(&stmt.value, const_map),
         pred: stmt.pred.as_ref().map(|p| propagate_in_expr(p, const_map)),
         mem_addr_args: stmt.mem_addr_args.as_ref().map(|args| {
-            args.iter().map(|a| propagate_in_expr(a, const_map)).collect()
+            args.iter()
+                .map(|a| propagate_in_expr(a, const_map))
+                .collect()
         }),
-        pred_old_defs: stmt.pred_old_defs.iter().map(|d| propagate_in_expr(d, const_map)).collect(),
+        pred_old_defs: stmt
+            .pred_old_defs
+            .iter()
+            .map(|d| propagate_in_expr(d, const_map))
+            .collect(),
     }
 }
 
@@ -108,10 +114,15 @@ fn propagate_in_rvalue(value: &RValue, const_map: &HashMap<RegId, IRExpr>) -> RV
     match value {
         RValue::Op { opcode, args } => RValue::Op {
             opcode: opcode.clone(),
-            args: args.iter().map(|a| propagate_in_expr(a, const_map)).collect(),
+            args: args
+                .iter()
+                .map(|a| propagate_in_expr(a, const_map))
+                .collect(),
         },
         RValue::Phi(args) => RValue::Phi(
-            args.iter().map(|a| propagate_in_expr(a, const_map)).collect(),
+            args.iter()
+                .map(|a| propagate_in_expr(a, const_map))
+                .collect(),
         ),
         RValue::ImmI(_) | RValue::ImmF(_) => value.clone(),
     }
@@ -141,14 +152,23 @@ fn propagate_in_expr(expr: &IRExpr, const_map: &HashMap<RegId, IRExpr>) -> IRExp
             }
             expr.clone()
         }
-        IRExpr::Mem { base, offset, width } => IRExpr::Mem {
+        IRExpr::Mem {
+            base,
+            offset,
+            width,
+        } => IRExpr::Mem {
             base: Box::new(propagate_in_expr(base, const_map)),
-            offset: offset.as_ref().map(|o| Box::new(propagate_in_expr(o, const_map))),
+            offset: offset
+                .as_ref()
+                .map(|o| Box::new(propagate_in_expr(o, const_map))),
             width: *width,
         },
         IRExpr::Op { op, args } => IRExpr::Op {
             op: op.clone(),
-            args: args.iter().map(|a| propagate_in_expr(a, const_map)).collect(),
+            args: args
+                .iter()
+                .map(|a| propagate_in_expr(a, const_map))
+                .collect(),
         },
         IRExpr::ImmI(_) | IRExpr::ImmF(_) => expr.clone(),
     }
@@ -177,7 +197,7 @@ fn is_immutable_reg(r: &RegId) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{build_cfg, build_ssa, parse_sass};
+    use crate::{build_cfg, build_ssa, decode_sass};
 
     #[test]
     fn constprop_inlines_imad_mov_immediate() {
@@ -186,12 +206,14 @@ mod tests {
             /*0010*/ IADD3 R2, R1, R0, RZ ;
             /*0020*/ EXIT ;
         "#;
-        let cfg = build_cfg(parse_sass(sass));
+        let cfg = build_cfg(decode_sass(sass));
         let fir = build_ssa(&cfg);
         let propagated = ir_constprop(&fir);
 
         // After constprop, the IADD3 should use ImmI(5) instead of R1
-        let iadd3_stmt = propagated.blocks.iter()
+        let iadd3_stmt = propagated
+            .blocks
+            .iter()
             .flat_map(|b| &b.stmts)
             .find(|s| matches!(&s.value, RValue::Op { opcode, .. } if opcode == "IADD3"))
             .expect("expected IADD3 statement");
@@ -199,7 +221,8 @@ mod tests {
             // First arg should now be ImmI(5) instead of Reg(R1)
             assert!(
                 matches!(args[0], IRExpr::ImmI(5)),
-                "expected ImmI(5), got {:?}", args[0]
+                "expected ImmI(5), got {:?}",
+                args[0]
             );
         }
     }
@@ -212,12 +235,14 @@ mod tests {
             /*0020*/ IADD3 R2, R1, R0, RZ ;
             /*0030*/ EXIT ;
         "#;
-        let cfg = build_cfg(parse_sass(sass));
+        let cfg = build_cfg(decode_sass(sass));
         let fir = build_ssa(&cfg);
         let propagated = ir_constprop(&fir);
 
         // Predicated def should NOT be propagated
-        let iadd3_stmt = propagated.blocks.iter()
+        let iadd3_stmt = propagated
+            .blocks
+            .iter()
             .flat_map(|b| &b.stmts)
             .find(|s| matches!(&s.value, RValue::Op { opcode, .. } if opcode == "IADD3"))
             .expect("expected IADD3 statement");
@@ -225,7 +250,8 @@ mod tests {
             // First arg should still be a register, not inlined constant
             assert!(
                 matches!(args[0], IRExpr::Reg(_)),
-                "predicated def should not be propagated, got {:?}", args[0]
+                "predicated def should not be propagated, got {:?}",
+                args[0]
             );
         }
     }

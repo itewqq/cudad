@@ -21,104 +21,107 @@
 // param_6 -> arg6 (word32, confidence: low, words: {0})
 // param_7 -> arg7 (word32, confidence: low, words: {0})
 __global__ void kernel(uint32_t arg0, uint32_t arg2, uintptr_t arg4_ptr, uint32_t arg6, uint32_t arg7) {
-  uint32_t v2;
-  bool b0; // live-in
+  uint32_t ctaid_x;
+  uint32_t tid_x;
+  int32_t v2;
   uint32_t v3;
   uint32_t v4;
-  uint32_t v5;
-  uint32_t v6; // live-in
+  float v6; // live-in
+  float v5;
   uint32_t v7;
   uint32_t v8;
+  int32_t v9;
   bool b1;
-  uint32_t v10;
+  float v10;
   bool b2;
-  uint32_t v11;
+  float v11;
   bool b4;
-  bool b5;
+  bool b6;
   bool b7;
   uint32_t v13;
   uint32_t v14;
   bool b8;
-  uint32_t v15;
-  uint32_t v16;
+  float v15;
+  float v16;
   bool b9;
   uint32_t v17;
   uint32_t v18;
   bool b10;
-  uint32_t v19;
-  uint32_t v20;
+  float v19;
+  float v20;
   bool b11;
   uint32_t v21;
   uint32_t v22;
   bool b12;
-  uint32_t v23;
-  uint32_t v24;
+  float v23;
+  float v24;
   bool b13;
   uint32_t v25;
   uint32_t v26;
   bool b14;
-  uint32_t v27;
-  uint32_t v28;
+  float v27;
+  float v28;
   bool b15;
   uint32_t v29;
   uint32_t v30;
   bool b16;
-  uint32_t v31;
-  uint32_t v32;
+  float v31;
+  float v32;
   bool b17;
   uint32_t v33;
   uint32_t v34;
   bool b18;
-  uint32_t v35;
-  uint32_t v36;
+  float v35;
+  float v36;
   bool b19;
   uint32_t v37;
   uint32_t v38;
   bool b20;
-  uint32_t v39;
+  float v39;
   bool b21;
   uint32_t v40;
-  uint32_t v41;
+  float v41;
   bool b22;
   uint32_t v43;
   uint32_t v44;
   bool b23;
-  uint32_t v45;
-  uint32_t v46;
+  float v45;
+  float v46;
   bool b24;
   uint32_t v47;
   uint32_t v48;
   bool b25;
-  uint32_t v49;
-  uint32_t v50;
+  float v49;
+  float v50;
   bool b26;
   uint32_t v51;
   uint32_t v52;
   bool b27;
-  uint32_t v53;
+  float v53;
   bool b28;
   uint32_t v54;
-  uint32_t v55;
+  float v55;
   bool b29;
   uint32_t v56;
   uint32_t v57;
   bool b30;
-  uint32_t v58;
+  float v58;
   bool b31;
   uint32_t v59;
-  uint32_t v60;
+  float v60;
   uint32_t v61;
-  uint32_t v62;
+  int32_t v62;
 
   ctaid_x = blockIdx.x;
   tid_x = threadIdx.x;
   v2 = ctaid_x * blockDim.x + tid_x;
-  if (b0) return;
+  if ((int32_t)(v2) >= (int32_t)(arg6)) return;
     v3 = v2 * 4 + arg0;
     v4 = v2 * 4 + arg2;
     v5 = *addr64(v3, v6);
     v7 = *addr64(v4, 4);
     v8 = arg7;
+    v9 = (int32_t)v2 >> 31;
     b1 = (int32_t)(v8) >= (int32_t)(1);
     v10 = v7 + v5;
     b2 = v10 > 1;
@@ -128,19 +131,14 @@ __global__ void kernel(uint32_t arg0, uint32_t arg2, uintptr_t arg4_ptr, uint32_
       v8 = v8 & 3;
     if (v3 >= 3) {
         v7 = -v8 + arg7;
-      if ((int32_t)(v7) > (int32_t)(0)) {
-          b4 = (int32_t)(v7) > (int32_t)(12);
-          b5 = false;
-        if ((int32_t)(v7) > (int32_t)(12)) {
-          b5 = false;
-        }
-      }
+      if ((int32_t)(v7) > (int32_t)(0)) b4 = (int32_t)(v7) > (int32_t)(12);
     }
   }
   do {
     b7 = v11 > 0.5;
     v7 = v7 - 16;
     v13 = b7 ? 1066192077 : 0.8999999761581421;
+    b6 = (int32_t)(v7) > (int32_t)(12);
     v14 = v13 * v11;
     b8 = v14 > 0.5;
     v15 = b8 ? 1066192077 : 0.8999999761581421;
@@ -187,7 +185,6 @@ __global__ void kernel(uint32_t arg0, uint32_t arg2, uintptr_t arg4_ptr, uint32_
     b4 = v3 > 0.5;
     v41 = b4 ? 1066192077 : 0.8999999761581421;
     v11 = v3 * v41;
-    // phi merge: v12 <- phi(1066192077, 4)
   } while((int32_t)(v7) > (int32_t)(12));
   if ((int32_t)(v7) > (int32_t)(4)) {
     b22 = v11 > 0.5;
@@ -211,14 +208,10 @@ __global__ void kernel(uint32_t arg0, uint32_t arg2, uintptr_t arg4_ptr, uint32_
     v5 = v52 * v53;
     b28 = v5 > 0.5;
     v54 = b28 ? 1066192077 : 0.8999999761581421;
-    b5 = false;
     v3 = v5 * v54;
     b1 = v3 > 0.5;
     v55 = b1 ? 1066192077 : 0.8999999761581421;
     v11 = v3 * v55;
-  }
-  if (v7 != 0 || b5) {
-    // phi merge: v42 <- phi(v42, 4)
   }
   do {
     b29 = v11 > 0.5;
@@ -235,8 +228,6 @@ __global__ void kernel(uint32_t arg0, uint32_t arg2, uintptr_t arg4_ptr, uint32_
     v60 = b1 ? 1066192077 : 0.8999999761581421;
     v11 = v3 * v60;
   } while(v7 != 0);
-  if (v8 != 0) {
-  }
   do {
     v8 = v8 - 1;
     b1 = v11 > 0.5;
@@ -247,8 +238,6 @@ __global__ void kernel(uint32_t arg0, uint32_t arg2, uintptr_t arg4_ptr, uint32_
   v61 = v2 + (arg4_ptr.lo32 << 2);
   v62 = lea_hi_x(v2, arg4_ptr.hi32, 2, b2);
   *addr64(v61, v62) = v11;
-  // phi merge: v42 <- phi(v42, v42, 4)
-  // phi merge: v5 <- phi(1066192077, v5, v5)
   return;
 }
 // --- End Structured Output ---

@@ -13,13 +13,12 @@
 //!   4. Repeat until the worklist is empty.
 //!   5. Remove all non-live, non-phi statements.
 //!
-//! Phi nodes are kept unconditionally because their removal would
-//! require re-computing the SSA form; the text-level DCE pass
-//! (`dce.rs`) handles residual dead phis after rendering.
+//! Phi nodes are kept unconditionally because removing them would require
+//! rebuilding SSA; later structural cleanup handles redundant rendered forms.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::ir::{FunctionIR, IRExpr, RegId};
+use crate::ir::{FunctionIR, RegId};
 
 /// A unique identifier for a statement within a `FunctionIR`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -36,7 +35,10 @@ pub fn ir_dce(fir: &FunctionIR) -> FunctionIR {
 
     for (block_idx, block) in fir.blocks.iter().enumerate() {
         for (stmt_idx, stmt) in block.stmts.iter().enumerate() {
-            let sid = StmtId { block_idx, stmt_idx };
+            let sid = StmtId {
+                block_idx,
+                stmt_idx,
+            };
             for def_expr in &stmt.defs {
                 if let Some(r) = def_expr.get_reg() {
                     if !is_immutable_reg(r) {
@@ -54,7 +56,10 @@ pub fn ir_dce(fir: &FunctionIR) -> FunctionIR {
     for (block_idx, block) in fir.blocks.iter().enumerate() {
         for (stmt_idx, stmt) in block.stmts.iter().enumerate() {
             if stmt.is_side_effectful() {
-                let sid = StmtId { block_idx, stmt_idx };
+                let sid = StmtId {
+                    block_idx,
+                    stmt_idx,
+                };
                 if live.insert(sid) {
                     worklist.push_back(sid);
                 }
@@ -83,7 +88,10 @@ pub fn ir_dce(fir: &FunctionIR) -> FunctionIR {
     for (block_idx, block) in fir.blocks.iter().enumerate() {
         let mut new_stmts = Vec::new();
         for (stmt_idx, stmt) in block.stmts.iter().enumerate() {
-            let sid = StmtId { block_idx, stmt_idx };
+            let sid = StmtId {
+                block_idx,
+                stmt_idx,
+            };
             let is_phi = matches!(stmt.value, crate::ir::RValue::Phi(_));
             if live.contains(&sid) || is_phi {
                 new_stmts.push(stmt.clone());
@@ -107,7 +115,7 @@ fn is_immutable_reg(r: &RegId) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{build_cfg, build_ssa, parse_sass};
+    use crate::{build_cfg, build_ssa, decode_sass};
 
     #[test]
     fn ir_dce_removes_dead_assignment() {
@@ -117,7 +125,7 @@ mod tests {
             /*0010*/ IMAD.MOV.U32 R2, RZ, RZ, 0x2 ;
             /*0020*/ EXIT ;
         "#;
-        let cfg = build_cfg(parse_sass(sass));
+        let cfg = build_cfg(decode_sass(sass));
         let fir = build_ssa(&cfg);
         let orig_stmts: usize = fir.blocks.iter().map(|b| b.stmts.len()).sum();
 
@@ -127,7 +135,12 @@ mod tests {
         // The two IMAD.MOV.U32 should be removed (dead), EXIT is side-effectful but
         // it's handled as control flow — in our model EXIT is not in stmts but
         // the IMAD.MOV.U32 instructions have no users.
-        assert!(new_stmts < orig_stmts, "DCE should remove dead stmts: orig={}, new={}", orig_stmts, new_stmts);
+        assert!(
+            new_stmts < orig_stmts,
+            "DCE should remove dead stmts: orig={}, new={}",
+            orig_stmts,
+            new_stmts
+        );
     }
 
     #[test]
@@ -138,13 +151,17 @@ mod tests {
             /*0010*/ STG.E [R4.64], R8 ;
             /*0020*/ EXIT ;
         "#;
-        let cfg = build_cfg(parse_sass(sass));
+        let cfg = build_cfg(decode_sass(sass));
         let fir = build_ssa(&cfg);
         let cleaned = ir_dce(&fir);
 
         // Store and its address computation must survive
         let total_stmts: usize = cleaned.blocks.iter().map(|b| b.stmts.len()).sum();
-        assert!(total_stmts >= 2, "store chain must survive DCE, got {} stmts", total_stmts);
+        assert!(
+            total_stmts >= 2,
+            "store chain must survive DCE, got {} stmts",
+            total_stmts
+        );
     }
 
     #[test]
@@ -155,11 +172,13 @@ mod tests {
             /*020*/ @P0 BRA 0x000 ;
             /*030*/ EXIT ;
         "#;
-        let cfg = build_cfg(parse_sass(sass));
+        let cfg = build_cfg(decode_sass(sass));
         let fir = build_ssa(&cfg);
         let cleaned = ir_dce(&fir);
 
-        let phi_count: usize = cleaned.blocks.iter()
+        let phi_count: usize = cleaned
+            .blocks
+            .iter()
             .flat_map(|b| &b.stmts)
             .filter(|s| matches!(s.value, crate::ir::RValue::Phi(_)))
             .count();

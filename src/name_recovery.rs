@@ -1,13 +1,15 @@
-//! Optional post-render name recovery for SSA-style pseudocode.
-//! This stage is intentionally conservative and non-structural:
-//! it rewrites variable tokens in rendered output only.
+//! Structural name-recovery planning for the canonical backend.
+//! This stage computes SSA-to-symbol mappings and semantic renames that are
+//! applied before final rendering rather than by post-render text surgery.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::OnceLock;
 
 use regex::Regex;
 
-use crate::ir::{FunctionIR, IRCond, IRExpr, RValue, RegId};
+use crate::ast::Expr;
+use crate::ir::{FunctionIR, IRCond, IRExpr, IRStatement, RValue, RegId};
+use crate::semantic_lift::SemanticLiftResult;
 use crate::semantic_propagation::{propagate_semantic_labels, SsaRegKey};
 
 // ---------------------------------------------------------------------------
@@ -19,35 +21,19 @@ fn ssa_token_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"\b(?:UR|UP|R|P)\d+\.\d+\b").unwrap())
 }
 
-fn nr_ident_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").unwrap())
-}
-
 fn nr_ident_word_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"\b[A-Za-z_][A-Za-z0-9_]*\b").unwrap())
 }
 
-fn nr_assign_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"^\s*(?P<lhs>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<rhs>[A-Za-z_][A-Za-z0-9_.]*)\s*;\s*$").unwrap()
-    })
-}
-
 fn nr_ternary_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"^(\s*)(\S+) = (.+?) \? \((.*)\) : (/\*phi\*/)?(\S+);$").unwrap()
-    })
+    RE.get_or_init(|| Regex::new(r"^(\s*)(\S+) = (.+?) \? \((.*)\) : (/\*phi\*/)?(\S+);$").unwrap())
 }
 
 fn nr_if_assign_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"^\s*if \((.+)\)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=.*;$").unwrap()
-    })
+    RE.get_or_init(|| Regex::new(r"^\s*if \((.+)\)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=.*;$").unwrap())
 }
 
 fn nr_plain_assign_re() -> &'static Regex {
@@ -60,15 +46,9 @@ fn nr_pred_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"\b(?:P|UP)\d+\b").unwrap())
 }
 
-fn nr_phi_summary_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^\s*//\s*\d+ phi node\(s\) omitted \[BB\d+\]$").unwrap())
-}
 
-fn nr_phi_block_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"phi node\(s\) omitted \[BB(\d+)\]").unwrap())
-}
+
+
 
 fn nr_arg_ptr_lane_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -85,7 +65,6 @@ pub enum NameStyle {
 pub struct NameRecoveryConfig {
     pub style: NameStyle,
     pub rewrite_control_predicates: bool,
-    pub emit_phi_merge_comments: bool,
     pub semantic_symbolization: bool,
 }
 
@@ -94,28 +73,27 @@ impl Default for NameRecoveryConfig {
         Self {
             style: NameStyle::Temp,
             rewrite_control_predicates: true,
-            emit_phi_merge_comments: false,
             semantic_symbolization: false,
         }
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct NameRecoveryStats {
-    pub ssa_tokens_seen: usize,
-    pub rewritten_tokens: usize,
-    pub output_vars: usize,
-    pub split_components: usize,
-}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct NameRecoveryResult {
-    pub output: String,
-    pub stats: NameRecoveryStats,
-    /// Map from recovered variable name (e.g., "v0") to the IR register base
-    /// class (e.g., ("R", 0)).  This lets callers look up type-inference data
-    /// for each recovered name.
-    pub name_to_reg_base: HashMap<String, (String, i32)>,
+pub struct RecoveredSymbol {
+    pub name: String,
+    pub reg_base: (String, i32),
+    pub live_in: bool,
+    pub order: usize,
+}
+
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StructuralNameRecoveryPlan {
+    /// Final token map used during AST renaming before rendering.
+    pub token_map: HashMap<String, String>,
+    /// Recovered symbol metadata before output-based dead-symbol filtering.
+    pub symbols: Vec<RecoveredSymbol>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -185,13 +163,9 @@ impl UnionFind {
     }
 }
 
-/// Build the SSA-token → recovered-name mapping from the IR, without
-/// touching any rendered text.  Returns the token_map plus internal
-/// bookkeeping structures needed by the text-level post-passes.
-///
-/// This is the pure-IR portion of `recover_structured_output_names`.
-/// It can also be used to construct a `NameAwareDisplay` that applies
-/// name recovery during rendering rather than after.
+/// Build the SSA-token → recovered-name mapping from the IR without
+/// mutating rendered text. The canonical backend now applies this plan
+/// structurally before the final pretty-print.
 #[allow(clippy::type_complexity)]
 pub(crate) fn build_name_map(
     function_ir: &FunctionIR,
@@ -275,11 +249,15 @@ pub(crate) fn build_name_map(
             }
         }
         let base = members[0].base.clone();
-        comp_rows.push((base_group(&base.class), min_loc, min_tok, base, members.clone()));
+        comp_rows.push((
+            base_group(&base.class),
+            min_loc,
+            min_tok,
+            base,
+            members.clone(),
+        ));
     }
-    comp_rows.sort_by(|a, b| {
-        (a.0, a.1, &a.2, &a.3).cmp(&(b.0, b.1, &b.2, &b.3))
-    });
+    comp_rows.sort_by(|a, b| (a.0, a.1, &a.2, &a.3).cmp(&(b.0, b.1, &b.2, &b.3)));
 
     let mut fam_count: BTreeMap<RegBase, usize> = BTreeMap::new();
     for row in &comp_rows {
@@ -379,129 +357,100 @@ pub(crate) fn build_name_map(
     (token_map, comp_rows, component_name, fam_count)
 }
 
-pub fn recover_structured_output_names(
+pub fn plan_structured_name_recovery_with_lift(
     function_ir: &FunctionIR,
     rendered: &str,
+    lifted: Option<&SemanticLiftResult>,
     config: &NameRecoveryConfig,
-) -> NameRecoveryResult {
-    let (token_map, comp_rows, component_name, fam_count) = build_name_map(function_ir, config);
-
-    let re = ssa_token_re();
-    let mut ssa_tokens_seen = 0usize;
-    let mut rewritten_tokens = 0usize;
-    let mut output = re
-        .replace_all(rendered, |caps: &regex::Captures<'_>| {
-            ssa_tokens_seen += 1;
-            let t = caps.get(0).expect("match").as_str();
-            if let Some(rep) = token_map.get(t) {
-                rewritten_tokens += 1;
-                rep.clone()
-            } else {
-                t.to_string()
-            }
-        })
-        .into_owned();
-
-    // Post-pass: convert self-referencing ternaries to if-guards.
-    // After name recovery, patterns like `v17 = b3 ? (v17 + 1) : v17;` have
-    // identical dest and old-value names.  These are clearer as
-    // `if (b3) v17 = v17 + 1;`.  Genuine selects (dest != old) are left alone.
-    output = simplify_predicated_ternaries(&output);
+) -> StructuralNameRecoveryPlan {
+    let (mut token_map, comp_rows, component_name, fam_count) = build_name_map(function_ir, config);
+    let mut recovered_names = component_name.clone();
+    let mut preview = apply_token_map_to_rendered(rendered, &token_map);
+    preview = simplify_predicated_ternaries(&preview);
 
     if config.rewrite_control_predicates {
-        let mut pred_map = HashMap::<String, String>::new();
-        for (row_idx, row) in comp_rows.iter().enumerate() {
-            let base = &row.3;
-            if !matches!(base.class.as_str(), "P" | "UP") {
-                continue;
-            }
-            if fam_count.get(base).copied().unwrap_or(0) != 1 {
-                continue;
-            }
-            pred_map.insert(
-                format!("{}{}", base.class, base.idx),
-                component_name[row_idx].clone(),
-            );
-        }
-        output = rewrite_control_guard_predicates(&output, &pred_map);
+        preview = rewrite_control_guard_predicates(
+            &preview,
+            &build_control_predicate_map(&comp_rows, &fam_count, &recovered_names),
+        );
     }
 
     if config.semantic_symbolization {
-        output = rewrite_semantic_seed_names_ir(function_ir, &output, &token_map, &comp_rows, &component_name);
+        let (symbolized_output, symbolized_names) =
+            semantic_symbolize_output(function_ir, &preview, lifted, &comp_rows, &recovered_names);
+        preview = symbolized_output;
+        recovered_names = symbolized_names;
     }
 
-    if config.emit_phi_merge_comments {
-        output = append_phi_merge_comments(function_ir, &output, &token_map);
+    let rename = component_name
+        .iter()
+        .cloned()
+        .zip(recovered_names.iter().cloned())
+        .filter(|(from, to)| from != to)
+        .collect::<BTreeMap<_, _>>();
+    for name in token_map.values_mut() {
+        if let Some(replacement) = rename.get(name) {
+            *name = replacement.clone();
+        }
     }
+    token_map.extend(build_control_predicate_map(
+        &comp_rows,
+        &fam_count,
+        &recovered_names,
+    ));
 
-    // Strip "// N phi node(s) omitted [BBx]" summary lines — they are structurizer
-    // bookkeeping noise that should never appear in the final pseudocode output.
-    {
-        let phi_summary = nr_phi_summary_re();
-        output = output
-            .lines()
-            .filter(|line| !phi_summary.is_match(line))
-            .collect::<Vec<_>>()
-            .join("\n");
-        output.push('\n');
+    let _ = preview;
+    StructuralNameRecoveryPlan {
+        token_map,
+        symbols: collect_recovered_symbol_metadata(function_ir, &comp_rows, &recovered_names),
     }
+}
 
-    let split_components = fam_count
-        .values()
-        .copied()
-        .filter(|n| *n > 1)
-        .map(|n| n - 1)
-        .sum::<usize>();
 
-    NameRecoveryResult {
-        output,
-        stats: NameRecoveryStats {
-            ssa_tokens_seen,
-            rewritten_tokens,
-            output_vars: component_name.len(),
-            split_components,
-        },
-        name_to_reg_base: comp_rows
-            .iter()
-            .zip(component_name.iter())
-            .map(|(row, name)| (name.clone(), (row.3.class.clone(), row.3.idx)))
-            .collect(),
-    }
+fn semantic_symbolize_output(
+    function_ir: &FunctionIR,
+    output: &str,
+    lifted: Option<&SemanticLiftResult>,
+    comp_rows: &[(Group, Loc, String, RegBase, Vec<RegSsa>)],
+    component_name: &[String],
+) -> (String, Vec<String>) {
+    let mut result = output.to_string();
+    let mut names = component_name.to_vec();
+
+    let ir_rename = build_ir_semantic_rename_map(function_ir, &result, comp_rows, &names);
+    result = apply_identifier_renames(&result, &ir_rename);
+    apply_name_renames(&mut names, &ir_rename);
+
+    let seed_rename =
+        build_semantic_seed_rename_map(function_ir, lifted, &result, comp_rows, &names);
+    result = apply_identifier_renames(&result, &seed_rename);
+    apply_name_renames(&mut names, &seed_rename);
+
+    (result, names)
 }
 
 /// SSA-graph-based semantic symbolization.
 ///
 /// Uses `propagate_semantic_labels` to find SSA registers with well-known
 /// meanings (tid_x, ctaid_y, etc.) and renames the corresponding recovered
-/// temp names (v0, v1, …) to their semantic names.  Falls back to the
-/// text-level `rewrite_semantic_seed_names` for any labels the IR pass
-/// might miss (e.g. ABI parameter patterns).
-fn rewrite_semantic_seed_names_ir(
+/// temp names (v0, v1, …) to their semantic names.
+fn build_ir_semantic_rename_map(
     function_ir: &FunctionIR,
     output: &str,
-    token_map: &HashMap<String, String>,
     comp_rows: &[(Group, Loc, String, RegBase, Vec<RegSsa>)],
     component_name: &[String],
-) -> String {
+) -> BTreeMap<String, String> {
     let ir_labels = propagate_semantic_labels(function_ir);
+    let mut used = collect_code_identifiers(output);
+    let mut rename = BTreeMap::<String, String>::new();
 
-    // Build a reverse map: recovered temp name → semantic label.
-    // For each component (row), check if any SSA member has an IR-level label.
-    // If all labeled members agree on the same label, use it.
-    let ident = nr_ident_re();
-    let mut used = BTreeSet::<String>::new();
-    for m in ident.find_iter(output) {
-        used.insert(m.as_str().to_string());
-    }
-
-    let mut rename = HashMap::<String, String>::new();
     for (row_idx, row) in comp_rows.iter().enumerate() {
         let temp_name = &component_name[row_idx];
         // Skip names that are already semantic (from a previous pass or manual)
         if !temp_name.starts_with('v') && !temp_name.starts_with('u') {
             continue;
         }
-        // Check if any SSA member of this component has an IR-level label
+        // Check if any SSA member of this component has an IR-level label.
         let mut label: Option<&str> = None;
         let mut conflict = false;
         for member in &row.4 {
@@ -510,10 +459,10 @@ fn rewrite_semantic_seed_names_ir(
                 idx: member.base.idx,
                 ssa: Some(member.ssa),
             };
-            if let Some(l) = ir_labels.get(&key) {
+            if let Some(candidate) = ir_labels.get(&key) {
                 match label {
-                    None => label = Some(l.as_str()),
-                    Some(prev) if prev == l.as_str() => {}
+                    None => label = Some(candidate.as_str()),
+                    Some(prev) if prev == candidate.as_str() => {}
                     Some(_) => {
                         conflict = true;
                         break;
@@ -521,73 +470,329 @@ fn rewrite_semantic_seed_names_ir(
                 }
             }
         }
-        if conflict || label.is_none() {
+        if conflict {
             continue;
         }
-        let sem = label.unwrap().to_string();
+        let Some(seed) = label else {
+            continue;
+        };
         if rename.contains_key(temp_name) {
             continue;
         }
-        let unique = alloc_unique_name(sem.clone(), &mut used);
+        let unique = alloc_unique_name(seed.to_string(), &mut used);
         rename.insert(temp_name.clone(), unique);
     }
 
-    // Apply IR-level renames
-    let mut result = output.to_string();
-    if !rename.is_empty() {
-        for (from, to) in &rename {
-            let pat =
-                Regex::new(&format!(r"\b{}\b", regex::escape(from))).expect("valid regex");
-            result = pat.replace_all(&result, to.as_str()).into_owned();
-        }
-    }
-
-    // Fall back to text-level for any patterns the IR pass doesn't cover
-    // (e.g. ABI parameter aliases like "arg0_ptr.lo32")
-    result = rewrite_semantic_seed_names(&result);
-
-    result
+    rename
 }
 
-fn rewrite_semantic_seed_names(output: &str) -> String {
-    let assign = nr_assign_re();
-    let ident = nr_ident_re();
-    let mut used = BTreeSet::<String>::new();
-    for m in ident.find_iter(output) {
-        used.insert(m.as_str().to_string());
-    }
+fn build_semantic_seed_rename_map(
+    function_ir: &FunctionIR,
+    lifted: Option<&SemanticLiftResult>,
+    output: &str,
+    comp_rows: &[(Group, Loc, String, RegBase, Vec<RegSsa>)],
+    component_name: &[String],
+) -> BTreeMap<String, String> {
+    let Some(lifted) = lifted else {
+        return BTreeMap::new();
+    };
+    build_lifted_seed_rename_map(function_ir, lifted, output, comp_rows, component_name)
+}
 
-    let mut rename = HashMap::<String, String>::new();
-    for line in output.lines() {
-        let Some(cap) = assign.captures(line) else {
+fn build_lifted_seed_rename_map(
+    function_ir: &FunctionIR,
+    lifted: &SemanticLiftResult,
+    output: &str,
+    comp_rows: &[(Group, Loc, String, RegBase, Vec<RegSsa>)],
+    component_name: &[String],
+) -> BTreeMap<String, String> {
+    let row_of = build_row_index_map(comp_rows);
+    let mut used = collect_code_identifiers(output);
+    let mut rename = BTreeMap::<String, String>::new();
+
+    for (def_ref, stmt) in &lifted.by_def {
+        let Some(def_expr) = lookup_stmt_def(
+            function_ir,
+            def_ref.block_id,
+            def_ref.stmt_idx,
+            def_ref.def_idx,
+        ) else {
             continue;
         };
-        let lhs = cap.name("lhs").expect("lhs").as_str().to_string();
-        let rhs = cap.name("rhs").expect("rhs").as_str();
-        let Some(seed) = semantic_name_seed(rhs) else {
+        let Some(row_idx) = row_index_for_expr(def_expr, &row_of) else {
             continue;
         };
-        if rename.contains_key(&lhs) {
+        let Some(current_name) = component_name.get(row_idx) else {
+            continue;
+        };
+        if rename.contains_key(current_name) {
             continue;
         }
-        // If the LHS is already the desired semantic name (or a suffixed
-        // variant like "tid_x_1"), skip — the IR-level pass already did it.
-        if lhs == seed || lhs.starts_with(&format!("{}_", seed)) {
+        let Some(seed) = semantic_seed_from_lifted_expr(&stmt.rhs) else {
+            continue;
+        };
+        if name_matches_seed(current_name, &seed) {
             continue;
         }
         let unique = alloc_unique_name(seed, &mut used);
-        rename.insert(lhs, unique);
+        rename.insert(current_name.clone(), unique);
     }
+
+    rename
+}
+
+fn build_row_index_map(
+    comp_rows: &[(Group, Loc, String, RegBase, Vec<RegSsa>)],
+) -> HashMap<RegSsa, usize> {
+    let mut row_of = HashMap::<RegSsa, usize>::new();
+    for (row_idx, row) in comp_rows.iter().enumerate() {
+        for member in &row.4 {
+            row_of.insert(member.clone(), row_idx);
+        }
+    }
+    row_of
+}
+
+fn lookup_stmt_def<'a>(
+    function_ir: &'a FunctionIR,
+    block_id: usize,
+    stmt_idx: usize,
+    def_idx: usize,
+) -> Option<&'a IRExpr> {
+    function_ir
+        .blocks
+        .iter()
+        .find(|block| block.id == block_id)
+        .and_then(|block| block.stmts.get(stmt_idx))
+        .and_then(|stmt| stmt.defs.get(def_idx))
+}
+
+fn semantic_seed_from_lifted_expr(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Raw(text) | Expr::ConstMemSymbol(text) | Expr::Builtin(text) => {
+            semantic_name_seed(text)
+        }
+        _ => None,
+    }
+}
+
+fn name_matches_seed(name: &str, seed: &str) -> bool {
+    name == seed
+        || name.strip_prefix(seed).is_some_and(|suffix| {
+            suffix.starts_with('_') && suffix[1..].chars().all(|c| c.is_ascii_digit())
+        })
+}
+
+fn apply_identifier_renames(output: &str, rename: &BTreeMap<String, String>) -> String {
     if rename.is_empty() {
         return output.to_string();
     }
 
     let mut out = output.to_string();
     for (from, to) in rename {
-        let pat = Regex::new(&format!(r"\b{}\b", regex::escape(&from))).expect("valid regex");
+        let pat = Regex::new(&format!(r"\b{}\b", regex::escape(from))).expect("valid regex");
         out = pat.replace_all(&out, to.as_str()).into_owned();
     }
     out
+}
+
+fn apply_name_renames(names: &mut [String], rename: &BTreeMap<String, String>) {
+    for name in names {
+        if let Some(replacement) = rename.get(name) {
+            *name = replacement.clone();
+        }
+    }
+}
+
+fn collect_recovered_symbol_metadata(
+    function_ir: &FunctionIR,
+    comp_rows: &[(Group, Loc, String, RegBase, Vec<RegSsa>)],
+    recovered_names: &[String],
+) -> Vec<RecoveredSymbol> {
+    let mut row_of = HashMap::<RegSsa, usize>::new();
+    for (row_idx, row) in comp_rows.iter().enumerate() {
+        for member in &row.4 {
+            row_of.insert(member.clone(), row_idx);
+        }
+    }
+
+    let mut defined = BTreeSet::<usize>::new();
+    let mut live_in = BTreeSet::<usize>::new();
+    let mut first_touch = BTreeMap::<usize, usize>::new();
+    let mut next_order = 0usize;
+
+    let mut record_touch = |row_idx: usize| {
+        first_touch.entry(row_idx).or_insert_with(|| {
+            let order = next_order;
+            next_order += 1;
+            order
+        });
+    };
+
+    for block in &function_ir.blocks {
+        for stmt in &block.stmts {
+            let defs_in_stmt = stmt
+                .defs
+                .iter()
+                .filter_map(|def| row_index_for_expr(def, &row_of))
+                .collect::<BTreeSet<_>>();
+            for row_idx in collect_stmt_use_rows(stmt, &row_of) {
+                record_touch(row_idx);
+                if !defined.contains(&row_idx) && !defs_in_stmt.contains(&row_idx) {
+                    live_in.insert(row_idx);
+                }
+            }
+            for row_idx in defs_in_stmt {
+                record_touch(row_idx);
+                defined.insert(row_idx);
+            }
+        }
+        for (cond, _) in &block.irdst {
+            let Some(IRCond::Pred { reg, .. }) = cond else {
+                continue;
+            };
+            let Some(row_idx) = row_index_for_reg_id(reg, &row_of) else {
+                continue;
+            };
+            record_touch(row_idx);
+            if !defined.contains(&row_idx) {
+                live_in.insert(row_idx);
+            }
+        }
+    }
+
+    let mut symbols = comp_rows
+        .iter()
+        .enumerate()
+        .filter_map(|(row_idx, row)| {
+            let name = recovered_names.get(row_idx)?.clone();
+            Some(RecoveredSymbol {
+                name,
+                reg_base: (row.3.class.clone(), row.3.idx),
+                live_in: live_in.contains(&row_idx),
+                order: first_touch.get(&row_idx).copied().unwrap_or(usize::MAX),
+            })
+        })
+        .collect::<Vec<_>>();
+    symbols.sort_by(|a, b| a.order.cmp(&b.order).then_with(|| a.name.cmp(&b.name)));
+    symbols
+}
+
+pub fn filter_recovered_symbols_by_output(
+    output: &str,
+    symbols: &[RecoveredSymbol],
+) -> Vec<RecoveredSymbol> {
+    let used_names = collect_code_identifiers(output);
+    symbols
+        .iter()
+        .filter(|symbol| used_names.contains(&symbol.name))
+        .cloned()
+        .collect()
+}
+
+fn row_index_for_reg_id(reg: &RegId, row_of: &HashMap<RegSsa, usize>) -> Option<usize> {
+    reg_ssa(reg).and_then(|key| row_of.get(&key).copied())
+}
+
+fn row_index_for_expr(expr: &IRExpr, row_of: &HashMap<RegSsa, usize>) -> Option<usize> {
+    let IRExpr::Reg(reg) = expr else {
+        return None;
+    };
+    row_index_for_reg_id(reg, row_of)
+}
+
+fn collect_stmt_use_rows(stmt: &IRStatement, row_of: &HashMap<RegSsa, usize>) -> Vec<usize> {
+    let mut out = Vec::new();
+    if let Some(pred) = &stmt.pred {
+        collect_expr_rows(pred, row_of, &mut out);
+    }
+    match &stmt.value {
+        RValue::Op { args, .. } | RValue::Phi(args) => {
+            for arg in args {
+                collect_expr_rows(arg, row_of, &mut out);
+            }
+        }
+        RValue::ImmI(_) | RValue::ImmF(_) => {}
+    }
+    if let Some(mem) = &stmt.mem_addr_args {
+        for arg in mem {
+            collect_expr_rows(arg, row_of, &mut out);
+        }
+    }
+    for old in &stmt.pred_old_defs {
+        collect_expr_rows(old, row_of, &mut out);
+    }
+    out
+}
+
+fn collect_expr_rows(expr: &IRExpr, row_of: &HashMap<RegSsa, usize>, out: &mut Vec<usize>) {
+    match expr {
+        IRExpr::Reg(reg) => {
+            if let Some(row_idx) = row_index_for_reg_id(reg, row_of) {
+                out.push(row_idx);
+            }
+        }
+        IRExpr::Mem { base, offset, .. } => {
+            collect_expr_rows(base, row_of, out);
+            if let Some(offset) = offset {
+                collect_expr_rows(offset, row_of, out);
+            }
+        }
+        IRExpr::Op { args, .. } => {
+            for arg in args {
+                collect_expr_rows(arg, row_of, out);
+            }
+        }
+        IRExpr::ImmI(_) | IRExpr::ImmF(_) => {}
+    }
+}
+
+fn collect_code_identifiers(output: &str) -> BTreeSet<String> {
+    let ident = nr_ident_word_re();
+    let mut used = BTreeSet::<String>::new();
+    for line in output.lines() {
+        let code = line.split("//").next().unwrap_or("");
+        if code.trim().is_empty() {
+            continue;
+        }
+        for m in ident.find_iter(code) {
+            used.insert(m.as_str().to_string());
+        }
+    }
+    used
+}
+
+pub fn apply_token_map_to_rendered(rendered: &str, token_map: &HashMap<String, String>) -> String {
+    let re = ssa_token_re();
+    re.replace_all(rendered, |caps: &regex::Captures<'_>| {
+        let token = caps.get(0).expect("match").as_str();
+        token_map
+            .get(token)
+            .cloned()
+            .unwrap_or_else(|| token.to_string())
+    })
+    .into_owned()
+}
+
+fn build_control_predicate_map(
+    comp_rows: &[(Group, Loc, String, RegBase, Vec<RegSsa>)],
+    fam_count: &BTreeMap<RegBase, usize>,
+    recovered_names: &[String],
+) -> HashMap<String, String> {
+    let mut pred_map = HashMap::<String, String>::new();
+    for (row_idx, row) in comp_rows.iter().enumerate() {
+        let base = &row.3;
+        if !matches!(base.class.as_str(), "P" | "UP") {
+            continue;
+        }
+        if fam_count.get(base).copied().unwrap_or(0) != 1 {
+            continue;
+        }
+        if let Some(name) = recovered_names.get(row_idx) {
+            pred_map.insert(format!("{}{}", base.class, base.idx), name.clone());
+        }
+    }
+    pred_map
 }
 
 fn alloc_unique_name(seed: String, used: &mut BTreeSet<String>) -> String {
@@ -702,10 +907,7 @@ fn simplify_predicated_ternaries_primary(output: &str) -> String {
                 || rhs_uses_cond_defined_any
             {
                 // Self-referencing or phi-marked ternary → if-guard.
-                out.push_str(&format!(
-                    "{}if ({}) {} = {};\n",
-                    indent, pred, dest, rhs
-                ));
+                out.push_str(&format!("{}if ({}) {} = {};\n", indent, pred, dest, rhs));
                 conditional_assign_pred.insert(dest.to_string(), pred_norm);
                 continue;
             }
@@ -855,118 +1057,6 @@ fn rewrite_control_guard_predicates(output: &str, pred_map: &HashMap<String, Str
     out
 }
 
-fn append_phi_merge_comments(
-    function_ir: &FunctionIR,
-    output: &str,
-    token_map: &HashMap<String, String>,
-) -> String {
-    let mut by_block = BTreeMap::<usize, Vec<String>>::new();
-    let mut live_ins = BTreeSet::<String>::new();
-
-    for block in &function_ir.blocks {
-        let mut merges = Vec::new();
-        for stmt in &block.stmts {
-            let (Some(IRExpr::Reg(dst)), RValue::Phi(args)) = (stmt.defs.first(), &stmt.value) else {
-                continue;
-            };
-            let Some(dst_ssa) = reg_ssa(dst) else {
-                continue;
-            };
-            let dst_tok = reg_token_core(&dst_ssa);
-            let dst_name = token_map.get(&dst_tok).cloned().unwrap_or(dst_tok);
-            let mut arg_names = Vec::new();
-            for a in args {
-                if let Some(a_ssa) = reg_ssa_from_expr(a) {
-                    let a_tok = reg_token_core(&a_ssa);
-                    let a_name = token_map.get(&a_tok).cloned().unwrap_or(a_tok);
-                    if a_name != dst_name {
-                        live_ins.insert(a_name.clone());
-                    }
-                    arg_names.push(a_name);
-                } else {
-                    arg_names.push(render_phi_fallback(a));
-                }
-            }
-            merges.push(format!("phi merge: {} <- phi({})", dst_name, arg_names.join(", ")));
-        }
-        // Filter out trivial phis where all args are identical to the dest.
-        // e.g. "phi merge: v13 <- phi(v13, v13)" is pure noise.
-        merges.retain(|m| {
-            // Parse "phi merge: DST <- phi(A, B, ...)"
-            if let Some(rest) = m.strip_prefix("phi merge: ") {
-                if let Some(arrow_pos) = rest.find(" <- phi(") {
-                    let dst = &rest[..arrow_pos];
-                    let args_str = &rest[arrow_pos + 8..]; // skip " <- phi("
-                    if let Some(args_str) = args_str.strip_suffix(')') {
-                        let all_same = args_str.split(", ").all(|a| a == dst);
-                        return !all_same; // keep only non-trivial phis
-                    }
-                }
-            }
-            true
-        });
-        if !merges.is_empty() {
-            by_block.insert(block.id, merges);
-        }
-    }
-
-    if by_block.is_empty() {
-        return output.to_string();
-    }
-
-    let phi_block = nr_phi_block_re();
-    let mut rendered = String::new();
-
-    if !live_ins.is_empty() {
-        rendered.push_str("// live-ins: ");
-        rendered.push_str(&live_ins.into_iter().collect::<Vec<_>>().join(", "));
-        rendered.push('\n');
-    }
-
-    for line in output.lines() {
-        if let Some(cap) = phi_block.captures(line) {
-            if let Some(m) = cap.get(1) {
-                let block_id = m.as_str().parse::<usize>().unwrap_or(usize::MAX);
-                if let Some(merges) = by_block.get(&block_id) {
-                    if !merges.is_empty() {
-                        // Emit only the individual phi merge comments, not the summary count line.
-                        let indent = line
-                            .chars()
-                            .take_while(|c| c.is_ascii_whitespace())
-                            .collect::<String>();
-                        for m in merges {
-                            rendered.push_str(&indent);
-                            rendered.push_str("// ");
-                            rendered.push_str(m);
-                            rendered.push('\n');
-                        }
-                    }
-                    // else: all phis were trivial — suppress entirely
-                } else {
-                    // No merges for this block at all — suppress the summary line
-                }
-            } else {
-                rendered.push_str(line);
-                rendered.push('\n');
-            }
-        } else {
-            rendered.push_str(line);
-            rendered.push('\n');
-        }
-    }
-    rendered
-}
-
-fn render_phi_fallback(e: &IRExpr) -> String {
-    match e {
-        IRExpr::Reg(r) => r.display(),
-        IRExpr::ImmI(i) => i.to_string(),
-        IRExpr::ImmF(f) => f.to_string(),
-        IRExpr::Mem { .. } => "<mem>".to_string(),
-        IRExpr::Op { op, .. } => op.clone(),
-    }
-}
-
 fn collect_tokens(
     function_ir: &FunctionIR,
 ) -> (
@@ -981,24 +1071,10 @@ fn collect_tokens(
     for block in &function_ir.blocks {
         for (stmt_idx, stmt) in block.stmts.iter().enumerate() {
             for def in &stmt.defs {
-                collect_expr_tokens(
-                    def,
-                    block.id,
-                    stmt_idx,
-                    0,
-                    &mut tokens,
-                    &mut first_seen,
-                );
+                collect_expr_tokens(def, block.id, stmt_idx, 0, &mut tokens, &mut first_seen);
             }
             if let Some(pred) = &stmt.pred {
-                collect_expr_tokens(
-                    pred,
-                    block.id,
-                    stmt_idx,
-                    1,
-                    &mut tokens,
-                    &mut first_seen,
-                );
+                collect_expr_tokens(pred, block.id, stmt_idx, 1, &mut tokens, &mut first_seen);
             }
             match &stmt.value {
                 RValue::Op { args, .. } => {
@@ -1029,14 +1105,7 @@ fn collect_tokens(
             }
             if let Some(mem) = &stmt.mem_addr_args {
                 for arg in mem {
-                    collect_expr_tokens(
-                        arg,
-                        block.id,
-                        stmt_idx,
-                        3,
-                        &mut tokens,
-                        &mut first_seen,
-                    );
+                    collect_expr_tokens(arg, block.id, stmt_idx, 3, &mut tokens, &mut first_seen);
                 }
             }
         }
@@ -1156,27 +1225,6 @@ fn is_immutable_reg(r: &RegId) -> bool {
     matches!(r.class.as_str(), "RZ" | "PT" | "URZ" | "UPT")
 }
 
-/// A `DisplayCtx` wrapper that applies the name recovery token map
-/// during rendering, so SSA tokens are replaced at render time rather
-/// than via post-render regex replacement.
-pub struct NameAwareDisplay<'a> {
-    inner: &'a dyn crate::ir::DisplayCtx,
-    token_map: &'a HashMap<String, String>,
-}
-
-impl<'a> NameAwareDisplay<'a> {
-    pub fn new(inner: &'a dyn crate::ir::DisplayCtx, token_map: &'a HashMap<String, String>) -> Self {
-        Self { inner, token_map }
-    }
-}
-
-impl crate::ir::DisplayCtx for NameAwareDisplay<'_> {
-    fn reg(&self, r: &RegId) -> String {
-        let raw = self.inner.reg(r);
-        self.token_map.get(&raw).cloned().unwrap_or(raw)
-    }
-}
-
 fn is_zero_expr(e: &IRExpr) -> bool {
     match e {
         IRExpr::ImmI(i) => *i == 0,
@@ -1189,10 +1237,32 @@ fn is_zero_expr(e: &IRExpr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{build_cfg, build_ssa, parse_sass};
+    use crate::semantic_lift::{lift_function_ir, SemanticLiftConfig};
+    use crate::{build_cfg, build_ssa, decode_sass};
 
     fn build_fir(sass: &str) -> FunctionIR {
-        build_ssa(&build_cfg(parse_sass(sass)))
+        build_ssa(&build_cfg(decode_sass(sass)))
+    }
+
+    fn apply_plan(
+        fir: &FunctionIR,
+        rendered: &str,
+        config: &NameRecoveryConfig,
+    ) -> (String, StructuralNameRecoveryPlan) {
+        let plan = plan_structured_name_recovery_with_lift(fir, rendered, None, config);
+        let output = apply_token_map_to_rendered(rendered, &plan.token_map);
+        (output, plan)
+    }
+
+    fn apply_plan_with_lift(
+        fir: &FunctionIR,
+        rendered: &str,
+        lifted: &SemanticLiftResult,
+        config: &NameRecoveryConfig,
+    ) -> (String, StructuralNameRecoveryPlan) {
+        let plan = plan_structured_name_recovery_with_lift(fir, rendered, Some(lifted), config);
+        let output = apply_token_map_to_rendered(rendered, &plan.token_map);
+        (output, plan)
     }
 
     #[test]
@@ -1214,9 +1284,9 @@ mod tests {
         r0.dedup();
         assert!(r0.len() >= 2);
         let rendered = format!("{} = {} + 1;", r0[0], r0[1]);
-        let out = recover_structured_output_names(&fir, &rendered, &NameRecoveryConfig::default());
+        let (out, _) = apply_plan(&fir, &rendered, &NameRecoveryConfig::default());
         for t in &r0 {
-            assert!(!out.output.contains(t));
+            assert!(!out.contains(t));
         }
     }
 
@@ -1229,10 +1299,9 @@ mod tests {
         "#;
         let fir = build_fir(sass);
         let rendered = "R1.0 = 1; R1.1 = 2; R2.0 = R1.0 + R1.1;";
-        let out = recover_structured_output_names(&fir, rendered, &NameRecoveryConfig::default());
-        // Distinct components should use different recovered names.
-        assert!(out.output.contains("v0 = 1;"));
-        assert!(out.output.contains("v1 = 2;"));
+        let (out, _) = apply_plan(&fir, rendered, &NameRecoveryConfig::default());
+        assert!(out.contains("v0 = 1;"));
+        assert!(out.contains("v1 = 2;"));
     }
 
     #[test]
@@ -1245,13 +1314,13 @@ mod tests {
         "#;
         let fir = build_fir(sass);
         let rendered = "R1.0 = R1.1 + 1; UR4.0 = UR4.1 + 1; P0.0 = R1.0 >= 1;";
-        let out = recover_structured_output_names(&fir, rendered, &NameRecoveryConfig::default());
-        assert!(out.output.contains("v"));
-        assert!(out.output.contains("u"));
-        assert!(out.output.contains("b"));
-        assert!(!out.output.contains("R1."));
-        assert!(!out.output.contains("UR4."));
-        assert!(!out.output.contains("P0."));
+        let (out, _) = apply_plan(&fir, rendered, &NameRecoveryConfig::default());
+        assert!(out.contains('v'));
+        assert!(out.contains('u'));
+        assert!(out.contains('b'));
+        assert!(!out.contains("R1."));
+        assert!(!out.contains("UR4."));
+        assert!(!out.contains("P0."));
     }
 
     #[test]
@@ -1262,9 +1331,9 @@ mod tests {
         "#;
         let fir = build_fir(sass);
         let rendered = "BB10 {\n  R1.0 = IADD3(R1.1, 1, RZ);\n}";
-        let out = recover_structured_output_names(&fir, rendered, &NameRecoveryConfig::default());
-        assert!(out.output.contains("BB10"));
-        assert!(out.output.contains("IADD3("));
+        let (out, _) = apply_plan(&fir, rendered, &NameRecoveryConfig::default());
+        assert!(out.contains("BB10"));
+        assert!(out.contains("IADD3("));
     }
 
     #[test]
@@ -1272,10 +1341,11 @@ mod tests {
         let sass = include_str!("../test_cu/if_loop.sass");
         let fir = build_fir(sass);
         let rendered = "R1.0 = R1.1 + R2.0; P0.1 = R1.0 >= 0;";
-        let o1 = recover_structured_output_names(&fir, rendered, &NameRecoveryConfig::default());
-        let o2 = recover_structured_output_names(&fir, rendered, &NameRecoveryConfig::default());
-        assert_eq!(o1.output, o2.output);
-        assert_eq!(o1.stats, o2.stats);
+        let (out1, plan1) = apply_plan(&fir, rendered, &NameRecoveryConfig::default());
+        let (out2, plan2) = apply_plan(&fir, rendered, &NameRecoveryConfig::default());
+        assert_eq!(out1, out2);
+        assert_eq!(plan1.token_map, plan2.token_map);
+        assert_eq!(plan1.symbols, plan2.symbols);
     }
 
     #[test]
@@ -1285,12 +1355,8 @@ mod tests {
             /*0010*/ EXIT ;
         "#;
         let fir = build_fir(sass);
-        let out = recover_structured_output_names(
-            &fir,
-            "if (P0) {\n}\n",
-            &NameRecoveryConfig::default(),
-        );
-        assert!(out.output.contains("if (b"));
+        let (_, plan) = apply_plan(&fir, "if (P0) {\n}\n", &NameRecoveryConfig::default());
+        assert!(plan.token_map.get("P0").is_some_and(|name| name.starts_with('b')));
     }
 
     #[test]
@@ -1301,45 +1367,8 @@ mod tests {
             /*0020*/ EXIT ;
         "#;
         let fir = build_fir(sass);
-        let out = recover_structured_output_names(
-            &fir,
-            "if (P0) {\n}\n",
-            &NameRecoveryConfig::default(),
-        );
-        assert!(out.output.contains("if (P0)"));
-    }
-
-    #[test]
-    fn emits_phi_merge_comments_when_enabled() {
-        let sass = r#"
-            /*000*/ IADD R0, R0, 0x1 ;
-            /*010*/ ISETP.LT.AND P0, PT, R0, 0x5, PT ;
-            /*020*/ @P0 BRA 0x000 ;
-            /*030*/ EXIT ;
-        "#;
-        let fir = build_fir(sass);
-        let phi_block = fir
-            .blocks
-            .iter()
-            .find(|b| b.stmts.iter().any(|s| matches!(s.value, RValue::Phi(_))))
-            .map(|b| b.id)
-            .expect("phi block");
-        let rendered = format!("// 1 phi node(s) omitted [BB{}]\n", phi_block);
-        let out = recover_structured_output_names(
-            &fir,
-            &rendered,
-            &NameRecoveryConfig {
-                style: NameStyle::Temp,
-                rewrite_control_predicates: true,
-                emit_phi_merge_comments: true,
-                semantic_symbolization: false,
-            },
-        );
-        // All phi args map to the same recovered name (same union-find
-        // component), so the merge is trivial and gets suppressed.
-        assert!(!out.output.contains("phi merge:"));
-        // The summary count line should also be stripped.
-        assert!(!out.output.contains("phi node(s) omitted"));
+        let (_, plan) = apply_plan(&fir, "if (P0) {\n}\n", &NameRecoveryConfig::default());
+        assert!(!plan.token_map.contains_key("P0"));
     }
 
     #[test]
@@ -1358,8 +1387,7 @@ mod tests {
 
     #[test]
     fn simplify_predicated_ternary_rewrites_when_old_only_exists_under_same_predicate() {
-        let input =
-            "  if (!b41) v176 = v175 & 255;\n  v177 = !b41 ? (shmem_u8[v176]) : v176;\n";
+        let input = "  if (!b41) v176 = v175 & 255;\n  v177 = !b41 ? (shmem_u8[v176]) : v176;\n";
         let out = simplify_predicated_ternaries(input);
         assert_eq!(
             out,
@@ -1427,18 +1455,48 @@ mod tests {
             /*0010*/ EXIT ;
         "#;
         let fir = build_fir(sass);
-        let rendered = "v0 = threadIdx.x;\nif (v0 > 1) {\n}\n";
-        let out = recover_structured_output_names(
+        let rendered = "R2.0 = threadIdx.x;\nif (R2.0 > 1) {\n}\n";
+        let lifted = lift_function_ir(&fir, &SemanticLiftConfig::default());
+        let (out, _) = apply_plan_with_lift(
             &fir,
             rendered,
+            &lifted,
             &NameRecoveryConfig {
                 style: NameStyle::Temp,
                 rewrite_control_predicates: true,
-                emit_phi_merge_comments: false,
                 semantic_symbolization: true,
             },
         );
-        assert!(out.output.contains("tid_x = threadIdx.x;"));
-        assert!(out.output.contains("if (tid_x > 1)"));
+        assert!(out.contains("tid_x = threadIdx.x;"));
+        assert!(out.contains("if (tid_x > 1)"));
+    }
+
+    #[test]
+    fn semantic_symbolization_updates_symbol_metadata() {
+        let sass = r#"
+            /*0000*/ S2R R2, SR_TID.X ;
+            /*0010*/ EXIT ;
+        "#;
+        let fir = build_fir(sass);
+        let rendered = "R2.0 = threadIdx.x;\nif (R2.0 > 1) {\n}\n";
+        let lifted = lift_function_ir(&fir, &SemanticLiftConfig::default());
+        let (_, plan) = apply_plan_with_lift(
+            &fir,
+            rendered,
+            &lifted,
+            &NameRecoveryConfig {
+                style: NameStyle::Temp,
+                rewrite_control_predicates: true,
+                semantic_symbolization: true,
+            },
+        );
+        let name_to_reg_base = plan
+            .symbols
+            .iter()
+            .map(|symbol| (symbol.name.clone(), symbol.reg_base.clone()))
+            .collect::<HashMap<_, _>>();
+        assert!(name_to_reg_base.contains_key("tid_x"));
+        assert!(!name_to_reg_base.contains_key("v0"));
+        assert!(plan.symbols.iter().any(|symbol| symbol.name == "tid_x"));
     }
 }

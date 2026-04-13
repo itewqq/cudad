@@ -5,6 +5,7 @@
 use std::collections::BTreeMap;
 
 use crate::abi::{AbiAnnotations, AbiArgAliases, ConstMemSemantic, StatementRef};
+use crate::ast::{Expr, LValue};
 use crate::ir::{FunctionIR, IRExpr, RValue};
 
 mod op_sig;
@@ -29,94 +30,17 @@ impl Default for SemanticLiftConfig<'_> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum LiftedExpr {
-    Raw(String),
-    Imm(String),
-    Reg(String),
-    Unary {
-        op: String,
-        arg: Box<LiftedExpr>,
-    },
-    Binary {
-        op: String,
-        lhs: Box<LiftedExpr>,
-        rhs: Box<LiftedExpr>,
-    },
-    Ternary {
-        cond: Box<LiftedExpr>,
-        then_expr: Box<LiftedExpr>,
-        else_expr: Box<LiftedExpr>,
-    },
-}
-
-impl LiftedExpr {
-    pub fn render(&self) -> String {
-        self.render_with_prec(0)
-    }
-
-    fn render_with_prec(&self, parent_prec: u8) -> String {
-        match self {
-            LiftedExpr::Raw(s) | LiftedExpr::Imm(s) | LiftedExpr::Reg(s) => s.clone(),
-            LiftedExpr::Unary { op, arg } => {
-                let prec = 14; // tightest binding, above * (13)
-                let inner = format!("{}{}", op, arg.render_with_prec(prec));
-                if prec < parent_prec {
-                    format!("({})", inner)
-                } else {
-                    inner
-                }
-            }
-            LiftedExpr::Binary { op, lhs, rhs } => {
-                let prec = binary_prec(op);
-                let inner = format!(
-                    "{} {} {}",
-                    lhs.render_with_prec(prec),
-                    op,
-                    rhs.render_with_prec(prec + 1)
-                );
-                if prec < parent_prec {
-                    format!("({})", inner)
-                } else {
-                    inner
-                }
-            }
-            LiftedExpr::Ternary {
-                cond,
-                then_expr,
-                else_expr,
-            } => {
-                // Lowest precedence, below || (4), matching C's ?: level.
-                // C's ?: is right-associative: `a?b:c?d:e` = `a?b:(c?d:e)`.
-                // Force parens on condition sub-expr (prec+1) to prevent ambiguity.
-                // The then-branch (between ? and :) is unambiguous so prec 0.
-                // The else-branch keeps same prec (right-assoc is natural).
-                let prec = 1;
-                let inner = format!(
-                    "{} ? {} : {}",
-                    cond.render_with_prec(prec + 1),
-                    then_expr.render_with_prec(0),
-                    else_expr.render_with_prec(prec)
-                );
-                if prec < parent_prec {
-                    format!("({})", inner)
-                } else {
-                    inner
-                }
-            }
-        }
-    }
-}
+pub type LiftedExpr = Expr;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct LiftedStmt {
-    pub dest: String,
-    pub pred: Option<LiftedExpr>,
-    pub rhs: LiftedExpr,
+    pub dest: LValue,
+    pub pred: Option<Expr>,
+    pub rhs: Expr,
     /// The previous SSA value of the destination when the predicate is false.
     /// Populated from `IRStatement::pred_old_defs` so the renderer can emit
     /// `dest = pred ? rhs : pred_old_val` instead of `if (pred) dest = rhs`.
-    pub pred_old_val: Option<String>,
+    pub pred_old_val: Option<Expr>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -139,7 +63,10 @@ pub struct DefRef {
     pub def_idx: usize,
 }
 
-pub fn lift_function_ir(function_ir: &FunctionIR, config: &SemanticLiftConfig<'_>) -> SemanticLiftResult {
+pub fn lift_function_ir(
+    function_ir: &FunctionIR,
+    config: &SemanticLiftConfig<'_>,
+) -> SemanticLiftResult {
     let mut out = SemanticLiftResult::default();
 
     for block in &function_ir.blocks {
@@ -180,10 +107,10 @@ pub fn lift_function_ir(function_ir: &FunctionIR, config: &SemanticLiftConfig<'_
             for def_idx in 0..def_count {
                 let lifted_rhs = lift_opcode_expr_for_def(opcode, args, def_idx, stmt_ref, config);
                 if let Some(rhs) = lifted_rhs {
-                    let dest = stmt
-                        .defs
-                        .get(def_idx)
-                        .map_or_else(|| "_".to_string(), |d| render_expr_raw(d, stmt_ref, config));
+                    let dest = stmt.defs.get(def_idx).map_or_else(
+                        || LValue::Raw("_".to_string()),
+                        |d| lvalue_from_ir_def(d, stmt_ref, config),
+                    );
                     let pred = stmt
                         .pred
                         .as_ref()
@@ -191,7 +118,7 @@ pub fn lift_function_ir(function_ir: &FunctionIR, config: &SemanticLiftConfig<'_
                     let pred_old_val = stmt
                         .pred_old_defs
                         .get(def_idx)
-                        .map(|d| render_expr_raw(d, stmt_ref, config));
+                        .map(|d| lift_ir_expr(d, stmt_ref, config));
                     out.by_def.insert(
                         DefRef {
                             block_id: block.id,
@@ -373,26 +300,134 @@ fn lift_store_stmt(
     args: &[IRExpr],
     stmt_ref: StatementRef,
     config: &SemanticLiftConfig<'_>,
-) -> Option<(String, LiftedExpr)> {
+) -> Option<(LValue, LiftedExpr)> {
     if args.len() < 2 || !is_mem_expr(&args[0]) {
         return None;
     }
     if opcode.starts_with("STS") {
         let dest = if opcode.contains(".U8") {
-            render_shared_u8_ref(&args[0], stmt_ref, config)?
+            shared_lvalue(&args[0], true, stmt_ref, config)?
         } else {
-            render_shared_ref(&args[0], stmt_ref, config)?
+            shared_lvalue(&args[0], false, stmt_ref, config)?
         };
         let rhs = lift_ir_expr(&args[1], stmt_ref, config);
         return Some((dest, rhs));
     }
     if opcode.starts_with("STG") {
-        let dest = render_global_store_ref(&args[0], opcode, stmt_ref, config)
-            .unwrap_or_else(|| render_expr_raw(&args[0], stmt_ref, config));
+        let dest = global_store_lvalue(&args[0], opcode, stmt_ref, config)
+            .unwrap_or_else(|| LValue::Raw(render_expr_raw(&args[0], stmt_ref, config)));
         let rhs = lift_ir_expr(&args[1], stmt_ref, config);
         return Some((dest, rhs));
     }
     None
+}
+
+fn lvalue_from_ir_def(
+    expr: &IRExpr,
+    stmt_ref: StatementRef,
+    config: &SemanticLiftConfig<'_>,
+) -> LValue {
+    match expr {
+        IRExpr::Reg(r) => {
+            if matches!(r.class.as_str(), "RZ" | "URZ") {
+                return LValue::Raw("0".to_string());
+            }
+            if matches!(r.class.as_str(), "PT" | "UPT") {
+                return LValue::Raw("true".to_string());
+            }
+            LValue::Var(r.display())
+        }
+        IRExpr::ImmI(i) => LValue::Raw(i.to_string()),
+        IRExpr::ImmF(f) => LValue::Raw(f.to_string()),
+        IRExpr::Mem { .. } | IRExpr::Op { .. } => {
+            LValue::Raw(render_expr_raw(expr, stmt_ref, config))
+        }
+    }
+}
+
+fn shared_lvalue(
+    mem_expr: &IRExpr,
+    byte_mode: bool,
+    stmt_ref: StatementRef,
+    config: &SemanticLiftConfig<'_>,
+) -> Option<LValue> {
+    let index = shared_index_expr(mem_expr, stmt_ref, config)?;
+    let base = if byte_mode { "shmem_u8" } else { "shmem" };
+    Some(LValue::Indexed {
+        base: Box::new(Expr::Builtin(base.to_string())),
+        index: Box::new(index),
+    })
+}
+
+fn shared_index_expr(
+    mem_expr: &IRExpr,
+    stmt_ref: StatementRef,
+    config: &SemanticLiftConfig<'_>,
+) -> Option<Expr> {
+    let IRExpr::Mem { base, offset, .. } = mem_expr else {
+        return None;
+    };
+    let index = lift_ir_expr(base, stmt_ref, config);
+    Some(match offset {
+        Some(off) => add_like_expr(index, lift_ir_expr(off, stmt_ref, config)),
+        None => index,
+    })
+}
+
+fn lift_addr_expr(
+    mem_expr: &IRExpr,
+    stmt_ref: StatementRef,
+    config: &SemanticLiftConfig<'_>,
+) -> Option<Expr> {
+    let IRExpr::Mem {
+        base,
+        offset,
+        width,
+    } = mem_expr
+    else {
+        return None;
+    };
+    let addr = if matches!(width, Some(64)) {
+        match base.as_ref() {
+            IRExpr::Op { op, args } if op == "addr64" && args.len() == 2 => Expr::Addr64 {
+                lo: Box::new(lift_ir_expr(&args[0], stmt_ref, config)),
+                hi: Box::new(lift_ir_expr(&args[1], stmt_ref, config)),
+            },
+            _ => lift_ir_expr(base, stmt_ref, config),
+        }
+    } else {
+        lift_ir_expr(base, stmt_ref, config)
+    };
+    Some(match offset {
+        Some(off) => add_like_expr(addr, lift_ir_expr(off, stmt_ref, config)),
+        None => addr,
+    })
+}
+
+fn global_load_expr(
+    mem_expr: &IRExpr,
+    opcode: &str,
+    stmt_ref: StatementRef,
+    config: &SemanticLiftConfig<'_>,
+) -> Option<Expr> {
+    let addr = lift_addr_expr(mem_expr, stmt_ref, config)?;
+    Some(Expr::Load {
+        ty: scalar_type_from_opcode(opcode).map(str::to_string),
+        addr: Box::new(addr),
+    })
+}
+
+fn global_store_lvalue(
+    mem_expr: &IRExpr,
+    opcode: &str,
+    stmt_ref: StatementRef,
+    config: &SemanticLiftConfig<'_>,
+) -> Option<LValue> {
+    let addr = lift_addr_expr(mem_expr, stmt_ref, config)?;
+    Some(LValue::Deref {
+        ty: scalar_type_from_opcode(opcode).map(str::to_string),
+        addr: Box::new(addr),
+    })
 }
 
 fn lift_imad_mov(
@@ -452,13 +487,14 @@ fn lift_iadd3_carry(
     config: &SemanticLiftConfig<'_>,
 ) -> Option<LiftedExpr> {
     let (a0, a1, a2) = extract_triplet_operands(args)?;
-    Some(LiftedExpr::Raw(format!(
-        "{}({}, {}, {})",
-        helper,
-        lift_ir_expr(a0, stmt_ref, config).render(),
-        lift_ir_expr(a1, stmt_ref, config).render(),
-        lift_ir_expr(a2, stmt_ref, config).render()
-    )))
+    Some(LiftedExpr::CallLike {
+        func: helper.to_string(),
+        args: vec![
+            lift_ir_expr(a0, stmt_ref, config),
+            lift_ir_expr(a1, stmt_ref, config),
+            lift_ir_expr(a2, stmt_ref, config),
+        ],
+    })
 }
 
 fn lift_iadd3_x(
@@ -581,14 +617,6 @@ fn lift_iabs(
     lift_unary_intrinsic("abs", args, stmt_ref, config)
 }
 
-fn lift_i2f_rp(
-    args: &[IRExpr],
-    stmt_ref: StatementRef,
-    config: &SemanticLiftConfig<'_>,
-) -> Option<LiftedExpr> {
-    lift_unary_intrinsic("i2f_rp", args, stmt_ref, config)
-}
-
 fn lift_mufu_rcp(
     args: &[IRExpr],
     stmt_ref: StatementRef,
@@ -679,11 +707,20 @@ fn lift_unary_intrinsic(
     if args.len() != 1 {
         return None;
     }
-    Some(LiftedExpr::Raw(format!(
-        "{}({})",
-        name,
-        lift_ir_expr(&args[0], stmt_ref, config).render()
-    )))
+    let arg = lift_ir_expr(&args[0], stmt_ref, config);
+    if let Some(ty) = name
+        .strip_prefix('(')
+        .and_then(|text| text.strip_suffix(')'))
+    {
+        return Some(LiftedExpr::Cast {
+            ty: ty.to_string(),
+            expr: Box::new(arg),
+        });
+    }
+    Some(LiftedExpr::CallLike {
+        func: name.to_string(),
+        args: vec![arg],
+    })
 }
 
 fn lift_binary_infix(
@@ -726,11 +763,14 @@ pub(crate) fn lift_lds_expr(
         return None;
     }
     let shared = if opcode.contains(".U8") {
-        render_shared_u8_ref(&args[0], stmt_ref, config)?
+        shared_lvalue(&args[0], true, stmt_ref, config)?
     } else {
-        render_shared_ref(&args[0], stmt_ref, config)?
+        shared_lvalue(&args[0], false, stmt_ref, config)?
     };
-    Some(LiftedExpr::Raw(shared))
+    Some(match shared {
+        LValue::Indexed { base, index } => Expr::Index { base, index },
+        other => Expr::Raw(other.render()),
+    })
 }
 
 fn lift_ldg_expr(
@@ -742,8 +782,8 @@ fn lift_ldg_expr(
     if args.len() != 1 || !is_mem_expr(&args[0]) {
         return None;
     }
-    if let Some(rendered) = render_global_load_ref(&args[0], opcode, stmt_ref, config) {
-        return Some(LiftedExpr::Raw(rendered));
+    if let Some(rendered) = global_load_expr(&args[0], opcode, stmt_ref, config) {
+        return Some(rendered);
     }
     Some(LiftedExpr::Raw(render_expr_raw(&args[0], stmt_ref, config)))
 }
@@ -763,50 +803,6 @@ fn scalar_type_from_opcode(opcode: &str) -> Option<&'static str> {
         }
     }
     None
-}
-
-fn render_addr_expr(mem_expr: &IRExpr, stmt_ref: StatementRef, config: &SemanticLiftConfig<'_>) -> Option<String> {
-    let IRExpr::Mem { base, offset, width } = mem_expr else {
-        return None;
-    };
-    let mut addr = if matches!(width, Some(64)) {
-        match base.as_ref() {
-            IRExpr::Op { op, args } if op == "addr64" && args.len() == 2 => {
-                let lo = render_expr_raw(&args[0], stmt_ref, config);
-                let hi = render_expr_raw(&args[1], stmt_ref, config);
-                format!("addr64({}, {})", lo, hi)
-            }
-            _ => render_expr_raw(base, stmt_ref, config),
-        }
-    } else {
-        render_expr_raw(base, stmt_ref, config)
-    };
-    if let Some(off) = offset {
-        addr = format!("({} + {})", addr, render_expr_raw(off, stmt_ref, config));
-    }
-    Some(addr)
-}
-
-fn render_global_load_ref(
-    mem_expr: &IRExpr,
-    opcode: &str,
-    stmt_ref: StatementRef,
-    config: &SemanticLiftConfig<'_>,
-) -> Option<String> {
-    let ty = scalar_type_from_opcode(opcode)?;
-    let addr = render_addr_expr(mem_expr, stmt_ref, config)?;
-    Some(format!("*(({}*){})", ty, addr))
-}
-
-fn render_global_store_ref(
-    mem_expr: &IRExpr,
-    opcode: &str,
-    stmt_ref: StatementRef,
-    config: &SemanticLiftConfig<'_>,
-) -> Option<String> {
-    let ty = scalar_type_from_opcode(opcode)?;
-    let addr = render_addr_expr(mem_expr, stmt_ref, config)?;
-    Some(format!("*(({}*){})", ty, addr))
 }
 
 fn lift_fsel(
@@ -834,7 +830,9 @@ fn lift_setp_compare(
         return None;
     }
     // Determine predicate combine mode from opcode: AND, OR, XOR
-    let combine_mode = opcode.split('.').find(|p| matches!(*p, "AND" | "OR" | "XOR"));
+    let combine_mode = opcode
+        .split('.')
+        .find(|p| matches!(*p, "AND" | "OR" | "XOR"));
 
     let cmp = cmp_token_to_op(opcode)?;
 
@@ -1252,10 +1250,7 @@ fn lift_prmt(
         .iter()
         .map(|a| lift_ir_expr(a, stmt_ref, config).render())
         .collect();
-    Some(LiftedExpr::Raw(format!(
-        "prmt({})",
-        rendered.join(", ")
-    )))
+    Some(LiftedExpr::Raw(format!("prmt({})", rendered.join(", "))))
 }
 
 /// VIMNMX: 32-bit integer min/max (video instruction set).
@@ -1297,10 +1292,7 @@ fn lift_vimnmx(
         .iter()
         .map(|a| lift_ir_expr(a, stmt_ref, config).render())
         .collect();
-    Some(LiftedExpr::Raw(format!(
-        "vimnmx({})",
-        rendered.join(", ")
-    )))
+    Some(LiftedExpr::Raw(format!("vimnmx({})", rendered.join(", "))))
 }
 
 /// VIADDMNMX: integer add-then-min/max (video instruction set).
@@ -1462,14 +1454,15 @@ fn lift_lea_hi(
             } else {
                 "lea_hi_x"
             };
-            let base = lift_ir_expr(&args[0], stmt_ref, config).render();
-            let off = lift_ir_expr(&args[1], stmt_ref, config).render();
-            let sh = lift_ir_expr(&args[2], stmt_ref, config).render();
-            let carry = lift_ir_expr(&args[3], stmt_ref, config).render();
-            return Some(LiftedExpr::Raw(format!(
-                "{}({}, {}, {}, {})",
-                helper, base, off, sh, carry
-            )));
+            return Some(LiftedExpr::CallLike {
+                func: helper.to_string(),
+                args: vec![
+                    lift_ir_expr(&args[0], stmt_ref, config),
+                    lift_ir_expr(&args[1], stmt_ref, config),
+                    lift_ir_expr(&args[2], stmt_ref, config),
+                    lift_ir_expr(&args[3], stmt_ref, config),
+                ],
+            });
         }
         return None;
     }
@@ -1484,14 +1477,15 @@ fn lift_lea_hi(
         } else {
             "lea_hi_x"
         };
-        let offset = lift_ir_expr(&args[0], stmt_ref, config).render();
-        let hi_base = lift_ir_expr(&args[1], stmt_ref, config).render();
-        let sh = lift_ir_expr(&args[3], stmt_ref, config).render();
-        let carry = lift_ir_expr(&args[4], stmt_ref, config).render();
-        return Some(LiftedExpr::Raw(format!(
-            "{}({}, {}, {}, {})",
-            helper, offset, hi_base, sh, carry
-        )));
+        return Some(LiftedExpr::CallLike {
+            func: helper.to_string(),
+            args: vec![
+                lift_ir_expr(&args[0], stmt_ref, config),
+                lift_ir_expr(&args[1], stmt_ref, config),
+                lift_ir_expr(&args[3], stmt_ref, config),
+                lift_ir_expr(&args[4], stmt_ref, config),
+            ],
+        });
     }
 
     None
@@ -1736,40 +1730,20 @@ fn is_mem_expr(e: &IRExpr) -> bool {
     matches!(e, IRExpr::Mem { .. })
 }
 
-fn render_shared_u8_ref(
-    mem_expr: &IRExpr,
-    stmt_ref: StatementRef,
-    config: &SemanticLiftConfig<'_>,
-) -> Option<String> {
-    let IRExpr::Mem { base, offset, .. } = mem_expr else {
-        return None;
-    };
-    let mut idx = render_expr_raw(base, stmt_ref, config);
-    if let Some(off) = offset {
-        idx.push_str(" + ");
-        idx.push_str(&render_expr_raw(off, stmt_ref, config));
-    }
-    Some(format!("shmem_u8[{}]", idx))
-}
-
 /// Render a shared memory reference (any width).  Returns `shmem[addr]`.
 pub(crate) fn render_shared_ref(
     mem_expr: &IRExpr,
     stmt_ref: StatementRef,
     config: &SemanticLiftConfig<'_>,
 ) -> Option<String> {
-    let IRExpr::Mem { base, offset, .. } = mem_expr else {
-        return None;
-    };
-    let mut idx = render_expr_raw(base, stmt_ref, config);
-    if let Some(off) = offset {
-        idx.push_str(" + ");
-        idx.push_str(&render_expr_raw(off, stmt_ref, config));
-    }
-    Some(format!("shmem[{}]", idx))
+    shared_lvalue(mem_expr, false, stmt_ref, config).map(|expr| expr.render())
 }
 
-fn lift_ir_expr(expr: &IRExpr, stmt_ref: StatementRef, config: &SemanticLiftConfig<'_>) -> LiftedExpr {
+fn lift_ir_expr(
+    expr: &IRExpr,
+    stmt_ref: StatementRef,
+    config: &SemanticLiftConfig<'_>,
+) -> LiftedExpr {
     match expr {
         IRExpr::Reg(r) => {
             // Render RZ/URZ as literal 0 instead of a register name.
@@ -1792,6 +1766,12 @@ fn lift_ir_expr(expr: &IRExpr, stmt_ref: StatementRef, config: &SemanticLiftConf
                 let child = lift_ir_expr(&args[0], stmt_ref, config);
                 return simplify_not(child);
             }
+            if op == "addr64" && args.len() == 2 {
+                return LiftedExpr::Addr64 {
+                    lo: Box::new(lift_ir_expr(&args[0], stmt_ref, config)),
+                    hi: Box::new(lift_ir_expr(&args[1], stmt_ref, config)),
+                };
+            }
             if args.is_empty() {
                 if let Some(pred_expr) = parse_inline_predicate_expr(op) {
                     return pred_expr;
@@ -1800,7 +1780,7 @@ fn lift_ir_expr(expr: &IRExpr, stmt_ref: StatementRef, config: &SemanticLiftConf
             if op == "ConstMem" && args.len() == 2 {
                 if let (Some(bank), Some(offset)) = (imm_as_u32(&args[0]), imm_as_u32(&args[1])) {
                     if let Some(sym) = resolve_constmem_symbol(stmt_ref, bank, offset, config) {
-                        return LiftedExpr::Raw(sym);
+                        return LiftedExpr::ConstMemSymbol(sym);
                     }
                     // Render unresolved constant memory in hex (SASS convention).
                     return LiftedExpr::Raw(format!("c[0x{:x}][0x{:x}]", bank, offset));
@@ -1819,7 +1799,9 @@ fn parse_inline_predicate_expr(op: &str) -> Option<LiftedExpr> {
     };
 
     if core == "PT" || core == "UPT" {
-        return Some(LiftedExpr::Imm(if negated { "false" } else { "true" }.to_string()));
+        return Some(LiftedExpr::Imm(
+            if negated { "false" } else { "true" }.to_string(),
+        ));
     }
 
     let pred_name = if let Some(num) = core.strip_prefix('P') {
@@ -1846,26 +1828,6 @@ fn parse_inline_predicate_expr(op: &str) -> Option<LiftedExpr> {
     }
 }
 
-fn binary_prec(op: &str) -> u8 {
-    // Mirrors C operator precedence (higher number = tighter binding).
-    // C99 §6.5: multiplicative(13) > additive(12) > shift(11) >
-    //   relational(10) > equality(9) > bit-and(8) > bit-xor(7) >
-    //   bit-or(6) > logical-and(5) > logical-or(4) > ternary(1)
-    match op {
-        "*" | "/" | "%" => 13,
-        "+" | "-" => 12,
-        "<<" | ">>" => 11,
-        "<" | "<=" | ">" | ">=" => 10,
-        "==" | "!=" => 9,
-        "&" => 8,
-        "^" => 7,
-        "|" => 6,
-        "&&" => 5,
-        "||" => 4,
-        _ => 9, // default to equality level
-    }
-}
-
 fn simplify_not(expr: LiftedExpr) -> LiftedExpr {
     if let LiftedExpr::Unary { op, arg } = expr {
         if op == "!" {
@@ -1879,7 +1841,11 @@ fn simplify_not(expr: LiftedExpr) -> LiftedExpr {
     }
 }
 
-fn render_expr_raw(expr: &IRExpr, stmt_ref: StatementRef, config: &SemanticLiftConfig<'_>) -> String {
+fn render_expr_raw(
+    expr: &IRExpr,
+    stmt_ref: StatementRef,
+    config: &SemanticLiftConfig<'_>,
+) -> String {
     match expr {
         IRExpr::Reg(r) => {
             if matches!(r.class.as_str(), "RZ" | "URZ") {
@@ -1965,7 +1931,11 @@ fn resolve_constmem_symbol(
         .iter()
         .find(|ann| ann.bank == bank && ann.offset == offset)?;
 
-    if let ConstMemSemantic::ParamWord { param_idx, word_idx } = ann.semantic {
+    if let ConstMemSemantic::ParamWord {
+        param_idx,
+        word_idx,
+    } = ann.semantic
+    {
         if let Some(aliases) = config.abi_aliases {
             if let Some(alias) = aliases.render_param_word(param_idx, word_idx) {
                 return Some(alias);
@@ -1979,10 +1949,10 @@ fn resolve_constmem_symbol(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{build_cfg, build_ssa, parse_sass};
+    use crate::{build_cfg, build_ssa, decode_sass};
 
     fn run_lift(sass: &str) -> SemanticLiftResult {
-        let cfg = build_cfg(parse_sass(sass));
+        let cfg = build_cfg(decode_sass(sass));
         let fir = build_ssa(&cfg);
         lift_function_ir(&fir, &SemanticLiftConfig::default())
     }
@@ -1992,11 +1962,8 @@ mod tests {
     /// the wide-load tests that need to exercise the
     /// `lift_uldc_wide_def_from_lo` annotation path (which exits early
     /// when `config.abi_annotations` is `None`).
-    fn run_lift_with_abi(
-        sass: &str,
-        profile: crate::abi::AbiProfile,
-    ) -> SemanticLiftResult {
-        let cfg = build_cfg(parse_sass(sass));
+    fn run_lift_with_abi(sass: &str, profile: crate::abi::AbiProfile) -> SemanticLiftResult {
+        let cfg = build_cfg(decode_sass(sass));
         let fir = build_ssa(&cfg);
         let anns = crate::abi::annotate_function_ir_constmem(&fir, profile);
         let config = SemanticLiftConfig {
@@ -2388,7 +2355,7 @@ mod tests {
                 def_idx: 0,
             })
             .expect("expected lifted STS");
-        assert_eq!(lifted.dest, "shmem_u8[UR4.0]");
+        assert_eq!(lifted.dest.render(), "shmem_u8[UR4.0]");
         assert_eq!(lifted.rhs.render(), "R11.0");
     }
 
@@ -2465,6 +2432,29 @@ mod tests {
     }
 
     #[test]
+    fn lifts_iabs_to_typed_calllike_expr() {
+        let sass = r#"
+            /*0000*/ IABS R5, R2 ;
+            /*0010*/ EXIT ;
+        "#;
+        let out = run_lift(sass);
+        let lifted = out
+            .by_def
+            .get(&DefRef {
+                block_id: 0,
+                stmt_idx: 0,
+                def_idx: 0,
+            })
+            .expect("expected lifted IABS");
+        assert!(matches!(
+            &lifted.rhs,
+            LiftedExpr::CallLike { func, args }
+                if func == "abs"
+                    && matches!(args.as_slice(), [Expr::Reg(name)] if name == "R2.0")
+        ));
+    }
+
+    #[test]
     fn lifts_i2f_rp_to_helper_intrinsic() {
         let sass = r#"
             /*0000*/ I2F.RP R7, R3 ;
@@ -2480,6 +2470,29 @@ mod tests {
             })
             .expect("expected lifted I2F.RP");
         assert_eq!(lifted.rhs.render(), "(float)(R3.0)");
+    }
+
+    #[test]
+    fn lifts_i2f_rp_to_typed_cast_expr() {
+        let sass = r#"
+            /*0000*/ I2F.RP R7, R3 ;
+            /*0010*/ EXIT ;
+        "#;
+        let out = run_lift(sass);
+        let lifted = out
+            .by_def
+            .get(&DefRef {
+                block_id: 0,
+                stmt_idx: 0,
+                def_idx: 0,
+            })
+            .expect("expected lifted I2F.RP");
+        assert!(matches!(
+            &lifted.rhs,
+            LiftedExpr::Cast { ty, expr }
+                if ty == "float"
+                    && matches!(expr.as_ref(), Expr::Reg(name) if name == "R3.0")
+        ));
     }
 
     #[test]
@@ -2644,7 +2657,10 @@ mod tests {
                     def_idx,
                 })
                 .unwrap_or_else(|| {
-                    panic!("expected lifted LDCU.128 def {} under ABI annotations", def_idx)
+                    panic!(
+                        "expected lifted LDCU.128 def {} under ABI annotations",
+                        def_idx
+                    )
                 });
             assert_eq!(
                 lifted.rhs.render(),
@@ -2663,18 +2679,15 @@ mod tests {
         let modern = crate::abi::AbiProfile::modern_param_160();
         let blackwell = crate::abi::AbiProfile::blackwell_param_380();
         let cases: &[(&str, &str, crate::abi::AbiProfile)] = &[
-            ("ULDC UR5, c[0x0][0x0]", "blockDim.x", modern),      // SM 89 builtin (uniform)
-            ("LDC R5, c[0x0][0x0]", "blockDim.x", modern),        // SM 89 builtin (non-uniform)
+            ("ULDC UR5, c[0x0][0x0]", "blockDim.x", modern), // SM 89 builtin (uniform)
+            ("LDC R5, c[0x0][0x0]", "blockDim.x", modern),   // SM 89 builtin (non-uniform)
             ("LDCU UR5, c[0x0][0x360]", "blockDim.x", blackwell), // SM 100 builtin
-            ("LDC R1, c[0x0][0x360]", "blockDim.x", blackwell),   // SM 100 builtin (non-uniform)
-            ("LDCU UR4, c[0x0][0x390]", "param_4", blackwell),   // SM 100 param
-            ("LDC R4, c[0x0][0x390]", "param_4", blackwell),     // SM 100 param (non-uniform)
+            ("LDC R1, c[0x0][0x360]", "blockDim.x", blackwell), // SM 100 builtin (non-uniform)
+            ("LDCU UR4, c[0x0][0x390]", "param_4", blackwell), // SM 100 param
+            ("LDC R4, c[0x0][0x390]", "param_4", blackwell), // SM 100 param (non-uniform)
         ];
         for &(instr, want, profile) in cases {
-            let sass = format!(
-                "/*0000*/ {} ;\n/*0010*/ EXIT ;\n",
-                instr
-            );
+            let sass = format!("/*0000*/ {} ;\n/*0010*/ EXIT ;\n", instr);
             let out = run_lift_with_abi(&sass, profile);
             let lifted = out
                 .by_def
@@ -2683,9 +2696,7 @@ mod tests {
                     stmt_idx: 0,
                     def_idx: 0,
                 })
-                .unwrap_or_else(|| {
-                    panic!("scalar {} should be lifted, not raw", instr)
-                });
+                .unwrap_or_else(|| panic!("scalar {} should be lifted, not raw", instr));
             assert_eq!(
                 lifted.rhs.render(),
                 want,

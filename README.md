@@ -12,8 +12,8 @@ It currently emphasizes:
 - conservative structurization,
 - semantic lifting with a rule-registry pattern for SASS opcodes,
 - name recovery, ABI-aware typed declarations, and semantic symbolization,
-- post-rendering optimization passes (DCE, CSE, constant propagation),
-- golden-based regression testing across four fixture directories.
+- structural AST cleanup and typed rendering on the canonical backend,
+- golden-based regression testing across the curated fixture directories.
 
 It does **not** yet aim for broad architecture/version coverage or production-grade decompilation quality.
 
@@ -118,8 +118,8 @@ This is the style of transformation the project targets: low-level SASS blocks/p
 
 ### Core path
 
-1. **Parse SASS**  
-   `parse_sass` in `src/parser.rs`
+1. **Decode SASS**  
+   `decode_sass` in `src/parser.rs`
 2. **Build CFG**  
    `build_cfg` in `src/cfg.rs`
 3. **Build SSA IR**  
@@ -127,33 +127,23 @@ This is the style of transformation the project targets: low-level SASS blocks/p
 4. **Structurize control flow**  
    `Structurizer::structure_function` in `src/structurizer.rs`
 5. **Render structured pseudocode**  
-   `Structurizer::pretty_print` in `src/structurizer.rs`
+   `Structurizer::pretty_print_with_lift_cleanup_and_names` in `src/structurizer.rs`
 
-### Semantic lifting and name recovery
+### Semantic lifting, naming, and final rendering
 
-1. **Semantic lifting** (expression-level cleanup)  
-   `lift_function_ir` in `src/semantic_lift.rs` — uses a rule-registry pattern (`src/semantic_lift/rules/`) to map SASS opcodes to C-like expressions. Rules cover arithmetic (`IMAD`, `IADD3`, `FFMA`), memory (`LDG`, `LDS`, `STG`, `STS`, `ULDC`, `ATOMS`), comparisons (`ISETP`, `FSETP`), bitwise (`LOP3`, `SHF`, `PLOP3`), and type conversions (`I2F`, `F2I`).
-2. **Name recovery + post-render cleanup**  
-   `recover_structured_output_names` in `src/name_recovery.rs`
-3. **ABI-aware typing/display pass**  
-   ABI profile detection, const-memory annotation, arg aliasing and typed signatures in `src/abi.rs`. Builtins render as CUDA C notation: `blockDim.x`, `gridDim.y`, `threadIdx.z`, etc.
-
-### Post-rendering optimization passes
-
-Applied as text-level transformations after structured rendering:
-
-1. **Common Subexpression Elimination (CSE)** — deduplicates repeated `threadIdx.x`, `blockIdx.x`, `blockDim.x`, `gridDim.x`, and `ConstMem(...)` loads.
-2. **Constant propagation** — inlines single-definition small literal constants into their use sites and removes the defining assignment.
-3. **Dead Code Elimination (DCE)** — removes unused variable assignments in a fixpoint loop.
-4. **Duplicate guard elimination** — collapses identical `if (pred) return;` guards.
+1. **Semantic lifting**  
+   `lift_function_ir` in `src/semantic_lift.rs` maps SSA ops to typed AST expressions.
+2. **Structural AST cleanup**  
+   `src/ast_passes.rs` handles structural simplification, predicate cleanup, and `addr64` folding before final formatting.
+3. **Structural name recovery**  
+   `plan_structured_name_recovery_with_lift` in `src/name_recovery.rs` computes SSA-to-symbol mappings that are applied on the AST path, not by post-render regex surgery.
+4. **ABI-aware typing/display pass**  
+   `src/abi.rs` and `src/typed_output.rs` produce typed signatures, declarations, and CUDA builtin names such as `blockDim.x`, `gridDim.y`, and `threadIdx.z`.
 
 ### Full-pass test/golden pipeline
 
-`src/test.rs` composes CFG + SSA + structurizer + lift + name recovery + ABI rendering + post-rendering optimization, then compares against fixtures in:
+`src/test.rs` and `examples/regen_goldens.rs` keep curated snapshots for the canonical full-pass backend in:
 
-- `test_cu/golden/`
-- `test_cu/golden_lifted/`
-- `test_cu/golden_lifted_named/`
 - `test_cu/golden_full_pass/`
 
 ---
@@ -164,8 +154,8 @@ Applied as text-level transformations after structured rendering:
 
 - End-to-end parse → CFG → SSA → structured output is stable.
 - Semantic lifting via rule registry covers most common SASS opcodes, including arithmetic, memory, comparisons, bitwise, atomics (`atomicAdd`, `atomicInc`, etc.), and type casts (`(float)`, `(uint32_t)`).
-- Post-rendering passes (CSE, constant propagation, DCE, duplicate guard elimination) significantly reduce variable count and noise.
-- Name recovery deterministically rewrites SSA tokens to C-like names.
+- Structural AST cleanup and typed rendering now handle the final output cleanup on the canonical backend.
+- Name recovery deterministically maps SSA values onto stable C-like symbols before the final render.
 - ABI profile/alias inference provides `__global__` qualified typed signatures with pointer/scalar arg inference.
 - Shared memory accesses render as `shmem_u8[addr]` / `shmem_u32[addr]` notation.
 - CUDA builtins use standard dot notation: `blockDim.x`, `gridDim.y`, `threadIdx.z`.
@@ -175,8 +165,8 @@ Applied as text-level transformations after structured rendering:
 
 ### Regression status
 
-- Golden fixtures are synchronized with current behavior across all four directories.
-- Test suite currently passes (`cargo test`): **251 passed, 0 failed**.
+- Golden fixtures are synchronized with the curated full-pass snapshot set.
+- Test suite currently passes locally with `cargo test`.
 
 ---
 
@@ -213,14 +203,14 @@ If the binary contains multiple kernels, the SASS dump will contain all of them.
 ### Step 3: Run the decompiler
 
 ```bash
-# Full decompilation (default — all passes enabled):
+# Full decompilation (canonical full-pass backend):
 cargo run -- -i my_kernel.sass
 
 # Save output to a file:
 cargo run -- -i my_kernel.sass -o my_kernel.pseudo.c
 
-# Just structured code without lifting/naming:
-cargo run -- -i my_kernel.sass --struct-code
+# Debug CFG only:
+cargo run -- -i my_kernel.sass --cfg-dot
 ```
 
 ### Step 4: Understand the output
@@ -230,6 +220,35 @@ The decompiler produces pseudo-C with:
 - **`__shared__` arrays** — detected shared memory usage
 - **CUDA builtins** — `threadIdx.x`, `blockDim.x`, `blockIdx.x`, etc.
 - **Structured control flow** — `if/else`, `do/while`, `while` loops recovered from SASS branches
+
+### Great usage examples
+
+```bash
+# 1. Decompile one kernel with the canonical pipeline
+cargo run -- -i test_cu/if_loop.sass
+
+# 2. Save canonical output for side-by-side source comparison
+cargo run -- -i test_cu/rc4.sass -o /tmp/rc4.pseudo.c
+
+# 3. Force an older ABI profile when testing pre-Ampere style dumps
+cargo run -- -i old_kernel.sass --abi-profile legacy140
+
+# 4. Inspect CFG shape when structurization looks suspicious
+cargo run -- -i test_cu/if_loop.sass --cfg-dot > /tmp/if_loop.cfg.dot
+
+# 5. Inspect optimized SSA when debugging lifting/name-recovery issues
+cargo run -- -i test_cu/if_loop.sass --ssa-dot > /tmp/if_loop.ssa.dot
+
+# 6. Refresh curated full-pass snapshots after intentional backend changes
+cargo run --example regen_goldens
+```
+
+A practical review loop for real kernels is usually:
+
+1. extract one kernel with `cuobjdump -sass` or `nvdisasm`
+2. run `cargo run -- -i kernel.sass -o kernel.pseudo.c`
+3. diff the result against source or expected semantics
+4. if the output shape looks wrong, inspect `--cfg-dot` first, then `--ssa-dot`
 
 ### Supported architectures
 
@@ -293,13 +312,7 @@ If you have Graphviz installed, render to SVG:
 dot -Tsvg ssa.dot -o ssa.svg
 ```
 
-#### 3) Generate structured pseudocode
-
-```bash
-cargo run --bin main -- --input test_cu/if_loop.sass --struct-code
-```
-
-#### 4) Generate lifted + named + typed output (full decompilation)
+#### 3) Generate canonical full-pass decompilation
 
 This is now the **default** when using `-i` with no other flags:
 
@@ -307,22 +320,16 @@ This is now the **default** when using `-i` with no other flags:
 cargo run -- -i test_cu/if_loop.sass
 ```
 
-Equivalent to explicitly specifying all passes:
+#### 4) Inspect the canonical structured output
 
 ```bash
-cargo run -- -i test_cu/if_loop.sass --struct-code --semantic-lift --recover-names --typed-decls --abi-map --semantic-symbolize
-```
-
-#### 5) Inspect phi/live-in hints (closest thing to def-use visibility today)
-
-```bash
-cargo run --bin main -- --input test_cu/if_loop.sass --struct-code --recover-names --phi-merge-comments
+cargo run --bin main -- --input test_cu/if_loop.sass
 ```
 
 Notes:
 
 - We do **not** currently provide a first-class standalone def-use chain dump CLI yet.
-- Def-use information exists internally in SSA/lifting/name-recovery passes, and partial hints can be seen via phi/live-in comments.
+- Def-use information exists internally in SSA and lifting passes, but the canonical renderer no longer emits legacy phi/live-in comment scaffolding.
 
 ### Basic usage (CLI)
 
@@ -332,14 +339,12 @@ Use the binary on a SASS file (defaults to full decompilation):
 cargo run -- -i test_cu/if_loop.sass
 ```
 
-Individual passes can be enabled selectively with:
+The CLI now exposes the canonical full-pass decompiler by default.
 
-- `--struct-code`
-- `--semantic-lift`
-- `--recover-names`
-- `--typed-decls`
-- `--abi-map`
-- `--semantic-symbolize`
+Debug outputs still exist for lower layers:
+
+- `--cfg-dot`
+- `--ssa-dot`
 - `--abi-profile auto|legacy140|modern160`
 
 ### Run tests

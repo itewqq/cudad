@@ -122,7 +122,10 @@ pub fn propagate_semantic_labels(fir: &FunctionIR) -> HashMap<SsaRegKey, String>
                                     .entry(src.clone())
                                     .or_default()
                                     .push(copy_idx);
-                                copies.push(CopyInfo { def_key, src_key: src });
+                                copies.push(CopyInfo {
+                                    def_key,
+                                    src_key: src,
+                                });
                             }
                         }
                     }
@@ -165,9 +168,10 @@ pub fn propagate_semantic_labels(fir: &FunctionIR) -> HashMap<SsaRegKey, String>
                     continue;
                 }
                 // All inputs must have the same label for the phi output to inherit
-                let all_same = phi.input_keys.iter().all(|inp| {
-                    labels.get(inp).map(|l| l == &label).unwrap_or(false)
-                });
+                let all_same = phi
+                    .input_keys
+                    .iter()
+                    .all(|inp| labels.get(inp).map(|l| l == &label).unwrap_or(false));
                 if all_same {
                     labels.insert(phi.def_key.clone(), label.clone());
                     worklist.push_back(phi.def_key.clone());
@@ -291,7 +295,7 @@ fn is_predicate_reg(r: &RegId) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{build_cfg, build_ssa, parse_sass};
+    use crate::{build_cfg, build_ssa, decode_sass};
 
     #[test]
     fn seeds_s2r_tid_x() {
@@ -300,7 +304,7 @@ mod tests {
             /*0010*/ IADD3 R3, R2, R0, RZ ;
             /*0020*/ EXIT ;
         "#;
-        let cfg = build_cfg(parse_sass(sass));
+        let cfg = build_cfg(decode_sass(sass));
         let fir = build_ssa(&cfg);
         let labels = propagate_semantic_labels(&fir);
 
@@ -316,7 +320,7 @@ mod tests {
             /*0010*/ IMAD.MOV.U32 R3, RZ, RZ, R2 ;
             /*0020*/ EXIT ;
         "#;
-        let cfg = build_cfg(parse_sass(sass));
+        let cfg = build_cfg(decode_sass(sass));
         let fir = build_ssa(&cfg);
         let labels = propagate_semantic_labels(&fir);
 
@@ -325,7 +329,8 @@ mod tests {
         assert!(
             tid_x_count >= 2,
             "Expected tid_x on both R2 and R3, got {} labels: {:?}",
-            tid_x_count, labels
+            tid_x_count,
+            labels
         );
     }
 
@@ -338,7 +343,7 @@ mod tests {
             /*0020*/ @P0 BRA 0x000 ;
             /*0030*/ EXIT ;
         "#;
-        let cfg = build_cfg(parse_sass(sass));
+        let cfg = build_cfg(decode_sass(sass));
         let fir = build_ssa(&cfg);
         let labels = propagate_semantic_labels(&fir);
 

@@ -161,9 +161,7 @@ fn subst_in_rvalue(value: &RValue, subst: &HashMap<RegId, RegId>) -> RValue {
             opcode: opcode.clone(),
             args: args.iter().map(|a| subst_in_expr(a, subst)).collect(),
         },
-        RValue::Phi(args) => {
-            RValue::Phi(args.iter().map(|a| subst_in_expr(a, subst)).collect())
-        }
+        RValue::Phi(args) => RValue::Phi(args.iter().map(|a| subst_in_expr(a, subst)).collect()),
         RValue::ImmI(_) | RValue::ImmF(_) => value.clone(),
     }
 }
@@ -189,11 +187,13 @@ fn subst_in_expr(expr: &IRExpr, subst: &HashMap<RegId, RegId>) -> IRExpr {
                 expr.clone()
             }
         }
-        IRExpr::Mem { base, offset, width } => IRExpr::Mem {
+        IRExpr::Mem {
+            base,
+            offset,
+            width,
+        } => IRExpr::Mem {
             base: Box::new(subst_in_expr(base, subst)),
-            offset: offset
-                .as_ref()
-                .map(|o| Box::new(subst_in_expr(o, subst))),
+            offset: offset.as_ref().map(|o| Box::new(subst_in_expr(o, subst))),
             width: *width,
         },
         IRExpr::Op { op, args } => IRExpr::Op {
@@ -204,10 +204,7 @@ fn subst_in_expr(expr: &IRExpr, subst: &HashMap<RegId, RegId>) -> IRExpr {
     }
 }
 
-fn subst_in_cond(
-    cond: &crate::ir::IRCond,
-    subst: &HashMap<RegId, RegId>,
-) -> crate::ir::IRCond {
+fn subst_in_cond(cond: &crate::ir::IRCond, subst: &HashMap<RegId, RegId>) -> crate::ir::IRCond {
     match cond {
         crate::ir::IRCond::True => crate::ir::IRCond::True,
         crate::ir::IRCond::Pred { reg, sense } => {
@@ -308,7 +305,7 @@ fn same_ssa_reg(a: &RegId, b: &RegId) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{build_cfg, build_ssa, parse_sass};
+    use crate::{build_cfg, build_ssa, decode_sass};
 
     #[test]
     fn copyprop_eliminates_trivial_phi() {
@@ -320,7 +317,7 @@ mod tests {
             /*0020*/ @P0 BRA 0x000 ;
             /*0030*/ EXIT ;
         "#;
-        let cfg = build_cfg(parse_sass(sass));
+        let cfg = build_cfg(decode_sass(sass));
         let fir = build_ssa(&cfg);
 
         // Before copyprop: there should be at least one phi node.
@@ -337,13 +334,12 @@ mod tests {
         // but the phi def itself remains (ir_dce removes it).
         // Verify that copy propagation ran without panicking and produced
         // valid output.
-        let total_stmts: usize = propagated
-            .blocks
-            .iter()
-            .map(|b| b.stmts.len())
-            .sum();
+        let total_stmts: usize = propagated.blocks.iter().map(|b| b.stmts.len()).sum();
         assert!(total_stmts > 0, "copyprop should produce non-empty output");
-        assert!(phi_count_before > 0, "test should have phi nodes to work with");
+        assert!(
+            phi_count_before > 0,
+            "test should have phi nodes to work with"
+        );
     }
 
     #[test]
@@ -354,7 +350,7 @@ mod tests {
             /*0020*/ STG.E [R2.64], R3 ;
             /*0030*/ EXIT ;
         "#;
-        let cfg = build_cfg(parse_sass(sass));
+        let cfg = build_cfg(decode_sass(sass));
         let fir = build_ssa(&cfg);
         let propagated = ir_copyprop(&fir);
 
@@ -364,9 +360,7 @@ mod tests {
             .blocks
             .iter()
             .flat_map(|b| &b.stmts)
-            .find(|s| {
-                matches!(&s.value, RValue::Op { opcode, .. } if opcode == "IADD3")
-            })
+            .find(|s| matches!(&s.value, RValue::Op { opcode, .. } if opcode == "IADD3"))
             .expect("expected IADD3 statement");
         if let RValue::Op { args, .. } = &iadd3_stmt.value {
             // First arg should now reference R0's SSA version, not R1's.
@@ -388,7 +382,7 @@ mod tests {
             /*0020*/ IADD3 R2, R1, 0x1, RZ ;
             /*0030*/ EXIT ;
         "#;
-        let cfg = build_cfg(parse_sass(sass));
+        let cfg = build_cfg(decode_sass(sass));
         let fir = build_ssa(&cfg);
         let propagated = ir_copyprop(&fir);
 
@@ -397,9 +391,7 @@ mod tests {
             .blocks
             .iter()
             .flat_map(|b| &b.stmts)
-            .find(|s| {
-                matches!(&s.value, RValue::Op { opcode, .. } if opcode == "IADD3")
-            })
+            .find(|s| matches!(&s.value, RValue::Op { opcode, .. } if opcode == "IADD3"))
             .expect("expected IADD3 statement");
         if let RValue::Op { args, .. } = &iadd3_stmt.value {
             if let Some(r) = args[0].get_reg() {

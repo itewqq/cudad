@@ -8,9 +8,11 @@
 // param_9 -> arg9 (word32, confidence: low, words: {0})
 __global__ void kernel(uint32_t arg9) {
   __shared__ uint8_t shmem_u8[256];
-  bool b0; // live-in
+  uint32_t ctaid_x;
+  uint32_t tid_x;
 
-  if (b0) return;
+  ctaid_x = blockIdx.x;
+  if ((int32_t)(ctaid_x) >= (int32_t)(arg9)) return;
     tid_x = threadIdx.x;
   if (!((int32_t)(tid_x) > (int32_t)(255))) {
     do {

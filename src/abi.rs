@@ -4,9 +4,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::ir::{DisplayCtx, FunctionIR, IRExpr, IRStatement, RegId, RValue};
-use crate::parser::{Instruction, Operand};
-use crate::type_inference::{infer_types, InferredType};
+use crate::ir::{DisplayCtx, FunctionIR, IRExpr, IRStatement, RValue, RegId};
+use crate::parser::{DecodedInstruction, DecodedOperand};
+use crate::type_inference::infer_types;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AbiGeneration {
@@ -125,9 +125,7 @@ impl AbiAnnotations {
         self.constmem_by_stmt.is_empty()
     }
 
-    pub fn iter(
-        &self,
-    ) -> impl Iterator<Item = (&StatementRef, &Vec<ConstMemAnnotation>)> + '_ {
+    pub fn iter(&self) -> impl Iterator<Item = (&StatementRef, &Vec<ConstMemAnnotation>)> + '_ {
         self.constmem_by_stmt.iter()
     }
 
@@ -337,7 +335,8 @@ pub fn infer_local_typed_declarations_with_abi(
                     hints.entry(key.clone()).or_default().insert(h);
                 }
                 if def_idx == 0 {
-                    if let Some(h) = abi_pointer_hint_from_dest_stmt(stmt_ref, stmt, annotations, aliases)
+                    if let Some(h) =
+                        abi_pointer_hint_from_dest_stmt(stmt_ref, stmt, annotations, aliases)
                     {
                         hints.entry(key.clone()).or_default().insert(h);
                     }
@@ -481,7 +480,11 @@ fn collect_pointer_hints_from_expr(
     hints: &mut BTreeMap<(String, i32), BTreeSet<LocalTypeHint>>,
 ) {
     match expr {
-        IRExpr::Mem { base, offset, width } => {
+        IRExpr::Mem {
+            base,
+            offset,
+            width,
+        } => {
             if matches!(width, Some(64)) {
                 mark_pointer_base_reg(base, hints);
             }
@@ -558,9 +561,13 @@ impl From<ConstMemKind> for ConstMemSemantic {
     fn from(value: ConstMemKind) -> Self {
         match value {
             ConstMemKind::Builtin(name) => ConstMemSemantic::Builtin(name),
-            ConstMemKind::ParamWord { param_idx, word_idx } => {
-                ConstMemSemantic::ParamWord { param_idx, word_idx }
-            }
+            ConstMemKind::ParamWord {
+                param_idx,
+                word_idx,
+            } => ConstMemSemantic::ParamWord {
+                param_idx,
+                word_idx,
+            },
             ConstMemKind::AbiInternal(offset) => ConstMemSemantic::AbiInternal(offset),
         }
     }
@@ -601,7 +608,7 @@ impl AbiProfile {
     /// (e.g. from a runtime helper) looks legacy/modern.  Prefer
     /// [`Self::detect_with_sm`] whenever SM metadata is available — it
     /// trusts the architecture name and avoids both failure modes.
-    pub fn detect(instructions: &[Instruction]) -> Self {
+    pub fn detect(instructions: &[DecodedInstruction]) -> Self {
         Self::detect_with_sm(instructions, None)
     }
 
@@ -614,7 +621,7 @@ impl AbiProfile {
     /// memory offsets entirely; otherwise it falls back to
     /// [`Self::detect_from_offsets`] (and finally to the modern profile
     /// to keep the historical default stable for empty inputs).
-    pub fn detect_with_sm(instructions: &[Instruction], sm: Option<u32>) -> Self {
+    pub fn detect_with_sm(instructions: &[DecodedInstruction], sm: Option<u32>) -> Self {
         if let Some(sm_val) = sm {
             return Self::profile_for_sm(sm_val);
         }
@@ -640,7 +647,7 @@ impl AbiProfile {
         Self::legacy_param_140()
     }
 
-    fn detect_from_offsets(instructions: &[Instruction]) -> Option<Self> {
+    fn detect_from_offsets(instructions: &[DecodedInstruction]) -> Option<Self> {
         let mut near_140_hits = 0usize;
         let mut near_160_hits = 0usize;
         let mut near_380_hits = 0usize;
@@ -716,17 +723,15 @@ impl AbiProfile {
             AbiGeneration::BlackwellParam380 => 0x360u32,
             _ => 0x0,
         };
-        let builtin = offset
-            .checked_sub(builtin_base)
-            .and_then(|rel| match rel {
-                0x0 => Some("blockDim.x"),
-                0x4 => Some("blockDim.y"),
-                0x8 => Some("blockDim.z"),
-                0xc => Some("gridDim.x"),
-                0x10 => Some("gridDim.y"),
-                0x14 => Some("gridDim.z"),
-                _ => None,
-            });
+        let builtin = offset.checked_sub(builtin_base).and_then(|rel| match rel {
+            0x0 => Some("blockDim.x"),
+            0x4 => Some("blockDim.y"),
+            0x8 => Some("blockDim.z"),
+            0xc => Some("gridDim.x"),
+            0x10 => Some("gridDim.y"),
+            0x14 => Some("gridDim.z"),
+            _ => None,
+        });
         if let Some(name) = builtin {
             return Some(ResolvedConstMem {
                 symbol: name.to_string(),
@@ -743,7 +748,10 @@ impl AbiProfile {
             let word_idx: u32 = 0;
             return Some(ResolvedConstMem {
                 symbol: format!("param_{}", param_idx),
-                kind: ConstMemKind::ParamWord { param_idx, word_idx },
+                kind: ConstMemKind::ParamWord {
+                    param_idx,
+                    word_idx,
+                },
             });
         }
 
@@ -782,7 +790,10 @@ pub struct AbiDisplay {
 
 impl AbiDisplay {
     pub fn new(profile: AbiProfile) -> Self {
-        Self { profile, aliases: None }
+        Self {
+            profile,
+            aliases: None,
+        }
     }
 
     pub fn with_aliases(profile: AbiProfile, aliases: AbiArgAliases) -> Self {
@@ -803,7 +814,11 @@ impl AbiDisplay {
         let bank = imm_as_u32(&args[0])?;
         let offset = imm_as_u32(&args[1])?;
         let resolved = self.profile.resolve_constmem(bank, offset)?;
-        if let ConstMemKind::ParamWord { param_idx, word_idx } = resolved.kind {
+        if let ConstMemKind::ParamWord {
+            param_idx,
+            word_idx,
+        } = resolved.kind
+        {
             if let Some(sym) = self
                 .aliases
                 .as_ref()
@@ -826,7 +841,11 @@ impl DisplayCtx for AbiDisplay {
             IRExpr::Reg(r) => self.reg(r),
             IRExpr::ImmI(i) => format!("{}", i),
             IRExpr::ImmF(f) => format!("{}", f),
-            IRExpr::Mem { base, offset, width } => {
+            IRExpr::Mem {
+                base,
+                offset,
+                width,
+            } => {
                 let s = if let Some(off) = offset {
                     format!("*({} + {})", self.expr(base), self.expr(off))
                 } else {
@@ -851,7 +870,11 @@ impl DisplayCtx for AbiDisplay {
                 if let Some(sym) = self.try_constmem_symbol(op, args) {
                     return sym;
                 }
-                let list = args.iter().map(|a| self.expr(a)).collect::<Vec<_>>().join(", ");
+                let list = args
+                    .iter()
+                    .map(|a| self.expr(a))
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 format!("{}({})", op, list)
             }
         }
@@ -865,18 +888,25 @@ fn imm_as_u32(e: &IRExpr) -> Option<u32> {
     }
 }
 
-fn collect_constmem_hits<F>(op: &Operand, f: &mut F)
+fn collect_constmem_hits<F>(op: &DecodedOperand, f: &mut F)
 where
     F: FnMut(u32, u32),
 {
     match op {
-        Operand::ConstMem { bank, offset } => f(*bank, *offset),
-        Operand::MemRef { base, .. } => collect_constmem_hits(base.as_ref(), f),
+        DecodedOperand::ConstMem { bank, offset } => f(*bank, *offset),
+        DecodedOperand::Address { base, .. } => collect_constmem_hits(base.as_ref(), f),
+        DecodedOperand::DescriptorMem { descriptor, addr, .. } => {
+            collect_constmem_hits(descriptor.as_ref(), f);
+            collect_constmem_hits(addr.as_ref(), f);
+        }
         _ => {}
     }
 }
 
-pub fn annotate_function_ir_constmem(function_ir: &FunctionIR, profile: AbiProfile) -> AbiAnnotations {
+pub fn annotate_function_ir_constmem(
+    function_ir: &FunctionIR,
+    profile: AbiProfile,
+) -> AbiAnnotations {
     let mut out = AbiAnnotations::default();
     for block in &function_ir.blocks {
         for (stmt_idx, stmt) in block.stmts.iter().enumerate() {
@@ -1134,7 +1164,7 @@ fn infer_pointer_pointee_ty(widths: &BTreeSet<u32>) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{build_cfg, build_ssa, parser::parse_sass};
+    use crate::{build_cfg, build_ssa, parser::decode_sass};
 
     #[test]
     fn detects_legacy_profile_from_param_window() {
@@ -1143,7 +1173,7 @@ mod tests {
             /*0010*/ IMAD.MOV.U32 R2, RZ, RZ, c[0x0][0x148] ;
             /*0020*/ IADD3 R3, R3, c[0x0][0x154], RZ ;
         "#;
-        let instrs = parse_sass(sass);
+        let instrs = decode_sass(sass);
         let p = AbiProfile::detect(&instrs);
         assert_eq!(p, AbiProfile::legacy_param_140());
     }
@@ -1155,7 +1185,7 @@ mod tests {
             /*0010*/ IMAD.WIDE R6, R0, R7, c[0x0][0x168] ;
             /*0020*/ IMAD.MOV.U32 R2, RZ, RZ, c[0x0][0x17c] ;
         "#;
-        let instrs = parse_sass(sass);
+        let instrs = decode_sass(sass);
         let p = AbiProfile::detect(&instrs);
         assert_eq!(p, AbiProfile::modern_param_160());
     }
@@ -1166,7 +1196,7 @@ mod tests {
             /*0000*/ S2R R0, SR_CTAID.X ;
             /*0010*/ S2R R1, SR_TID.X ;
         "#;
-        let instrs = parse_sass(sass);
+        let instrs = decode_sass(sass);
         assert_eq!(
             AbiProfile::detect_with_sm(&instrs, Some(89)),
             AbiProfile::modern_param_160()
@@ -1196,7 +1226,7 @@ mod tests {
         let sass = r#"
             /*0000*/ LDC R1, c[0x0][0x360] ;
         "#;
-        let instrs = parse_sass(sass);
+        let instrs = decode_sass(sass);
         assert_eq!(
             AbiProfile::detect_with_sm(&instrs, Some(89)),
             AbiProfile::modern_param_160()
@@ -1221,7 +1251,7 @@ mod tests {
             /*0000*/ LDC R1, c[0x0][0x140] ;
             /*0010*/ LDC R2, c[0x0][0x37c] ;
         "#;
-        let instrs = parse_sass(sass);
+        let instrs = decode_sass(sass);
         assert_eq!(
             AbiProfile::detect_with_sm(&instrs, Some(100)),
             AbiProfile::blackwell_param_380()
@@ -1245,7 +1275,7 @@ mod tests {
             /*0020*/ LDC.64 R2, c[0x0][0x380] ;
             /*0030*/ LDCU.64 UR6, c[0x0][0x358] ;
         "#;
-        let instrs = parse_sass(sass);
+        let instrs = decode_sass(sass);
         let p = AbiProfile::detect(&instrs);
         assert_eq!(p, AbiProfile::blackwell_param_380());
     }
@@ -1265,7 +1295,7 @@ mod tests {
             /*0010*/ LDC R1, c[0x0][0x37c] ;
             /*0020*/ LDC R2, c[0x0][0x160] ;
         "#;
-        let instrs = parse_sass(sass);
+        let instrs = decode_sass(sass);
         let p = AbiProfile::detect(&instrs);
         assert_eq!(p, AbiProfile::modern_param_160());
     }
@@ -1280,7 +1310,7 @@ mod tests {
         let sass = r#"
             /*0000*/ LDC R1, c[0x0][0x37c] ;
         "#;
-        let instrs = parse_sass(sass);
+        let instrs = decode_sass(sass);
         let p = AbiProfile::detect(&instrs);
         assert_eq!(p, AbiProfile::blackwell_param_380());
     }
@@ -1294,7 +1324,7 @@ mod tests {
         let sass = r#"
             /*0000*/ LDC R1, c[0x0][0x378] ;
         "#;
-        let instrs = parse_sass(sass);
+        let instrs = decode_sass(sass);
         let p = AbiProfile::detect(&instrs);
         // Default fallback is the modern profile; the important thing
         // is that we did NOT pick Blackwell on a single 0x378 hit.
@@ -1313,7 +1343,7 @@ mod tests {
             /*0010*/ LDC R2, c[0x0][0x164] ;
             /*0020*/ LDC R3, c[0x0][0x380] ;
         "#;
-        let instrs = parse_sass(sass);
+        let instrs = decode_sass(sass);
         let p = AbiProfile::detect(&instrs);
         assert_eq!(p, AbiProfile::modern_param_160());
     }
@@ -1327,7 +1357,7 @@ mod tests {
             /*0010*/ LDC R2, c[0x0][0x144] ;
             /*0020*/ LDC R3, c[0x0][0x380] ;
         "#;
-        let instrs = parse_sass(sass);
+        let instrs = decode_sass(sass);
         let p = AbiProfile::detect(&instrs);
         assert_eq!(p, AbiProfile::legacy_param_140());
     }
@@ -1343,8 +1373,14 @@ mod tests {
         assert_eq!(p.resolve_constmem(0, 0x370).unwrap().symbol, "gridDim.y");
         assert_eq!(p.resolve_constmem(0, 0x374).unwrap().symbol, "gridDim.z");
         // ABI internals relocated for Blackwell.
-        assert_eq!(p.resolve_constmem(0, 0x358).unwrap().symbol, "abi_internal_0x358");
-        assert_eq!(p.resolve_constmem(0, 0x37c).unwrap().symbol, "abi_internal_0x37c");
+        assert_eq!(
+            p.resolve_constmem(0, 0x358).unwrap().symbol,
+            "abi_internal_0x358"
+        );
+        assert_eq!(
+            p.resolve_constmem(0, 0x37c).unwrap().symbol,
+            "abi_internal_0x37c"
+        );
         // Old legacy slots must NOT resolve under Blackwell.
         assert!(p.resolve_constmem(0, 0x0).is_none());
         assert!(p.resolve_constmem(0, 0x28).is_none());
@@ -1375,12 +1411,18 @@ mod tests {
         // legacy param_base = 0x140, so offset 0x160 is word (0x160-0x140)/4 = 8
         assert!(matches!(
             legacy.classify_constmem(0, 0x160),
-            ConstMemSemantic::ParamWord { param_idx: 8, word_idx: 0 }
+            ConstMemSemantic::ParamWord {
+                param_idx: 8,
+                word_idx: 0
+            }
         ));
         // modern param_base = 0x160, so offset 0x160 is word 0
         assert!(matches!(
             modern.classify_constmem(0, 0x160),
-            ConstMemSemantic::ParamWord { param_idx: 0, word_idx: 0 }
+            ConstMemSemantic::ParamWord {
+                param_idx: 0,
+                word_idx: 0
+            }
         ));
     }
 
@@ -1389,8 +1431,14 @@ mod tests {
         let p = AbiProfile::legacy_param_140();
         assert_eq!(p.resolve_constmem(0, 0x0).unwrap().symbol, "blockDim.x");
         assert_eq!(p.resolve_constmem(0, 0x8).unwrap().symbol, "blockDim.z");
-        assert_eq!(p.resolve_constmem(0, 0x28).unwrap().symbol, "abi_internal_0x28");
-        assert_eq!(p.resolve_constmem(0, 0x44).unwrap().symbol, "abi_internal_0x44");
+        assert_eq!(
+            p.resolve_constmem(0, 0x28).unwrap().symbol,
+            "abi_internal_0x28"
+        );
+        assert_eq!(
+            p.resolve_constmem(0, 0x44).unwrap().symbol,
+            "abi_internal_0x44"
+        );
         // Per-word param indexing: each 4-byte word is its own param.
         assert_eq!(p.resolve_constmem(0, 0x140).unwrap().symbol, "param_0");
         assert_eq!(p.resolve_constmem(0, 0x144).unwrap().symbol, "param_1");
@@ -1417,7 +1465,7 @@ mod tests {
             /*0010*/ IADD3.X R5, R5, c[0x0][0x164], RZ ;
             /*0020*/ EXIT ;
         "#;
-        let cfg = build_cfg(parse_sass(sass));
+        let cfg = build_cfg(decode_sass(sass));
         let fir = build_ssa(&cfg);
         let anns = annotate_function_ir_constmem(&fir, AbiProfile::modern_param_160());
         let aliases = infer_arg_aliases(&fir, &anns);
@@ -1435,7 +1483,7 @@ mod tests {
             /*0010*/ LEA.HI.X.SX32 R11, R6, c[0x0][0x164], 0x1, P2 ;
             /*0020*/ EXIT ;
         "#;
-        let cfg = build_cfg(parse_sass(sass));
+        let cfg = build_cfg(decode_sass(sass));
         let fir = build_ssa(&cfg);
         let anns = annotate_function_ir_constmem(&fir, AbiProfile::modern_param_160());
         let aliases = infer_arg_aliases(&fir, &anns);
@@ -1450,7 +1498,7 @@ mod tests {
             /*0010*/ ISETP.GE.AND P0, PT, R1, c[0x0][0x184], PT ;
             /*0020*/ EXIT ;
         "#;
-        let cfg = build_cfg(parse_sass(sass));
+        let cfg = build_cfg(decode_sass(sass));
         let fir = build_ssa(&cfg);
         let anns = annotate_function_ir_constmem(&fir, AbiProfile::modern_param_160());
         let aliases = infer_arg_aliases(&fir, &anns);
@@ -1559,7 +1607,7 @@ mod tests {
             /*0020*/ LDG.E.U8 R8, [R4.64] ;
             /*0030*/ EXIT ;
         "#;
-        let cfg = build_cfg(parse_sass(sass));
+        let cfg = build_cfg(decode_sass(sass));
         let fir = build_ssa(&cfg);
         let anns = annotate_function_ir_constmem(&fir, AbiProfile::modern_param_160());
         let aliases = infer_arg_aliases(&fir, &anns);
@@ -1574,7 +1622,7 @@ mod tests {
             /*0010*/ IADD3.X R9, R9, c[0x0][0x164], RZ ;
             /*0020*/ EXIT ;
         "#;
-        let cfg = build_cfg(parse_sass(sass));
+        let cfg = build_cfg(decode_sass(sass));
         let fir = build_ssa(&cfg);
         let anns = annotate_function_ir_constmem(&fir, AbiProfile::modern_param_160());
         let aliases = infer_arg_aliases(&fir, &anns);
@@ -1589,7 +1637,7 @@ mod tests {
             /*0010*/ IADD3 R1, R1, 0x1, RZ ;
             /*0020*/ EXIT ;
         "#;
-        let cfg = build_cfg(parse_sass(sass));
+        let cfg = build_cfg(decode_sass(sass));
         let fir = build_ssa(&cfg);
         let decls = infer_local_typed_declarations(&fir);
         assert!(decls.iter().any(|d| d == "bool P0;"));
@@ -1605,7 +1653,7 @@ mod tests {
             /*0030*/ IMAD.WIDE R8, R0, 0x4, RZ ;
             /*0040*/ EXIT ;
         "#;
-        let cfg = build_cfg(parse_sass(sass));
+        let cfg = build_cfg(decode_sass(sass));
         let fir = build_ssa(&cfg);
         let decls = infer_local_typed_declarations(&fir);
         assert!(decls.iter().any(|d| d == "float R2;"));
@@ -1622,7 +1670,7 @@ mod tests {
             /*0020*/ IMAD.MOV.U32 R3, RZ, RZ, c[0x0][0x44] ;
             /*0030*/ EXIT ;
         "#;
-        let cfg = build_cfg(parse_sass(sass));
+        let cfg = build_cfg(decode_sass(sass));
         let fir = build_ssa(&cfg);
         let anns = annotate_function_ir_constmem(&fir, AbiProfile::legacy_param_140());
         assert!(!anns.is_empty());
@@ -1633,7 +1681,10 @@ mod tests {
         for (_stmt, entries) in anns.iter() {
             for e in entries {
                 match e.semantic {
-                    ConstMemSemantic::ParamWord { param_idx: 0, word_idx: 0 } => saw_param = true,
+                    ConstMemSemantic::ParamWord {
+                        param_idx: 0,
+                        word_idx: 0,
+                    } => saw_param = true,
                     ConstMemSemantic::Builtin("blockDim.x") => saw_builtin = true,
                     ConstMemSemantic::AbiInternal(0x44) => saw_internal = true,
                     _ => {}

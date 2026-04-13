@@ -4,14 +4,16 @@ use crate::ir::IRExpr;
 use crate::semantic_lift::op_sig::OpSig;
 use crate::semantic_lift::registry::RuleRegistry;
 use crate::semantic_lift::{
-    lift_ffma, lift_fmnmx, lift_fsel, lift_i2f_rp, lift_iabs, lift_iadd3, lift_iadd3_x, lift_imad,
+    lift_ffma, lift_fmnmx, lift_fsel, lift_iabs, lift_iadd3, lift_iadd3_x, lift_imad,
     lift_imad_hi_u32, lift_imad_iadd, lift_imad_mov, lift_imad_wide, lift_imad_x, lift_ir_expr,
     lift_mufu_rcp, lift_prmt, lift_unary_intrinsic, lift_viaddmnmx, lift_vimnmx, LiftedExpr,
     SemanticLiftConfig,
 };
 
 pub(super) fn register(registry: &mut RuleRegistry) {
-    registry.register("S2R", "s2r", |_, args, _, _| crate::semantic_lift::lift_s2r(args));
+    registry.register("S2R", "s2r", |_, args, _, _| {
+        crate::semantic_lift::lift_s2r(args)
+    });
     registry.register("IMAD", "imad_mov", |sig, args, stmt_ref, config| {
         if sig.raw_opcode.starts_with("IMAD.MOV") {
             return lift_imad_mov(args, stmt_ref, config);
@@ -75,11 +77,11 @@ pub(super) fn register(registry: &mut RuleRegistry) {
     registry.register("IABS", "iabs", |_, args, stmt_ref, config| {
         lift_iabs(args, stmt_ref, config)
     });
-    registry.register("I2F", "i2f", |sig, args, stmt_ref, config| {
+    registry.register("I2F", "i2f", |_sig, args, stmt_ref, config| {
         // I2F converts integer to float.  Any variant gets a (float) cast.
         lift_unary_intrinsic("(float)", args, stmt_ref, config)
     });
-    registry.register("I2FP", "i2fp", |sig, args, stmt_ref, config| {
+    registry.register("I2FP", "i2fp", |_sig, args, stmt_ref, config| {
         // I2FP is the SM100+ variant of I2F.
         lift_unary_intrinsic("(float)", args, stmt_ref, config)
     });
@@ -149,7 +151,9 @@ pub(super) fn register(registry: &mut RuleRegistry) {
     // Just pass through the single source operand.
     registry.register("UMOV", "umov", |_, args, stmt_ref, config| {
         if args.len() == 1 {
-            Some(crate::semantic_lift::lift_ir_expr(&args[0], stmt_ref, config))
+            Some(crate::semantic_lift::lift_ir_expr(
+                &args[0], stmt_ref, config,
+            ))
         } else {
             None
         }
@@ -157,7 +161,9 @@ pub(super) fn register(registry: &mut RuleRegistry) {
     // MOV is a regular register move: MOV Rd, Rs → Rd = Rs.
     registry.register("MOV", "mov", |_, args, stmt_ref, config| {
         if args.len() == 1 {
-            Some(crate::semantic_lift::lift_ir_expr(&args[0], stmt_ref, config))
+            Some(crate::semantic_lift::lift_ir_expr(
+                &args[0], stmt_ref, config,
+            ))
         } else {
             None
         }
@@ -191,7 +197,9 @@ pub(super) fn register(registry: &mut RuleRegistry) {
     });
     // S2UR: copy special register to uniform register.
     // Already handled by S2R lift, but S2UR is the uniform variant.
-    registry.register("S2UR", "s2ur", |_, args, _, _| crate::semantic_lift::lift_s2r(args));
+    registry.register("S2UR", "s2ur", |_, args, _, _| {
+        crate::semantic_lift::lift_s2r(args)
+    });
     // HFMA2: half-precision FMA. When all args are zero-like, simplify.
     registry.register("HFMA2", "hfma2", |_, args, stmt_ref, config| {
         // Check if this is a zero-initialization pattern: HFMA2(-RZ, RZ, 0, 0)
@@ -209,10 +217,15 @@ pub(super) fn register(registry: &mut RuleRegistry) {
         }
         // General case: render as hfma2(a, b, c)
         if args.len() >= 3 {
-            let rendered_args: Vec<String> = args.iter().take(3)
+            let rendered_args: Vec<String> = args
+                .iter()
+                .take(3)
                 .map(|a| lift_ir_expr(a, stmt_ref, config).render())
                 .collect();
-            Some(LiftedExpr::Raw(format!("hfma2({})", rendered_args.join(", "))))
+            Some(LiftedExpr::Raw(format!(
+                "hfma2({})",
+                rendered_args.join(", ")
+            )))
         } else {
             None
         }

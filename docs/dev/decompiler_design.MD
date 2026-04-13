@@ -4,11 +4,12 @@
 
 The canonical path for this project is:
 
-1. `parse_sass` (`src/parser.rs`)
+1. `decode_sass` (`src/parser.rs`)
 2. `build_cfg` (`src/cfg.rs`)
 3. `build_ssa` (`src/ir.rs`)
 4. `Structurizer::structure_function` (`src/structurizer.rs`)
-5. `Structurizer::pretty_print` (C-like pseudocode, default path)
+5. `Structurizer::pretty_print_with_lift_cleanup_and_names` (canonical structured render)
+6. `render_typed_structured_output` (`src/typed_output.rs`)
 
 Semantic lifting stage:
 
@@ -19,20 +20,15 @@ Semantic lifting stage:
    - `memory.rs` — loads (`LDG`, `LDS`, `LDC`, `ULDC`, `LDCU`), atomic operations (`ATOMS`, `ATOM`, `RED` → CUDA `atomicXxx()` calls).
    - `bitwise.rs` — shifts (`SHF`), logical (`LOP3`, `PLOP3.LUT` with constant folding), `LEA.HI`.
    - `comparison.rs` — integer/float comparisons (`ISETP`, `FSETP`, `UISETP`) including unordered float variants (`GEU`, `GTU`, `LEU`, `LTU`, `EQU`, `NEU`).
-3. `Structurizer::pretty_print_with_lift` renders lifted expressions when
-   available, and falls back to current opcode-style rendering otherwise.
-4. CLI control: `--semantic-lift` (effective with `--struct-code`).
+3. The active backend always feeds lifted expressions into the canonical AST/render path; there is no separate CLI-exposed partial lift mode anymore.
 
 Name recovery stage:
 
-1. `recover_structured_output_names` (`src/name_recovery.rs`) rewrites SSA-style
-   register tokens in rendered structured output into stable C-like names.
+1. `plan_structured_name_recovery_with_lift` (`src/name_recovery.rs`) computes
+   SSA-to-symbol mappings before final rendering.
 2. Merging is conservative: only phi/copy-congruent SSA versions are merged;
    reused register families can split into multiple recovered names.
-3. CLI controls (effective with `--struct-code`):
-   - `--recover-names`
-   - `--name-style temp|reg` (default `temp`)
-   - `--phi-merge-comments` (comment-only merge/live-in annotations)
+3. Name recovery is part of the default CLI path; the style is currently fixed to stable temp-style names in the binary.
 
 Declaration stage:
 
@@ -41,28 +37,16 @@ Declaration stage:
 2. `infer_local_typed_declarations` (`src/abi.rs`) emits heuristic local
    declarations from SSA destinations and opcode usage hints
    (`float`, `uint8_t`, `uintptr_t`, etc.).
-3. CLI control: `--typed-decls` (effective with `--struct-code`).
-   - `--typed-decls` can infer ABI aliases for declarations even when
-     `--abi-map` display mapping is not enabled.
-   - With `--typed-decls`, structured output is wrapped as
-     `__global__ void kernel(<typed args>) { ... }` and locals are emitted inside.
+3. Typed declarations are part of the default CLI path; structured output is wrapped as `__global__ void kernel(<typed args>) { ... }` with inferred locals.
 
-Post-rendering optimization passes (`src/dce.rs`):
+Structural cleanup stage (`src/ast_passes.rs`):
 
-Applied as text-level transformations after structured rendering:
+Applied on the typed AST before final rendering:
 
-1. **Common Subexpression Elimination (CSE)** — deduplicates repeated
-   `threadIdx.x`, `blockIdx.x`, `blockDim.x`, `gridDim.x`, and `ConstMem(...)` loads
-   across the function body.
-2. **Constant propagation** — finds single-definition small literal assignments
-   (e.g., `v67 = 1;`) and inlines the literal into all use sites, then removes
-   the defining line.
-3. **Dead Code Elimination (DCE)** — removes unused variable assignments in a
-   fixpoint loop until no further eliminations are possible.
-4. **Duplicate guard elimination** — collapses identical `if (pred) return;` guards
-   that appear consecutively.
-
-Pipeline order: CSE → constant propagation → DCE fixpoint → duplicate guard elimination.
+1. `ast_dce` removes dead pure assignments while preserving stores, returns, and side effects.
+2. `ast_predicate_cleanup` drops duplicate return guards and other redundant predicate scaffolding.
+3. `ast_addr64_fold` structurally recovers pointer expressions from low/high helper chains.
+4. `ast_simplify` normalizes the final statement tree before rendering.
 
 Experimental modules are intentionally not part of this critical path.
 
@@ -73,8 +57,8 @@ Experimental modules are intentionally not part of this critical path.
 1. `AbiProfile::detect` infers a profile from observed parameter windows (e.g. `0x140` vs `0x160` bases).
    - `AbiProfile::detect_with_sm` can also use parsed SM metadata from `.headerflags` / `.target sm_xx` as fallback.
 2. `AbiProfile::resolve_constmem` maps known built-ins (`blockDim.x`, `gridDim.y`, etc.) and parameter words (`param_i[j]`).
-3. `AbiDisplay` is an optional `DisplayCtx` that renders symbolic ABI names in DOT/pseudocode output.
-   - CLI controls: `--abi-map` and `--abi-profile auto|legacy140|modern160`.
+3. `AbiDisplay` renders symbolic ABI names in DOT/pseudocode output.
+   - CLI control: `--abi-profile auto|legacy140|modern160`.
 4. `annotate_function_ir_constmem` creates typed annotations (`ConstMemSemantic`) over SSA statements.
    - This pass is non-invasive and keeps SSA algorithm/output semantics intact.
    - It is intended as the bridge for future structurizer/HL passes that need ABI meaning, not raw offsets.
@@ -109,7 +93,7 @@ by falling back to goto when recognition is uncertain.
 
 ## Rendering Cleanup (Structurizer)
 
-The structurizer's `pretty_print_with_lift` applies several cleanup rules during rendering:
+The structurizer's canonical render path applies several cleanup rules during rendering:
 
 1. **BB label suppression**: Basic block labels (`BB0 { ... }`) are not emitted; statements render directly at the current indentation level.
 2. **NOP suppression**: `NOP` instructions are skipped.
@@ -138,3 +122,24 @@ Suggested instrumentation points when debugging structurization:
 4. `structure_loop_body_recursive` successor classification (`break`, `continue`, fallback goto).
 
 Use these checkpoints to correlate CFG nodes, `irdst`, and final pseudocode shape.
+
+## Practical Recipes
+
+A few high-signal workflows for development and regression work:
+
+1. **Canonical decompile smoke test**
+   - `cargo run -- -i test_cu/if_loop.sass`
+   - Verifies the real public path: decode -> CFG -> SSA -> optimize -> structurize -> lift -> name -> typed render.
+2. **CFG-first debugging**
+   - `cargo run -- -i test_cu/if_loop.sass --cfg-dot > /tmp/if_loop.cfg.dot`
+   - Use when recovered control flow looks wrong; inspect leader splits and successor edges before touching the structurizer.
+3. **SSA/lift debugging**
+   - `cargo run -- -i test_cu/if_loop.sass --ssa-dot > /tmp/if_loop.ssa.dot`
+   - Use when compare lifting, pointer recovery, or predicate cleanup looks wrong.
+4. **Architecture-specific ABI checks**
+   - `cargo run -- -i kernel.sass --abi-profile legacy140`
+   - `cargo run -- -i kernel.sass --abi-profile modern160`
+   - Useful when a dump lacks trustworthy SM metadata and you need to compare inferred signatures.
+5. **Snapshot refresh after intentional backend changes**
+   - `cargo run --example regen_goldens`
+   - Only do this after `cargo test` is green and the canonical output change is intentional.

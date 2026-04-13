@@ -19,14 +19,15 @@
 // param_3 -> arg3 (word32, confidence: low, words: {0})
 __global__ void kernel(int32_t arg0, int32_t arg1, uint32_t arg2, uint32_t arg3) {
   uint32_t v0;
-  uint32_t u0;
+  int32_t u0;
   uint32_t u1;
-  uint32_t u2;
+  int32_t u2;
   uint32_t v1;
   bool b0;
   uint32_t v2;
   uint32_t v3;
   uint32_t v4;
+  uint32_t v5;
   uint32_t v6;
   uint32_t v7;
   uint32_t v8;
@@ -51,9 +52,10 @@ __global__ void kernel(int32_t arg0, int32_t arg1, uint32_t arg2, uint32_t arg3)
   v2 = rcp_approx(v1);
   v3 = v2 + 268435454;
   v4 = (uint32_t)(v3);
+  v5 = 0;
   v6 = -v4 * v0;
   v7 = abs(arg0);
-  v8 = mul_hi_u32(v4, v6);
+  v8 = mul_hi_u32(v4, v6) + v5;
   v9 = arg2;
   v10 = mul_hi_u32(v8, v7);
   v11 = v0 * -v10 + v7;
@@ -65,7 +67,7 @@ __global__ void kernel(int32_t arg0, int32_t arg1, uint32_t arg2, uint32_t arg3)
   v14 = b3 ? (v13 + 1) : v13;
   v15 = arg3;
   if (!b0) v14 = -v14;
-  if (!b2) v16 = ~arg1;
+  v16 = !b2 ? (~arg1) : v14;
   *addr64(v9, v15) = v16;
   return;
 }

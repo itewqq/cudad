@@ -30,12 +30,24 @@ enum ExprKey {
 /// A hashable representation of an IRExpr leaf or sub-expression.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum ExprAtom {
-    Reg { class: String, idx: i32, sign: i32, ssa: Option<usize> },
+    Reg {
+        class: String,
+        idx: i32,
+        sign: i32,
+        ssa: Option<usize>,
+    },
     ImmI(i64),
     /// Float bits for exact comparison (avoids f64 Hash issues).
     ImmF(u64),
-    Mem { base: Box<ExprAtom>, offset: Option<Box<ExprAtom>>, width: Option<u32> },
-    Op { op: String, args: Vec<ExprAtom> },
+    Mem {
+        base: Box<ExprAtom>,
+        offset: Option<Box<ExprAtom>>,
+        width: Option<u32>,
+    },
+    Op {
+        op: String,
+        args: Vec<ExprAtom>,
+    },
 }
 
 fn expr_to_atom(e: &IRExpr) -> ExprAtom {
@@ -48,7 +60,11 @@ fn expr_to_atom(e: &IRExpr) -> ExprAtom {
         },
         IRExpr::ImmI(v) => ExprAtom::ImmI(*v),
         IRExpr::ImmF(v) => ExprAtom::ImmF(v.to_bits()),
-        IRExpr::Mem { base, offset, width } => ExprAtom::Mem {
+        IRExpr::Mem {
+            base,
+            offset,
+            width,
+        } => ExprAtom::Mem {
             base: Box::new(expr_to_atom(base)),
             offset: offset.as_ref().map(|o| Box::new(expr_to_atom(o))),
             width: *width,
@@ -183,14 +199,30 @@ pub fn ir_cse(fir: &FunctionIR, cfg: &ControlFlowGraph) -> FunctionIR {
         // Recurse into dominator children.
         if let Some(kids) = children.get(&node) {
             for &child in kids {
-                walk(child, cfg, fir, children, bid_to_idx, scope_stack, replacements);
+                walk(
+                    child,
+                    cfg,
+                    fir,
+                    children,
+                    bid_to_idx,
+                    scope_stack,
+                    replacements,
+                );
             }
         }
 
         scope_stack.pop();
     }
 
-    walk(entry, cfg, fir, &children, &bid_to_idx, &mut scope_stack, &mut replacements);
+    walk(
+        entry,
+        cfg,
+        fir,
+        &children,
+        &bid_to_idx,
+        &mut scope_stack,
+        &mut replacements,
+    );
 
     if replacements.is_empty() {
         return fir.clone();
@@ -248,7 +280,7 @@ fn find_entry_node(cfg: &ControlFlowGraph) -> NodeIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{build_cfg, build_ssa, parse_sass};
+    use crate::{build_cfg, build_ssa, decode_sass};
 
     #[test]
     fn cse_eliminates_duplicate_pure_computation() {
@@ -260,7 +292,7 @@ mod tests {
             /*0020*/ STG.E [R1.64], R2 ;
             /*0030*/ EXIT ;
         "#;
-        let cfg = build_cfg(parse_sass(sass));
+        let cfg = build_cfg(decode_sass(sass));
         let fir = build_ssa(&cfg);
         let cse_fir = ir_cse(&fir, &cfg);
 
@@ -270,7 +302,11 @@ mod tests {
             .filter(|s| matches!(&s.value, RValue::Op { opcode, args } if opcode == "IMAD.MOV.U32" && args.len() == 3))
             .count();
         // At least one IMAD.MOV.U32 copy should exist from CSE
-        assert!(copy_count >= 1, "CSE should create at least one copy, found {}", copy_count);
+        assert!(
+            copy_count >= 1,
+            "CSE should create at least one copy, found {}",
+            copy_count
+        );
     }
 
     #[test]
@@ -282,12 +318,14 @@ mod tests {
             /*0020*/ IADD3 R3, R1, R2, RZ ;
             /*0030*/ EXIT ;
         "#;
-        let cfg = build_cfg(parse_sass(sass));
+        let cfg = build_cfg(decode_sass(sass));
         let fir = build_ssa(&cfg);
         let cse_fir = ir_cse(&fir, &cfg);
 
         // Both loads should survive
-        let load_count = cse_fir.blocks.iter()
+        let load_count = cse_fir
+            .blocks
+            .iter()
             .flat_map(|b| &b.stmts)
             .filter(|s| matches!(&s.value, RValue::Op { opcode, .. } if opcode.starts_with("LDG")))
             .count();
@@ -305,12 +343,14 @@ mod tests {
             /*0020*/ IADD3 R3, R1, R2, RZ ;
             /*0030*/ EXIT ;
         "#;
-        let cfg = build_cfg(parse_sass(sass));
+        let cfg = build_cfg(decode_sass(sass));
         let fir = build_ssa(&cfg);
         let cse_fir = ir_cse(&fir, &cfg);
 
         // After CSE, R2's computation should be replaced with a copy of R1
-        let copy_count = cse_fir.blocks.iter()
+        let copy_count = cse_fir
+            .blocks
+            .iter()
             .flat_map(|b| &b.stmts)
             .filter(|s| {
                 matches!(&s.value, RValue::Op { opcode, .. }

@@ -113,7 +113,9 @@ fn is_hi_part_def(
             if let Some(srcs) = copy_sources.get(key) {
                 // For phi: if ANY input is hi-part, consider it verified
                 // (loop-carried phis commonly have one entry from LEA.HI)
-                return srcs.iter().any(|s| is_hi_part_def(s, def_opcode, copy_sources, visited));
+                return srcs
+                    .iter()
+                    .any(|s| is_hi_part_def(s, def_opcode, copy_sources, visited));
             }
         }
     } else {
@@ -266,7 +268,7 @@ fn is_immutable_reg(r: &RegId) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{build_cfg, build_ssa, parse_sass};
+    use crate::{build_cfg, build_ssa, decode_sass};
 
     #[test]
     fn verifies_imad_wide_hi_part() {
@@ -275,7 +277,7 @@ mod tests {
             /*0010*/ LDG.E.64 R2, [R4.64] ;
             /*0020*/ EXIT ;
         "#;
-        let cfg = build_cfg(parse_sass(sass));
+        let cfg = build_cfg(decode_sass(sass));
         let fir = build_ssa(&cfg);
         let result = verify_ptr64_pairs(&fir);
 
@@ -299,7 +301,7 @@ mod tests {
             /*0020*/ LDG.E.64 R2, [R4.64] ;
             /*0030*/ EXIT ;
         "#;
-        let cfg = build_cfg(parse_sass(sass));
+        let cfg = build_cfg(decode_sass(sass));
         let fir = build_ssa(&cfg);
         let result = verify_ptr64_pairs(&fir);
 

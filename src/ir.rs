@@ -2,38 +2,39 @@
 //! fully implements Cytron 91 algorithm (minimal Φ + rename)
 //! no string cached inside nodes; all printing via DisplayCtx
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use crate::parser::Operand;
 use crate::cfg::{ControlFlowGraph, EdgeKind};
 use crate::op_semantics::derive_op_semantics;
-use petgraph::{
-    graph::NodeIndex,
-    Direction,
-};
+use crate::parser::DecodedOperand;
 use petgraph::visit::EdgeRef;
+use petgraph::{graph::NodeIndex, Direction};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /* =======================================================================
    Section 0 – Printing context
 ======================================================================= */
 /// An external formatter that decides how to show registers / expressions
 pub trait DisplayCtx {
-    fn reg(&self, r:&RegId)->String;
-    fn expr(&self, e:&IRExpr)->String {
+    fn reg(&self, r: &RegId) -> String;
+    fn expr(&self, e: &IRExpr) -> String {
         match e {
             IRExpr::Reg(r) => self.reg(r),
-            IRExpr::ImmI(i)=>format!("{}",i),
-            IRExpr::ImmF(f)=>format!("{}",f),
-            IRExpr::Mem{base,offset,width}=>{
-                let s=if let Some(off)=offset{
-                    format!("*({} + {})",self.expr(base),self.expr(off))
+            IRExpr::ImmI(i) => format!("{}", i),
+            IRExpr::ImmF(f) => format!("{}", f),
+            IRExpr::Mem {
+                base,
+                offset,
+                width,
+            } => {
+                let s = if let Some(off) = offset {
+                    format!("*({} + {})", self.expr(base), self.expr(off))
                 } else {
-                    format!("*{}",self.expr(base))
+                    format!("*{}", self.expr(base))
                 };
                 let _ = width;
                 s
             }
-            IRExpr::Op{op,args}=>{
-                if op=="-" && args.len()==1 {
+            IRExpr::Op { op, args } => {
+                if op == "-" && args.len() == 1 {
                     let inner = self.expr(&args[0]);
                     let simple = match &args[0] {
                         IRExpr::Reg(_) | IRExpr::ImmI(_) | IRExpr::ImmF(_) => true,
@@ -45,8 +46,12 @@ pub trait DisplayCtx {
                     }
                     return format!("-({})", inner);
                 }
-                let list=args.iter().map(|a|self.expr(a)).collect::<Vec<_>>().join(", ");
-                format!("{}({})",op,list)
+                let list = args
+                    .iter()
+                    .map(|a| self.expr(a))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{}({})", op, list)
             }
         }
     }
@@ -54,55 +59,88 @@ pub trait DisplayCtx {
 /// Default formatter ⟶ 原先 display() 效果
 pub struct DefaultDisplay;
 impl DisplayCtx for DefaultDisplay {
-    fn reg(&self, r:&RegId)->String { r.display() }
+    fn reg(&self, r: &RegId) -> String {
+        r.display()
+    }
 }
 
 /* =======================================================================
    Section 1 – Core IR data structures  (unchanged except `DisplayCtx`)
 ======================================================================= */
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum RegType { BitWidth(u32) }
+pub enum RegType {
+    BitWidth(u32),
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub struct RegId {
-    pub class:String, pub idx:i32, pub sign:i32, pub ssa:Option<usize>
+    pub class: String,
+    pub idx: i32,
+    pub sign: i32,
+    pub ssa: Option<usize>,
 }
 impl RegId {
-    pub fn new(class:&str, idx:i32, sign:i32)->Self{
-        Self{class:class.into(), idx, sign, ssa:None}
+    pub fn new(class: &str, idx: i32, sign: i32) -> Self {
+        Self {
+            class: class.into(),
+            idx,
+            sign,
+            ssa: None,
+        }
     }
-    pub fn with_ssa(&self, v:usize)->Self{
-        let mut r=self.clone(); r.ssa=Some(v); r
+    pub fn with_ssa(&self, v: usize) -> Self {
+        let mut r = self.clone();
+        r.ssa = Some(v);
+        r
     }
-    pub fn display(&self)->String{
+    pub fn display(&self) -> String {
         let base = match self.class.as_str() {
             // Immutable pseudo-registers print without numeric suffix.
             "RZ" | "PT" | "URZ" | "UPT" => self.class.clone(),
             _ => format!("{}{}", self.class, self.idx),
         };
-        let ssa=self.ssa.map(|v|format!(".{}",v)).unwrap_or_default();
-        let sign=if self.sign<0{"-"}else{""};
-        format!("{}{}{}",sign,base,ssa)
+        let ssa = self.ssa.map(|v| format!(".{}", v)).unwrap_or_default();
+        let sign = if self.sign < 0 { "-" } else { "" };
+        format!("{}{}{}", sign, base, ssa)
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum IRCond{
+pub enum IRCond {
     True,
-    Pred{reg:RegId, sense:bool},
+    Pred { reg: RegId, sense: bool },
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum IRExpr{
+pub enum IRExpr {
     Reg(RegId),
     ImmI(i64),
     ImmF(f64),
-    Mem{base:Box<IRExpr>,offset:Option<Box<IRExpr>>,width:Option<u32>},
-    Op { op:String, args:Vec<IRExpr>},
+    Mem {
+        base: Box<IRExpr>,
+        offset: Option<Box<IRExpr>>,
+        width: Option<u32>,
+    },
+    Op {
+        op: String,
+        args: Vec<IRExpr>,
+    },
 }
-impl IRExpr{
-    pub fn get_reg(&self)->Option<&RegId>{ if let IRExpr::Reg(r)=self{Some(r)}else{None}}
-    pub fn get_reg_mut(&mut self)->Option<&mut RegId>{ if let IRExpr::Reg(r)=self{Some(r)}else{None}}
+impl IRExpr {
+    pub fn get_reg(&self) -> Option<&RegId> {
+        if let IRExpr::Reg(r) = self {
+            Some(r)
+        } else {
+            None
+        }
+    }
+    pub fn get_reg_mut(&mut self) -> Option<&mut RegId> {
+        if let IRExpr::Reg(r) = self {
+            Some(r)
+        } else {
+            None
+        }
+    }
 
     /// Collect all register references reachable from this expression.
     pub fn collect_reg_uses(&self, out: &mut Vec<RegId>) {
@@ -125,24 +163,24 @@ impl IRExpr{
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum RValue{
-    Op{opcode:String,args:Vec<IRExpr>},
+pub enum RValue {
+    Op { opcode: String, args: Vec<IRExpr> },
     Phi(Vec<IRExpr>),
     ImmI(i64),
     ImmF(f64),
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct IRStatement{
-    pub defs:Vec<IRExpr>,
-    pub value:RValue,
-    pub pred:Option<IRExpr>,
-    pub mem_addr_args:Option<Vec<IRExpr>>,
+pub struct IRStatement {
+    pub defs: Vec<IRExpr>,
+    pub value: RValue,
+    pub pred: Option<IRExpr>,
+    pub mem_addr_args: Option<Vec<IRExpr>>,
     /// For predicated non-branch instructions: the *previous* SSA version of
     /// each def register (i.e. the value the register keeps when the predicate
     /// is false).  Populated during SSA renaming so the renderer can emit
     /// `dest = pred ? rhs : old;` instead of `if (pred) dest = rhs;`.
-    pub pred_old_defs:Vec<IRExpr>,
+    pub pred_old_defs: Vec<IRExpr>,
 }
 
 impl IRStatement {
@@ -199,8 +237,21 @@ impl IRStatement {
                     return true;
                 }
                 // EXIT / RET / BRA / BRX — control flow
-                if matches!(mnem, "EXIT" | "RET" | "BRA" | "BRX" | "BREAK" | "CONT"
-                    | "BSSY" | "BSYNC" | "SSY" | "SYNC" | "CALL" | "VOTE") {
+                if matches!(
+                    mnem,
+                    "EXIT"
+                        | "RET"
+                        | "BRA"
+                        | "BRX"
+                        | "BREAK"
+                        | "CONT"
+                        | "BSSY"
+                        | "BSYNC"
+                        | "SSY"
+                        | "SYNC"
+                        | "CALL"
+                        | "VOTE"
+                ) {
                     return true;
                 }
                 // If has memory address args for stores, it's side-effectful
@@ -215,45 +266,74 @@ impl IRStatement {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct IRBlock{
-    pub id:usize,
-    pub start_addr:u32,
-    pub irdst:Vec<(Option<IRCond>,u32)>,
-    pub stmts:Vec<IRStatement>,
+pub struct IRBlock {
+    pub id: usize,
+    pub start_addr: u32,
+    pub irdst: Vec<(Option<IRCond>, u32)>,
+    pub stmts: Vec<IRStatement>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct FunctionIR{
-    pub blocks:Vec<IRBlock>,
+pub struct FunctionIR {
+    pub blocks: Vec<IRBlock>,
 }
 
 /* =======================================================================
    Section 2 – Helpers: parser→IR lowering
 ======================================================================= */
-fn phys_reg_of(op:&Operand)->Option<RegId>{
-    match op{
-        Operand::Register{class,idx,sign,..} => {
-            match class.as_str() {
-                "RZ" | "PT" | "URZ" | "UPT" => Some(RegId::new(class, 0, *sign)),
-                "UP" | "P" => Some(RegId::new(class, *idx, *sign)),
-                _ => Some(RegId::new(class, *idx, *sign)),
-            }
+fn phys_reg_of(op: &DecodedOperand) -> Option<RegId> {
+    match op {
+        DecodedOperand::Register {
+            class, idx, sign, ..
         }
-        Operand::Uniform{idx} => Some(RegId::new("UR",*idx,1)),
-        _=>None
+        | DecodedOperand::UniformRegister {
+            class, idx, sign, ..
+        } => match class.as_str() {
+            "RZ" | "PT" | "URZ" | "UPT" => Some(RegId::new(class, 0, *sign)),
+            "UP" | "P" => Some(RegId::new(class, *idx, *sign)),
+            _ => Some(RegId::new(class, *idx, *sign)),
+        },
+        DecodedOperand::PredicateRegister { class, idx, .. } => Some(RegId::new(class, *idx, 1)),
+        _ => None,
     }
 }
-fn lower_operand(op:&Operand)->IRExpr{
-    match op{
-        Operand::Register{..}|Operand::Uniform{..}=>{
-            if let Some(r)=phys_reg_of(op){ IRExpr::Reg(r)} else{IRExpr::ImmI(0)}
+fn lower_operand(op: &DecodedOperand) -> IRExpr {
+    match op {
+        DecodedOperand::Register { .. } | DecodedOperand::UniformRegister { .. } => {
+            if let Some(r) = phys_reg_of(op) {
+                IRExpr::Reg(r)
+            } else {
+                IRExpr::ImmI(0)
+            }
         }
-        Operand::ImmediateI(i)=>IRExpr::ImmI(*i),
-        Operand::ImmediateF(f)=>IRExpr::ImmF(*f),
-        Operand::ConstMem{bank,offset}=>{
-            IRExpr::Op{op:"ConstMem".into(),args:vec![IRExpr::ImmI(*bank as i64),IRExpr::ImmI(*offset as i64)]}
+        DecodedOperand::PredicateRegister { class, idx: _, sense } => {
+            if *sense {
+                phys_reg_of(op).map(IRExpr::Reg).unwrap_or(IRExpr::ImmI(0))
+            } else if matches!(class.as_str(), "PT" | "UPT") {
+                IRExpr::Op {
+                    op: format!("!{}", class),
+                    args: vec![],
+                }
+            } else {
+                let base = phys_reg_of(op).map(IRExpr::Reg).unwrap_or(IRExpr::ImmI(0));
+                IRExpr::Op {
+                    op: "!".into(),
+                    args: vec![base],
+                }
+            }
         }
-        Operand::MemRef { base, offset, width, .. } => {
+        DecodedOperand::ImmediateI(i) => IRExpr::ImmI(*i),
+        DecodedOperand::ImmediateF(f) => IRExpr::ImmF(*f),
+        DecodedOperand::ConstMem { bank, offset } => IRExpr::Op {
+            op: "ConstMem".into(),
+            args: vec![IRExpr::ImmI(*bank as i64), IRExpr::ImmI(*offset as i64)],
+        },
+        DecodedOperand::Address {
+            base,
+            offset,
+            width,
+            ..
+        } => {
             let mut base_expr = lower_operand(base.as_ref());
             if matches!(width, Some(64)) {
                 if let Some(hi_expr) = infer_64bit_pair_hi_expr(base.as_ref()) {
@@ -270,7 +350,8 @@ fn lower_operand(op:&Operand)->IRExpr{
                 width: *width,
             }
         }
-        Operand::Raw(s)=>{
+        DecodedOperand::DescriptorMem { addr, .. } => lower_operand(addr.as_ref()),
+        DecodedOperand::Raw(s) => {
             if let Some(pred) = parse_raw_predicate_token(s) {
                 return pred;
             }
@@ -287,19 +368,28 @@ fn lower_operand(op:&Operand)->IRExpr{
                 }
                 return cm;
             }
-            if let Ok(i)=s.parse::<i64>() { IRExpr::ImmI(i)}
-            else if let Ok(f)=s.parse::<f64>(){ IRExpr::ImmF(f)}
-            else{ IRExpr::Op{op:s.clone(),args:vec![]}}
+            if let Ok(i) = s.parse::<i64>() {
+                IRExpr::ImmI(i)
+            } else if let Ok(f) = s.parse::<f64>() {
+                IRExpr::ImmF(f)
+            } else {
+                IRExpr::Op {
+                    op: s.clone(),
+                    args: vec![],
+                }
+            }
         }
     }
 }
 
-fn infer_64bit_pair_hi_expr(base: &Operand) -> Option<IRExpr> {
+fn infer_64bit_pair_hi_expr(base: &DecodedOperand) -> Option<IRExpr> {
     match base {
-        Operand::Register { class, idx, .. } if class == "R" || class == "UR" => {
+        DecodedOperand::Register { class, idx, .. }
+        | DecodedOperand::UniformRegister { class, idx, .. }
+            if class == "R" || class == "UR" =>
+        {
             Some(IRExpr::Reg(RegId::new(class, idx + 1, 1)))
         }
-        Operand::Uniform { idx } => Some(IRExpr::Reg(RegId::new("UR", idx + 1, 1))),
         _ => None,
     }
 }
@@ -363,8 +453,12 @@ fn parse_raw_predicate_token(s: &str) -> Option<IRExpr> {
     }
 }
 /* mem load/store heuristics */
-fn is_mem_load(op:&str)->bool{op.starts_with("LD")}
-fn is_mem_store(op:&str)->bool{op.starts_with("ST")}
+fn is_mem_load(op: &str) -> bool {
+    op.starts_with("LD")
+}
+fn is_mem_store(op: &str) -> bool {
+    op.starts_with("ST")
+}
 
 /* =======================================================================
    Section 3 – Build SSA (Cytron algorithm)
@@ -467,7 +561,7 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
 
     /* ---------- step-0: build IR blocks & defsites ---------- */
     let mut ir_blocks = HashMap::<usize, IRBlock>::new();
-    let mut defsites=BTreeMap::<RegId,BTreeSet<NodeIndex>>::new();
+    let mut defsites = BTreeMap::<RegId, BTreeSet<NodeIndex>>::new();
 
     for n in cfg.node_indices() {
         let bb = &cfg[n];
@@ -645,22 +739,20 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
     /* 在块头插入 Φ，占位向量长度 = succ.in_edges() 长度 */
     for (blk_node, reg) in &phi_needed {
         let block_id = cfg[*blk_node].id;
-        let preds: Vec<_> = cfg.neighbors_directed(*blk_node, Direction::Incoming).collect();
+        let preds: Vec<_> = cfg
+            .neighbors_directed(*blk_node, Direction::Incoming)
+            .collect();
         let placeholder = vec![IRExpr::ImmI(0); preds.len()];
-        ir_blocks
-            .get_mut(&block_id)
-            .unwrap()
-            .stmts
-            .insert(
-                0,
-                IRStatement {
-                    defs: vec![IRExpr::Reg(reg.clone())],
-                    value: RValue::Phi(placeholder),
-                    pred: None,
-                    mem_addr_args: None,
-                    pred_old_defs: vec![],
-                },
-            );
+        ir_blocks.get_mut(&block_id).unwrap().stmts.insert(
+            0,
+            IRStatement {
+                defs: vec![IRExpr::Reg(reg.clone())],
+                value: RValue::Phi(placeholder),
+                pred: None,
+                mem_addr_args: None,
+                pred_old_defs: vec![],
+            },
+        );
     }
 
     /* ---------- step-3: Rename (Cytron WHICH-PRED) ---------- */
@@ -695,7 +787,10 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
             {
                 let key = base_reg(stmt.defs.first().unwrap().get_reg().unwrap());
                 let new = IRExpr::Reg(new_ssa(&key, counter));
-                stack.entry(key.clone()).or_default().push(new.get_reg().unwrap().clone());
+                stack
+                    .entry(key.clone())
+                    .or_default()
+                    .push(new.get_reg().unwrap().clone());
                 stmt.defs = vec![new];
             }
 
@@ -707,9 +802,7 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
                             rename_expr(a, stack, counter);
                         }
                     }
-                    RValue::Phi(_)
-                    | RValue::ImmI(_)
-                    | RValue::ImmF(_) => {}
+                    RValue::Phi(_) | RValue::ImmI(_) | RValue::ImmF(_) => {}
                 }
                 if let Some(ma) = &mut stmt.mem_addr_args {
                     for a in ma {
@@ -819,35 +912,52 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
 }
 
 /* ==================== DF helper ==================== */
-fn compute_df(cfg:&ControlFlowGraph,idom:&BTreeMap<NodeIndex,NodeIndex>, root: NodeIndex)
-->HashMap<NodeIndex,BTreeSet<NodeIndex>>
-{
-    let mut local=HashMap::<NodeIndex,BTreeSet<NodeIndex>>::new();
-    for n in cfg.node_indices(){
-        for succ in cfg.neighbors_directed(n,Direction::Outgoing){
-            if idom.get(&succ).copied()!=Some(n){
+fn compute_df(
+    cfg: &ControlFlowGraph,
+    idom: &BTreeMap<NodeIndex, NodeIndex>,
+    root: NodeIndex,
+) -> HashMap<NodeIndex, BTreeSet<NodeIndex>> {
+    let mut local = HashMap::<NodeIndex, BTreeSet<NodeIndex>>::new();
+    for n in cfg.node_indices() {
+        for succ in cfg.neighbors_directed(n, Direction::Outgoing) {
+            if idom.get(&succ).copied() != Some(n) {
                 local.entry(n).or_default().insert(succ);
             }
         }
     }
-    let mut children:BTreeMap<NodeIndex,Vec<NodeIndex>>=BTreeMap::new();
-    for (&b,&p) in idom{ children.entry(p).or_default().push(b); }
+    let mut children: BTreeMap<NodeIndex, Vec<NodeIndex>> = BTreeMap::new();
+    for (&b, &p) in idom {
+        children.entry(p).or_default().push(b);
+    }
 
-    fn up(n:NodeIndex,child:&BTreeMap<NodeIndex,Vec<NodeIndex>>,
-          df:&mut HashMap<NodeIndex,BTreeSet<NodeIndex>>,idom:&BTreeMap<NodeIndex,NodeIndex>)
-    {
-        if let Some(ch)=child.get(&n){ for &c in ch{ up(c,child,df,idom); } }
-        for &c in child.get(&n).unwrap_or(&Vec::new()){
-            let propagate: Vec<NodeIndex> = df.get(&c)
-                .map(|s| s.iter().copied().filter(|w| idom.get(w).copied() != Some(n)).collect())
+    fn up(
+        n: NodeIndex,
+        child: &BTreeMap<NodeIndex, Vec<NodeIndex>>,
+        df: &mut HashMap<NodeIndex, BTreeSet<NodeIndex>>,
+        idom: &BTreeMap<NodeIndex, NodeIndex>,
+    ) {
+        if let Some(ch) = child.get(&n) {
+            for &c in ch {
+                up(c, child, df, idom);
+            }
+        }
+        for &c in child.get(&n).unwrap_or(&Vec::new()) {
+            let propagate: Vec<NodeIndex> = df
+                .get(&c)
+                .map(|s| {
+                    s.iter()
+                        .copied()
+                        .filter(|w| idom.get(w).copied() != Some(n))
+                        .collect()
+                })
                 .unwrap_or_default();
             for w in propagate {
                 df.entry(n).or_default().insert(w);
             }
         }
     }
-    let mut df=local;
-    up(root,&children,&mut df,idom);
+    let mut df = local;
+    up(root, &children, &mut df, idom);
     df
 }
 
@@ -859,12 +969,16 @@ impl FunctionIR {
         use std::fmt::Write;
 
         /// 将 IRCond 显示成 “(P0.3)” / “(!P1.7)” / “(uncond)”
-        fn cond_str(c: &Option<IRCond>, ctx:&dyn DisplayCtx) -> String {
+        fn cond_str(c: &Option<IRCond>, ctx: &dyn DisplayCtx) -> String {
             match c {
                 Some(IRCond::True) | None => "(uncond)".into(),
                 Some(IRCond::Pred { reg, sense }) => {
                     let s = ctx.reg(reg);
-                    if *sense { format!("({})", s) } else { format!("(!{})", s) }
+                    if *sense {
+                        format!("({})", s)
+                    } else {
+                        format!("(!{})", s)
+                    }
                 }
             }
         }

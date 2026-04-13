@@ -10,10 +10,10 @@ use petgraph::{algo::dominators::simple_fast, graph::NodeIndex, Direction};
 /// 单个自然循环
 #[derive(Debug, Clone)]
 pub struct NaturalLoop {
-    pub head: NodeIndex,              // 回边的 head(入口)
-    pub tail: NodeIndex,              // 回边的 tail
-    pub body: BTreeSet<NodeIndex>,    // 包含 head+tail 的所有节点
-    pub exits: BTreeSet<NodeIndex>,   // body→外部 的出口节点(目标)
+    pub head: NodeIndex,            // 回边的 head(入口)
+    pub tail: NodeIndex,            // 回边的 tail
+    pub body: BTreeSet<NodeIndex>,  // 包含 head+tail 的所有节点
+    pub exits: BTreeSet<NodeIndex>, // body→外部 的出口节点(目标)
 }
 
 /// 综合分析结果
@@ -39,7 +39,12 @@ impl CFGAnalysis {
             }
         }
 
-        Self { idom, ipdom, loops, node_to_loop }
+        Self {
+            idom,
+            ipdom,
+            loops,
+            node_to_loop,
+        }
     }
 
     /* ---------- 基本算法 ---------- */
@@ -63,7 +68,11 @@ impl CFGAnalysis {
     fn compute_postdom(cfg: &ControlFlowGraph) -> BTreeMap<NodeIndex, NodeIndex> {
         let exits: Vec<NodeIndex> = cfg
             .node_indices()
-            .filter(|&n| cfg.neighbors_directed(n, Direction::Outgoing).next().is_none())
+            .filter(|&n| {
+                cfg.neighbors_directed(n, Direction::Outgoing)
+                    .next()
+                    .is_none()
+            })
             .collect();
 
         if exits.len() <= 1 {

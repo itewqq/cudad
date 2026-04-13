@@ -36,10 +36,18 @@ impl InferredType {
     /// Least upper bound in the type lattice.
     pub fn join(self, other: Self) -> Self {
         use InferredType::*;
-        if self == other { return self; }
-        if self == Bottom { return other; }
-        if other == Bottom { return self; }
-        if self == Top || other == Top { return Top; }
+        if self == other {
+            return self;
+        }
+        if self == Bottom {
+            return other;
+        }
+        if other == Bottom {
+            return self;
+        }
+        if self == Top || other == Top {
+            return Top;
+        }
 
         // Check if both are in the integer family.
         let is_int = |t: InferredType| matches!(t, U8 | U16 | U32 | I32 | AnyInt);
@@ -176,7 +184,8 @@ pub fn infer_types(fir: &FunctionIR) -> BTreeMap<(String, i32), InferredType> {
                         if is_immutable_reg(def) || is_predicate_reg(def) {
                             continue;
                         }
-                        let inputs: Vec<SsaReg> = args.iter()
+                        let inputs: Vec<SsaReg> = args
+                            .iter()
                             .filter_map(|a| a.get_reg())
                             .filter(|r| !is_immutable_reg(r))
                             .map(|r| to_ssa_reg(r))
@@ -219,7 +228,10 @@ pub fn infer_types(fir: &FunctionIR) -> BTreeMap<(String, i32), InferredType> {
         for copy in &copies {
             if let Some(&src_ty) = types.get(&copy.src_reg) {
                 if src_ty != InferredType::Bottom && src_ty != InferredType::Top {
-                    let prev = types.get(&copy.def_reg).copied().unwrap_or(InferredType::Bottom);
+                    let prev = types
+                        .get(&copy.def_reg)
+                        .copied()
+                        .unwrap_or(InferredType::Bottom);
                     let joined = prev.join(src_ty);
                     if joined != prev {
                         types.insert(copy.def_reg.clone(), joined);
@@ -237,7 +249,10 @@ pub fn infer_types(fir: &FunctionIR) -> BTreeMap<(String, i32), InferredType> {
                 joined = joined.join(input_ty);
             }
             if joined != InferredType::Bottom && joined != InferredType::Top {
-                let prev = types.get(&phi.def_reg).copied().unwrap_or(InferredType::Bottom);
+                let prev = types
+                    .get(&phi.def_reg)
+                    .copied()
+                    .unwrap_or(InferredType::Bottom);
                 let new = prev.join(joined);
                 if new != prev {
                     types.insert(phi.def_reg.clone(), new);
@@ -427,14 +442,18 @@ fn infer_arg_types_from_opcode(opcode: &str, num_args: usize) -> Vec<Option<Infe
             InferredType::I32
         };
         // First arg is the integer source
-        if num_args >= 1 { result[0] = Some(src_ty); }
+        if num_args >= 1 {
+            result[0] = Some(src_ty);
+        }
         return result;
     }
 
     // ---- F2I: float-to-integer conversion ----
     // The source is always float; we seed the float input.
     if opcode.starts_with("F2I") {
-        if num_args >= 1 { result[0] = Some(InferredType::F32); }
+        if num_args >= 1 {
+            result[0] = Some(InferredType::F32);
+        }
         return result;
     }
 
@@ -456,7 +475,9 @@ fn infer_arg_types_from_opcode(opcode: &str, num_args: usize) -> Vec<Option<Infe
     // ---- MUFU: multi-function unit (sin, cos, rsqrt, etc.) ----
     // Input is float.
     if opcode.starts_with("MUFU") {
-        if num_args >= 1 { result[0] = Some(InferredType::F32); }
+        if num_args >= 1 {
+            result[0] = Some(InferredType::F32);
+        }
         return result;
     }
 
@@ -470,7 +491,9 @@ fn infer_arg_types_from_opcode(opcode: &str, num_args: usize) -> Vec<Option<Infe
 
     // ---- IABS: absolute value (input is signed) ----
     if opcode.starts_with("IABS") {
-        if num_args >= 1 { result[0] = Some(InferredType::I32); }
+        if num_args >= 1 {
+            result[0] = Some(InferredType::I32);
+        }
         return result;
     }
 
@@ -480,7 +503,10 @@ fn infer_arg_types_from_opcode(opcode: &str, num_args: usize) -> Vec<Option<Infe
     // Only IMAD.HI (which produces the *high* 32 bits) is signedness-sensitive:
     //   IMAD.HI.U32 → unsigned;  IMAD.HI (no U32) → signed.
     // IMAD.U32 / IMAD.SHL.U32 also explicitly mark unsigned.
-    if opcode.starts_with("IMAD") && !opcode.starts_with("IMAD.MOV") && !opcode.starts_with("IMAD.WIDE") {
+    if opcode.starts_with("IMAD")
+        && !opcode.starts_with("IMAD.MOV")
+        && !opcode.starts_with("IMAD.WIDE")
+    {
         // Only infer signedness when the opcode has an explicit signedness marker
         let has_hi = opcode.contains(".HI");
         let has_u32 = opcode.contains(".U32");
@@ -508,10 +534,16 @@ fn infer_arg_types_from_opcode(opcode: &str, num_args: usize) -> Vec<Option<Infe
             InferredType::U32
         };
         // arg[0] = data_lo, arg[1] = shift_amount (unsigned), arg[2] = data_hi
-        if num_args >= 1 { result[0] = Some(input_ty); }
+        if num_args >= 1 {
+            result[0] = Some(input_ty);
+        }
         // shift amount is always unsigned
-        if num_args >= 2 { result[1] = Some(InferredType::U32); }
-        if num_args >= 3 { result[2] = Some(input_ty); }
+        if num_args >= 2 {
+            result[1] = Some(InferredType::U32);
+        }
+        if num_args >= 3 {
+            result[2] = Some(input_ty);
+        }
         return result;
     }
 
@@ -565,7 +597,7 @@ fn is_predicate_reg(r: &RegId) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{build_cfg, build_ssa, parse_sass};
+    use crate::{build_cfg, build_ssa, decode_sass};
 
     #[test]
     fn infers_float_from_fadd() {
@@ -573,11 +605,14 @@ mod tests {
             /*0000*/ FADD R2, R0, R1 ;
             /*0010*/ EXIT ;
         "#;
-        let cfg = build_cfg(parse_sass(sass));
+        let cfg = build_cfg(decode_sass(sass));
         let fir = build_ssa(&cfg);
         let types = infer_types(&fir);
 
-        let r2_ty = types.get(&("R".to_string(), 2)).copied().unwrap_or(InferredType::Bottom);
+        let r2_ty = types
+            .get(&("R".to_string(), 2))
+            .copied()
+            .unwrap_or(InferredType::Bottom);
         assert_eq!(r2_ty, InferredType::F32);
     }
 
@@ -587,11 +622,14 @@ mod tests {
             /*0000*/ IMAD.WIDE R4, R0, R7, c[0x0][0x160] ;
             /*0010*/ EXIT ;
         "#;
-        let cfg = build_cfg(parse_sass(sass));
+        let cfg = build_cfg(decode_sass(sass));
         let fir = build_ssa(&cfg);
         let types = infer_types(&fir);
 
-        let r4_ty = types.get(&("R".to_string(), 4)).copied().unwrap_or(InferredType::Bottom);
+        let r4_ty = types
+            .get(&("R".to_string(), 4))
+            .copied()
+            .unwrap_or(InferredType::Bottom);
         assert_eq!(r4_ty, InferredType::Ptr64);
     }
 
@@ -605,11 +643,14 @@ mod tests {
             /*0020*/ @P0 BRA 0x000 ;
             /*0030*/ EXIT ;
         "#;
-        let cfg = build_cfg(parse_sass(sass));
+        let cfg = build_cfg(decode_sass(sass));
         let fir = build_ssa(&cfg);
         let types = infer_types(&fir);
 
-        let r2_ty = types.get(&("R".to_string(), 2)).copied().unwrap_or(InferredType::Bottom);
+        let r2_ty = types
+            .get(&("R".to_string(), 2))
+            .copied()
+            .unwrap_or(InferredType::Bottom);
         assert_eq!(r2_ty, InferredType::F32);
     }
 
@@ -620,15 +661,29 @@ mod tests {
             /*0000*/ ISETP.GE.AND P0, PT, R0, R1, PT ;
             /*0010*/ EXIT ;
         "#;
-        let cfg = build_cfg(parse_sass(sass));
+        let cfg = build_cfg(decode_sass(sass));
         let fir = build_ssa(&cfg);
         let types = infer_types(&fir);
 
         // R0 and R1 should be inferred as I32 (signed comparison inputs)
-        let r0_ty = types.get(&("R".to_string(), 0)).copied().unwrap_or(InferredType::Bottom);
-        let r1_ty = types.get(&("R".to_string(), 1)).copied().unwrap_or(InferredType::Bottom);
-        assert_eq!(r0_ty, InferredType::I32, "ISETP.GE.AND input R0 should be I32");
-        assert_eq!(r1_ty, InferredType::I32, "ISETP.GE.AND input R1 should be I32");
+        let r0_ty = types
+            .get(&("R".to_string(), 0))
+            .copied()
+            .unwrap_or(InferredType::Bottom);
+        let r1_ty = types
+            .get(&("R".to_string(), 1))
+            .copied()
+            .unwrap_or(InferredType::Bottom);
+        assert_eq!(
+            r0_ty,
+            InferredType::I32,
+            "ISETP.GE.AND input R0 should be I32"
+        );
+        assert_eq!(
+            r1_ty,
+            InferredType::I32,
+            "ISETP.GE.AND input R1 should be I32"
+        );
     }
 
     #[test]
@@ -638,14 +693,28 @@ mod tests {
             /*0000*/ ISETP.GT.U32.AND P0, PT, R0, R1, PT ;
             /*0010*/ EXIT ;
         "#;
-        let cfg = build_cfg(parse_sass(sass));
+        let cfg = build_cfg(decode_sass(sass));
         let fir = build_ssa(&cfg);
         let types = infer_types(&fir);
 
-        let r0_ty = types.get(&("R".to_string(), 0)).copied().unwrap_or(InferredType::Bottom);
-        let r1_ty = types.get(&("R".to_string(), 1)).copied().unwrap_or(InferredType::Bottom);
-        assert_eq!(r0_ty, InferredType::U32, "ISETP.GT.U32 input R0 should be U32");
-        assert_eq!(r1_ty, InferredType::U32, "ISETP.GT.U32 input R1 should be U32");
+        let r0_ty = types
+            .get(&("R".to_string(), 0))
+            .copied()
+            .unwrap_or(InferredType::Bottom);
+        let r1_ty = types
+            .get(&("R".to_string(), 1))
+            .copied()
+            .unwrap_or(InferredType::Bottom);
+        assert_eq!(
+            r0_ty,
+            InferredType::U32,
+            "ISETP.GT.U32 input R0 should be U32"
+        );
+        assert_eq!(
+            r1_ty,
+            InferredType::U32,
+            "ISETP.GT.U32 input R1 should be U32"
+        );
     }
 
     #[test]
@@ -656,14 +725,28 @@ mod tests {
             /*0000*/ ISETP.NE.AND P0, PT, R0, R1, PT ;
             /*0010*/ EXIT ;
         "#;
-        let cfg = build_cfg(parse_sass(sass));
+        let cfg = build_cfg(decode_sass(sass));
         let fir = build_ssa(&cfg);
         let types = infer_types(&fir);
 
-        let r0_ty = types.get(&("R".to_string(), 0)).copied().unwrap_or(InferredType::Bottom);
-        let r1_ty = types.get(&("R".to_string(), 1)).copied().unwrap_or(InferredType::Bottom);
-        assert_eq!(r0_ty, InferredType::Bottom, "ISETP.NE should not seed signedness on R0");
-        assert_eq!(r1_ty, InferredType::Bottom, "ISETP.NE should not seed signedness on R1");
+        let r0_ty = types
+            .get(&("R".to_string(), 0))
+            .copied()
+            .unwrap_or(InferredType::Bottom);
+        let r1_ty = types
+            .get(&("R".to_string(), 1))
+            .copied()
+            .unwrap_or(InferredType::Bottom);
+        assert_eq!(
+            r0_ty,
+            InferredType::Bottom,
+            "ISETP.NE should not seed signedness on R0"
+        );
+        assert_eq!(
+            r1_ty,
+            InferredType::Bottom,
+            "ISETP.NE should not seed signedness on R1"
+        );
     }
 
     #[test]
@@ -673,12 +756,18 @@ mod tests {
             /*0000*/ FADD R2, R0, R1 ;
             /*0010*/ EXIT ;
         "#;
-        let cfg = build_cfg(parse_sass(sass));
+        let cfg = build_cfg(decode_sass(sass));
         let fir = build_ssa(&cfg);
         let types = infer_types(&fir);
 
-        let r0_ty = types.get(&("R".to_string(), 0)).copied().unwrap_or(InferredType::Bottom);
-        let r1_ty = types.get(&("R".to_string(), 1)).copied().unwrap_or(InferredType::Bottom);
+        let r0_ty = types
+            .get(&("R".to_string(), 0))
+            .copied()
+            .unwrap_or(InferredType::Bottom);
+        let r1_ty = types
+            .get(&("R".to_string(), 1))
+            .copied()
+            .unwrap_or(InferredType::Bottom);
         assert_eq!(r0_ty, InferredType::F32, "FADD input R0 should be F32");
         assert_eq!(r1_ty, InferredType::F32, "FADD input R1 should be F32");
     }
@@ -690,17 +779,31 @@ mod tests {
             /*0000*/ SHF.R.S32.HI R2, RZ, 0x1f, R0 ;
             /*0010*/ EXIT ;
         "#;
-        let cfg = build_cfg(parse_sass(sass));
+        let cfg = build_cfg(decode_sass(sass));
         let fir = build_ssa(&cfg);
         let types = infer_types(&fir);
 
         // R2 (output) should be I32 from type_from_opcode
-        let r2_ty = types.get(&("R".to_string(), 2)).copied().unwrap_or(InferredType::Bottom);
-        assert_eq!(r2_ty, InferredType::I32, "SHF.R.S32.HI output should be I32");
+        let r2_ty = types
+            .get(&("R".to_string(), 2))
+            .copied()
+            .unwrap_or(InferredType::Bottom);
+        assert_eq!(
+            r2_ty,
+            InferredType::I32,
+            "SHF.R.S32.HI output should be I32"
+        );
 
         // R0 (data_hi input) should also be I32 from back-propagation
-        let r0_ty = types.get(&("R".to_string(), 0)).copied().unwrap_or(InferredType::Bottom);
-        assert_eq!(r0_ty, InferredType::I32, "SHF.R.S32.HI data input should be I32");
+        let r0_ty = types
+            .get(&("R".to_string(), 0))
+            .copied()
+            .unwrap_or(InferredType::Bottom);
+        assert_eq!(
+            r0_ty,
+            InferredType::I32,
+            "SHF.R.S32.HI data input should be I32"
+        );
     }
 
     #[test]
@@ -710,14 +813,24 @@ mod tests {
             /*0000*/ IABS R1, R0 ;
             /*0010*/ EXIT ;
         "#;
-        let cfg = build_cfg(parse_sass(sass));
+        let cfg = build_cfg(decode_sass(sass));
         let fir = build_ssa(&cfg);
         let types = infer_types(&fir);
 
-        let r1_ty = types.get(&("R".to_string(), 1)).copied().unwrap_or(InferredType::Bottom);
+        let r1_ty = types
+            .get(&("R".to_string(), 1))
+            .copied()
+            .unwrap_or(InferredType::Bottom);
         assert_eq!(r1_ty, InferredType::I32, "IABS output should be I32");
 
-        let r0_ty = types.get(&("R".to_string(), 0)).copied().unwrap_or(InferredType::Bottom);
-        assert_eq!(r0_ty, InferredType::I32, "IABS input should be I32 (back-propagated)");
+        let r0_ty = types
+            .get(&("R".to_string(), 0))
+            .copied()
+            .unwrap_or(InferredType::Bottom);
+        assert_eq!(
+            r0_ty,
+            InferredType::I32,
+            "IABS input should be I32 (back-propagated)"
+        );
     }
 }

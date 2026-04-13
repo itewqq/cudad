@@ -32,15 +32,31 @@
 // param_9 -> arg9 (word32, confidence: low, words: {0})
 __global__ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8_t* arg6_ptr, uint32_t arg8, uint32_t arg9) {
   __shared__ uint8_t shmem_u8[256];
-  bool b0; // live-in
-  bool b2;
+  uint32_t ctaid_x;
+  uint32_t tid_x;
+  bool b1;
   uint32_t v2;
   uint32_t v3;
+  uint32_t v4;
+  uint32_t v5;
+  uint32_t v6;
+  uint32_t v7;
+  uint32_t v8;
+  uint32_t v9;
+  uint32_t v10;
+  uint32_t v11;
+  uint32_t v12;
+  uint32_t v13;
+  uint32_t v14;
+  uint32_t v16;
+  uint32_t v17;
+  bool b3;
+  bool b4;
   uint32_t v18;
   uint32_t v19;
   bool b5;
-  uint32_t v20;
   uint32_t v21; // live-in
+  uint32_t v20;
   bool b6;
   uint32_t v22;
   bool b7;
@@ -52,8 +68,8 @@ __global__ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8
   uint32_t v29;
   uint32_t v30;
   bool b10;
-  uint32_t v31;
   uint32_t v32; // live-in
+  uint32_t v31;
   bool b11;
   uint32_t v33;
   bool b12;
@@ -63,8 +79,8 @@ __global__ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8
   uint32_t v39;
   uint32_t v40;
   bool b14;
-  uint32_t v41;
   uint32_t v42; // live-in
+  uint32_t v41;
   bool b15;
   uint32_t v43;
   bool b16;
@@ -74,8 +90,8 @@ __global__ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8
   uint32_t v49;
   uint32_t v50;
   bool b18;
-  uint32_t v51;
   uint32_t v52; // live-in
+  uint32_t v51;
   bool b19;
   uint32_t v53;
   bool b20;
@@ -83,14 +99,14 @@ __global__ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8
   uint32_t v55;
   uint32_t v56;
   uint32_t v59;
-  uint32_t v60;
   uint32_t v61; // live-in
+  uint32_t v60;
   uint32_t v62;
   uint32_t v63;
   uint32_t v64;
   bool b22;
-  uint32_t v65;
   uint32_t v66; // live-in
+  uint32_t v65;
   bool b23;
   uint32_t v67;
   bool b24;
@@ -99,14 +115,14 @@ __global__ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8
   uint32_t v70;
   uint32_t v73;
   uint32_t v74;
-  uint32_t v75;
   uint32_t v76; // live-in
+  uint32_t v75;
   uint32_t v77;
   uint32_t v78;
   uint32_t v79;
   bool b26;
-  uint32_t v80;
   uint32_t v81; // live-in
+  uint32_t v80;
   bool b27;
   uint32_t v82;
   bool b28;
@@ -115,15 +131,13 @@ __global__ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8
   uint32_t v85;
   uint32_t v88;
   uint32_t v89;
-  uint32_t v5;
   uint32_t v90; // live-in
   uint32_t v91;
   uint32_t v92;
   uint32_t v93;
-  uint32_t v94;
   uint32_t v95; // live-in
+  uint32_t v94;
   bool b30;
-  uint32_t v4;
   uint32_t v96;
   bool b31;
   bool b32;
@@ -131,62 +145,48 @@ __global__ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8
   uint32_t v98;
   uint32_t v100;
   uint32_t v102;
-  uint32_t v6;
   uint32_t v103; // live-in
   uint32_t v104;
   uint32_t v105;
   uint32_t v106;
-  uint32_t v107;
   uint32_t v108; // live-in
+  uint32_t v107;
   bool b34;
   uint32_t v109;
   uint32_t v110;
-  bool b3;
-  bool b4;
-  uint32_t v8;
   uint32_t v111;
   uint32_t v113;
   uint32_t v115;
-  uint32_t v12;
   uint32_t v116; // live-in
   uint32_t v117;
-  uint32_t v9;
   uint32_t v118;
-  uint32_t v14;
   uint32_t v119; // live-in
   uint32_t v120;
-  uint32_t v11;
   uint32_t v121;
-  uint32_t v17;
   uint32_t v122; // live-in
-  uint32_t v13;
-  uint32_t v7;
-  uint32_t v10;
   uint32_t v123; // live-in
-  uint32_t v16;
   uint32_t v124;
-  bool b36; // live-in
   uint32_t v125;
   uint32_t u0;
   uint32_t v126;
   uint32_t v127;
   uint32_t v128;
-  bool b38;
-  uint32_t arg4_ptr_lo32;
   uint32_t arg4_ptr_hi32;
-  uint32_t arg6_ptr_lo32;
   uint32_t arg6_ptr_hi32;
+  uint32_t u5;
+  uint32_t v129;
+  uint32_t v130;
+  uint32_t v131;
   uint32_t v132;
   bool b41;
   uint32_t v135;
   uint32_t u6;
-  uint32_t u7;
   uint32_t u8; // live-in
+  uint32_t u7;
   uint32_t v136;
   uint32_t v137;
-  uint32_t v131; // live-in
-  uint32_t v138;
   uint32_t v139; // live-in
+  uint32_t v138;
   uint32_t v140;
   uint32_t v141;
   bool b43;
@@ -197,11 +197,10 @@ __global__ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8
   uint32_t u9;
   uint32_t v146;
   uint32_t v147;
-  uint32_t u10;
   uint32_t u11; // live-in
+  uint32_t u10;
   uint32_t v148;
   uint32_t v149;
-  uint32_t v129;
   uint32_t v150; // live-in
   uint32_t v151;
   uint32_t v152;
@@ -210,14 +209,13 @@ __global__ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8
   uint32_t v155;
   uint32_t v156;
   uint32_t u12;
-  uint32_t u13;
   uint32_t u14; // live-in
+  uint32_t u13;
   uint32_t v157;
   uint32_t v158;
   uint32_t v159;
   uint32_t v160;
   bool b44;
-  uint32_t v130;
   uint32_t v161; // live-in
   uint32_t v162;
   uint32_t v163;
@@ -225,21 +223,14 @@ __global__ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8
   uint32_t v165;
   uint32_t v166;
   uint32_t u15;
-  uint32_t u5; // live-in
   uint32_t v167;
-  bool b40;
-  bool b39;
   uint32_t v168;
   uint32_t v169;
   uint32_t v170;
   uint32_t v171;
   uint32_t v172;
-  uint32_t v173;
-  bool b45;
+  int32_t v173;
   uint32_t v174;
-  bool b46;
-  uint32_t v175;
-  uint32_t v176;
   bool b47;
   uint32_t v177;
   uint32_t u16;
@@ -252,11 +243,10 @@ __global__ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8
   uint32_t v184;
   uint32_t v185;
 
-  // live-ins: v128, v3
   ctaid_x = blockIdx.x;
-  if (b0) return;
+  if ((int32_t)(ctaid_x) >= (int32_t)(arg9)) return;
     tid_x = threadIdx.x;
-    b2 = tid_x != 0;
+    b1 = (int32_t)(tid_x) > (int32_t)(255);
   if (!((int32_t)(tid_x) > (int32_t)(255))) {
     do {
       shmem_u8[tid_x] = tid_x;
@@ -264,10 +254,11 @@ __global__ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8
     } while(!((int32_t)(tid_x) >= (int32_t)(256)));
   }
     __syncthreads();
-  if (!(b2)) {
+  if (!(tid_x != 0)) {
     v2 = abs(arg2);
     v3 = 0;
   }
+  tid_x = v3;
   do {
     v18 = abs(tid_x);
     v19 = shmem_u8[tid_x];
@@ -407,32 +398,29 @@ __global__ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8
     shmem_u8[tid_x + 7] = v16;
     shmem_u8[v3] = v7;
     tid_x = tid_x + 8;
-    // phi merge: v1 <- phi(v1, v3)
   } while(tid_x != 256);
   __syncthreads();
-  if (b2) return;
+  if (tid_x != 0) return;
   v124 = arg8;
-  if (!(b36)) return;
+  if (!((int32_t)(v124) >= (int32_t)(1))) return;
     v125 = v124 - 1;
     u0 = 0;
     v126 = v124 & 3;
     v127 = v124 * arg9;
     v128 = 0;
-    b38 = v126 != 0;
   if (v125 >= 3) {
     v5 = ctaid_x * arg8;
     v12 = v126 - arg8;
-    arg4_ptr_lo32 = arg4_ptr.lo32;
     arg4_ptr_hi32 = arg4_ptr.hi32;
     v14 = v5 + 3;
-    arg6_ptr_lo32 = arg6_ptr.lo32;
     arg6_ptr_hi32 = arg6_ptr.hi32;
     v4 = (int32_t)v5 >> 31;
   }
+  v131 = v128;
   do {
     v132 = v14 - 3;
     b41 = (int32_t)(v132) >= (int32_t)(v127);
-    if (!b41) v135 = *((uint8_t*)(arg4_ptr + (int64_t)v5));
+    v135 = !b41 ? (*((uint8_t*)(arg4_ptr + (int64_t)v5))) : v8;
     u6 = u0 + 1;
     u7 = u6 - u8;
     v136 = shmem_u8[u7];
@@ -441,19 +429,16 @@ __global__ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8
     v140 = v14 - 2;
     v141 = shmem_u8[v138];
     b43 = (int32_t)(v140) >= (int32_t)(v127);
-    b3 = carry_u32_add3(v5, arg6_ptr_lo32, 0);
-    v17 = v5 + arg6_ptr_lo32;
     shmem_u8[u7] = v141;
     shmem_u8[v138] = v136;
     v142 = shmem_u8[u7];
     v143 = v136 + v142;
-    if (!b41) v144 = v143 & 255;
-    v16 = v4 + arg6_ptr_hi32 + (b3 ? 1 : 0);
-    if (!b41) v145 = shmem_u8[v144];
+    v144 = !b41 ? (v143 & 255) : v9;
+    v145 = !b41 ? (shmem_u8[v144]) : v144;
     u9 = u7 + 1;
-    if (!b41) v146 = v135 ^ v145;
+    v146 = !b41 ? (v135 ^ v145) : v7;
     if (!b41) *((uint8_t*)(arg6_ptr + (int64_t)v5)) = v146;
-    if (!b43) v147 = *((uint8_t*)((arg4_ptr + (int64_t)v5) + 1));
+    v147 = !b43 ? (*((uint8_t*)((arg4_ptr + (int64_t)v5) + 1))) : v6;
     u10 = u9 - u11;
     v148 = shmem_u8[u10];
     v149 = v138 + v148;
@@ -464,15 +449,15 @@ __global__ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8
     v152 = shmem_u8[u10];
     v153 = v148 + v152;
     v154 = v14 - 1;
-    if (!b43) v155 = v153 & 255;
+    v155 = !b43 ? (v153 & 255) : v153;
     b4 = (int32_t)(v154) >= (int32_t)(v127);
-    if (!b43) v156 = shmem_u8[v155];
+    v156 = !b43 ? (shmem_u8[v155]) : v155;
     u12 = u10 + 1;
     u13 = u12 - u14;
     v157 = shmem_u8[u13];
-    if (!b43) v158 = v147 ^ v156;
+    v158 = !b43 ? (v147 ^ v156) : v146;
     if (!b43) *((uint8_t*)((arg6_ptr + (int64_t)v5) + 1)) = v158;
-    if (!b4) v159 = *((uint8_t*)((arg4_ptr + (int64_t)v5) + 2));
+    v159 = !b4 ? (*((uint8_t*)((arg4_ptr + (int64_t)v5) + 2))) : v147;
     v160 = v129 + v157;
     b44 = (int32_t)(v14) >= (int32_t)(v127);
     v130 = v160 - v161;
@@ -481,25 +466,18 @@ __global__ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8
     shmem_u8[v130] = v157;
     v163 = shmem_u8[u13];
     v164 = v157 + v163;
-    if (!b4) v165 = v164 & 255;
-    if (!b4) v166 = shmem_u8[v165];
+    v165 = !b4 ? (v164 & 255) : v164;
+    v166 = !b4 ? (shmem_u8[v165]) : v165;
     u15 = u13 + 1;
     u0 = u15 - u5;
     v10 = shmem_u8[u0];
-    if (!b4) v7 = v159 ^ v166;
+    v7 = !b4 ? (v159 ^ v166) : v158;
     if (!b4) *((uint8_t*)((arg6_ptr + (int64_t)v5) + 2)) = v7;
-    if (!b44) v6 = *((uint8_t*)((arg4_ptr + (int64_t)v5) + 3));
+    v6 = !b44 ? (*((uint8_t*)((arg4_ptr + (int64_t)v5) + 3))) : v159;
     v167 = v130 + v10;
     v12 = v12 + 4;
-    b40 = carry_u32_add3(arg6_ptr_lo32, 4, 0);
-    arg6_ptr_lo32 = arg6_ptr_lo32 + 4;
     v128 = v128 + 4;
-    b39 = carry_u32_add3(arg4_ptr_lo32, 4, 0);
-    arg4_ptr_lo32 = arg4_ptr_lo32 + 4;
     v168 = (int32_t)v167 >> 31;
-    arg6_ptr_hi32 = arg6_ptr_hi32 + (b40 ? 1 : 0);
-    v14 = v14 + 4;
-    arg4_ptr_hi32 = arg4_ptr_hi32 + (b39 ? 1 : 0);
     v169 = hi32(v168 + (v167 << 8));
     v8 = v169 & 4294967040;
     v131 = v167 - v8;
@@ -508,31 +486,20 @@ __global__ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8
     shmem_u8[v131] = v10;
     v170 = shmem_u8[u0];
     v171 = v10 + v170;
-    if (!b44) v172 = v171 & 255;
-    if (!b44) v2 = shmem_u8[v172];
-    if (!b44) v9 = v6 ^ v2;
+    v172 = !b44 ? (v171 & 255) : v171;
+    v2 = !b44 ? (shmem_u8[v172]) : v172;
+    v9 = !b44 ? (v6 ^ v2) : v166;
     if (!b44) *((uint8_t*)((arg6_ptr + (int64_t)v5) + 3)) = v9;
-    // phi merge: v131 <- phi(v131, v128)
   } while(v12 != 0);
-  if (!(b38)) return;
-  // phi merge: v131 <- phi(v131, v128)
+  if (!(v126 != 0)) return;
   v173 = ctaid_x * arg8 + v128;
-  b45 = carry_u32_add3(v173, arg6_ptr.lo32, 0);
-  v174 = v173 + arg6_ptr.lo32;
-  b46 = carry_u32_add3(v173, arg4_ptr.lo32, 0);
-  v175 = v173 + arg4_ptr.lo32;
   v174 = (int32_t)v173 >> 31;
-  v2 = v174 + arg6_ptr.hi32 + (b45 ? 1 : 0);
-  v176 = v174 + arg4_ptr.hi32 + (b46 ? 1 : 0);
   do {
     b47 = (int32_t)(v173) >= (int32_t)(v127);
-    if (!b47) v177 = *((uint8_t*)(arg4_ptr + (int64_t)v173));
+    v177 = !b47 ? (*((uint8_t*)(arg4_ptr + (int64_t)v173))) : v16;
     u16 = u0 + 1;
     v126 = v126 - 1;
-    b4 = carry_u32_add3(v175, 1, 0);
-    v175 = v175 + 1;
     v173 = v173 + 1;
-    v176 = v176 + (b4 ? 1 : 0);
     u0 = u16 - u5;
     v17 = shmem_u8[u0];
     v178 = v17 + v131;
@@ -544,14 +511,10 @@ __global__ void kernel(uint8_t* arg0_ptr, int32_t arg2, uint8_t* arg4_ptr, uint8
     shmem_u8[u0] = v182;
     shmem_u8[v131] = v17;
     v183 = shmem_u8[u0];
-    v174 = !b47 ? (v174) : v182;
-    b46 = carry_u32_add3(v174, 1, 0);
-    v174 = v174 + 1;
     v184 = v17 + v183;
-    if (!b47) v185 = v184 & 255;
-    if (!b47) v14 = shmem_u8[v185];
-    v2 = v2 + (b46 ? 1 : 0);
-    if (!b47) v16 = v177 ^ v14;
+    v185 = !b47 ? (v184 & 255) : v184;
+    v14 = !b47 ? (shmem_u8[v185]) : v181;
+    v16 = !b47 ? (v177 ^ v14) : v177;
     if (!b47) *((uint8_t*)(arg6_ptr + (int64_t)v173)) = v16;
   } while(v126 != 0);
   return;

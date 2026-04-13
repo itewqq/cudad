@@ -1,4 +1,4 @@
-use crate::parser::Operand;
+use crate::parser::DecodedOperand;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DefRole {
@@ -22,10 +22,10 @@ pub struct OpSemantics {
     pub use_roles: Vec<UseRole>,
 }
 
-fn is_pred_operand(op: &Operand) -> bool {
+fn is_pred_operand(op: &DecodedOperand) -> bool {
     matches!(
         op,
-        Operand::Register { class, .. } if class == "P" || class == "UP"
+        DecodedOperand::PredicateRegister { class, .. } if class == "P" || class == "UP"
     )
 }
 
@@ -88,8 +88,7 @@ fn build_op_table() -> Vec<(fn(&str) -> bool, OpDesc)> {
         (
             |op: &str| {
                 let m = opcode_mnemonic(op);
-                m == "IADD3" && opcode_has_mod(op, "X")
-                    || m == "UIADD3" && opcode_has_mod(op, "X")
+                m == "IADD3" && opcode_has_mod(op, "X") || m == "UIADD3" && opcode_has_mod(op, "X")
             },
             OpDesc {
                 data_defs: 1,
@@ -124,7 +123,7 @@ fn build_op_table() -> Vec<(fn(&str) -> bool, OpDesc)> {
 
 pub fn derive_op_semantics(
     opcode: &str,
-    operands: &[Operand],
+    operands: &[DecodedOperand],
     is_mem_load: bool,
     is_mem_store: bool,
 ) -> OpSemantics {
@@ -151,7 +150,11 @@ pub fn derive_op_semantics(
         let use_operand_indices = (0..operands.len()).collect::<Vec<_>>();
         let mut use_roles = Vec::with_capacity(use_operand_indices.len());
         for (idx, _) in use_operand_indices.iter().enumerate() {
-            use_roles.push(if idx == 0 { UseRole::Addr } else { UseRole::Data });
+            use_roles.push(if idx == 0 {
+                UseRole::Addr
+            } else {
+                UseRole::Data
+            });
         }
         return OpSemantics {
             def_operand_indices: Vec::new(),
@@ -179,7 +182,7 @@ pub fn derive_op_semantics(
     apply_op_desc(&OpDesc::default(), opcode, operands)
 }
 
-fn derive_setp_semantics(operands: &[Operand]) -> OpSemantics {
+fn derive_setp_semantics(operands: &[DecodedOperand]) -> OpSemantics {
     let mut def_operand_indices = Vec::new();
     let mut def_roles = Vec::new();
     // First two operands are predicate defs (result, overflow/carry)
@@ -206,7 +209,7 @@ fn derive_setp_semantics(operands: &[Operand]) -> OpSemantics {
     }
 }
 
-fn apply_op_desc(desc: &OpDesc, _opcode: &str, operands: &[Operand]) -> OpSemantics {
+fn apply_op_desc(desc: &OpDesc, _opcode: &str, operands: &[DecodedOperand]) -> OpSemantics {
     let mut def_operand_indices = Vec::new();
     let mut def_roles = Vec::new();
 
@@ -257,22 +260,42 @@ fn apply_op_desc(desc: &OpDesc, _opcode: &str, operands: &[Operand]) -> OpSemant
 mod tests {
     use super::*;
 
-    fn reg(class: &str, idx: i32) -> Operand {
-        Operand::Register {
-            class: class.to_string(),
-            idx,
-            sign: 1,
-            ty: None,
+    fn reg(class: &str, idx: i32) -> DecodedOperand {
+        match class {
+            "P" | "UP" | "PT" | "UPT" => DecodedOperand::PredicateRegister {
+                class: class.to_string(),
+                idx,
+                sense: true,
+            },
+            "UR" | "URZ" => DecodedOperand::UniformRegister {
+                class: class.to_string(),
+                idx,
+                sign: 1,
+                ty: None,
+            },
+            _ => DecodedOperand::Register {
+                class: class.to_string(),
+                idx,
+                sign: 1,
+                ty: None,
+            },
         }
     }
 
-    fn imm(v: i64) -> Operand {
-        Operand::ImmediateI(v)
+    fn imm(v: i64) -> DecodedOperand {
+        DecodedOperand::ImmediateI(v)
     }
 
     #[test]
     fn iadd3_defs_include_predicates() {
-        let ops = vec![reg("R", 4), reg("P", 0), reg("P", 1), reg("R", 2), imm(1), reg("RZ", 0)];
+        let ops = vec![
+            reg("R", 4),
+            reg("P", 0),
+            reg("P", 1),
+            reg("R", 2),
+            imm(1),
+            reg("RZ", 0),
+        ];
         let sem = derive_op_semantics("IADD3", &ops, false, false);
         assert!(sem.def_operand_indices.contains(&0)); // R4 data def
         assert!(sem.def_operand_indices.contains(&1)); // P0 pred def
@@ -281,7 +304,13 @@ mod tests {
 
     #[test]
     fn iadd3_x_last_uses_are_pred() {
-        let ops = vec![reg("R", 3), reg("R", 0), reg("R", 1), reg("RZ", 0), reg("P", 2)];
+        let ops = vec![
+            reg("R", 3),
+            reg("R", 0),
+            reg("R", 1),
+            reg("RZ", 0),
+            reg("P", 2),
+        ];
         let sem = derive_op_semantics("IADD3.X", &ops, false, false);
         // Last use should be PredCtrl, second-to-last PredIn
         assert!(sem.use_roles.contains(&UseRole::PredCtrl));
