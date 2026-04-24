@@ -1297,7 +1297,7 @@ fn full_pass_dot_thread_recovers_pointer_params_and_typed_loads() {
         .into_iter()
         .find(|f| f.name == "dot_thread")
         .expect("dot_thread fixture should exist");
-    let out = run_structured_output_full_pass_from_instrs(dot.instrs, dot.sm);
+    let out = run_canonical_output_full_pass_from_instrs(dot.instrs, dot.sm, "dot_thread");
     assert!(
         out.contains("float* arg0_ptr")
             && out.contains("float* arg2_ptr")
@@ -1307,9 +1307,9 @@ fn full_pass_dot_thread_recovers_pointer_params_and_typed_loads() {
         out
     );
     assert!(
-        out.contains("*(arg0_ptr + v28_next_3)")
-            && out.contains("*(arg2_ptr + v28_next_3)")
-            && out.contains("*(arg4_ptr + v2) ="),
+        out.contains("arg0_ptr[")
+            && out.contains("arg2_ptr[")
+            && out.contains("arg4_ptr["),
         "expected dot_thread main memory accesses to stay on typed pointer arithmetic, got:
 {}",
         out
@@ -1334,7 +1334,8 @@ fn full_pass_dot_thread_recovers_pointer_params_and_typed_loads() {
 {}",
         out
     );
-    let ffma_recurrence = Regex::new(r"v\d+(?:_next(?:_\d+)?)? = v\d+(?:_next(?:_\d+)?)? \* v\d+(?:_next(?:_\d+)?)? \+ v\d+(?:_next(?:_\d+)?)?;")
+    let ffma_recurrence =
+        Regex::new(r"r\d+_\d+ = r\d+_\d+ \* r\d+_\d+ \+ r\d+_\d+;")
         .expect("valid dot_thread recurrence regex");
     assert!(
         ffma_recurrence.is_match(&out),
@@ -1350,7 +1351,7 @@ fn full_pass_cumsum_linear_no_longer_overflows_named_render() {
         .into_iter()
         .find(|f| f.name == "cumsum_linear")
         .expect("cumsum_linear fixture should exist");
-    let out = run_structured_output_full_pass_from_instrs(cumsum.instrs, cumsum.sm);
+    let out = run_canonical_output_full_pass_from_instrs(cumsum.instrs, cumsum.sm, "cumsum_linear");
     assert!(
         !out.trim().is_empty(),
         "expected cumsum_linear to decompile to non-empty output"
@@ -1431,27 +1432,19 @@ fn full_pass_nbody_final_store_uses_collapsed_force_pointer() {
     .into_iter()
     .find(|f| f.name == "nbody_forces")
     .expect("nbody_forces fixture should exist");
-    let out = run_structured_output_full_pass_from_instrs(nbody.instrs, nbody.sm);
+    let out = run_canonical_output_full_pass_from_instrs(nbody.instrs, nbody.sm, "nbody_forces");
     let store0 = Regex::new(
-        r"(\*\(arg2_ptr \+ \(int64_t\)v\w+ \* 12\) = v\w+;)|(\*\(arg2_ptr \+ \(v\w+ \* 3\)\) = v\w+;)",
+        r"arg2_ptr\[[A-Za-z0-9_]+ \* 12 / 4\] = [A-Za-z0-9_]+;",
     )
         .expect("valid first store regex");
     let store1 = Regex::new(
-        r"(\*\(arg2_ptr \+ \(int64_t\)v\w+ \* 12 \+ 4\) = v\w+;)|(\*\(arg2_ptr \+ \(v\w+ \* 3 \+ 1\)\) = v\w+;)",
+        r"arg2_ptr\[\([A-Za-z0-9_]+ \* 12 \+ 4\) / 4\] = [A-Za-z0-9_]+;",
     )
         .expect("valid flattened second store regex");
-    let store1_alt = Regex::new(
-        r"(\*\(\(arg2_ptr \+ \(int64_t\)v\w+ \* 12\) \+ 4\) = v\w+;)|(\*\(\(arg2_ptr \+ \(v\w+ \* 3\)\) \+ 1\) = v\w+;)",
-    )
-        .expect("valid nested second store regex");
     let store2 = Regex::new(
-        r"(\*\(arg2_ptr \+ \(int64_t\)v\w+ \* 12 \+ 8\) = v\w+;)|(\*\(arg2_ptr \+ \(v\w+ \* 3 \+ 2\)\) = v\w+;)",
+        r"arg2_ptr\[\([A-Za-z0-9_]+ \* 12 \+ 8\) / 4\] = [A-Za-z0-9_]+;",
     )
         .expect("valid flattened third store regex");
-    let store2_alt = Regex::new(
-        r"(\*\(\(arg2_ptr \+ \(int64_t\)v\w+ \* 12\) \+ 8\) = v\w+;)|(\*\(\(arg2_ptr \+ \(v\w+ \* 3\)\) \+ 2\) = v\w+;)",
-    )
-        .expect("valid nested third store regex");
     assert!(
         store0.is_match(&out),
         "expected collapsed first force store, got:
@@ -1459,13 +1452,13 @@ fn full_pass_nbody_final_store_uses_collapsed_force_pointer() {
         out
     );
     assert!(
-        store1.is_match(&out) || store1_alt.is_match(&out),
+        store1.is_match(&out),
         "expected collapsed second force store, got:
 {}",
         out
     );
     assert!(
-        store2.is_match(&out) || store2_alt.is_match(&out),
+        store2.is_match(&out),
         "expected collapsed third force store, got:
 {}",
         out
@@ -1491,9 +1484,9 @@ fn full_pass_sgemm_tiled_predicated_global_loads_collapse_to_typed_pointers() {
             .into_iter()
             .find(|f| f.name == "sgemm_tiled")
             .expect("sgemm_tiled fixture should exist");
-    let out = run_structured_output_full_pass_from_instrs(sgemm.instrs, sgemm.sm);
+    let out = run_canonical_output_full_pass_from_instrs(sgemm.instrs, sgemm.sm, "sgemm_tiled");
     let lhs_load = Regex::new(
-        r"v\w+ = !b\w+ \? \(\*\(arg0_ptr \+ (?:\(int64_t\))?v\w+(?: \+ v\w+)?(?: \+ threadIdx\.x)?\)\) : (?:0|0\.0|v\w+);",
+        r"r\d+_\d+ = !p\d+_\d+ \? \(arg0_ptr\[[A-Za-z0-9_()+*/ ]+\]\) : (?:0|0\.0|r\d+_\d+);",
     )
     .expect("valid lhs load regex");
     assert!(
@@ -1503,7 +1496,7 @@ fn full_pass_sgemm_tiled_predicated_global_loads_collapse_to_typed_pointers() {
         out
     );
     let rhs_load = Regex::new(
-        r"v\w+ = !b\w+ \? \(\*\(arg2_ptr \+ (?:\(int64_t\))?v\w+(?: \+ v\w+)?(?: \+ threadIdx\.x)?\)\) : (?:0|0\.0|v\w+);",
+        r"r\d+_\d+ = !p\d+_\d+ \? \(arg2_ptr\[[A-Za-z0-9_()+*/ ]+\]\) : (?:0|0\.0|r\d+_\d+);",
     )
     .expect("valid rhs load regex");
     assert!(
@@ -1527,7 +1520,7 @@ fn full_pass_sgemm_tiled_eliminates_lea_helpers_in_predicated_loads() {
             .into_iter()
             .find(|f| f.name == "sgemm_tiled")
             .expect("sgemm_tiled fixture should exist");
-    let out = run_structured_output_full_pass_from_instrs(sgemm.instrs, sgemm.sm);
+    let out = run_canonical_output_full_pass_from_instrs(sgemm.instrs, sgemm.sm, "sgemm_tiled");
     assert!(
         !out.contains("lea_hi_x("),
         "expected sgemm_tiled output to fold LEA.HI.X helpers, got:
