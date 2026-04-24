@@ -21,6 +21,10 @@ The target backend is:
 Only one full-pass driver is allowed once the cutover is complete. The CLI,
 tests, and golden regeneration must all use that driver.
 
+The canonical driver must also preserve decoded function identity; multi-
+function dumps are not allowed to collapse every rendered function back to
+`kernel`.
+
 ## Front-half contract
 
 - The parser must stay tolerant and lossless.
@@ -41,6 +45,11 @@ The core CUDA memory spaces for this rewrite are:
 
 Texture, surface, sampler, and other special engines are out of scope for the
 first cutover and should remain explicit unsupported/special forms.
+
+Shared/local declaration planning must not invent fixed extents when analysis
+only proves a dynamic rooted offset. In those cases the AST must preserve that
+the backing object has unresolved extent instead of pretending it is a small
+constant array.
 
 ## Quality bar
 

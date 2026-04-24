@@ -36,6 +36,7 @@ use crate::structurizer::{StructuredStatement, Structurizer};
 
 #[derive(Clone, Debug, Default)]
 pub struct DecompileArtifacts {
+    pub function_name: Option<String>,
     pub cfg: Option<ControlFlowGraph>,
     pub optimized_ir: Option<FunctionIR>,
     pub analysis: Option<FunctionAnalysis>,
@@ -48,12 +49,22 @@ pub fn build_decompile_artifacts(
     instrs: Vec<DecodedInstruction>,
     sm: Option<u32>,
 ) -> DecompileArtifacts {
+    build_named_decompile_artifacts(instrs, sm, None)
+}
+
+pub fn build_named_decompile_artifacts(
+    instrs: Vec<DecodedInstruction>,
+    sm: Option<u32>,
+    function_name: Option<&str>,
+) -> DecompileArtifacts {
     let mut artifacts = DecompileArtifacts::default();
     if instrs.is_empty() {
         return artifacts;
     }
+    let function_name = function_name.unwrap_or("kernel");
     let cfg = crate::build_cfg(instrs.clone());
     if cfg.node_count() == 0 {
+        artifacts.function_name = Some(function_name.to_string());
         artifacts.cfg = Some(cfg);
         return artifacts;
     }
@@ -72,7 +83,8 @@ pub fn build_decompile_artifacts(
     let ast = structured
         .as_ref()
         .map(|structured| lower_structured_function(structured, &analysis));
-    let rendered = ast.as_ref().map(|function| function.render("kernel"));
+    let rendered = ast.as_ref().map(|function| function.render(function_name));
+    artifacts.function_name = Some(function_name.to_string());
     artifacts.cfg = Some(cfg);
     artifacts.optimized_ir = Some(optimized_ir);
     artifacts.analysis = Some(analysis);
@@ -86,6 +98,7 @@ pub fn build_decompile_artifacts(
 mod tests {
     use super::*;
     use crate::decode_sass;
+    use regex::Regex;
 
     #[test]
     fn builds_pipeline_artifacts_for_memory_aware_samples() {
@@ -140,8 +153,9 @@ mod tests {
         let rendered = build_decompile_artifacts(decode_sass(sass), None)
             .rendered
             .expect("rendered output");
-        assert!(rendered.contains("arg0_ptr[1]") || rendered.contains("arg0[1]"));
-        assert!(!rendered.contains(".0"));
+        let raw_ssa = Regex::new(r"\b(?:R|UR|P|UP)\d+\.\d+\b").expect("raw ssa regex");
+        assert!(rendered.contains("arg0_ptr[1]"));
+        assert!(!raw_ssa.is_match(&rendered), "rendered output leaked raw SSA tokens:\n{rendered}");
     }
 
     #[test]
@@ -154,5 +168,17 @@ mod tests {
             .rendered
             .expect("rendered output");
         assert!(rendered.contains("shmem[(r2_0 + 8) / 4] = r4_0;"));
+    }
+
+    #[test]
+    fn renders_with_explicit_function_names_when_provided() {
+        let sass = r#"
+            /*0000*/ MOV R0, RZ ;
+            /*0010*/ EXIT ;
+        "#;
+        let rendered = build_named_decompile_artifacts(decode_sass(sass), None, Some("named_kernel"))
+            .rendered
+            .expect("rendered output");
+        assert!(rendered.starts_with("void named_kernel("), "unexpected render:\n{rendered}");
     }
 }

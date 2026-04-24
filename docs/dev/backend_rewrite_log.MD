@@ -36,6 +36,18 @@
 - Non-memory AST lowering now folds trivial `MOV` and add-family ops into
   native AST expressions instead of rendering every scalar op as a call-like
   helper.
+- Shared/local declaration planning now distinguishes fixed-size backing
+  objects from dynamic-extent objects instead of fabricating small scalar or
+  fixed arrays for dynamic offsets.
+- The renderer now preserves byte-pointer widening for complex rooted offsets
+  instead of collapsing them back into element indices too early.
+- The canonical backend driver can now render with an explicit function name,
+  which will be required when the CLI/test entrypoints switch over.
+- Canonical backend tests now enforce:
+  - semantic pointer-param names (`argN_ptr`)
+  - no raw SSA token leaks
+  - dynamic shared-index rendering
+  - named entrypoint rendering
 - Early AST lowering can now emit space-aware AST for:
   - global param-rooted loads
   - shared/local indexed stores

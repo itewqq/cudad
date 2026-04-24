@@ -813,6 +813,67 @@ fn run_structured_output_full_pass(sass: &str) -> String {
     out
 }
 
+fn run_canonical_output_full_pass_from_instrs(
+    instrs: Vec<DecodedInstruction>,
+    sm: Option<u32>,
+) -> String {
+    build_decompile_artifacts(instrs, sm)
+        .rendered
+        .unwrap_or_else(|| "void kernel(void) {\n}\n".to_string())
+}
+
+fn run_canonical_output_full_pass(sass: &str) -> String {
+    let instrs = decode_sass(sass);
+    if instrs.is_empty() {
+        return "void kernel(void) {\n}\n".to_string();
+    }
+    run_canonical_output_full_pass_from_instrs(instrs, parse_sm_version(sass))
+}
+
+fn assert_canonical_full_pass_nonempty_and_deterministic(sass: &str) -> String {
+    let out1 = run_canonical_output_full_pass(sass);
+    let out2 = run_canonical_output_full_pass(sass);
+    assert!(!out1.trim().is_empty());
+    assert_eq!(out1, out2);
+    out1
+}
+
+#[test]
+fn canonical_full_pass_emits_clean_pointer_and_shared_forms() {
+    let sass = r#"
+        /*0000*/ MOV R4, c[0x0][0x160] ;
+        /*0010*/ MOV R5, c[0x0][0x164] ;
+        /*0020*/ IADD3 R4, R4, 0x4, RZ ;
+        /*0030*/ LDG.E R6, [R4.64] ;
+        /*0040*/ ATOMS.ADD R0, [R2], R6 ;
+        /*0050*/ STS [R2+0x8], R6 ;
+        /*0060*/ EXIT ;
+    "#;
+    let out = assert_canonical_full_pass_nonempty_and_deterministic(sass);
+    let raw_ssa = Regex::new(r"\b(?:R|UR|P|UP)\d+\.\d+\b").expect("raw ssa regex");
+    assert!(out.contains("arg0_ptr[1]"), "expected typed pointer access, got:\n{out}");
+    assert!(out.contains("atomicAdd("), "expected atomic lowering, got:\n{out}");
+    assert!(
+        out.contains("shmem[(r2_0 + 8) / 4]"),
+        "expected shared byte-offset indexing, got:\n{out}"
+    );
+    assert!(
+        !raw_ssa.is_match(&out),
+        "expected canonical output to avoid raw SSA tokens, got:\n{out}"
+    );
+}
+
+#[test]
+fn canonical_full_pass_preserves_named_render_entrypoints() {
+    let rendered = build_named_decompile_artifacts(decode_sass("/*0000*/ MOV R0, RZ ;\n/*0010*/ EXIT ;\n"), None, Some("named_kernel"))
+        .rendered
+        .expect("rendered output");
+    assert!(
+        rendered.starts_with("void named_kernel("),
+        "expected named render entrypoint, got:\n{rendered}"
+    );
+}
+
 fn assert_full_pass_nonempty_and_deterministic(sass: &str) -> String {
     let out1 = run_structured_output_full_pass(sass);
     let out2 = run_structured_output_full_pass(sass);
