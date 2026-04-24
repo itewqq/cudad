@@ -71,6 +71,13 @@
   raw fallback helper call.
 - Simple scalar lowering now only rewrites unmodified opcodes; modifier-bearing
   add-family instructions stay explicit until their semantics are modeled.
+- Canonical scalar lowering now materializes:
+  - `S2R`/`CS2R`/`S2UR` builtin-register reads
+  - `ISETP`/`UISETP` comparison predicates
+  - `FFMA`
+  - `FMNMX`
+  - `MUFU` transcendental helpers
+  before falling back to raw opcode-shaped helpers.
 - Early AST lowering can now emit space-aware AST for:
   - global param-rooted loads
   - shared/local indexed stores
@@ -86,12 +93,13 @@
 
 1. Switch the remaining curated full-pass tests and helper entrypoints from the
    old structured-output path onto the canonical driver, starting with the
-   corpus checks that only assert output-shape contracts.
+   fixtures that now pass thanks to semantic scalar lowering.
 2. Delete duplicated CLI/test helper logic that still builds semantic-lift,
    token-map, or post-render cleanup artifacts after the canonical path is
    proven on those fixtures.
-3. Replace the remaining placeholder non-memory AST lowering with semantic
-   lowering that no longer depends on the old semantic-lift backend.
+3. Replace the remaining placeholder non-memory AST lowering gaps
+   (`IADD.64`/`CALL`/residual helper leaks) with semantic lowering that no
+   longer depends on the old semantic-lift backend.
 
 ## Open questions
 
@@ -115,6 +123,7 @@
 - `src/symbol_plan.rs`
 - `src/bin/main.rs`
 - `src/lib.rs`
+- `src/test.rs`
 
 ## Interrupt resume note
 

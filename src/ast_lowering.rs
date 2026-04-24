@@ -144,13 +144,15 @@ pub fn lower_structured_stmt(
 ) -> Stmt {
     match structured {
         StructuredStatement::BasicBlock { block_id, stmts } => Stmt::Sequence(
-            stmts.iter()
+            stmts
+                .iter()
                 .enumerate()
                 .map(|(stmt_idx, stmt)| lower_basic_stmt(*block_id, stmt_idx, stmt, analysis))
                 .collect(),
         ),
         StructuredStatement::Sequence(parts) => Stmt::Sequence(
-            parts.iter()
+            parts
+                .iter()
                 .map(|part| lower_structured_stmt(part, analysis))
                 .collect(),
         ),
@@ -243,10 +245,7 @@ fn lookup_mem_access<'a>(
         .find(|access| access.block_id == block_id && access.stmt_idx == stmt_idx)
 }
 
-fn lower_constmem_load_expr(
-    access: &MemAccessInfo,
-    analysis: &FunctionAnalysis,
-) -> Option<Expr> {
+fn lower_constmem_load_expr(access: &MemAccessInfo, analysis: &FunctionAnalysis) -> Option<Expr> {
     let stmt_ref = crate::abi::StatementRef {
         block_id: access.block_id,
         stmt_idx: access.stmt_idx,
@@ -257,7 +256,10 @@ fn lower_constmem_load_expr(
         .get(&stmt_ref)
         .and_then(|annotations| annotations.first())?;
     match &annotation.semantic {
-        ConstMemSemantic::ParamWord { param_idx, word_idx } => {
+        ConstMemSemantic::ParamWord {
+            param_idx,
+            word_idx,
+        } => {
             let rendered = analysis
                 .abi_aliases
                 .render_param_word(*param_idx, *word_idx)
@@ -268,9 +270,10 @@ fn lower_constmem_load_expr(
         ConstMemSemantic::AbiInternal(offset) => {
             Some(Expr::ConstMemSymbol(format!("abi_internal_0x{:x}", offset)))
         }
-        ConstMemSemantic::Unknown { bank, offset } => {
-            Some(Expr::ConstMemSymbol(format!("c[0x{:x}][0x{:x}]", bank, offset)))
-        }
+        ConstMemSemantic::Unknown { bank, offset } => Some(Expr::ConstMemSymbol(format!(
+            "c[0x{:x}][0x{:x}]",
+            bank, offset
+        ))),
     }
 }
 
@@ -298,7 +301,9 @@ fn lower_base_and_index(
             _ => "local_mem".to_string(),
         }),
         CudaMemorySpace::Global => match &access.root {
-            AddressRoot::ParamWord(param_idx) => Expr::Reg(global_param_base_name(*param_idx, analysis)),
+            AddressRoot::ParamWord(param_idx) => {
+                Expr::Reg(global_param_base_name(*param_idx, analysis))
+            }
             AddressRoot::RegisterBase(reg) => lower_reg_expr(reg),
             _ => lower_scalar_expr(mem_expr),
         },
@@ -309,13 +314,11 @@ fn lower_base_and_index(
         CudaMemorySpace::Param | CudaMemorySpace::Generic => lower_scalar_expr(mem_expr),
     };
     let index = match access.space {
-        CudaMemorySpace::Shared | CudaMemorySpace::Local => {
-            lower_element_index_expr(
-                addr_base.as_ref(),
-                offset.as_deref(),
-                Some(space_backing_bit_width(access.space)),
-            )
-        }
+        CudaMemorySpace::Shared | CudaMemorySpace::Local => lower_element_index_expr(
+            addr_base.as_ref(),
+            offset.as_deref(),
+            Some(space_backing_bit_width(access.space)),
+        ),
         CudaMemorySpace::Global => lower_global_index_expr(
             addr_base.as_ref(),
             offset.as_deref(),
@@ -361,12 +364,7 @@ fn lower_explicit_local_stmt(stmt: &IRStatement, access: &MemAccessInfo) -> Opti
 
 fn lower_local_byte_offset_expr(stmt: &IRStatement) -> Option<Expr> {
     let mem_expr = stmt.mem_addr_args.as_ref()?.first()?;
-    let IRExpr::Mem {
-        base,
-        offset,
-        ..
-    } = mem_expr
-    else {
+    let IRExpr::Mem { base, offset, .. } = mem_expr else {
         return None;
     };
     Some(combine_byte_offset_expr(base.as_ref(), offset.as_deref()))
@@ -402,7 +400,9 @@ fn lower_index_expr(offset: Option<&IRExpr>, bit_width: Option<u32>) -> Expr {
     match offset {
         None => Expr::Imm("0".to_string()),
         Some(IRExpr::ImmI(value)) => {
-            let bytes = bit_width.and_then(|bits| bits.checked_div(8)).filter(|bytes| *bytes > 0);
+            let bytes = bit_width
+                .and_then(|bits| bits.checked_div(8))
+                .filter(|bytes| *bytes > 0);
             if let Some(bytes) = bytes {
                 if value % i64::from(bytes) == 0 {
                     return Expr::Imm((value / i64::from(bytes)).to_string());
@@ -414,7 +414,11 @@ fn lower_index_expr(offset: Option<&IRExpr>, bit_width: Option<u32>) -> Expr {
     }
 }
 
-fn lower_element_index_expr(base: &IRExpr, offset: Option<&IRExpr>, bit_width: Option<u32>) -> Expr {
+fn lower_element_index_expr(
+    base: &IRExpr,
+    offset: Option<&IRExpr>,
+    bit_width: Option<u32>,
+) -> Expr {
     let byte_expr = combine_byte_offset_expr(base, offset);
     scale_index_expr(byte_expr, bit_width)
 }
@@ -439,7 +443,9 @@ fn combine_byte_offset_expr(base: &IRExpr, offset: Option<&IRExpr>) -> Expr {
 }
 
 fn scale_index_expr(expr: Expr, bit_width: Option<u32>) -> Expr {
-    let bytes = bit_width.and_then(|bits| bits.checked_div(8)).filter(|bytes| *bytes > 1);
+    let bytes = bit_width
+        .and_then(|bits| bits.checked_div(8))
+        .filter(|bytes| *bytes > 1);
     let Some(bytes) = bytes else {
         return expr;
     };
@@ -679,6 +685,9 @@ fn lower_structural_control_stmt(stmt: &IRStatement) -> Option<LoweredStmt> {
 }
 
 fn lower_op_expr(opcode: &str, args: &[IRExpr]) -> Expr {
+    if let Some(expr) = lower_semantic_op_expr(opcode, args) {
+        return expr;
+    }
     if let Some(expr) = lower_simple_op_expr(opcode, args) {
         return expr;
     }
@@ -688,14 +697,81 @@ fn lower_op_expr(opcode: &str, args: &[IRExpr]) -> Expr {
     }
 }
 
+fn lower_semantic_op_expr(opcode: &str, args: &[IRExpr]) -> Option<Expr> {
+    lower_setp_expr(opcode, args)
+        .or_else(|| lower_ffma_expr(opcode, args))
+        .or_else(|| lower_fmnmx_expr(opcode, args))
+        .or_else(|| lower_mufu_expr(opcode, args))
+}
+
 fn lower_simple_op_expr(opcode: &str, args: &[IRExpr]) -> Option<Expr> {
-    if opcode.contains('.') {
-        return None;
-    }
     let mnem = opcode.split('.').next().unwrap_or(opcode);
     match mnem {
+        "S2R" | "CS2R" | "S2UR" => args.first().map(lower_scalar_expr),
         "MOV" | "UMOV" | "FMOV" => args.first().map(lower_scalar_expr),
-        "IADD" | "IADD3" | "UIADD" | "UIADD3" | "FADD" => lower_add_expr(args),
+        "IADD" | "IADD3" | "UIADD" | "UIADD3" | "FADD" if !opcode.contains('.') => {
+            lower_add_expr(args)
+        }
+        _ => None,
+    }
+}
+
+fn lower_setp_expr(opcode: &str, args: &[IRExpr]) -> Option<Expr> {
+    let mnem = opcode.split('.').next().unwrap_or(opcode);
+    if !matches!(mnem, "ISETP" | "UISETP" | "FSETP" | "DSETP" | "HSETP2") || args.len() < 2 {
+        return None;
+    }
+    let parts = opcode.split('.').collect::<Vec<_>>();
+    let cmp = parts
+        .iter()
+        .skip(1)
+        .find_map(|part| setp_comparison_op(part))?;
+    let mut lhs = lower_scalar_expr(&args[0]);
+    let mut rhs = lower_scalar_expr(&args[1]);
+    if mnem == "ISETP" && !parts.iter().any(|part| *part == "U32") && !matches!(cmp, "==" | "!=") {
+        lhs = Expr::Cast {
+            ty: "int32_t".to_string(),
+            expr: Box::new(lhs),
+        };
+        rhs = Expr::Cast {
+            ty: "int32_t".to_string(),
+            expr: Box::new(rhs),
+        };
+    }
+    let cmp_expr = Expr::Binary {
+        op: cmp.to_string(),
+        lhs: Box::new(lhs),
+        rhs: Box::new(rhs),
+    };
+    let Some(combine) = args.get(2) else {
+        return Some(cmp_expr);
+    };
+    if ir_expr_is_true_pred(combine) {
+        return Some(cmp_expr);
+    }
+    if ir_expr_is_false_pred(combine) {
+        return Some(Expr::Imm("false".to_string()));
+    }
+    let combine_op = if parts.iter().any(|part| *part == "OR") {
+        "||"
+    } else {
+        "&&"
+    };
+    Some(Expr::Binary {
+        op: combine_op.to_string(),
+        lhs: Box::new(cmp_expr),
+        rhs: Box::new(lower_scalar_expr(combine)),
+    })
+}
+
+fn setp_comparison_op(part: &str) -> Option<&'static str> {
+    match part {
+        "LT" => Some("<"),
+        "LE" => Some("<="),
+        "GT" => Some(">"),
+        "GE" => Some(">="),
+        "EQ" => Some("=="),
+        "NE" => Some("!="),
         _ => None,
     }
 }
@@ -713,7 +789,75 @@ fn lower_add_expr(args: &[IRExpr]) -> Option<Expr> {
     }))
 }
 
+fn lower_ffma_expr(opcode: &str, args: &[IRExpr]) -> Option<Expr> {
+    if !opcode.split('.').next().is_some_and(|mnem| mnem == "FFMA") || args.len() != 3 {
+        return None;
+    }
+    Some(Expr::Binary {
+        op: "+".to_string(),
+        lhs: Box::new(Expr::Binary {
+            op: "*".to_string(),
+            lhs: Box::new(lower_scalar_expr(&args[0])),
+            rhs: Box::new(lower_scalar_expr(&args[1])),
+        }),
+        rhs: Box::new(lower_scalar_expr(&args[2])),
+    })
+}
+
+fn lower_fmnmx_expr(opcode: &str, args: &[IRExpr]) -> Option<Expr> {
+    if !opcode.split('.').next().is_some_and(|mnem| mnem == "FMNMX") || args.len() != 3 {
+        return None;
+    }
+    let fmin = Expr::CallLike {
+        func: "fminf".to_string(),
+        args: vec![lower_scalar_expr(&args[0]), lower_scalar_expr(&args[1])],
+    };
+    let fmax = Expr::CallLike {
+        func: "fmaxf".to_string(),
+        args: vec![lower_scalar_expr(&args[0]), lower_scalar_expr(&args[1])],
+    };
+    if ir_expr_is_true_pred(&args[2]) {
+        return Some(fmin);
+    }
+    if ir_expr_is_false_pred(&args[2]) {
+        return Some(fmax);
+    }
+    Some(Expr::Ternary {
+        cond: Box::new(lower_scalar_expr(&args[2])),
+        then_expr: Box::new(fmin),
+        else_expr: Box::new(fmax),
+    })
+}
+
+fn lower_mufu_expr(opcode: &str, args: &[IRExpr]) -> Option<Expr> {
+    if args.len() != 1 {
+        return None;
+    }
+    let func = if opcode.starts_with("MUFU.RSQ") {
+        "rsqrtf"
+    } else if opcode.starts_with("MUFU.EX2") {
+        "exp2f"
+    } else if opcode.starts_with("MUFU.LG2") {
+        "log2f"
+    } else if opcode.starts_with("MUFU.SIN") {
+        "sinf"
+    } else if opcode.starts_with("MUFU.COS") {
+        "cosf"
+    } else if opcode.starts_with("MUFU.SQRT") {
+        "sqrtf"
+    } else {
+        return None;
+    };
+    Some(Expr::CallLike {
+        func: func.to_string(),
+        args: vec![lower_scalar_expr(&args[0])],
+    })
+}
+
 fn lower_ir_op_expr(op: &str, args: &[IRExpr]) -> Expr {
+    if let Some(expr) = lower_builtin_expr(op, args) {
+        return expr;
+    }
     if let Some(expr) = lower_simple_ir_op_expr(op, args) {
         return expr;
     }
@@ -721,6 +865,28 @@ fn lower_ir_op_expr(op: &str, args: &[IRExpr]) -> Expr {
         func: op.to_string(),
         args: args.iter().map(lower_scalar_expr).collect(),
     }
+}
+
+fn lower_builtin_expr(op: &str, args: &[IRExpr]) -> Option<Expr> {
+    if !args.is_empty() {
+        return None;
+    }
+    let name = match op {
+        "SR_CTAID.X" => "blockIdx.x",
+        "SR_CTAID.Y" => "blockIdx.y",
+        "SR_CTAID.Z" => "blockIdx.z",
+        "SR_TID.X" => "threadIdx.x",
+        "SR_TID.Y" => "threadIdx.y",
+        "SR_TID.Z" => "threadIdx.z",
+        "SR_NTID.X" => "blockDim.x",
+        "SR_NTID.Y" => "blockDim.y",
+        "SR_NTID.Z" => "blockDim.z",
+        "SR_GRIDID" => "gridId",
+        "SR_LANEID" => "laneId",
+        "SRZ" => "0",
+        _ => return None,
+    };
+    Some(Expr::Builtin(name.to_string()))
 }
 
 fn lower_simple_ir_op_expr(op: &str, args: &[IRExpr]) -> Option<Expr> {
@@ -741,8 +907,7 @@ fn lower_simple_ir_op_expr(op: &str, args: &[IRExpr]) -> Option<Expr> {
 fn is_simple_binary_op(op: &str) -> bool {
     matches!(
         op,
-        "+"
-            | "-"
+        "+" | "-"
             | "*"
             | "/"
             | "%"
@@ -784,6 +949,15 @@ fn ir_expr_is_zero(expr: &IRExpr) -> bool {
         IRExpr::Reg(reg) => matches!(reg.class.as_str(), "RZ" | "URZ"),
         _ => false,
     }
+}
+
+fn ir_expr_is_true_pred(expr: &IRExpr) -> bool {
+    matches!(expr, IRExpr::Reg(reg) if matches!(reg.class.as_str(), "PT" | "UPT"))
+}
+
+fn ir_expr_is_false_pred(expr: &IRExpr) -> bool {
+    matches!(expr, IRExpr::Op { op, args } if args.is_empty() && matches!(op.as_str(), "!PT" | "!UPT"))
+        || matches!(expr, IRExpr::Op { op, args } if op == "!" && args.len() == 1 && ir_expr_is_true_pred(&args[0]))
 }
 
 fn named_param_word_expr(name: &str) -> Expr {
@@ -890,7 +1064,8 @@ mod tests {
             /*0020*/ LDG.E R6, [R4.64+0x4] ;
             /*0030*/ EXIT ;
         "#;
-        let (analysis, block_id, stmt_idx, stmt) = analyze_stmt(sass, |stmt| stmt_opcode(stmt).starts_with("LDG"));
+        let (analysis, block_id, stmt_idx, stmt) =
+            analyze_stmt(sass, |stmt| stmt_opcode(stmt).starts_with("LDG"));
         let lowered = lower_memory_stmt(block_id, stmt_idx, &stmt, &analysis).expect("lowered");
         let Stmt::Assign { src, .. } = lowered else {
             panic!("expected assign");
@@ -922,7 +1097,8 @@ mod tests {
             /*0000*/ STS [R2+0x8], R4 ;
             /*0010*/ EXIT ;
         "#;
-        let (analysis, block_id, stmt_idx, stmt) = analyze_stmt(sass, |stmt| stmt_opcode(stmt).starts_with("STS"));
+        let (analysis, block_id, stmt_idx, stmt) =
+            analyze_stmt(sass, |stmt| stmt_opcode(stmt).starts_with("STS"));
         let lowered = lower_memory_stmt(block_id, stmt_idx, &stmt, &analysis).expect("lowered");
         let Stmt::Assign { dst, .. } = lowered else {
             panic!("expected assign");
@@ -936,7 +1112,8 @@ mod tests {
             /*0000*/ STL [R2+0x8], R4 ;
             /*0010*/ EXIT ;
         "#;
-        let (analysis, block_id, stmt_idx, stmt) = analyze_stmt(sass, |stmt| stmt_opcode(stmt).starts_with("STL"));
+        let (analysis, block_id, stmt_idx, stmt) =
+            analyze_stmt(sass, |stmt| stmt_opcode(stmt).starts_with("STL"));
         let lowered = lower_basic_stmt(block_id, stmt_idx, &stmt, &analysis);
         let Stmt::ExprStmt(expr) = lowered else {
             panic!("expected explicit helper call");
@@ -1007,8 +1184,14 @@ mod tests {
             /*0010*/ LDC R5, c[0x0][0x164] ;
             /*0020*/ EXIT ;
         "#;
-        let (analysis, block_id, stmt_idx, stmt) =
-            analyze_stmt(sass, |stmt| stmt_opcode(stmt).starts_with("LDC") && stmt.defs.first().and_then(IRExpr::get_reg).is_some_and(|reg| reg.idx == 4));
+        let (analysis, block_id, stmt_idx, stmt) = analyze_stmt(sass, |stmt| {
+            stmt_opcode(stmt).starts_with("LDC")
+                && stmt
+                    .defs
+                    .first()
+                    .and_then(IRExpr::get_reg)
+                    .is_some_and(|reg| reg.idx == 4)
+        });
         let lowered = lower_memory_stmt(block_id, stmt_idx, &stmt, &analysis).expect("lowered");
         let Stmt::Assign { src, .. } = lowered else {
             panic!("expected assignment");
@@ -1227,6 +1410,60 @@ mod tests {
             panic!("expected assignment");
         };
         assert_eq!(src.render(), "IADD3.X(r2_0, r3_0, 0)");
+    }
+
+    #[test]
+    fn lowers_special_register_and_setp_ops_semantically() {
+        let s2r = lower_op_expr(
+            "S2R",
+            &[IRExpr::Op {
+                op: "SR_TID.X".to_string(),
+                args: Vec::new(),
+            }],
+        );
+        assert_eq!(s2r.render(), "threadIdx.x");
+
+        let setp = lower_op_expr(
+            "ISETP.GE.AND",
+            &[
+                IRExpr::Reg(crate::ir::RegId::new("R", 2, 1).with_ssa(0)),
+                IRExpr::ImmI(1),
+                IRExpr::Reg(crate::ir::RegId::new("PT", 0, 1)),
+            ],
+        );
+        assert_eq!(setp.render(), "(int32_t)(r2_0) >= (int32_t)(1)");
+    }
+
+    #[test]
+    fn lowers_ffma_fmnmx_and_mufu_ops_semantically() {
+        let ffma = lower_op_expr(
+            "FFMA.FTZ",
+            &[
+                IRExpr::Reg(crate::ir::RegId::new("R", 1, 1).with_ssa(0)),
+                IRExpr::Reg(crate::ir::RegId::new("R", 2, 1).with_ssa(0)),
+                IRExpr::Reg(crate::ir::RegId::new("R", 3, 1).with_ssa(0)),
+            ],
+        );
+        assert_eq!(ffma.render(), "r1_0 * r2_0 + r3_0");
+
+        let fmnmx = lower_op_expr(
+            "FMNMX",
+            &[
+                IRExpr::Reg(crate::ir::RegId::new("R", 1, 1).with_ssa(0)),
+                IRExpr::Reg(crate::ir::RegId::new("R", 2, 1).with_ssa(0)),
+                IRExpr::Op {
+                    op: "!PT".to_string(),
+                    args: Vec::new(),
+                },
+            ],
+        );
+        assert_eq!(fmnmx.render(), "fmaxf(r1_0, r2_0)");
+
+        let mufu = lower_op_expr(
+            "MUFU.EX2",
+            &[IRExpr::Reg(crate::ir::RegId::new("R", 4, 1).with_ssa(0))],
+        );
+        assert_eq!(mufu.render(), "exp2f(r4_0)");
     }
 
     #[test]
