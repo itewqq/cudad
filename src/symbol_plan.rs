@@ -23,6 +23,7 @@ use std::collections::BTreeSet;
 
 use crate::abi::{ArgAlias, ArgAliasKind, ArgScalarKind};
 use crate::ast::{Decl, Expr, LValue, StorageClass, StructuredFunction, Stmt};
+use crate::backend_names::is_predicate_ident;
 use crate::function_analysis::FunctionAnalysis;
 use crate::memory_model::CudaMemorySpace;
 
@@ -224,7 +225,7 @@ fn maybe_add_local(name: &str, locals: &mut Vec<Decl>, seen: &mut BTreeSet<Strin
     seen.insert(name.to_string());
     locals.push(Decl {
         name: name.to_string(),
-        ty: if name.starts_with('b') {
+        ty: if name.starts_with('b') || is_predicate_ident(name) {
             "bool".to_string()
         } else {
             "uint32_t".to_string()

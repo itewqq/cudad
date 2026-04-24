@@ -23,6 +23,7 @@
 //! - repair names or declarations after rendering
 
 use crate::ast::{Expr, LValue, Stmt};
+use crate::backend_names::canonical_reg_ident;
 use crate::function_analysis::{AddressRoot, FunctionAnalysis, MemAccessInfo};
 use crate::ir::{IRExpr, IRStatement, RValue};
 use crate::memory_model::{CudaMemorySpace, MemAccessKind};
@@ -41,7 +42,7 @@ pub fn lower_memory_stmt(
             let dst = stmt.defs.first()?.get_reg()?;
             let src = lower_memory_load_expr(stmt, access, analysis)?;
             Some(Stmt::Assign {
-                dst: LValue::Var(dst.display()),
+                dst: LValue::Var(lower_reg_name(dst)),
                 src,
             })
         }
@@ -216,7 +217,7 @@ fn lower_base_and_index(
         }),
         CudaMemorySpace::Global => match &access.root {
             AddressRoot::ParamWord(param_idx) => Expr::Reg(global_param_base_name(*param_idx, analysis)),
-            AddressRoot::RegisterBase(reg) => Expr::Reg(reg.display()),
+            AddressRoot::RegisterBase(reg) => lower_reg_expr(reg),
             _ => lower_scalar_expr(mem_expr),
         },
         CudaMemorySpace::Const => match &access.root {
@@ -301,7 +302,7 @@ fn atomic_func_name(opcode: &str) -> &'static str {
 
 fn lower_scalar_expr(expr: &IRExpr) -> Expr {
     match expr {
-        IRExpr::Reg(reg) => Expr::Reg(reg.display()),
+        IRExpr::Reg(reg) => lower_reg_expr(reg),
         IRExpr::ImmI(value) => Expr::Imm(value.to_string()),
         IRExpr::ImmF(value) => Expr::Imm(value.to_string()),
         IRExpr::Addr64 { lo, hi } => Expr::CallLike {
@@ -344,7 +345,7 @@ fn lower_non_memory_stmt(stmt: &IRStatement) -> Stmt {
             };
             if let Some(def) = stmt.defs.first().and_then(|expr| expr.get_reg()) {
                 Stmt::Assign {
-                    dst: LValue::Var(def.display()),
+                    dst: LValue::Var(lower_reg_name(def)),
                     src: rhs,
                 }
             } else {
@@ -358,7 +359,7 @@ fn lower_non_memory_stmt(stmt: &IRStatement) -> Stmt {
             };
             if let Some(def) = stmt.defs.first().and_then(|expr| expr.get_reg()) {
                 Stmt::Assign {
-                    dst: LValue::Var(def.display()),
+                    dst: LValue::Var(lower_reg_name(def)),
                     src: rhs,
                 }
             } else {
@@ -369,7 +370,7 @@ fn lower_non_memory_stmt(stmt: &IRStatement) -> Stmt {
             let src = Expr::Imm(value.to_string());
             if let Some(def) = stmt.defs.first().and_then(|expr| expr.get_reg()) {
                 Stmt::Assign {
-                    dst: LValue::Var(def.display()),
+                    dst: LValue::Var(lower_reg_name(def)),
                     src,
                 }
             } else {
@@ -380,7 +381,7 @@ fn lower_non_memory_stmt(stmt: &IRStatement) -> Stmt {
             let src = Expr::Imm(value.to_string());
             if let Some(def) = stmt.defs.first().and_then(|expr| expr.get_reg()) {
                 Stmt::Assign {
-                    dst: LValue::Var(def.display()),
+                    dst: LValue::Var(lower_reg_name(def)),
                     src,
                 }
             } else {
@@ -388,6 +389,22 @@ fn lower_non_memory_stmt(stmt: &IRStatement) -> Stmt {
             }
         }
     }
+}
+
+fn lower_reg_expr(reg: &crate::ir::RegId) -> Expr {
+    match reg.class.as_str() {
+        "RZ" | "URZ" => Expr::Imm("0".to_string()),
+        "PT" | "UPT" => Expr::Imm("true".to_string()),
+        _ if reg.sign < 0 => Expr::Unary {
+            op: "-".to_string(),
+            arg: Box::new(Expr::Reg(lower_reg_name(reg))),
+        },
+        _ => Expr::Reg(lower_reg_name(reg)),
+    }
+}
+
+fn lower_reg_name(reg: &crate::ir::RegId) -> String {
+    canonical_reg_ident(reg)
 }
 
 #[cfg(test)]
@@ -482,7 +499,7 @@ mod tests {
         };
         let lowered = lower_structured_stmt(&structured, &analysis);
         let rendered = lowered.render_with_indent(0);
-        assert!(rendered.contains("if (P0)"));
-        assert!(rendered.contains("R4 = MOV(1);"));
+        assert!(rendered.contains("if (p0)"));
+        assert!(rendered.contains("r4 = MOV(1);"));
     }
 }
