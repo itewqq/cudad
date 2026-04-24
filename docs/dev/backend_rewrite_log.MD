@@ -98,6 +98,12 @@
   `UIADD3.64` structurally, which removes another class of raw wide-add helper
   leaks even in functions where structurization still leaves `goto` blocks and
   the canonical dead-temp pass stays conservative.
+- Canonical scalar lowering now resolves scalar `ConstMem(bank, off)` operands
+  through the ABI/profile fact base, so non-memory ops can render param aliases
+  and builtin symbols instead of leaking raw `ConstMem(...)` calls.
+- Canonical scalar lowering now handles `IABS` and `MUFU.RCP` semantically,
+  which restores `abs(...)` / `rcp_approx(...)` rendering on the canonical path
+  without reviving semantic-lift side tables.
 - Shared-memory declaration planning now carries the pointee type recovered
   from SSA/shared round-trips into canonical symbol planning, so canonical
   `shmem` backing objects can render as `float` instead of a hard-coded
@@ -120,9 +126,10 @@
 
 1. Switch the remaining curated full-pass tests and helper entrypoints from the
    old structured-output path onto the canonical driver, starting with the
-   fixtures that now pass thanks to semantic scalar lowering, recursive rooted
-   offset expansion, `UIADD3.64` root propagation, and the raw `IADD.64`
-   helper-lowering cleanup plus typed shared-backing declarations.
+   fixtures that now pass thanks to semantic scalar lowering of `ConstMem`,
+   `IABS`, and `MUFU.RCP`, plus recursive rooted offset expansion,
+   `UIADD3.64` root propagation, the raw `IADD.64` helper-lowering cleanup,
+   and typed shared-backing declarations.
 2. Delete duplicated CLI/test helper logic that still builds semantic-lift,
    token-map, or post-render cleanup artifacts after the canonical path is
    proven on those fixtures.

@@ -73,7 +73,7 @@ fn lower_memory_stmt_detail(
         }
         MemAccessKind::Store => {
             let dst = lower_memory_store_lvalue(stmt, access, analysis)?;
-            let src = store_value_expr(stmt)?;
+            let src = store_value_expr(stmt, Some(analysis))?;
             Some(LoweredStmt {
                 stmt: Stmt::Assign { dst, src },
                 predicate_def_idx: None,
@@ -96,7 +96,7 @@ fn lower_memory_stmt_detail(
                 stmt_args(stmt)
                     .iter()
                     .filter(|expr| !matches!(expr, IRExpr::Mem { .. }))
-                    .map(lower_scalar_expr),
+                    .map(|expr| lower_scalar_expr_with_analysis(expr, Some(analysis))),
             );
             if opcode.contains(".POPC.INC") && args.len() == 1 {
                 args.push(Expr::Imm("1".to_string()));
@@ -165,7 +165,7 @@ pub fn lower_structured_stmt(
             else_branch,
             ..
         } => Stmt::If {
-            condition: lower_scalar_expr(condition_expr),
+            condition: lower_scalar_expr_with_analysis(condition_expr, Some(analysis)),
             then_branch: Box::new(lower_structured_stmt(then_branch, analysis)),
             else_branch: else_branch
                 .as_ref()
@@ -258,26 +258,7 @@ fn lower_constmem_load_expr(access: &MemAccessInfo, analysis: &FunctionAnalysis)
         .constmem_by_stmt
         .get(&stmt_ref)
         .and_then(|annotations| annotations.first())?;
-    match &annotation.semantic {
-        ConstMemSemantic::ParamWord {
-            param_idx,
-            word_idx,
-        } => {
-            let rendered = analysis
-                .abi_aliases
-                .render_param_word(*param_idx, *word_idx)
-                .unwrap_or_else(|| format!("param_{}", param_idx.saturating_add(*word_idx)));
-            Some(named_param_word_expr(&rendered))
-        }
-        ConstMemSemantic::Builtin(name) => Some(Expr::Builtin((*name).to_string())),
-        ConstMemSemantic::AbiInternal(offset) => {
-            Some(Expr::ConstMemSymbol(format!("abi_internal_0x{:x}", offset)))
-        }
-        ConstMemSemantic::Unknown { bank, offset } => Some(Expr::ConstMemSymbol(format!(
-            "c[0x{:x}][0x{:x}]",
-            bank, offset
-        ))),
-    }
+    Some(constmem_semantic_expr(&annotation.semantic, analysis))
 }
 
 fn lower_base_and_index(
@@ -308,19 +289,22 @@ fn lower_base_and_index(
                 Expr::Reg(global_param_base_name(*param_idx, analysis))
             }
             AddressRoot::RegisterBase(reg) => lower_reg_expr(reg),
-            _ => lower_scalar_expr(mem_expr),
+            _ => lower_scalar_expr_with_analysis(mem_expr, Some(analysis)),
         },
         CudaMemorySpace::Const => match &access.root {
             AddressRoot::ConstSymbol(name) => Expr::ConstMemSymbol(name.clone()),
-            _ => lower_scalar_expr(mem_expr),
+            _ => lower_scalar_expr_with_analysis(mem_expr, Some(analysis)),
         },
-        CudaMemorySpace::Param | CudaMemorySpace::Generic => lower_scalar_expr(mem_expr),
+        CudaMemorySpace::Param | CudaMemorySpace::Generic => {
+            lower_scalar_expr_with_analysis(mem_expr, Some(analysis))
+        }
     };
     let index = match access.space {
         CudaMemorySpace::Shared | CudaMemorySpace::Local => lower_element_index_expr(
             addr_base.as_ref(),
             offset.as_deref(),
             Some(space_backing_bit_width(access.space)),
+            Some(analysis),
         ),
         CudaMemorySpace::Global => lower_global_index_expr(
             addr_base.as_ref(),
@@ -329,7 +313,7 @@ fn lower_base_and_index(
             analysis,
             access.bit_width.or(*width),
         ),
-        _ => lower_index_expr(offset.as_deref(), access.bit_width.or(*width)),
+        _ => lower_index_expr(offset.as_deref(), access.bit_width.or(*width), Some(analysis)),
     };
     Some((base, index))
 }
@@ -352,7 +336,7 @@ fn lower_explicit_local_stmt(stmt: &IRStatement, access: &MemAccessInfo) -> Opti
             })
         }
         MemAccessKind::Store => {
-            let src = store_value_expr(stmt)?;
+            let src = store_value_expr(stmt, None)?;
             Some(LoweredStmt {
                 stmt: Stmt::ExprStmt(Expr::CallLike {
                     func: local_space_helper_name("store", access),
@@ -370,7 +354,7 @@ fn lower_local_byte_offset_expr(stmt: &IRStatement) -> Option<Expr> {
     let IRExpr::Mem { base, offset, .. } = mem_expr else {
         return None;
     };
-    Some(combine_byte_offset_expr(base.as_ref(), offset.as_deref()))
+    Some(combine_byte_offset_expr(base.as_ref(), offset.as_deref(), None))
 }
 
 fn local_space_helper_name(prefix: &str, access: &MemAccessInfo) -> String {
@@ -399,7 +383,11 @@ fn space_backing_bit_width(space: CudaMemorySpace) -> u32 {
     }
 }
 
-fn lower_index_expr(offset: Option<&IRExpr>, bit_width: Option<u32>) -> Expr {
+fn lower_index_expr(
+    offset: Option<&IRExpr>,
+    bit_width: Option<u32>,
+    analysis: Option<&FunctionAnalysis>,
+) -> Expr {
     match offset {
         None => Expr::Imm("0".to_string()),
         Some(IRExpr::ImmI(value)) => {
@@ -413,7 +401,7 @@ fn lower_index_expr(offset: Option<&IRExpr>, bit_width: Option<u32>) -> Expr {
             }
             Expr::Imm(value.to_string())
         }
-        Some(expr) => lower_scalar_expr(expr),
+        Some(expr) => lower_scalar_expr_with_analysis(expr, analysis),
     }
 }
 
@@ -421,18 +409,23 @@ fn lower_element_index_expr(
     base: &IRExpr,
     offset: Option<&IRExpr>,
     bit_width: Option<u32>,
+    analysis: Option<&FunctionAnalysis>,
 ) -> Expr {
-    let byte_expr = combine_byte_offset_expr(base, offset);
+    let byte_expr = combine_byte_offset_expr(base, offset, analysis);
     scale_index_expr(byte_expr, bit_width)
 }
 
-fn combine_byte_offset_expr(base: &IRExpr, offset: Option<&IRExpr>) -> Expr {
+fn combine_byte_offset_expr(
+    base: &IRExpr,
+    offset: Option<&IRExpr>,
+    analysis: Option<&FunctionAnalysis>,
+) -> Expr {
     let mut terms = Vec::new();
     if !ir_expr_is_zero(base) {
-        terms.push(lower_scalar_expr(base));
+        terms.push(lower_scalar_expr_with_analysis(base, analysis));
     }
     if let Some(offset) = offset.filter(|expr| !ir_expr_is_zero(expr)) {
-        terms.push(lower_scalar_expr(offset));
+        terms.push(lower_scalar_expr_with_analysis(offset, analysis));
     }
     match terms.len() {
         0 => Expr::Imm("0".to_string()),
@@ -497,9 +490,9 @@ fn lower_global_index_expr(
     bit_width: Option<u32>,
 ) -> Expr {
     let Some(rooted_offset) = rooted_global_byte_offset(addr_base, access, analysis) else {
-        return lower_index_expr(offset, bit_width);
+        return lower_index_expr(offset, bit_width, Some(analysis));
     };
-    let byte_expr = combine_byte_offset_expr(&rooted_offset, offset);
+    let byte_expr = combine_byte_offset_expr(&rooted_offset, offset, Some(analysis));
     scale_index_expr(byte_expr, bit_width)
 }
 
@@ -512,11 +505,11 @@ fn global_param_base_name(param_idx: u32, analysis: &FunctionAnalysis) -> String
     format!("param_{}", param_idx)
 }
 
-fn store_value_expr(stmt: &IRStatement) -> Option<Expr> {
+fn store_value_expr(stmt: &IRStatement, analysis: Option<&FunctionAnalysis>) -> Option<Expr> {
     stmt_args(stmt)
         .iter()
         .find(|expr| !matches!(expr, IRExpr::Mem { .. }))
-        .map(lower_scalar_expr)
+        .map(|expr| lower_scalar_expr_with_analysis(expr, analysis))
 }
 
 fn stmt_args(stmt: &IRStatement) -> &[IRExpr] {
@@ -558,16 +551,20 @@ fn atomic_func_name(opcode: &str) -> &'static str {
 }
 
 fn lower_scalar_expr(expr: &IRExpr) -> Expr {
+    lower_scalar_expr_with_analysis(expr, None)
+}
+
+fn lower_scalar_expr_with_analysis(expr: &IRExpr, analysis: Option<&FunctionAnalysis>) -> Expr {
     match expr {
         IRExpr::Reg(reg) => lower_reg_expr(reg),
         IRExpr::ImmI(value) => Expr::Imm(value.to_string()),
         IRExpr::ImmF(value) => Expr::Imm(value.to_string()),
         IRExpr::Addr64 { lo, hi } => Expr::Addr64 {
-            lo: Box::new(lower_scalar_expr(lo)),
-            hi: Box::new(lower_scalar_expr(hi)),
+            lo: Box::new(lower_scalar_expr_with_analysis(lo, analysis)),
+            hi: Box::new(lower_scalar_expr_with_analysis(hi, analysis)),
         },
         IRExpr::Mem { .. } => Expr::Raw("/*mem*/".to_string()),
-        IRExpr::Op { op, args } => lower_ir_op_expr(op, args),
+        IRExpr::Op { op, args } => lower_ir_op_expr_with_analysis(op, args, analysis),
     }
 }
 
@@ -578,17 +575,25 @@ fn lower_basic_stmt(
     analysis: &FunctionAnalysis,
 ) -> Stmt {
     let lowered = lower_memory_stmt_detail(block_id, stmt_idx, stmt, analysis)
-        .unwrap_or_else(|| lower_non_memory_stmt(stmt));
+        .unwrap_or_else(|| lower_non_memory_stmt_with_analysis(stmt, Some(analysis)));
     apply_stmt_predicate(stmt, lowered)
 }
 
+#[cfg(test)]
 fn lower_non_memory_stmt(stmt: &IRStatement) -> LoweredStmt {
+    lower_non_memory_stmt_with_analysis(stmt, None)
+}
+
+fn lower_non_memory_stmt_with_analysis(
+    stmt: &IRStatement,
+    analysis: Option<&FunctionAnalysis>,
+) -> LoweredStmt {
     if let Some(lowered) = lower_structural_control_stmt(stmt) {
         return lowered;
     }
     match &stmt.value {
         RValue::Op { opcode, args } => {
-            let rhs = lower_op_expr(opcode, args);
+            let rhs = lower_op_expr_with_analysis(opcode, args, analysis);
             if let Some(def) = stmt.defs.first().and_then(|expr| expr.get_reg()) {
                 LoweredStmt {
                     stmt: Stmt::Assign {
@@ -607,7 +612,10 @@ fn lower_non_memory_stmt(stmt: &IRStatement) -> LoweredStmt {
         RValue::Phi(args) => {
             let rhs = Expr::CallLike {
                 func: "phi".to_string(),
-                args: args.iter().map(lower_scalar_expr).collect(),
+                args: args
+                    .iter()
+                    .map(|arg| lower_scalar_expr_with_analysis(arg, analysis))
+                    .collect(),
             };
             if let Some(def) = stmt.defs.first().and_then(|expr| expr.get_reg()) {
                 LoweredStmt {
@@ -687,40 +695,69 @@ fn lower_structural_control_stmt(stmt: &IRStatement) -> Option<LoweredStmt> {
     })
 }
 
+#[cfg(test)]
 fn lower_op_expr(opcode: &str, args: &[IRExpr]) -> Expr {
-    if let Some(expr) = lower_semantic_op_expr(opcode, args) {
+    lower_op_expr_with_analysis(opcode, args, None)
+}
+
+fn lower_op_expr_with_analysis(
+    opcode: &str,
+    args: &[IRExpr],
+    analysis: Option<&FunctionAnalysis>,
+) -> Expr {
+    if let Some(expr) = lower_semantic_op_expr(opcode, args, analysis) {
         return expr;
     }
-    if let Some(expr) = lower_simple_op_expr(opcode, args) {
+    if let Some(expr) = lower_simple_op_expr(opcode, args, analysis) {
         return expr;
     }
     Expr::CallLike {
         func: opcode.to_string(),
-        args: args.iter().map(lower_scalar_expr).collect(),
+        args: args
+            .iter()
+            .map(|arg| lower_scalar_expr_with_analysis(arg, analysis))
+            .collect(),
     }
 }
 
-fn lower_semantic_op_expr(opcode: &str, args: &[IRExpr]) -> Option<Expr> {
-    lower_setp_expr(opcode, args)
-        .or_else(|| lower_wide_add_lo_expr(opcode, args))
-        .or_else(|| lower_ffma_expr(opcode, args))
-        .or_else(|| lower_fmnmx_expr(opcode, args))
-        .or_else(|| lower_mufu_expr(opcode, args))
+fn lower_semantic_op_expr(
+    opcode: &str,
+    args: &[IRExpr],
+    analysis: Option<&FunctionAnalysis>,
+) -> Option<Expr> {
+    lower_setp_expr(opcode, args, analysis)
+        .or_else(|| lower_wide_add_lo_expr(opcode, args, analysis))
+        .or_else(|| lower_iabs_expr(opcode, args, analysis))
+        .or_else(|| lower_ffma_expr(opcode, args, analysis))
+        .or_else(|| lower_fmnmx_expr(opcode, args, analysis))
+        .or_else(|| lower_mufu_expr(opcode, args, analysis))
 }
 
-fn lower_simple_op_expr(opcode: &str, args: &[IRExpr]) -> Option<Expr> {
+fn lower_simple_op_expr(
+    opcode: &str,
+    args: &[IRExpr],
+    analysis: Option<&FunctionAnalysis>,
+) -> Option<Expr> {
     let mnem = opcode.split('.').next().unwrap_or(opcode);
     match mnem {
-        "S2R" | "CS2R" | "S2UR" => args.first().map(lower_scalar_expr),
-        "MOV" | "UMOV" | "FMOV" => args.first().map(lower_scalar_expr),
+        "S2R" | "CS2R" | "S2UR" => args
+            .first()
+            .map(|arg| lower_scalar_expr_with_analysis(arg, analysis)),
+        "MOV" | "UMOV" | "FMOV" => args
+            .first()
+            .map(|arg| lower_scalar_expr_with_analysis(arg, analysis)),
         "IADD" | "IADD3" | "UIADD" | "UIADD3" | "FADD" if !opcode.contains('.') => {
-            lower_add_expr(args)
+            lower_add_expr(args, analysis)
         }
         _ => None,
     }
 }
 
-fn lower_setp_expr(opcode: &str, args: &[IRExpr]) -> Option<Expr> {
+fn lower_setp_expr(
+    opcode: &str,
+    args: &[IRExpr],
+    analysis: Option<&FunctionAnalysis>,
+) -> Option<Expr> {
     let mnem = opcode.split('.').next().unwrap_or(opcode);
     if !matches!(mnem, "ISETP" | "UISETP" | "FSETP" | "DSETP" | "HSETP2") || args.len() < 2 {
         return None;
@@ -730,8 +767,8 @@ fn lower_setp_expr(opcode: &str, args: &[IRExpr]) -> Option<Expr> {
         .iter()
         .skip(1)
         .find_map(|part| setp_comparison_op(part))?;
-    let mut lhs = lower_scalar_expr(&args[0]);
-    let mut rhs = lower_scalar_expr(&args[1]);
+    let mut lhs = lower_scalar_expr_with_analysis(&args[0], analysis);
+    let mut rhs = lower_scalar_expr_with_analysis(&args[1], analysis);
     if mnem == "ISETP" && !parts.iter().any(|part| *part == "U32") && !matches!(cmp, "==" | "!=") {
         lhs = Expr::Cast {
             ty: "int32_t".to_string(),
@@ -764,7 +801,7 @@ fn lower_setp_expr(opcode: &str, args: &[IRExpr]) -> Option<Expr> {
     Some(Expr::Binary {
         op: combine_op.to_string(),
         lhs: Box::new(cmp_expr),
-        rhs: Box::new(lower_scalar_expr(combine)),
+        rhs: Box::new(lower_scalar_expr_with_analysis(combine, analysis)),
     })
 }
 
@@ -780,11 +817,11 @@ fn setp_comparison_op(part: &str) -> Option<&'static str> {
     }
 }
 
-fn lower_add_expr(args: &[IRExpr]) -> Option<Expr> {
+fn lower_add_expr(args: &[IRExpr], analysis: Option<&FunctionAnalysis>) -> Option<Expr> {
     let mut terms = args
         .iter()
         .filter(|expr| !ir_expr_is_zero(expr))
-        .map(lower_scalar_expr);
+        .map(|expr| lower_scalar_expr_with_analysis(expr, analysis));
     let first = terms.next()?;
     Some(terms.fold(first, |lhs, rhs| Expr::Binary {
         op: "+".to_string(),
@@ -793,7 +830,21 @@ fn lower_add_expr(args: &[IRExpr]) -> Option<Expr> {
     }))
 }
 
-fn lower_ffma_expr(opcode: &str, args: &[IRExpr]) -> Option<Expr> {
+fn lower_iabs_expr(
+    opcode: &str,
+    args: &[IRExpr],
+    analysis: Option<&FunctionAnalysis>,
+) -> Option<Expr> {
+    if !opcode.starts_with("IABS") || args.len() != 1 {
+        return None;
+    }
+    Some(Expr::CallLike {
+        func: "abs".to_string(),
+        args: vec![lower_scalar_expr_with_analysis(&args[0], analysis)],
+    })
+}
+
+fn lower_ffma_expr(opcode: &str, args: &[IRExpr], analysis: Option<&FunctionAnalysis>) -> Option<Expr> {
     if opcode != "FFMA" || args.len() != 3 {
         return None;
     }
@@ -801,24 +852,34 @@ fn lower_ffma_expr(opcode: &str, args: &[IRExpr]) -> Option<Expr> {
         op: "+".to_string(),
         lhs: Box::new(Expr::Binary {
             op: "*".to_string(),
-            lhs: Box::new(lower_scalar_expr(&args[0])),
-            rhs: Box::new(lower_scalar_expr(&args[1])),
+            lhs: Box::new(lower_scalar_expr_with_analysis(&args[0], analysis)),
+            rhs: Box::new(lower_scalar_expr_with_analysis(&args[1], analysis)),
         }),
-        rhs: Box::new(lower_scalar_expr(&args[2])),
+        rhs: Box::new(lower_scalar_expr_with_analysis(&args[2], analysis)),
     })
 }
 
-fn lower_fmnmx_expr(opcode: &str, args: &[IRExpr]) -> Option<Expr> {
+fn lower_fmnmx_expr(
+    opcode: &str,
+    args: &[IRExpr],
+    analysis: Option<&FunctionAnalysis>,
+) -> Option<Expr> {
     if opcode != "FMNMX" || args.len() != 3 {
         return None;
     }
     let fmin = Expr::CallLike {
         func: "fminf".to_string(),
-        args: vec![lower_scalar_expr(&args[0]), lower_scalar_expr(&args[1])],
+        args: vec![
+            lower_scalar_expr_with_analysis(&args[0], analysis),
+            lower_scalar_expr_with_analysis(&args[1], analysis),
+        ],
     };
     let fmax = Expr::CallLike {
         func: "fmaxf".to_string(),
-        args: vec![lower_scalar_expr(&args[0]), lower_scalar_expr(&args[1])],
+        args: vec![
+            lower_scalar_expr_with_analysis(&args[0], analysis),
+            lower_scalar_expr_with_analysis(&args[1], analysis),
+        ],
     };
     if ir_expr_is_true_pred(&args[2]) {
         return Some(fmin);
@@ -827,17 +888,23 @@ fn lower_fmnmx_expr(opcode: &str, args: &[IRExpr]) -> Option<Expr> {
         return Some(fmax);
     }
     Some(Expr::Ternary {
-        cond: Box::new(lower_scalar_expr(&args[2])),
+        cond: Box::new(lower_scalar_expr_with_analysis(&args[2], analysis)),
         then_expr: Box::new(fmin),
         else_expr: Box::new(fmax),
     })
 }
 
-fn lower_mufu_expr(opcode: &str, args: &[IRExpr]) -> Option<Expr> {
+fn lower_mufu_expr(
+    opcode: &str,
+    args: &[IRExpr],
+    analysis: Option<&FunctionAnalysis>,
+) -> Option<Expr> {
     if args.len() != 1 {
         return None;
     }
-    let func = if opcode.starts_with("MUFU.RSQ") {
+    let func = if opcode.starts_with("MUFU.RCP") {
+        "rcp_approx"
+    } else if opcode.starts_with("MUFU.RSQ") {
         "rsqrtf"
     } else if opcode.starts_with("MUFU.EX2") {
         "exp2f"
@@ -854,23 +921,27 @@ fn lower_mufu_expr(opcode: &str, args: &[IRExpr]) -> Option<Expr> {
     };
     Some(Expr::CallLike {
         func: func.to_string(),
-        args: vec![lower_scalar_expr(&args[0])],
+        args: vec![lower_scalar_expr_with_analysis(&args[0], analysis)],
     })
 }
 
-fn lower_wide_add_lo_expr(opcode: &str, args: &[IRExpr]) -> Option<Expr> {
+fn lower_wide_add_lo_expr(
+    opcode: &str,
+    args: &[IRExpr],
+    analysis: Option<&FunctionAnalysis>,
+) -> Option<Expr> {
     let wide_value = if opcode == "IADD.64" && args.len() == 4 {
         Some(add_expr(
-            lower_wide_input_expr(&args[0], &args[2]),
-            lower_wide_input_expr(&args[1], &args[3]),
+            lower_wide_input_expr(&args[0], &args[2], analysis),
+            lower_wide_input_expr(&args[1], &args[3], analysis),
         ))
     } else if matches!(opcode, "IADD3.64" | "UIADD3.64") && args.len() == 6 {
         Some(add_expr(
             add_expr(
-                lower_wide_input_expr(&args[0], &args[3]),
-                lower_wide_input_expr(&args[1], &args[4]),
+                lower_wide_input_expr(&args[0], &args[3], analysis),
+                lower_wide_input_expr(&args[1], &args[4], analysis),
             ),
-            lower_wide_input_expr(&args[2], &args[5]),
+            lower_wide_input_expr(&args[2], &args[5], analysis),
         ))
     } else {
         None
@@ -881,19 +952,19 @@ fn lower_wide_add_lo_expr(opcode: &str, args: &[IRExpr]) -> Option<Expr> {
     })
 }
 
-fn lower_wide_input_expr(lo: &IRExpr, hi: &IRExpr) -> Expr {
+fn lower_wide_input_expr(lo: &IRExpr, hi: &IRExpr, analysis: Option<&FunctionAnalysis>) -> Expr {
     if ir_expr_is_zero(hi) {
         return Expr::Cast {
             ty: "uint64_t".to_string(),
             expr: Box::new(Expr::Cast {
                 ty: "uint32_t".to_string(),
-                expr: Box::new(lower_scalar_expr(lo)),
+                expr: Box::new(lower_scalar_expr_with_analysis(lo, analysis)),
             }),
         };
     }
     Expr::Addr64 {
-        lo: Box::new(lower_scalar_expr(lo)),
-        hi: Box::new(lower_scalar_expr(hi)),
+        lo: Box::new(lower_scalar_expr_with_analysis(lo, analysis)),
+        hi: Box::new(lower_scalar_expr_with_analysis(hi, analysis)),
     }
 }
 
@@ -911,17 +982,47 @@ fn add_expr(lhs: Expr, rhs: Expr) -> Expr {
     }
 }
 
-fn lower_ir_op_expr(op: &str, args: &[IRExpr]) -> Expr {
+fn lower_ir_op_expr_with_analysis(
+    op: &str,
+    args: &[IRExpr],
+    analysis: Option<&FunctionAnalysis>,
+) -> Expr {
+    if let Some(expr) = lower_constmem_ir_op_expr(op, args, analysis) {
+        return expr;
+    }
     if let Some(expr) = lower_builtin_expr(op, args) {
         return expr;
     }
-    if let Some(expr) = lower_simple_ir_op_expr(op, args) {
+    if let Some(expr) = lower_simple_ir_op_expr(op, args, analysis) {
         return expr;
     }
     Expr::CallLike {
         func: op.to_string(),
-        args: args.iter().map(lower_scalar_expr).collect(),
+        args: args
+            .iter()
+            .map(|arg| lower_scalar_expr_with_analysis(arg, analysis))
+            .collect(),
     }
+}
+
+fn lower_constmem_ir_op_expr(
+    op: &str,
+    args: &[IRExpr],
+    analysis: Option<&FunctionAnalysis>,
+) -> Option<Expr> {
+    if op != "ConstMem" || args.len() != 2 {
+        return None;
+    }
+    let bank = expr_i64(&args[0]).and_then(|value| u32::try_from(value).ok())?;
+    let offset = expr_i64(&args[1]).and_then(|value| u32::try_from(value).ok())?;
+    let semantic = analysis
+        .and_then(|facts| facts.abi_profile)
+        .map(|profile| profile.classify_constmem(bank, offset))
+        .unwrap_or(ConstMemSemantic::Unknown { bank, offset });
+    Some(match analysis {
+        Some(facts) => constmem_semantic_expr(&semantic, facts),
+        None => Expr::ConstMemSymbol(format!("c[0x{:x}][0x{:x}]", bank, offset)),
+    })
 }
 
 fn lower_builtin_expr(op: &str, args: &[IRExpr]) -> Option<Expr> {
@@ -946,16 +1047,20 @@ fn lower_builtin_expr(op: &str, args: &[IRExpr]) -> Option<Expr> {
     Some(Expr::Builtin(name.to_string()))
 }
 
-fn lower_simple_ir_op_expr(op: &str, args: &[IRExpr]) -> Option<Expr> {
+fn lower_simple_ir_op_expr(
+    op: &str,
+    args: &[IRExpr],
+    analysis: Option<&FunctionAnalysis>,
+) -> Option<Expr> {
     match (op, args) {
         ("!", [arg]) | ("-", [arg]) => Some(Expr::Unary {
             op: op.to_string(),
-            arg: Box::new(lower_scalar_expr(arg)),
+            arg: Box::new(lower_scalar_expr_with_analysis(arg, analysis)),
         }),
         (binary_op, [lhs, rhs]) if is_simple_binary_op(binary_op) => Some(Expr::Binary {
             op: binary_op.to_string(),
-            lhs: Box::new(lower_scalar_expr(lhs)),
-            rhs: Box::new(lower_scalar_expr(rhs)),
+            lhs: Box::new(lower_scalar_expr_with_analysis(lhs, analysis)),
+            rhs: Box::new(lower_scalar_expr_with_analysis(rhs, analysis)),
         }),
         _ => None,
     }
@@ -1168,6 +1273,35 @@ fn apply_stmt_predicate(stmt: &IRStatement, lowered: LoweredStmt) -> Stmt {
     }
 }
 
+fn constmem_semantic_expr(semantic: &ConstMemSemantic, analysis: &FunctionAnalysis) -> Expr {
+    match semantic {
+        ConstMemSemantic::ParamWord {
+            param_idx,
+            word_idx,
+        } => {
+            let rendered = analysis
+                .abi_aliases
+                .render_param_word(*param_idx, *word_idx)
+                .unwrap_or_else(|| format!("param_{}", param_idx.saturating_add(*word_idx)));
+            named_param_word_expr(&rendered)
+        }
+        ConstMemSemantic::Builtin(name) => Expr::Builtin((*name).to_string()),
+        ConstMemSemantic::AbiInternal(offset) => {
+            Expr::ConstMemSymbol(format!("abi_internal_0x{:x}", offset))
+        }
+        ConstMemSemantic::Unknown { bank, offset } => {
+            Expr::ConstMemSymbol(format!("c[0x{:x}][0x{:x}]", bank, offset))
+        }
+    }
+}
+
+fn expr_i64(expr: &IRExpr) -> Option<i64> {
+    match expr {
+        IRExpr::ImmI(value) => Some(*value),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1189,6 +1323,13 @@ mod tests {
             }
         }
         panic!("statement not found");
+    }
+
+    fn analyze_sass(sass: &str) -> FunctionAnalysis {
+        let instrs = decode_sass(sass);
+        let cfg = build_cfg(instrs.clone());
+        let fir = build_ssa(&cfg);
+        analyze_function_ir(&fir, &instrs, None)
     }
 
     #[test]
@@ -1675,6 +1816,31 @@ mod tests {
     }
 
     #[test]
+    fn lowers_constmem_scalars_to_param_aliases_and_builtin_symbols() {
+        let analysis = analyze_sass(
+            "/*0000*/ IABS R5, c[0x0][0x164] ;\n\
+             /*0010*/ EXIT ;\n",
+        );
+        let param = lower_ir_op_expr_with_analysis(
+            "ConstMem",
+            &[IRExpr::ImmI(0), IRExpr::ImmI(0x164)],
+            Some(&analysis),
+        );
+        assert_eq!(param.render(), "arg1");
+
+        let legacy_analysis = FunctionAnalysis {
+            abi_profile: Some(crate::abi::AbiProfile::legacy_param_140()),
+            ..FunctionAnalysis::default()
+        };
+        let builtin = lower_ir_op_expr_with_analysis(
+            "ConstMem",
+            &[IRExpr::ImmI(0), IRExpr::ImmI(0x0)],
+            Some(&legacy_analysis),
+        );
+        assert_eq!(builtin.render(), "blockDim.x");
+    }
+
+    #[test]
     fn lowers_ffma_fmnmx_and_mufu_ops_semantically() {
         let ffma = lower_op_expr(
             "FFMA",
@@ -1704,6 +1870,31 @@ mod tests {
             &[IRExpr::Reg(crate::ir::RegId::new("R", 4, 1).with_ssa(0))],
         );
         assert_eq!(mufu.render(), "exp2f(r4_0)");
+    }
+
+    #[test]
+    fn lowers_iabs_and_mufu_rcp_semantically() {
+        let analysis = analyze_sass(
+            "/*0000*/ IABS R5, c[0x0][0x164] ;\n\
+             /*0010*/ MUFU.RCP R6, R5 ;\n\
+             /*0020*/ EXIT ;\n",
+        );
+        let iabs = lower_op_expr_with_analysis(
+            "IABS",
+            &[IRExpr::Op {
+                op: "ConstMem".to_string(),
+                args: vec![IRExpr::ImmI(0), IRExpr::ImmI(0x164)],
+            }],
+            Some(&analysis),
+        );
+        assert_eq!(iabs.render(), "abs(arg1)");
+
+        let rcp = lower_op_expr_with_analysis(
+            "MUFU.RCP",
+            &[IRExpr::Reg(crate::ir::RegId::new("R", 5, 1).with_ssa(0))],
+            Some(&analysis),
+        );
+        assert_eq!(rcp.render(), "rcp_approx(r5_0)");
     }
 
     #[test]
