@@ -37,10 +37,11 @@ pub fn prune_dead_pure_defs(function: StructuredFunction) -> StructuredFunction 
     if contains_unstructured_control_flow(&function.body) {
         return function;
     }
+    let body = simplify_trivial_stmt(prune_dead_pure_stmt(function.body));
     StructuredFunction {
         params: function.params,
         locals: function.locals,
-        body: prune_dead_pure_stmt(function.body),
+        body,
     }
 }
 
@@ -201,6 +202,105 @@ fn dce_sequence_like(
         Stmt::Sequence(kept)
     };
     (stmt, live)
+}
+
+fn simplify_trivial_stmt(stmt: Stmt) -> Stmt {
+    match stmt {
+        Stmt::Sequence(stmts) => {
+            let kept = stmts
+                .into_iter()
+                .map(simplify_trivial_stmt)
+                .filter(|stmt| !stmt_is_trivial_empty(stmt))
+                .collect::<Vec<_>>();
+            match kept.len() {
+                0 => Stmt::Empty,
+                1 => kept.into_iter().next().expect("single stmt"),
+                _ => Stmt::Sequence(kept),
+            }
+        }
+        Stmt::Block(stmts) => {
+            let kept = stmts
+                .into_iter()
+                .map(simplify_trivial_stmt)
+                .filter(|stmt| !stmt_is_trivial_empty(stmt))
+                .collect::<Vec<_>>();
+            match kept.len() {
+                0 => Stmt::Empty,
+                1 => kept.into_iter().next().expect("single stmt"),
+                _ => Stmt::Block(kept),
+            }
+        }
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            let then_branch = simplify_trivial_stmt(*then_branch);
+            let else_branch = else_branch.map(|branch| simplify_trivial_stmt(*branch));
+            if stmt_is_trivial_empty(&then_branch)
+                && else_branch
+                    .as_ref()
+                    .is_none_or(stmt_is_trivial_empty)
+            {
+                Stmt::Empty
+            } else {
+                Stmt::If {
+                    condition,
+                    then_branch: Box::new(then_branch),
+                    else_branch: else_branch
+                        .filter(|branch| !stmt_is_trivial_empty(branch))
+                        .map(Box::new),
+                }
+            }
+        }
+        Stmt::Loop {
+            kind,
+            condition,
+            body,
+        } => Stmt::Loop {
+            kind,
+            condition,
+            body: Box::new(simplify_trivial_stmt(*body)),
+        },
+        Stmt::Switch {
+            discriminant,
+            cases,
+            default,
+        } => Stmt::Switch {
+            discriminant,
+            cases: cases
+                .into_iter()
+                .map(|(label, body)| (label, simplify_trivial_stmt(body)))
+                .collect(),
+            default: default.map(|body| Box::new(simplify_trivial_stmt(*body))),
+        },
+        Stmt::Label { name, body } => {
+            let body = simplify_trivial_stmt(*body);
+            if stmt_is_trivial_empty(&body) {
+                Stmt::Empty
+            } else {
+                Stmt::Label {
+                    name,
+                    body: Box::new(body),
+                }
+            }
+        }
+        Stmt::Goto(_)
+        | Stmt::Break
+        | Stmt::Continue
+        | Stmt::Return(_)
+        | Stmt::Assign { .. }
+        | Stmt::ExprStmt(_)
+        | Stmt::Empty => stmt,
+    }
+}
+
+fn stmt_is_trivial_empty(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Empty => true,
+        Stmt::Sequence(stmts) | Stmt::Block(stmts) => stmts.iter().all(stmt_is_trivial_empty),
+        _ => false,
+    }
 }
 
 fn dce_assign(dst: LValue, src: Expr, mut live_out: BTreeSet<String>) -> (Stmt, BTreeSet<String>) {
@@ -453,5 +553,25 @@ mod tests {
             ])),
         };
         assert_eq!(prune_dead_pure_stmt(stmt.clone()), stmt);
+    }
+
+    #[test]
+    fn prunes_empty_ifs_after_dead_code_cleanup() {
+        let function = StructuredFunction {
+            params: Vec::new(),
+            locals: Vec::new(),
+            body: Stmt::Sequence(vec![
+                Stmt::If {
+                    condition: Expr::Reg("p0".to_string()),
+                    then_branch: Box::new(Stmt::Empty),
+                    else_branch: Some(Box::new(Stmt::Block(Vec::new()))),
+                },
+                Stmt::Return(None),
+            ]),
+        };
+        assert_eq!(
+            prune_dead_pure_defs(function).body,
+            Stmt::Return(None),
+        );
     }
 }

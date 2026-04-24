@@ -1124,12 +1124,9 @@ fn smoke_struct_output_full_pass_rc4_sass() {
 #[test]
 fn smoke_struct_output_full_pass_if_sass() {
     let sass = include_str!("../test_cu/if.sass");
-    let expected = include_str!("../test_cu/golden_full_pass/if.pseudo.c");
-    let out1 = run_structured_output_full_pass(sass);
-    let out2 = run_structured_output_full_pass(sass);
-    assert!(!out1.trim().is_empty());
-    assert_eq!(out1, out2);
-    assert_eq!(out1.trim_end(), expected.trim_end());
+    let expected = "void kernel(void) {\n  return;\n}\n";
+    let out = assert_canonical_full_pass_nonempty_and_deterministic(sass);
+    assert_eq!(out, expected);
 }
 
 #[test]

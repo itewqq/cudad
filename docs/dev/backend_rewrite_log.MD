@@ -108,6 +108,10 @@
   bases in explicit typed pointer casts before indexing, which removes raw
   pseudo-pointer forms like `r2_5[0]` from canonical output while preserving
   unresolved pointer semantics structurally.
+- Canonical AST cleanup now prunes structurally empty `if` shells after local
+  dead-code cleanup, which removes uninitialized-predicate scaffolding from
+  trivial kernels like `if.sass` without reviving the old whole-function repair
+  pipeline.
 - Shared-memory declaration planning now carries the pointee type recovered
   from SSA/shared round-trips into canonical symbol planning, so canonical
   `shmem` backing objects can render as `float` instead of a hard-coded
@@ -120,6 +124,7 @@
   - shared/local indexed stores
   - shared atomics
 - Canonical full-pass test coverage now owns:
+  - `if.sass`
   - `test_div.sass`
   - `dot_thread`
   - `nbody_forces`
@@ -142,7 +147,7 @@
 2. Delete duplicated CLI/test helper logic that still builds semantic-lift,
    token-map, or post-render cleanup artifacts after the canonical path is
    proven on those fixtures, starting with the stable canonical smoke path
-   (`test_div.sass`) and the ready corpus fixtures (`dot_thread`,
+   (`if.sass`, `test_div.sass`) and the ready corpus fixtures (`dot_thread`,
    `nbody_forces`).
 3. Replace the remaining placeholder non-memory AST lowering gaps
    (`IMAD.WIDE`/packed-pointer arithmetic/residual helper leaks) with semantic
