@@ -81,3 +81,49 @@ pub fn build_decompile_artifacts(
     artifacts.rendered = rendered;
     artifacts
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decode_sass;
+
+    #[test]
+    fn builds_pipeline_artifacts_for_memory_aware_samples() {
+        let sass = r#"
+            /*0000*/ MOV R4, c[0x0][0x160] ;
+            /*0010*/ MOV R5, c[0x0][0x164] ;
+            /*0020*/ LDG.E R6, [R4.64+0x4] ;
+            /*0030*/ STS [R2+0x8], R6 ;
+            /*0040*/ EXIT ;
+        "#;
+        let artifacts = build_decompile_artifacts(decode_sass(sass), None);
+        assert!(artifacts.cfg.is_some());
+        assert!(artifacts.optimized_ir.is_some());
+        assert!(artifacts.analysis.is_some());
+        assert!(artifacts.structured.is_some());
+        assert!(artifacts.ast.is_some());
+        assert!(artifacts.rendered.is_some());
+    }
+
+    #[test]
+    fn rendered_output_is_produced_alongside_memory_analysis() {
+        let sass = r#"
+            /*0000*/ MOV R4, c[0x0][0x160] ;
+            /*0010*/ MOV R5, c[0x0][0x164] ;
+            /*0020*/ LDG.E R6, [R4.64+0x4] ;
+            /*0030*/ MOV R8, c[0x0][0x168] ;
+            /*0040*/ MOV R9, c[0x0][0x16c] ;
+            /*0050*/ STG.E [R8.64], R6 ;
+            /*0060*/ EXIT ;
+        "#;
+        let artifacts = build_decompile_artifacts(decode_sass(sass), None);
+        let analysis = artifacts.analysis.expect("analysis");
+        assert!(
+            analysis
+                .mem_accesses
+                .iter()
+                .any(|access| matches!(access.space, crate::memory_model::CudaMemorySpace::Global))
+        );
+        assert!(artifacts.rendered.is_some());
+    }
+}
