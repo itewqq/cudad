@@ -257,11 +257,7 @@ fn collect_memory_accesses(
                 .and_then(|args| args.first())
                 .and_then(|expr| expr_root(expr, root_by_reg))
                 .unwrap_or_else(|| default_root_for_space(space, stmt));
-            let bit_width = stmt
-                .mem_addr_args
-                .as_ref()
-                .and_then(|args| args.first())
-                .and_then(memory_expr_bit_width);
+            let bit_width = opcode_memory_bit_width(stmt_opcode(stmt));
             out.push(MemAccessInfo {
                 block_id: block.id,
                 stmt_idx,
@@ -361,13 +357,6 @@ fn first_reg_in_expr(expr: &IRExpr) -> Option<RegId> {
     }
 }
 
-fn memory_expr_bit_width(expr: &IRExpr) -> Option<u32> {
-    match expr {
-        IRExpr::Mem { width, .. } => *width,
-        _ => None,
-    }
-}
-
 fn opcode_vector_width(opcode: &str) -> Option<u8> {
     if opcode.split('.').any(|part| part == "128") {
         Some(4)
@@ -376,6 +365,34 @@ fn opcode_vector_width(opcode: &str) -> Option<u8> {
     } else {
         None
     }
+}
+
+fn opcode_memory_bit_width(opcode: &str) -> Option<u32> {
+    let parts = opcode.split('.').collect::<Vec<_>>();
+    if parts.iter().any(|part| matches!(*part, "U8" | "S8" | "B8")) {
+        return Some(8);
+    }
+    if parts.iter().any(|part| matches!(*part, "U16" | "S16" | "B16" | "F16")) {
+        return Some(16);
+    }
+    if parts.iter().any(|part| matches!(*part, "64" | "U64" | "S64")) {
+        return Some(64);
+    }
+    if parts.iter().any(|part| matches!(*part, "128")) {
+        return Some(128);
+    }
+    if stmt_like_memory_opcode(opcode) {
+        return Some(32);
+    }
+    None
+}
+
+fn stmt_like_memory_opcode(opcode: &str) -> bool {
+    let mnem = opcode.split('.').next().unwrap_or(opcode);
+    mnem.starts_with("LD")
+        || mnem.starts_with("ST")
+        || mnem.starts_with("ATOM")
+        || mnem.starts_with("RED")
 }
 
 #[cfg(test)]

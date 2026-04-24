@@ -4,7 +4,7 @@
 
 - Branch: `codex/memory-aware-backend-refactor`
 - Checkpoint commit: `f464db3`
-- Current stage: phase 2 memory-aware analysis on top of the current SSA IR
+- Current stage: phase 3 early AST lowering on top of memory-aware analysis
 
 ## Landed invariants
 
@@ -15,17 +15,22 @@
   - pipeline orchestration
   - memory model vocabulary
   - function analysis
+  - AST lowering
   - symbol planning
 - `FunctionAnalysis` now classifies memory accesses by CUDA space and carries
   propagated address-root facts.
+- Early AST lowering can now emit space-aware AST for:
+  - global param-rooted loads
+  - shared/local indexed stores
+  - shared atomics
 
 ## Next safe step
 
-1. Start rewriting the lowering path to consume `FunctionAnalysis`.
-2. Introduce a canonical AST lowering module that removes the semantic-lift
-   dependency from the full pass.
-3. Keep stage-local tests close to the new lowering path instead of extending
-   old backend tests.
+1. Expand AST lowering from memory-only helpers into full structured statement
+   lowering.
+2. Introduce deterministic symbol/declaration planning driven by AST plus
+   analysis facts.
+3. Start switching the canonical driver away from semantic lift and text repair.
 
 ## Open questions
 
@@ -40,6 +45,7 @@
 - `docs/dev/backend_rewrite_log.MD`
 - `src/backend_pipeline.rs`
 - `src/function_analysis.rs`
+- `src/ast_lowering.rs`
 - `src/memory_model.rs`
 - `src/symbol_plan.rs`
 - `src/lib.rs`
