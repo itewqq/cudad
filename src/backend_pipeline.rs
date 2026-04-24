@@ -27,11 +27,12 @@
 //! - duplicate the old post-struct pipeline
 
 use crate::ast::StructuredFunction;
+use crate::ast_lowering::lower_structured_function;
 use crate::cfg::ControlFlowGraph;
 use crate::function_analysis::FunctionAnalysis;
 use crate::ir::FunctionIR;
 use crate::parser::DecodedInstruction;
-use crate::structurizer::StructuredStatement;
+use crate::structurizer::{StructuredStatement, Structurizer};
 
 #[derive(Clone, Debug, Default)]
 pub struct DecompileArtifacts {
@@ -66,8 +67,17 @@ pub fn build_decompile_artifacts(
         crate::ir_dce(&copy)
     };
     let analysis = crate::analyze_function_ir(&optimized_ir, &instrs, sm);
+    let mut structurizer = Structurizer::new(&cfg, &optimized_ir);
+    let structured = structurizer.structure_function();
+    let ast = structured
+        .as_ref()
+        .map(|structured| lower_structured_function(structured, &analysis));
+    let rendered = ast.as_ref().map(|function| function.render("kernel"));
     artifacts.cfg = Some(cfg);
     artifacts.optimized_ir = Some(optimized_ir);
     artifacts.analysis = Some(analysis);
+    artifacts.structured = structured;
+    artifacts.ast = ast;
+    artifacts.rendered = rendered;
     artifacts
 }

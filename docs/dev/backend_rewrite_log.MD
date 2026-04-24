@@ -23,14 +23,21 @@
   - global param-rooted loads
   - shared/local indexed stores
   - shared atomics
+- The canonical backend driver now builds:
+  - optimized SSA
+  - `FunctionAnalysis`
+  - structured control flow
+  - an early structured AST
+  - rendered output from that AST
 
 ## Next safe step
 
-1. Expand AST lowering from memory-only helpers into full structured statement
-   lowering.
-2. Introduce deterministic symbol/declaration planning driven by AST plus
-   analysis facts.
-3. Start switching the canonical driver away from semantic lift and text repair.
+1. Replace the remaining placeholder non-memory AST lowering with semantic
+   lowering that no longer depends on the old semantic-lift backend.
+2. Switch CLI/tests/examples to the canonical driver once the new path covers
+   enough structured statements.
+3. Delete duplicated full-pass driver logic and transitional tests after the
+   new path is used by default.
 
 ## Open questions
 

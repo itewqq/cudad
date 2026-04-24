@@ -26,6 +26,8 @@ use crate::ast::{Expr, LValue, Stmt};
 use crate::function_analysis::{AddressRoot, FunctionAnalysis, MemAccessInfo};
 use crate::ir::{IRExpr, IRStatement, RValue};
 use crate::memory_model::{CudaMemorySpace, MemAccessKind};
+use crate::structurizer::{LoopType, StructuredStatement};
+use crate::symbol_plan::plan_symbols;
 
 pub fn lower_memory_stmt(
     block_id: usize,
@@ -71,6 +73,91 @@ pub fn lower_memory_stmt(
                 args,
             }))
         }
+    }
+}
+
+pub fn lower_structured_function(
+    structured: &StructuredStatement,
+    analysis: &FunctionAnalysis,
+) -> crate::ast::StructuredFunction {
+    let body = lower_structured_stmt(structured, analysis);
+    let seed = crate::ast::StructuredFunction {
+        params: Vec::new(),
+        locals: Vec::new(),
+        body,
+    };
+    let plan = plan_symbols(&seed, analysis);
+    crate::ast::StructuredFunction {
+        params: plan.params,
+        locals: plan.locals,
+        body: seed.body,
+    }
+}
+
+pub fn lower_structured_stmt(
+    structured: &StructuredStatement,
+    analysis: &FunctionAnalysis,
+) -> Stmt {
+    match structured {
+        StructuredStatement::BasicBlock { block_id, stmts } => Stmt::Sequence(
+            stmts.iter()
+                .enumerate()
+                .map(|(stmt_idx, stmt)| lower_basic_stmt(*block_id, stmt_idx, stmt, analysis))
+                .collect(),
+        ),
+        StructuredStatement::Sequence(parts) => Stmt::Sequence(
+            parts.iter()
+                .map(|part| lower_structured_stmt(part, analysis))
+                .collect(),
+        ),
+        StructuredStatement::If {
+            condition_expr,
+            then_branch,
+            else_branch,
+            ..
+        } => Stmt::If {
+            condition: lower_scalar_expr(condition_expr),
+            then_branch: Box::new(lower_structured_stmt(then_branch, analysis)),
+            else_branch: else_branch
+                .as_ref()
+                .map(|branch| Box::new(lower_structured_stmt(branch, analysis))),
+        },
+        StructuredStatement::Loop {
+            loop_type,
+            condition_expr,
+            body,
+            ..
+        } => Stmt::Loop {
+            kind: match loop_type {
+                LoopType::While => crate::ast::LoopKind::While,
+                LoopType::DoWhile => crate::ast::LoopKind::DoWhile,
+                LoopType::Endless => crate::ast::LoopKind::Endless,
+            },
+            condition: condition_expr.as_ref().map(lower_scalar_expr),
+            body: Box::new(lower_structured_stmt(body, analysis)),
+        },
+        StructuredStatement::Break(_) => Stmt::Break,
+        StructuredStatement::Continue(_) => Stmt::Continue,
+        StructuredStatement::Return(expr) => Stmt::Return(expr.as_ref().map(lower_scalar_expr)),
+        StructuredStatement::UnstructuredJump { to_block_id, .. } => {
+            Stmt::Goto(format!("BB{}", to_block_id))
+        }
+        StructuredStatement::Switch {
+            discriminant,
+            cases,
+            default,
+            ..
+        } => Stmt::Switch {
+            discriminant: discriminant.as_ref().map(lower_scalar_expr),
+            cases: cases
+                .iter()
+                .map(|(label, body)| (*label, lower_structured_stmt(body, analysis)))
+                .collect(),
+            default: default
+                .as_ref()
+                .map(|body| Box::new(lower_structured_stmt(body, analysis))),
+        },
+        StructuredStatement::Empty => Stmt::Empty,
     }
 }
 
@@ -229,6 +316,80 @@ fn lower_scalar_expr(expr: &IRExpr) -> Expr {
     }
 }
 
+fn lower_basic_stmt(
+    block_id: usize,
+    stmt_idx: usize,
+    stmt: &IRStatement,
+    analysis: &FunctionAnalysis,
+) -> Stmt {
+    let lowered = lower_memory_stmt(block_id, stmt_idx, stmt, analysis)
+        .unwrap_or_else(|| lower_non_memory_stmt(stmt));
+    if let Some(pred) = &stmt.pred {
+        Stmt::If {
+            condition: lower_scalar_expr(pred),
+            then_branch: Box::new(lowered),
+            else_branch: None,
+        }
+    } else {
+        lowered
+    }
+}
+
+fn lower_non_memory_stmt(stmt: &IRStatement) -> Stmt {
+    match &stmt.value {
+        RValue::Op { opcode, args } => {
+            let rhs = Expr::CallLike {
+                func: opcode.clone(),
+                args: args.iter().map(lower_scalar_expr).collect(),
+            };
+            if let Some(def) = stmt.defs.first().and_then(|expr| expr.get_reg()) {
+                Stmt::Assign {
+                    dst: LValue::Var(def.display()),
+                    src: rhs,
+                }
+            } else {
+                Stmt::ExprStmt(rhs)
+            }
+        }
+        RValue::Phi(args) => {
+            let rhs = Expr::CallLike {
+                func: "phi".to_string(),
+                args: args.iter().map(lower_scalar_expr).collect(),
+            };
+            if let Some(def) = stmt.defs.first().and_then(|expr| expr.get_reg()) {
+                Stmt::Assign {
+                    dst: LValue::Var(def.display()),
+                    src: rhs,
+                }
+            } else {
+                Stmt::ExprStmt(rhs)
+            }
+        }
+        RValue::ImmI(value) => {
+            let src = Expr::Imm(value.to_string());
+            if let Some(def) = stmt.defs.first().and_then(|expr| expr.get_reg()) {
+                Stmt::Assign {
+                    dst: LValue::Var(def.display()),
+                    src,
+                }
+            } else {
+                Stmt::ExprStmt(src)
+            }
+        }
+        RValue::ImmF(value) => {
+            let src = Expr::Imm(value.to_string());
+            if let Some(def) = stmt.defs.first().and_then(|expr| expr.get_reg()) {
+                Stmt::Assign {
+                    dst: LValue::Var(def.display()),
+                    src,
+                }
+            } else {
+                Stmt::ExprStmt(src)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,5 +457,32 @@ mod tests {
         };
         assert!(expr.render().contains("atomicAdd"));
         assert!(expr.render().contains("&shmem[0]"));
+    }
+
+    #[test]
+    fn lowers_structured_if_and_memory_load_body() {
+        let analysis = FunctionAnalysis::default();
+        let structured = StructuredStatement::If {
+            condition_block_id: 0,
+            condition_expr: IRExpr::Reg(crate::ir::RegId::new("P", 0, 1)),
+            then_branch: Box::new(StructuredStatement::BasicBlock {
+                block_id: 1,
+                stmts: vec![IRStatement {
+                    defs: vec![IRExpr::Reg(crate::ir::RegId::new("R", 4, 1))],
+                    value: RValue::Op {
+                        opcode: "MOV".to_string(),
+                        args: vec![IRExpr::ImmI(1)],
+                    },
+                    pred: None,
+                    mem_addr_args: None,
+                    pred_old_defs: Vec::new(),
+                }],
+            }),
+            else_branch: None,
+        };
+        let lowered = lower_structured_stmt(&structured, &analysis);
+        let rendered = lowered.render_with_indent(0);
+        assert!(rendered.contains("if (P0)"));
+        assert!(rendered.contains("R4 = MOV(1);"));
     }
 }
