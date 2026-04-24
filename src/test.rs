@@ -1614,7 +1614,7 @@ fn full_pass_histogram256_lowers_shared_atomics_on_sm89() {
         .into_iter()
         .find(|f| f.name == "histogram256")
         .expect("histogram256 fixture should exist");
-    let out = run_structured_output_full_pass_from_instrs(hist.instrs, hist.sm);
+    let out = run_canonical_output_full_pass_from_instrs(hist.instrs, hist.sm, "histogram256");
     assert!(
         out.contains("atomicAdd(&shmem["),
         "expected histogram256 shared atomic to lower to atomicAdd, got:\n{}",

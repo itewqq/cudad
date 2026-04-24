@@ -52,6 +52,9 @@
 - The CLI structured-output path now goes through the canonical backend driver
   and ABI summary facts from `FunctionAnalysis` instead of the old lift/name/
   cleanup pipeline.
+- The first curated corpus acceptance check (`histogram256` shared atomics on
+  SM89) now runs directly against the canonical driver instead of the old
+  structured-output helper path.
 - Canonical backend tests now enforce:
   - semantic pointer-param names (`argN_ptr`)
   - no raw SSA token leaks
