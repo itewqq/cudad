@@ -126,4 +126,33 @@ mod tests {
         );
         assert!(artifacts.rendered.is_some());
     }
+
+    #[test]
+    fn rendered_output_uses_param_symbols_without_raw_ssa_tokens() {
+        let sass = r#"
+            /*0000*/ MOV R4, c[0x0][0x160] ;
+            /*0010*/ MOV R5, c[0x0][0x164] ;
+            /*0020*/ IADD3 R4, R4, 0x4, RZ ;
+            /*0030*/ LDG.E R6, [R4.64] ;
+            /*0040*/ STS [R2], R6 ;
+            /*0050*/ EXIT ;
+        "#;
+        let rendered = build_decompile_artifacts(decode_sass(sass), None)
+            .rendered
+            .expect("rendered output");
+        assert!(rendered.contains("arg0_ptr[1]") || rendered.contains("arg0[1]"));
+        assert!(!rendered.contains(".0"));
+    }
+
+    #[test]
+    fn rendered_output_keeps_shared_byte_offsets_as_indices() {
+        let sass = r#"
+            /*0000*/ STS [R2+0x8], R4 ;
+            /*0010*/ EXIT ;
+        "#;
+        let rendered = build_decompile_artifacts(decode_sass(sass), None)
+            .rendered
+            .expect("rendered output");
+        assert!(rendered.contains("shmem[(r2_0 + 8) / 4] = r4_0;"));
+    }
 }
