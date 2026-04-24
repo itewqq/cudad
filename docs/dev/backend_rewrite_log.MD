@@ -61,6 +61,11 @@
   instead of silently substituting a fake `kernel` stub.
 - Dynamic local-memory accesses now stay explicit unresolved operations instead
   of degrading into invalid local declarations or fake pointer variables.
+- Canonical lowering now drops structurization-owned control skeleton ops
+  (`BRA`, `BSYNC`, `BSSY`, etc.), lowers `EXIT`/`RET` to structured returns,
+  and maps `BAR.SYNC` to `__syncthreads()`.
+- Shared `ATOMS.POPC.INC` lowering now emits `atomicAdd(..., 1)` instead of a
+  raw fallback helper call.
 - Simple scalar lowering now only rewrites unmodified opcodes; modifier-bearing
   add-family instructions stay explicit until their semantics are modeled.
 - Early AST lowering can now emit space-aware AST for:
@@ -77,7 +82,8 @@
 ## Next safe step
 
 1. Switch the remaining curated full-pass tests and helper entrypoints from the
-   old structured-output path onto the canonical driver.
+   old structured-output path onto the canonical driver, starting with the
+   corpus checks that only assert output-shape contracts.
 2. Delete duplicated CLI/test helper logic that still builds semantic-lift,
    token-map, or post-render cleanup artifacts after the canonical path is
    proven on those fixtures.

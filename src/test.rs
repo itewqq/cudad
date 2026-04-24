@@ -897,6 +897,29 @@ fn canonical_full_pass_lowers_imad_wide_param_roots_through_helper_path() {
     );
 }
 
+#[test]
+fn canonical_full_pass_histogram256_lowers_shared_atomic_popc_and_barriers() {
+    let hist = split_decoded_functions(include_str!("../test_cu/corpus/shared_mem_kernels.sass"))
+        .into_iter()
+        .find(|f| f.name == "histogram256")
+        .expect("histogram256 fixture should exist");
+    let out = run_canonical_output_full_pass_from_instrs(hist.instrs, hist.sm, "histogram256");
+    assert!(
+        out.contains("atomicAdd(&shmem[") && out.contains(", 1);"),
+        "expected POPC/INC shared atomic to lower to atomicAdd(..., 1), got:\n{out}"
+    );
+    assert!(
+        out.contains("__syncthreads();"),
+        "expected barrier op to lower to __syncthreads(), got:\n{out}"
+    );
+    for leak in ["ATOMS.POPC.INC", "BAR.SYNC", "BSYNC()", "BRA()", "EXIT()"] {
+        assert!(
+            !out.contains(leak),
+            "expected canonical histogram output to drop raw `{leak}` artifacts, got:\n{out}"
+        );
+    }
+}
+
 fn assert_full_pass_nonempty_and_deterministic(sass: &str) -> String {
     let out1 = run_structured_output_full_pass(sass);
     let out2 = run_structured_output_full_pass(sass);

@@ -77,7 +77,8 @@ fn lower_memory_stmt_detail(
             })
         }
         MemAccessKind::Atomic | MemAccessKind::Reduction => {
-            let func = atomic_func_name(stmt_opcode(stmt));
+            let opcode = stmt_opcode(stmt);
+            let func = atomic_func_name(opcode);
             let Some((base, index)) = lower_base_and_index(stmt, access, analysis) else {
                 return None;
             };
@@ -94,6 +95,9 @@ fn lower_memory_stmt_detail(
                     .filter(|expr| !matches!(expr, IRExpr::Mem { .. }))
                     .map(lower_scalar_expr),
             );
+            if opcode.contains(".POPC.INC") && args.len() == 1 {
+                args.push(Expr::Imm("1".to_string()));
+            }
             let call = Expr::CallLike {
                 func: func.to_string(),
                 args,
@@ -523,7 +527,7 @@ fn stmt_opcode(stmt: &IRStatement) -> &str {
 }
 
 fn atomic_func_name(opcode: &str) -> &'static str {
-    if opcode.contains(".ADD") {
+    if opcode.contains(".POPC.INC") || opcode.contains(".ADD") {
         "atomicAdd"
     } else if opcode.contains(".MIN") {
         "atomicMin"
@@ -570,6 +574,9 @@ fn lower_basic_stmt(
 }
 
 fn lower_non_memory_stmt(stmt: &IRStatement) -> LoweredStmt {
+    if let Some(lowered) = lower_structural_control_stmt(stmt) {
+        return lowered;
+    }
     match &stmt.value {
         RValue::Op { opcode, args } => {
             let rhs = lower_op_expr(opcode, args);
@@ -643,6 +650,32 @@ fn lower_non_memory_stmt(stmt: &IRStatement) -> LoweredStmt {
             }
         }
     }
+}
+
+fn lower_structural_control_stmt(stmt: &IRStatement) -> Option<LoweredStmt> {
+    let RValue::Op { opcode, .. } = &stmt.value else {
+        return None;
+    };
+    let mnem = opcode.split('.').next().unwrap_or(opcode);
+    let lowered_stmt = match mnem {
+        "EXIT" | "RET" => Stmt::Return(None),
+        "BAR" if opcode.contains("SYNC") => Stmt::ExprStmt(Expr::CallLike {
+            func: "__syncthreads".to_string(),
+            args: Vec::new(),
+        }),
+        "WARPSYNC" => Stmt::ExprStmt(Expr::CallLike {
+            func: "__syncwarp".to_string(),
+            args: Vec::new(),
+        }),
+        "BRA" | "BSSY" | "BSYNC" | "SSY" | "SYNC" | "NOP" | "DEPBAR" | "MEMBAR" | "FENCE" => {
+            Stmt::Empty
+        }
+        _ => return None,
+    };
+    Some(LoweredStmt {
+        stmt: lowered_stmt,
+        predicate_def_idx: None,
+    })
 }
 
 fn lower_op_expr(opcode: &str, args: &[IRExpr]) -> Expr {
@@ -799,6 +832,9 @@ fn apply_stmt_predicate(stmt: &IRStatement, lowered: LoweredStmt) -> Stmt {
         stmt: lowered_stmt,
         predicate_def_idx,
     } = lowered;
+    if matches!(lowered_stmt, Stmt::Empty) {
+        return Stmt::Empty;
+    }
     let Some(pred) = &stmt.pred else {
         return lowered_stmt;
     };
@@ -926,6 +962,45 @@ mod tests {
     }
 
     #[test]
+    fn lowers_popc_inc_shared_atomics_to_atomic_add_one() {
+        let stmt = IRStatement {
+            defs: vec![IRExpr::Reg(crate::ir::RegId::new("R", 0, 1).with_ssa(0))],
+            value: RValue::Op {
+                opcode: "ATOMS.POPC.INC".to_string(),
+                args: vec![IRExpr::Mem {
+                    base: Box::new(IRExpr::Reg(crate::ir::RegId::new("R", 2, 1))),
+                    offset: None,
+                    width: Some(32),
+                }],
+            },
+            pred: None,
+            mem_addr_args: Some(vec![IRExpr::Mem {
+                base: Box::new(IRExpr::Reg(crate::ir::RegId::new("R", 2, 1))),
+                offset: None,
+                width: Some(32),
+            }]),
+            pred_old_defs: Vec::new(),
+        };
+        let mut analysis = FunctionAnalysis::default();
+        analysis.mem_accesses.push(MemAccessInfo {
+            block_id: 0,
+            stmt_idx: 0,
+            kind: MemAccessKind::Atomic,
+            space: CudaMemorySpace::Shared,
+            bit_width: Some(32),
+            vector_width: None,
+            constant_byte_offset: Some(0),
+            has_dynamic_offset: true,
+            root: AddressRoot::SharedObject("shmem".to_string()),
+        });
+        let lowered = lower_memory_stmt(0, 0, &stmt, &analysis).expect("lowered");
+        let Stmt::Assign { src, .. } = lowered else {
+            panic!("expected assignment");
+        };
+        assert_eq!(src.render(), "atomicAdd(&shmem[r2 / 4], 1)");
+    }
+
+    #[test]
     fn lowers_param_window_loads_to_kernel_param_symbols() {
         let sass = r#"
             /*0000*/ LDC R4, c[0x0][0x160] ;
@@ -1050,6 +1125,35 @@ mod tests {
         };
         assert_eq!(dst.render(), "r7_1");
         assert_eq!(src.render(), "p2 ? (atomicAdd(&r4[0], r13)) : r7_0");
+    }
+
+    #[test]
+    fn lowers_exit_and_barrier_ops_without_raw_helpers() {
+        let exit_stmt = IRStatement {
+            defs: Vec::new(),
+            value: RValue::Op {
+                opcode: "EXIT".to_string(),
+                args: Vec::new(),
+            },
+            pred: Some(IRExpr::Reg(crate::ir::RegId::new("P", 0, 1))),
+            mem_addr_args: None,
+            pred_old_defs: Vec::new(),
+        };
+        let exit_lowered = lower_basic_stmt(0, 0, &exit_stmt, &FunctionAnalysis::default());
+        assert_eq!(exit_lowered.render_with_indent(0), "if (p0) return;\n");
+
+        let barrier_stmt = IRStatement {
+            defs: Vec::new(),
+            value: RValue::Op {
+                opcode: "BAR.SYNC".to_string(),
+                args: Vec::new(),
+            },
+            pred: None,
+            mem_addr_args: None,
+            pred_old_defs: Vec::new(),
+        };
+        let barrier_lowered = lower_basic_stmt(0, 0, &barrier_stmt, &FunctionAnalysis::default());
+        assert_eq!(barrier_lowered.render_with_indent(0), "__syncthreads();\n");
     }
 
     #[test]
