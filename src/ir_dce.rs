@@ -42,7 +42,7 @@ pub fn ir_dce(fir: &FunctionIR) -> FunctionIR {
             for def_expr in &stmt.defs {
                 if let Some(r) = def_expr.get_reg() {
                     if !is_immutable_reg(r) {
-                        def_map.insert(r.clone(), sid);
+                        def_map.insert(normalize_reg_key(r), sid);
                     }
                 }
             }
@@ -75,7 +75,7 @@ pub fn ir_dce(fir: &FunctionIR) -> FunctionIR {
             if is_immutable_reg(&used_reg) {
                 continue;
             }
-            if let Some(&def_sid) = def_map.get(&used_reg) {
+            if let Some(&def_sid) = def_map.get(&normalize_reg_key(&used_reg)) {
                 if live.insert(def_sid) {
                     worklist.push_back(def_sid);
                 }
@@ -112,10 +112,16 @@ fn is_immutable_reg(r: &RegId) -> bool {
     matches!(r.class.as_str(), "RZ" | "PT" | "URZ" | "UPT")
 }
 
+fn normalize_reg_key(r: &RegId) -> RegId {
+    let mut normalized = r.clone();
+    normalized.sign = 1;
+    normalized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{build_cfg, build_ssa, decode_sass};
+    use crate::{build_cfg, build_ssa, decode_sass, IRBlock, IRExpr, IRStatement, RValue};
 
     #[test]
     fn ir_dce_removes_dead_assignment() {
@@ -183,5 +189,111 @@ mod tests {
             .filter(|s| matches!(s.value, crate::ir::RValue::Phi(_)))
             .count();
         assert!(phi_count > 0, "phi nodes must survive IR-DCE");
+    }
+
+    #[test]
+    fn ir_dce_keeps_defs_used_with_negative_sign() {
+        let def = RegId::new("R", 7, 1).with_ssa(1);
+        let pred = RegId::new("P", 0, 1).with_ssa(1);
+        let fir = FunctionIR {
+            blocks: vec![IRBlock {
+                id: 0,
+                start_addr: 0,
+                irdst: vec![],
+                stmts: vec![
+                    IRStatement {
+                        defs: vec![IRExpr::Reg(def.clone())],
+                        value: RValue::Op {
+                            opcode: "I2FP.F32.S32".to_string(),
+                            args: vec![IRExpr::ImmI(42)],
+                        },
+                        pred: None,
+                        mem_addr_args: None,
+                        pred_old_defs: vec![],
+                    },
+                    IRStatement {
+                        defs: vec![IRExpr::Reg(pred.clone())],
+                        value: RValue::Op {
+                            opcode: "FSETP.GT.AND".to_string(),
+                            args: vec![
+                                IRExpr::Reg(RegId::new("R", 7, -1).with_ssa(1)),
+                                IRExpr::ImmF(0.0),
+                                IRExpr::Reg(RegId::new("PT", 0, 1)),
+                            ],
+                        },
+                        pred: None,
+                        mem_addr_args: None,
+                        pred_old_defs: vec![],
+                    },
+                    IRStatement {
+                        defs: vec![],
+                        value: RValue::Op {
+                            opcode: "EXIT".to_string(),
+                            args: vec![],
+                        },
+                        pred: Some(IRExpr::Reg(pred)),
+                        mem_addr_args: None,
+                        pred_old_defs: vec![],
+                    },
+                ],
+            }],
+        };
+
+        let cleaned = ir_dce(&fir);
+        let total_stmts: usize = cleaned.blocks.iter().map(|b| b.stmts.len()).sum();
+        assert_eq!(total_stmts, 3, "negative-signed use must keep its defining stmt");
+    }
+
+    #[test]
+    fn ir_dce_keeps_uniform_defs_used_with_negative_sign() {
+        let def = RegId::new("UR", 5, 1).with_ssa(0);
+        let pred = RegId::new("P", 0, 1).with_ssa(1);
+        let fir = FunctionIR {
+            blocks: vec![IRBlock {
+                id: 0,
+                start_addr: 0,
+                irdst: vec![],
+                stmts: vec![
+                    IRStatement {
+                        defs: vec![IRExpr::Reg(def.clone())],
+                        value: RValue::Op {
+                            opcode: "UMOV".to_string(),
+                            args: vec![IRExpr::ImmI(1)],
+                        },
+                        pred: None,
+                        mem_addr_args: None,
+                        pred_old_defs: vec![],
+                    },
+                    IRStatement {
+                        defs: vec![IRExpr::Reg(pred.clone())],
+                        value: RValue::Op {
+                            opcode: "UISETP.GE.U32.AND".to_string(),
+                            args: vec![
+                                IRExpr::Reg(RegId::new("UR", 5, -1).with_ssa(0)),
+                                IRExpr::ImmI(0),
+                                IRExpr::Reg(RegId::new("PT", 0, 1)),
+                            ],
+                        },
+                        pred: None,
+                        mem_addr_args: None,
+                        pred_old_defs: vec![],
+                    },
+                    IRStatement {
+                        defs: vec![],
+                        value: RValue::Op {
+                            opcode: "EXIT".to_string(),
+                            args: vec![],
+                        },
+                        pred: Some(IRExpr::Reg(pred)),
+                        mem_addr_args: None,
+                        pred_old_defs: vec![],
+                    },
+                ],
+            }],
+        };
+
+        let cleaned = ir_dce(&fir);
+        let total_stmts: usize = cleaned.blocks.iter().map(|b| b.stmts.len()).sum();
+        assert_eq!(total_stmts, 3, "negative-signed uniform use must keep its defining stmt");
     }
 }

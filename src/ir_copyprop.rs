@@ -53,18 +53,17 @@ fn build_substitution_map(fir: &FunctionIR) -> HashMap<RegId, RegId> {
             if stmt.pred.is_some() {
                 continue;
             }
-            // Must define exactly one register.
-            if stmt.defs.len() != 1 {
-                continue;
-            }
-            let def_reg = match stmt.defs[0].get_reg() {
-                Some(r) if !is_immutable(r) => r,
-                _ => continue,
-            };
 
             match &stmt.value {
                 RValue::Phi(args) => {
                     // Trivial phi: all args are the same register (ignoring sign).
+                    if stmt.defs.len() != 1 {
+                        continue;
+                    }
+                    let def_reg = match stmt.defs[0].get_reg() {
+                        Some(r) if !is_immutable(r) => r,
+                        _ => continue,
+                    };
                     if let Some(canonical) = all_same_reg(args) {
                         // Don't create self-loops: if the phi defines the same
                         // register it would substitute to, skip.
@@ -74,9 +73,17 @@ fn build_substitution_map(fir: &FunctionIR) -> HashMap<RegId, RegId> {
                     }
                 }
                 RValue::Op { opcode, args } => {
-                    if let Some(src) = extract_copy_src(opcode, args) {
-                        if !is_immutable(&src) && !same_ssa_reg(def_reg, &src) {
-                            subst.insert(def_reg.clone(), src);
+                    if let Some(srcs) = extract_copy_srcs(opcode, args, stmt.defs.len()) {
+                        for (def_expr, src) in stmt.defs.iter().zip(srcs) {
+                            let Some(def_reg) = def_expr.get_reg() else {
+                                continue;
+                            };
+                            if is_immutable(def_reg) {
+                                continue;
+                            }
+                            if !same_ssa_reg(def_reg, &src) {
+                                subst.insert(def_reg.clone(), src);
+                            }
                         }
                     }
                 }
@@ -187,6 +194,10 @@ fn subst_in_expr(expr: &IRExpr, subst: &HashMap<RegId, RegId>) -> IRExpr {
                 expr.clone()
             }
         }
+        IRExpr::Addr64 { lo, hi } => IRExpr::Addr64 {
+            lo: Box::new(subst_in_expr(lo, subst)),
+            hi: Box::new(subst_in_expr(hi, subst)),
+        },
         IRExpr::Mem {
             base,
             offset,
@@ -237,11 +248,6 @@ fn all_same_reg(args: &[IRExpr]) -> Option<RegId> {
             IRExpr::Reg(r) => r,
             _ => return None, // Non-register phi arg — can't simplify.
         };
-        if is_immutable(r) {
-            // Phi args that are RZ/PT are fine but don't count as the
-            // canonical value.
-            continue;
-        }
         // Preserve sign so φ(-R5, R5) is correctly rejected as non-trivial.
         let normalized = RegId {
             class: r.class.clone(),
@@ -265,21 +271,30 @@ fn all_same_reg(args: &[IRExpr]) -> Option<RegId> {
     canonical
 }
 
-/// Extract the source register from a copy instruction.
+/// Extract per-def source registers from a copy instruction.
 /// Returns None if the instruction is not a copy.
-fn extract_copy_src(opcode: &str, args: &[IRExpr]) -> Option<RegId> {
+fn extract_copy_srcs(opcode: &str, args: &[IRExpr], def_count: usize) -> Option<Vec<RegId>> {
     // IMAD.MOV.U32 Rdst, RZ, RZ, Rsrc → copy from Rsrc
-    if opcode.starts_with("IMAD.MOV") && args.len() >= 3 {
+    if opcode.starts_with("IMAD.MOV") && args.len() >= 3 && def_count == 1 {
         if is_zero_expr(&args[0]) && is_zero_expr(&args[1]) {
             if let Some(r) = args[2].get_reg() {
-                return Some(r.clone());
+                return Some(vec![r.clone()]);
             }
         }
     }
-    // MOV Rdst, Rsrc
-    if (opcode == "MOV" || opcode.starts_with("MOV.")) && args.len() == 1 {
-        if let Some(r) = args[0].get_reg() {
-            return Some(r.clone());
+    // MOV/UMOV Rdst, Rsrc and *.64 register-pair copies.
+    if opcode == "MOV"
+        || opcode.starts_with("MOV.")
+        || opcode == "UMOV"
+        || opcode.starts_with("UMOV.")
+    {
+        if def_count == 1 && args.len() == 1 {
+            return args[0].get_reg().cloned().map(|r| vec![r]);
+        }
+        if opcode.split('.').any(|part| part == "64") && def_count == 2 && args.len() >= 2 {
+            let lo = args[0].get_reg()?.clone();
+            let hi = args[1].get_reg()?.clone();
+            return Some(vec![lo, hi]);
         }
     }
     None
@@ -372,6 +387,67 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn copyprop_propagates_mov64_pair_copy() {
+        let sass = r#"
+            /*0000*/ MOV.64 R10, R8 ;
+            /*0010*/ IADD.64 R12, R10, 0x40 ;
+            /*0020*/ EXIT ;
+        "#;
+        let cfg = build_cfg(decode_sass(sass));
+        let fir = build_ssa(&cfg);
+        let propagated = ir_copyprop(&fir);
+
+        let iadd64_stmt = propagated
+            .blocks
+            .iter()
+            .flat_map(|b| &b.stmts)
+            .find(|s| matches!(&s.value, RValue::Op { opcode, .. } if opcode == "IADD.64"))
+            .expect("expected IADD.64 statement");
+        let RValue::Op { args, .. } = &iadd64_stmt.value else {
+            panic!("expected IADD.64 op")
+        };
+        let lo = args[0].get_reg().expect("low arg should be register");
+        let hi = args[2].get_reg().expect("high arg should be register");
+        assert_eq!(
+            lo.idx, 8,
+            "expected low half to propagate from R8, got R{}",
+            lo.idx
+        );
+        assert_eq!(
+            hi.idx, 9,
+            "expected high half to propagate from R9, got R{}",
+            hi.idx
+        );
+    }
+
+    #[test]
+    fn copyprop_propagates_umov_copy() {
+        let sass = r#"
+            /*0000*/ UMOV UR4, URZ ;
+            /*0010*/ UIADD3 UR6, UR4, 0x1, URZ ;
+            /*0020*/ EXIT ;
+        "#;
+        let cfg = build_cfg(decode_sass(sass));
+        let fir = build_ssa(&cfg);
+        let propagated = ir_copyprop(&fir);
+
+        let uiadd3_stmt = propagated
+            .blocks
+            .iter()
+            .flat_map(|b| &b.stmts)
+            .find(|s| matches!(&s.value, RValue::Op { opcode, .. } if opcode == "UIADD3"))
+            .expect("expected UIADD3 statement");
+        let RValue::Op { args, .. } = &uiadd3_stmt.value else {
+            panic!("expected UIADD3 op")
+        };
+        let src = args[0].get_reg().expect("first arg should be register");
+        assert_eq!(
+            src.class, "URZ",
+            "expected UMOV source to propagate as the uniform zero register"
+        );
     }
 
     #[test]

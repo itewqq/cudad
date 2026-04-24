@@ -104,26 +104,81 @@ fn to_ssa_reg(r: &RegId) -> SsaReg {
 /// returns the consensus type per physical register — matching the
 /// granularity used by `infer_local_typed_declarations_with_abi`.
 pub fn infer_types(fir: &FunctionIR) -> BTreeMap<(String, i32), InferredType> {
+    let types = infer_ssa_types_raw(fir);
+
+    // ---- Phase 3: Merge SSA versions into per-physical-register types ----
+    let mut result: BTreeMap<(String, i32), InferredType> = BTreeMap::new();
+    for (ssa_reg, ty) in &types {
+        if *ty == InferredType::Bottom || *ty == InferredType::Top {
+            continue;
+        }
+        let key = (ssa_reg.class.clone(), ssa_reg.idx);
+        let prev = result.get(&key).copied().unwrap_or(InferredType::Bottom);
+        result.insert(key, prev.join(*ty));
+    }
+
+    result
+}
+
+/// Run type inference on SSA registers without collapsing versions back to the
+/// physical register name. This preserves distinctions between reused physical
+/// registers that hold different logical values across the function.
+pub fn infer_ssa_types(fir: &FunctionIR) -> BTreeMap<RegId, InferredType> {
+    infer_ssa_types_raw(fir)
+        .into_iter()
+        .filter_map(|(ssa_reg, ty)| {
+            if matches!(ty, InferredType::Bottom | InferredType::Top) {
+                return None;
+            }
+            Some((
+                RegId {
+                    class: ssa_reg.class,
+                    idx: ssa_reg.idx,
+                    sign: 1,
+                    ssa: ssa_reg.ssa,
+                },
+                ty,
+            ))
+        })
+        .collect()
+}
+
+fn infer_ssa_types_raw(fir: &FunctionIR) -> HashMap<SsaReg, InferredType> {
     let mut types: HashMap<SsaReg, InferredType> = HashMap::new();
+    let mut hard_seeds: HashMap<SsaReg, InferredType> = HashMap::new();
     let mut worklist: VecDeque<SsaReg> = VecDeque::new();
+    let should_preserve_hard_seed =
+        |reg: &SsaReg, incoming: InferredType, hard_seeds: &HashMap<SsaReg, InferredType>| {
+            hard_seeds.get(reg).copied().is_some_and(|seed_ty| {
+                seed_ty != InferredType::Bottom
+                    && seed_ty != InferredType::Top
+                    && seed_ty.join(incoming) == InferredType::Top
+            })
+        };
 
     // ---- Phase 1: Seed from instruction opcodes ----
     for block in &fir.blocks {
         for stmt in &block.stmts {
             if let RValue::Op { opcode, .. } = &stmt.value {
-                if let Some(ty) = type_from_opcode(opcode) {
-                    for def in &stmt.defs {
-                        if let Some(r) = def.get_reg() {
-                            if is_immutable_reg(r) || is_predicate_reg(r) {
-                                continue;
-                            }
-                            let key = to_ssa_reg(r);
-                            let prev = types.get(&key).copied().unwrap_or(InferredType::Bottom);
-                            let joined = prev.join(ty);
-                            if joined != prev {
-                                types.insert(key.clone(), joined);
-                                worklist.push_back(key);
-                            }
+                for (def_idx, def) in stmt.defs.iter().enumerate() {
+                    let Some(ty) = type_from_opcode_def(opcode, def_idx) else {
+                        continue;
+                    };
+                    if let Some(r) = def.get_reg() {
+                        if is_immutable_reg(r) || is_predicate_reg(r) {
+                            continue;
+                        }
+                        let key = to_ssa_reg(r);
+                        let hard_prev = hard_seeds.get(&key).copied().unwrap_or(InferredType::Bottom);
+                        let hard_joined = hard_prev.join(ty);
+                        if hard_joined != hard_prev {
+                            hard_seeds.insert(key.clone(), hard_joined);
+                        }
+                        let prev = types.get(&key).copied().unwrap_or(InferredType::Bottom);
+                        let joined = prev.join(ty);
+                        if joined != prev {
+                            types.insert(key.clone(), joined);
+                            worklist.push_back(key);
                         }
                     }
                 }
@@ -146,6 +201,14 @@ pub fn infer_types(fir: &FunctionIR) -> BTreeMap<(String, i32), InferredType> {
                             }
                             let key = to_ssa_reg(r);
                             let prev = types.get(&key).copied().unwrap_or(InferredType::Bottom);
+                            if should_preserve_hard_seed(&key, *ty, &hard_seeds) {
+                                // Def-opcode seeds are usually more trustworthy than
+                                // heuristic arg-side propagation. Preserving them avoids
+                                // demoting float FFMA results to `Top` when the same SSA
+                                // value later flows through integer-looking helper shapes
+                                // such as split wide-address lane assembly.
+                                continue;
+                            }
                             let joined = prev.join(*ty);
                             if joined != prev {
                                 types.insert(key.clone(), joined);
@@ -161,7 +224,8 @@ pub fn infer_types(fir: &FunctionIR) -> BTreeMap<(String, i32), InferredType> {
     // ---- Phase 2: Forward propagation through phi and copy ----
     // Build a map: SSA reg → list of (block, stmt) where it's used as phi/copy input
     // For each phi: if all inputs have the same type, the output inherits it.
-    // For copies (IMAD.MOV.U32 with src = known reg): output inherits source type.
+    // For copy-like ops (MOV / IMAD.MOV / SHFL data outputs), the result and
+    // source should converge to the same scalar type.
 
     // Build phi/copy dependency graph
     struct PhiInfo {
@@ -197,19 +261,35 @@ pub fn infer_types(fir: &FunctionIR) -> BTreeMap<(String, i32), InferredType> {
                     }
                 }
                 RValue::Op { opcode, args } => {
-                    // Detect copy patterns
-                    if stmt.defs.len() == 1 && stmt.pred.is_none() {
-                        if let Some(def) = stmt.defs[0].get_reg() {
-                            if is_immutable_reg(def) || is_predicate_reg(def) {
-                                continue;
-                            }
-                            if let Some(src) = extract_copy_source(opcode, args) {
-                                copies.push(CopyInfo {
-                                    def_reg: to_ssa_reg(def),
-                                    src_reg: src,
-                                });
-                            }
+                    if stmt.pred.is_some() {
+                        continue;
+                    }
+                    let Some(src) = extract_copy_source(opcode, args) else {
+                        continue;
+                    };
+                    for (def_idx, def_expr) in stmt.defs.iter().enumerate() {
+                        let Some(def) = def_expr.get_reg() else {
+                            continue;
+                        };
+                        if is_immutable_reg(def) || is_predicate_reg(def) {
+                            continue;
                         }
+                        let is_data_copy_def = if opcode.starts_with("SHFL")
+                            || opcode.starts_with("USHFL")
+                        {
+                            // SHFL can define an optional predicate in lane 0 and the
+                            // data result in lane 1.
+                            def_idx == 1
+                        } else {
+                            def_idx == 0 && stmt.defs.len() == 1
+                        };
+                        if !is_data_copy_def {
+                            continue;
+                        }
+                        copies.push(CopyInfo {
+                            def_reg: to_ssa_reg(def),
+                            src_reg: src.clone(),
+                        });
                     }
                 }
                 _ => {}
@@ -228,6 +308,9 @@ pub fn infer_types(fir: &FunctionIR) -> BTreeMap<(String, i32), InferredType> {
         for copy in &copies {
             if let Some(&src_ty) = types.get(&copy.src_reg) {
                 if src_ty != InferredType::Bottom && src_ty != InferredType::Top {
+                    if should_preserve_hard_seed(&copy.def_reg, src_ty, &hard_seeds) {
+                        continue;
+                    }
                     let prev = types
                         .get(&copy.def_reg)
                         .copied()
@@ -241,6 +324,28 @@ pub fn infer_types(fir: &FunctionIR) -> BTreeMap<(String, i32), InferredType> {
             }
         }
 
+        // Copy-like ops are bidirectional for scalar typing: once the data
+        // result is known, feed that type back into the source lane.
+        for copy in &copies {
+            if let Some(&def_ty) = types.get(&copy.def_reg) {
+                if def_ty == InferredType::Bottom || def_ty == InferredType::Top {
+                    continue;
+                }
+                if matches!(def_ty, InferredType::Ptr64 | InferredType::U64) {
+                    continue;
+                }
+                if should_preserve_hard_seed(&copy.src_reg, def_ty, &hard_seeds) {
+                    continue;
+                }
+                let prev = types.get(&copy.src_reg).copied().unwrap_or(InferredType::Bottom);
+                let joined = prev.join(def_ty);
+                if joined != prev {
+                    types.insert(copy.src_reg.clone(), joined);
+                    changed = true;
+                }
+            }
+        }
+
         // Propagate through phis
         for phi in &phis {
             let mut joined = InferredType::Bottom;
@@ -249,6 +354,9 @@ pub fn infer_types(fir: &FunctionIR) -> BTreeMap<(String, i32), InferredType> {
                 joined = joined.join(input_ty);
             }
             if joined != InferredType::Bottom && joined != InferredType::Top {
+                if should_preserve_hard_seed(&phi.def_reg, joined, &hard_seeds) {
+                    continue;
+                }
                 let prev = types
                     .get(&phi.def_reg)
                     .copied()
@@ -261,39 +369,54 @@ pub fn infer_types(fir: &FunctionIR) -> BTreeMap<(String, i32), InferredType> {
             }
         }
 
-        // Backward propagation: if a def has a known type, propagate to
-        // its use sites' defs (through phi inputs)
-        for phi in &phis {
-            if let Some(&def_ty) = types.get(&phi.def_reg) {
-                if def_ty != InferredType::Bottom && def_ty != InferredType::Top {
-                    for input in &phi.input_regs {
-                        let prev = types.get(input).copied().unwrap_or(InferredType::Bottom);
-                        let joined = prev.join(def_ty);
-                        if joined != prev {
-                            types.insert(input.clone(), joined);
-                            changed = true;
-                        }
-                    }
-                }
-            }
-        }
+        // Do not back-propagate through phis.
+        //
+        // In optimized SASS, loop/header phis routinely join values that only
+        // share a physical register family because of register reuse. Feeding a
+        // typed phi result back into its incoming lanes leaks float/pointer
+        // types into unrelated special-register seeds and address helpers. The
+        // forward direction is still useful, but the backward direction is not
+        // sound without a stronger variable-web splitting analysis.
     }
 
-    // ---- Phase 3: Merge SSA versions into per-physical-register types ----
-    let mut result: BTreeMap<(String, i32), InferredType> = BTreeMap::new();
-    for (ssa_reg, ty) in &types {
-        if *ty == InferredType::Bottom || *ty == InferredType::Top {
-            continue;
-        }
-        let key = (ssa_reg.class.clone(), ssa_reg.idx);
-        let prev = result.get(&key).copied().unwrap_or(InferredType::Bottom);
-        result.insert(key, prev.join(*ty));
-    }
+    types
+}
 
-    result
+fn type_from_opcode_def(opcode: &str, def_idx: usize) -> Option<InferredType> {
+    if (opcode.starts_with("IMAD.WIDE") || opcode.starts_with("UIMAD.WIDE")) && def_idx > 0 {
+        return Some(InferredType::U32);
+    }
+    if opcode.starts_with("IADD.64") && def_idx > 0 {
+        // The second def of a wide add is the high 32-bit lane, not a full
+        // pointer-typed scalar. Treating it as `Ptr64` pollutes downstream load
+        // typing when that lane is later copied or reused as a plain register.
+        return Some(InferredType::U32);
+    }
+    if matches!(opcode, "LEA" | "ULEA") && def_idx > 0 {
+        // LEA's auxiliary defs are carry/high-lane pieces, not pointer-valued
+        // scalars. Keep them as plain 32-bit integers for declaration/load type
+        // recovery.
+        return Some(InferredType::U32);
+    }
+    if def_idx > 0 {
+        return type_from_opcode(opcode);
+    }
+    type_from_opcode(opcode)
 }
 
 fn type_from_opcode(opcode: &str) -> Option<InferredType> {
+    // Special-register reads produce scalar integer coordinates/ids.
+    if opcode.starts_with("S2R") || opcode.starts_with("CS2R") || opcode.starts_with("S2UR") {
+        return Some(InferredType::U32);
+    }
+
+    // SHFL transfers preserve the source lane's type. Do not force a scalar
+    // integer type here; downstream use-sites (for example FADD) should drive
+    // the result type.
+    if opcode.starts_with("SHFL") || opcode.starts_with("USHFL") {
+        return None;
+    }
+
     // Float operations → F32 for the DEF
     if opcode.starts_with("FADD")
         || opcode.starts_with("FMUL")
@@ -325,7 +448,11 @@ fn type_from_opcode(opcode: &str) -> Option<InferredType> {
     }
 
     // Pointer / wide operations
-    if opcode.starts_with("IMAD.WIDE") || opcode == "LEA" {
+    if opcode.starts_with("IMAD.WIDE")
+        || opcode.starts_with("UIMAD.WIDE")
+        || opcode.starts_with("IADD.64")
+        || opcode == "LEA"
+    {
         return Some(InferredType::Ptr64);
     }
 
@@ -385,7 +512,10 @@ fn type_from_opcode(opcode: &str) -> Option<InferredType> {
 ///
 /// This enables **use-site back-propagation**: if ISETP.GE.AND compares
 /// two signed integers, the input registers get seeded as I32.
-fn infer_arg_types_from_opcode(opcode: &str, num_args: usize) -> Vec<Option<InferredType>> {
+pub(crate) fn infer_arg_types_from_opcode(
+    opcode: &str,
+    num_args: usize,
+) -> Vec<Option<InferredType>> {
     let mut result = vec![None; num_args];
     if num_args == 0 {
         return result;
@@ -457,7 +587,7 @@ fn infer_arg_types_from_opcode(opcode: &str, num_args: usize) -> Vec<Option<Infe
         return result;
     }
 
-    // ---- FADD, FMUL, FFMA, FSEL, FMNMX, FSETP: float operations ----
+    // ---- FADD, FMUL, FFMA, FSEL, FMNMX, FSETP, FCHK: float operations ----
     // All inputs are float.
     if opcode.starts_with("FADD")
         || opcode.starts_with("FMUL")
@@ -465,6 +595,7 @@ fn infer_arg_types_from_opcode(opcode: &str, num_args: usize) -> Vec<Option<Infe
         || opcode.starts_with("FSEL")
         || opcode.starts_with("FMNMX")
         || opcode.starts_with("FSETP")
+        || opcode.starts_with("FCHK")
     {
         for slot in result.iter_mut() {
             *slot = Some(InferredType::F32);
@@ -525,6 +656,18 @@ fn infer_arg_types_from_opcode(opcode: &str, num_args: usize) -> Vec<Option<Infe
         return result;
     }
 
+    // ---- SHFL: source lane keeps its existing scalar type; only the lane and
+    // clamp operands are known unsigned integers. ----
+    if opcode.starts_with("SHFL") || opcode.starts_with("USHFL") {
+        if num_args >= 2 {
+            result[1] = Some(InferredType::U32);
+        }
+        if num_args >= 3 {
+            result[2] = Some(InferredType::U32);
+        }
+        return result;
+    }
+
     // ---- SHF: funnel shift ----
     // SHF.R.S32.HI → signed shift; SHF.L.U32 → unsigned shift
     if opcode.starts_with("SHF") {
@@ -563,6 +706,14 @@ fn extract_copy_source(opcode: &str, args: &[IRExpr]) -> Option<SsaReg> {
                 if !is_immutable_reg(r) {
                     return Some(to_ssa_reg(r));
                 }
+            }
+        }
+    }
+    // SHFL preserves the scalar lane type of its source operand.
+    if (opcode.starts_with("SHFL") || opcode.starts_with("USHFL")) && !args.is_empty() {
+        if let Some(r) = args[0].get_reg() {
+            if !is_immutable_reg(r) {
+                return Some(to_ssa_reg(r));
             }
         }
     }
@@ -631,6 +782,29 @@ mod tests {
             .copied()
             .unwrap_or(InferredType::Bottom);
         assert_eq!(r4_ty, InferredType::Ptr64);
+    }
+
+    #[test]
+    fn wide_add_high_lane_stays_scalar() {
+        let sass = r#"
+            /*0000*/ IADD.64 R4, R0, 0x10 ;
+            /*0010*/ EXIT ;
+        "#;
+        let cfg = build_cfg(decode_sass(sass));
+        let fir = build_ssa(&cfg);
+        let types = infer_ssa_types(&fir);
+
+        let r4_ty = types
+            .iter()
+            .find_map(|(reg, ty)| (reg.class == "R" && reg.idx == 4).then_some(*ty))
+            .unwrap_or(InferredType::Bottom);
+        let r5_ty = types
+            .iter()
+            .find_map(|(reg, ty)| (reg.class == "R" && reg.idx == 5).then_some(*ty))
+            .unwrap_or(InferredType::Bottom);
+
+        assert_eq!(r4_ty, InferredType::Ptr64);
+        assert_eq!(r5_ty, InferredType::U32);
     }
 
     #[test]
@@ -807,6 +981,28 @@ mod tests {
     }
 
     #[test]
+    fn back_propagates_shfl_result_type_to_source_lane() {
+        let sass = r#"
+            /*0000*/ SHFL.DOWN PT, R2, R3, 0x10, 0x1f ;
+            /*0010*/ FADD R4, R2, 0f00000000 ;
+            /*0020*/ EXIT ;
+        "#;
+        let cfg = build_cfg(decode_sass(sass));
+        let fir = build_ssa(&cfg);
+        let types = infer_types(&fir);
+
+        let r3_ty = types
+            .get(&("R".to_string(), 3))
+            .copied()
+            .unwrap_or(InferredType::Bottom);
+        assert_eq!(
+            r3_ty,
+            InferredType::F32,
+            "SHFL source lane should inherit the scalar type of its data result"
+        );
+    }
+
+    #[test]
     fn infers_signed_from_iabs() {
         // IABS R1, R0 → output is I32, input should be I32
         let sass = r#"
@@ -831,6 +1027,41 @@ mod tests {
             r0_ty,
             InferredType::I32,
             "IABS input should be I32 (back-propagated)"
+        );
+    }
+
+    #[test]
+    fn keeps_special_register_seed_out_of_mixed_float_phi() {
+        let sass = r#"
+            /*0000*/ S2R R0, SR_CTAID.X ;
+            /*0010*/ ISETP.NE.AND P0, PT, R1, RZ, PT ;
+            /*0020*/ @P0 BRA 0x050 ;
+            /*0030*/ FADD R0, R2, R3 ;
+            /*0040*/ BRA 0x060 ;
+            /*0050*/ NOP ;
+            /*0060*/ FADD R4, R0, R5 ;
+            /*0070*/ EXIT ;
+        "#;
+        let cfg = build_cfg(decode_sass(sass));
+        let fir = build_ssa(&cfg);
+        let ssa_types = infer_ssa_types(&fir);
+
+        let s2r_def = fir
+            .blocks
+            .iter()
+            .flat_map(|block| block.stmts.iter())
+            .find_map(|stmt| match &stmt.value {
+                RValue::Op { opcode, .. } if opcode == "S2R" => {
+                    stmt.defs.first().and_then(IRExpr::get_reg).cloned()
+                }
+                _ => None,
+            })
+            .expect("expected S2R def");
+
+        assert_eq!(
+            ssa_types.get(&s2r_def).copied(),
+            Some(InferredType::U32),
+            "special-register seed must stay integer even when a later phi feeds float use-sites"
         );
     }
 }

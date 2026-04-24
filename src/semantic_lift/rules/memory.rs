@@ -7,6 +7,9 @@ pub(super) fn register(registry: &mut RuleRegistry) {
     registry.register("LDG", "ldg", |sig, args, stmt_ref, config| {
         crate::semantic_lift::lift_ldg_expr(&sig.raw_opcode, args, stmt_ref, config)
     });
+    registry.register("LDL", "ldl", |sig, args, stmt_ref, config| {
+        crate::semantic_lift::lift_ldl_expr(&sig.raw_opcode, args, stmt_ref, config)
+    });
     registry.register("LDC", "ldc", |_sig, args, stmt_ref, config| {
         // LDC loads a (non-uniform) register from constant memory.
         // Scalar, `.64`, and `.128` all lift the low-half (or only) def
@@ -33,8 +36,16 @@ pub(super) fn register(registry: &mut RuleRegistry) {
     registry.register("ATOM", "atom", |sig, args, stmt_ref, config| {
         lift_atoms(&sig.raw_opcode, args, stmt_ref, config)
     });
+    // ATOMG: explicit global-memory atomic operations (common in real kernels).
+    registry.register("ATOMG", "atomg", |sig, args, stmt_ref, config| {
+        lift_atoms(&sig.raw_opcode, args, stmt_ref, config)
+    });
     // RED: global-memory reduction (atomic without return value).
     registry.register("RED", "red", |sig, args, stmt_ref, config| {
+        lift_atoms(&sig.raw_opcode, args, stmt_ref, config)
+    });
+    // REDG: explicit global-memory reduction variant used with descriptors.
+    registry.register("REDG", "redg", |sig, args, stmt_ref, config| {
         lift_atoms(&sig.raw_opcode, args, stmt_ref, config)
     });
 }
@@ -46,13 +57,17 @@ fn lift_atoms(
     stmt_ref: crate::StatementRef,
     config: &crate::semantic_lift::SemanticLiftConfig<'_>,
 ) -> Option<crate::semantic_lift::LiftedExpr> {
-    let rendered: Vec<String> = args
+    let lifted_args: Vec<crate::semantic_lift::LiftedExpr> = args
         .iter()
-        .map(|a| crate::semantic_lift::lift_ir_expr(a, stmt_ref, config).render())
+        .map(|a| crate::semantic_lift::lift_ir_expr(a, stmt_ref, config))
         .collect();
+    let mem_idx = args
+        .iter()
+        .position(|arg| matches!(arg, crate::ir::IRExpr::Mem { .. }))?;
 
     // Map the atomic operation modifier to a CUDA API function name.
-    let cuda_fn = if opcode.contains(".ADD") {
+    let popc_inc = opcode.contains(".POPC.INC.");
+    let cuda_fn = if popc_inc || opcode.contains(".ADD") {
         "atomicAdd"
     } else if opcode.contains(".MIN") {
         "atomicMin"
@@ -73,37 +88,41 @@ fn lift_atoms(
     } else if opcode.contains(".XOR") {
         "atomicXor"
     } else {
-        // Unknown atomic variant — render as raw opcode(...).
-        return Some(crate::semantic_lift::LiftedExpr::Raw(format!(
-            "{}({})",
-            opcode,
-            rendered.join(", ")
-        )));
+        opcode
     };
 
     // For shared-memory atomics, try to render the address as shmem[...].
-    let addr_str = if opcode.starts_with("ATOMS") && !args.is_empty() {
-        crate::semantic_lift::render_shared_ref(&args[0], stmt_ref, config)
-            .map(|s| format!("&{}", s))
-            .unwrap_or_else(|| rendered[0].clone())
-    } else if !args.is_empty() {
-        rendered[0].clone()
+    let addr_expr = if opcode.starts_with("ATOMS") {
+        crate::semantic_lift::lift_shared_ref_expr(&args[mem_idx], false, 0, stmt_ref, config)
+            .map(|expr| crate::semantic_lift::LiftedExpr::Unary {
+                op: "&".to_string(),
+                arg: Box::new(expr),
+            })
+            .unwrap_or_else(|| lifted_args[mem_idx].clone())
     } else {
-        return None;
+        let addr = crate::semantic_lift::lift_addr_expr(&args[mem_idx], stmt_ref, config)
+            .unwrap_or_else(|| lifted_args[mem_idx].clone());
+        crate::semantic_lift::scalar_type_from_opcode(opcode)
+            .map(|ty| crate::semantic_lift::LiftedExpr::Cast {
+                ty: format!("{}*", ty),
+                expr: Box::new(addr.clone()),
+            })
+            .unwrap_or(addr)
     };
 
-    let rest_args = &rendered[1..];
-    if rest_args.is_empty() {
-        Some(crate::semantic_lift::LiftedExpr::Raw(format!(
-            "{}({})",
-            cuda_fn, addr_str
-        )))
-    } else {
-        Some(crate::semantic_lift::LiftedExpr::Raw(format!(
-            "{}({}, {})",
-            cuda_fn,
-            addr_str,
-            rest_args.join(", ")
-        )))
+    let mut call_args = Vec::with_capacity(args.len());
+    call_args.push(addr_expr);
+    call_args.extend(
+        lifted_args
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, arg)| (idx != mem_idx).then_some(arg.clone())),
+    );
+    if popc_inc && call_args.len() == 1 {
+        call_args.push(crate::semantic_lift::LiftedExpr::Imm("1".to_string()));
     }
+    Some(crate::semantic_lift::LiftedExpr::CallLike {
+        func: cuda_fn.to_string(),
+        args: call_args,
+    })
 }

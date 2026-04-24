@@ -17,38 +17,76 @@ This is a reverse-engineering and compiler-internals project, not a production d
 
 ## What the output looks like
 
-For `test_cu/test_div.sass`, the canonical output looks like this:
+For `test_cu/if_loop.sass`, the canonical output already looks like real structured code rather than a flat opcode dump. This is an abridged excerpt from the current full-pass snapshot:
 
 ```c
-__global__ void kernel(int32_t arg0, int32_t arg1, uint32_t arg2, uint32_t arg3) {
-  uint32_t v0;
-  int32_t u0;
-  uint32_t u1;
-  int32_t u2;
-  uint32_t v1;
-  bool b0;
-  uint32_t v2;
-  uint32_t v3;
+__global__ void kernel(uint32_t arg0, uint32_t arg2, uintptr_t arg4_ptr, uint32_t arg6, uint32_t arg7) {
+  uint32_t ctaid_x;
+  uint32_t tid_x;
   ...
 
-  v0 = abs(arg1);
-  u0 = arg0;
-  u1 = arg1;
-  u2 = u0 ^ u1;
-  v1 = (float)(v0);
-  b0 = (int32_t)(0) <= (int32_t)(u2);
-  ...
-  *addr64(v9, v15) = v16;
+  ctaid_x = blockIdx.x;
+  tid_x = threadIdx.x;
+  v2 = ctaid_x * blockDim.x + tid_x;
+  if ((int32_t)(v2) >= (int32_t)(arg6)) return;
+  v3 = v2 * 4 + arg0;
+  v4 = v2 * 4 + arg2;
+  v5 = *addr64(v3, v6);
+  v7 = *addr64(v4, 4);
+  v8 = arg7;
+  v10 = v7 + v5;
+  b2 = v10 > 1;
+  v11 = !b2 ? (v7 * v5) : v10;
+
+  if ((int32_t)(v8) >= (int32_t)(1)) {
+    v3 = v8 - 1;
+    v8 = v8 & 3;
+    if (v3 >= 3) {
+      v7 = -v8 + arg7;
+      if ((int32_t)(v7) > (int32_t)(0)) b4 = (int32_t)(v7) > (int32_t)(12);
+    }
+  }
+
+  do {
+    b7 = v11 > 0.5;
+    v7 = v7 - 16;
+    ...
+    v11 = v3 * v41;
+  } while((int32_t)(v7) > (int32_t)(12));
+
+  do {
+    v8 = v8 - 1;
+    b1 = v11 > 0.5;
+    b2 = v8 != 0;
+    v3 = b1 ? 1066192077 : 0.8999999761581421;
+    v11 = v3 * v11;
+  } while(v8 != 0);
+
+  v61 = v2 + (arg4_ptr.lo32 << 2);
+  v62 = lea_hi_x(v2, arg4_ptr.hi32, 2, b2);
+  *addr64(v61, v62) = v11;
   return;
 }
 ```
 
 That is representative of the current backend:
-- signatures are inferred heuristically from ABI usage
+- signatures are inferred heuristically from ABI usage and CUDA builtins such as `blockIdx.x`, `threadIdx.x`, and `blockDim.x` are recovered
+- control flow is no longer raw `BRA` / `EXIT`; it becomes structured `if` / `do ... while` code when the CFG is recoverable
+- semantic lift recovers helpers such as `lea_hi_x`, typed loads/stores, and arithmetic/comparison structure instead of dumping raw mnemonics
 - locals are typed, but names are still generic (`vN`, `bN`, `uN`) unless stronger recovery exists
-- semantic lift recovers helpers such as `abs`, `rcp_approx`, `mul_hi_u32`, CUDA builtins, and shared-memory access
-- pointer reconstruction is partial, so `addr64(lo, hi)` still appears in many kernels
+- pointer reconstruction is improved but still incomplete, so `addr64(lo, hi)` style artifacts can remain in real kernels
 
+### Real compute kernels covered
+
+The corpus also exercises real compute kernels beyond the small single-file fixtures. Good examples in `test_cu/corpus/compute_kernels.cu` include:
+
+- `bitonic_sort` — nested compare/swap passes with `__syncthreads()` and pairwise exchange logic recovered from real sorting code
+- `sgemm_tiled` — 2D block indexing, `__shared__` tile buffers, synchronized load/compute phases, and a final matrix-store path
+- `stencil2d_5pt` — shared-memory tile + halo loads, `blockIdx.{x,y}` / `threadIdx.{x,y}` recovery, boundary guards, and a weighted output store
+
+Those kernels are still more temp-heavy than ideal, but they are real corpus workloads that the canonical backend decompiles and regression-tests today.
+
+For a larger shared-memory example, see `test_cu/golden_full_pass/rc4.pseudo.c`.
 For concrete snapshots, see `test_cu/golden_full_pass/`.
 
 ## Quick start
@@ -56,7 +94,7 @@ For concrete snapshots, see `test_cu/golden_full_pass/`.
 ### 1. Build and run on a bundled fixture
 
 ```bash
-cargo run -- -i test_cu/test_div.sass
+cargo run -- -i test_cu/if_loop.sass
 ```
 
 A few more useful examples:
@@ -110,14 +148,20 @@ nvdisasm my_kernel.cubin > my_kernel.sass
 cargo run -- -i my_kernel.sass -o my_kernel.pseudo.c
 ```
 
-### Important current limitation: one function per CLI input
+### Multi-function dumps
 
-The CLI currently runs the canonical pipeline on one instruction stream. If your dump contains multiple `Function : ...` sections, either:
+If your dump contains multiple `Function : ...` sections, the CLI now decompiles each function in sequence by default.
 
-- extract the single kernel you care about into its own `.sass` file, or
-- use the library helper `split_decoded_functions()` and run functions one by one
+Useful patterns:
 
-The test corpus uses `split_decoded_functions()` for multi-kernel dumps, but the public CLI does not yet expose a `--function <name>` selector.
+- decompile every function in a corpus-style dump:
+  - `cargo run -- -i test_cu/corpus_sm100/arith_kernels.sass`
+- select one named function from a multi-function dump:
+  - `cargo run -- -i test_cu/corpus_sm100/arith_kernels.sass --function relu`
+- inspect DOT for one function from a multi-function dump:
+  - `cargo run -- -i test_cu/corpus_sm100/arith_kernels.sass --function relu --cfg-dot`
+
+`--cfg-dot` and `--ssa-dot` require a single selected function, so use `--function <name>` with those modes on multi-function inputs.
 
 ## CLI reference
 
@@ -128,13 +172,17 @@ Current `main` options:
 -o, --output <OUTPUT>            Output file for structured output or SSA DOT
     --cfg-dot                    Dump CFG as DOT to stdout
     --ssa-dot                    Dump optimized SSA IR as DOT
+    --function <FUNCTION>        Select one function from a multi-function dump by `Function :` name
     --abi-profile <ABI_PROFILE>  Force ABI profile (`auto|legacy140|modern160`)
 ```
 
 Notes:
 - default mode is the full decompiler pipeline
+- multi-function dumps are split automatically for structured output
+- `--function <name>` selects one function from a multi-function dump
 - `--cfg-dot` writes DOT to stdout; redirect it with `>`
 - `--ssa-dot` can print to stdout or write via `-o`
+- `--cfg-dot` and `--ssa-dot` require a single selected function on multi-function inputs
 - on the decompile path, `-o` writes the final pseudo-C file while stdout still prints a small status banner
 
 ## Canonical pipeline

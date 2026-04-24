@@ -60,6 +60,10 @@ fn expr_to_atom(e: &IRExpr) -> ExprAtom {
         },
         IRExpr::ImmI(v) => ExprAtom::ImmI(*v),
         IRExpr::ImmF(v) => ExprAtom::ImmF(v.to_bits()),
+        IRExpr::Addr64 { lo, hi } => ExprAtom::Op {
+            op: "addr64".to_string(),
+            args: vec![expr_to_atom(lo), expr_to_atom(hi)],
+        },
         IRExpr::Mem {
             base,
             offset,

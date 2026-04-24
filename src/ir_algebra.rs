@@ -219,7 +219,7 @@ fn is_plain_imad(opcode: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{build_cfg, build_ssa, ir_constprop, ir_copyprop, ir_dce, decode_sass};
+    use crate::{build_cfg, build_ssa, decode_sass, ir_constprop, ir_copyprop, ir_dce};
 
     #[test]
     fn iadd3_x_0_0_simplifies_to_copy() {

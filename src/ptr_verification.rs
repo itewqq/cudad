@@ -183,26 +183,24 @@ fn scan_expr_for_addr64(
     result: &mut Ptr64VerificationResult,
 ) {
     match expr {
-        IRExpr::Op { op, args } if op == "addr64" && args.len() == 2 => {
-            let lo_reg = args[0].get_reg().cloned();
-            let hi_reg = args[1].get_reg().cloned();
-            if let (Some(lo), Some(hi)) = (lo_reg, hi_reg) {
-                let hi_key = RegKey::from(&hi);
+        IRExpr::Addr64 { lo, hi } => {
+            let lo_reg = lo.get_reg().cloned();
+            let hi_reg = hi.get_reg().cloned();
+            if let (Some(lo_reg), Some(hi_reg)) = (lo_reg, hi_reg) {
+                let hi_key = RegKey::from(&hi_reg);
                 let mut visited = HashSet::new();
                 if is_hi_part_def(&hi_key, def_opcode, copy_sources, &mut visited) {
-                    result.verified_pairs.push((lo, hi));
+                    result.verified_pairs.push((lo_reg, hi_reg));
                 } else {
-                    result.unverified_pairs.push((lo, hi));
+                    result.unverified_pairs.push((lo_reg, hi_reg));
                 }
             }
-            // Also scan sub-expressions
-            for a in args {
-                scan_expr_for_addr64(a, def_opcode, copy_sources, result);
-            }
+            scan_expr_for_addr64(lo.as_ref(), def_opcode, copy_sources, result);
+            scan_expr_for_addr64(hi.as_ref(), def_opcode, copy_sources, result);
         }
         IRExpr::Op { args, .. } => {
-            for a in args {
-                scan_expr_for_addr64(a, def_opcode, copy_sources, result);
+            for arg in args {
+                scan_expr_for_addr64(arg, def_opcode, copy_sources, result);
             }
         }
         IRExpr::Mem { base, offset, .. } => {
@@ -211,7 +209,7 @@ fn scan_expr_for_addr64(
                 scan_expr_for_addr64(off, def_opcode, copy_sources, result);
             }
         }
-        _ => {}
+        IRExpr::Reg(_) | IRExpr::ImmI(_) | IRExpr::ImmF(_) => {}
     }
 }
 

@@ -16,12 +16,14 @@
 use std::collections::HashMap;
 
 use crate::ir::{FunctionIR, IRBlock, IRExpr, IRStatement, RValue, RegId};
+use crate::type_inference::{infer_types, InferredType};
 
 /// Run sparse constant propagation on `fir`, returning a new `FunctionIR`
 /// with constant uses inlined.
 pub fn ir_constprop(fir: &FunctionIR) -> FunctionIR {
     // ---- Step 1: Identify constant definitions ----
     let mut const_map: HashMap<RegId, IRExpr> = HashMap::new();
+    let inferred_types = infer_types(fir);
 
     for block in &fir.blocks {
         for stmt in &block.stmts {
@@ -38,7 +40,10 @@ pub fn ir_constprop(fir: &FunctionIR) -> FunctionIR {
                 _ => continue,
             };
 
-            if let Some(const_expr) = extract_constant_value(&stmt.value) {
+            let def_ty = inferred_types
+                .get(&(def_reg.class.clone(), def_reg.idx))
+                .copied();
+            if let Some(const_expr) = extract_constant_value(&stmt.value, def_ty) {
                 const_map.insert(def_reg, const_expr);
             }
         }
@@ -67,23 +72,23 @@ pub fn ir_constprop(fir: &FunctionIR) -> FunctionIR {
 }
 
 /// If `value` defines a known constant, return the constant as an `IRExpr`.
-fn extract_constant_value(value: &RValue) -> Option<IRExpr> {
+fn extract_constant_value(value: &RValue, def_ty: Option<InferredType>) -> Option<IRExpr> {
     match value {
-        RValue::ImmI(v) => Some(IRExpr::ImmI(*v)),
+        RValue::ImmI(v) => Some(retype_constant_for_def(IRExpr::ImmI(*v), def_ty)),
         RValue::ImmF(v) => Some(IRExpr::ImmF(*v)),
         RValue::Op { opcode, args } => {
             // IMAD.MOV.U32 Rdst, RZ, RZ, <imm>  →  imm (0 * 0 + imm)
             if opcode.starts_with("IMAD.MOV") && args.len() >= 3 {
                 if is_zero_expr(&args[0]) && is_zero_expr(&args[1]) {
                     if let Some(c) = as_immediate(&args[2]) {
-                        return Some(c);
+                        return Some(retype_constant_for_def(c, def_ty));
                     }
                 }
             }
             // MOV Rdst, <imm>
             if (opcode == "MOV" || opcode.starts_with("MOV.")) && args.len() == 1 {
                 if let Some(c) = as_immediate(&args[0]) {
-                    return Some(c);
+                    return Some(retype_constant_for_def(c, def_ty));
                 }
             }
             None
@@ -92,10 +97,51 @@ fn extract_constant_value(value: &RValue) -> Option<IRExpr> {
     }
 }
 
+fn retype_constant_for_def(expr: IRExpr, def_ty: Option<InferredType>) -> IRExpr {
+    let Some(def_ty) = def_ty else {
+        return expr;
+    };
+    let IRExpr::ImmI(bits_i64) = expr else {
+        return expr;
+    };
+    if !matches!(def_ty, InferredType::F32 | InferredType::AnyFloat) {
+        return IRExpr::ImmI(bits_i64);
+    }
+    if !looks_like_f32_bitpattern(bits_i64) {
+        return IRExpr::ImmI(bits_i64);
+    }
+    IRExpr::ImmF(f32::from_bits(bits_i64 as u32) as f64)
+}
+
+fn looks_like_f32_bitpattern(bits_i64: i64) -> bool {
+    let bits = bits_i64 as u32;
+    if bits_i64.unsigned_abs() < 0x1_0000 {
+        return false;
+    }
+    f32::from_bits(bits).is_finite()
+}
+
 fn propagate_in_stmt(stmt: &IRStatement, const_map: &HashMap<RegId, IRExpr>) -> IRStatement {
+    let canonical_value = stmt
+        .defs
+        .first()
+        .and_then(IRExpr::get_reg)
+        .filter(|_| stmt.defs.len() == 1 && stmt.pred.is_none())
+        .and_then(|reg| {
+            let lookup_key = RegId {
+                class: reg.class.clone(),
+                idx: reg.idx,
+                sign: reg.sign.abs(),
+                ssa: reg.ssa,
+            };
+            const_map
+                .get(&lookup_key)
+                .cloned()
+                .and_then(rvalue_from_const_expr)
+        });
     IRStatement {
         defs: stmt.defs.clone(),
-        value: propagate_in_rvalue(&stmt.value, const_map),
+        value: canonical_value.unwrap_or_else(|| propagate_in_rvalue(&stmt.value, const_map)),
         pred: stmt.pred.as_ref().map(|p| propagate_in_expr(p, const_map)),
         mem_addr_args: stmt.mem_addr_args.as_ref().map(|args| {
             args.iter()
@@ -107,6 +153,14 @@ fn propagate_in_stmt(stmt: &IRStatement, const_map: &HashMap<RegId, IRExpr>) -> 
             .iter()
             .map(|d| propagate_in_expr(d, const_map))
             .collect(),
+    }
+}
+
+fn rvalue_from_const_expr(expr: IRExpr) -> Option<RValue> {
+    match expr {
+        IRExpr::ImmI(v) => Some(RValue::ImmI(v)),
+        IRExpr::ImmF(v) => Some(RValue::ImmF(v)),
+        IRExpr::Reg(_) | IRExpr::Addr64 { .. } | IRExpr::Mem { .. } | IRExpr::Op { .. } => None,
     }
 }
 
@@ -152,6 +206,10 @@ fn propagate_in_expr(expr: &IRExpr, const_map: &HashMap<RegId, IRExpr>) -> IRExp
             }
             expr.clone()
         }
+        IRExpr::Addr64 { lo, hi } => IRExpr::Addr64 {
+            lo: Box::new(propagate_in_expr(lo, const_map)),
+            hi: Box::new(propagate_in_expr(hi, const_map)),
+        },
         IRExpr::Mem {
             base,
             offset,

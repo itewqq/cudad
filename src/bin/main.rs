@@ -1,6 +1,6 @@
 use clap::Parser;
 use cudad::*;
-use std::fs;
+use std::{fs, process};
 
 /// Embedded demo SASS for quick testing without --input.
 const SAMPLE_SASS: &str = include_str!("../../test_cu/sample_verify_kernel.sass");
@@ -27,9 +27,32 @@ struct Args {
     /// Dump optimized SSA IR as DOT
     #[clap(long)]
     ssa_dot: bool,
+    /// Select one function from a multi-function dump by `Function :` name
+    #[clap(long)]
+    function: Option<String>,
     /// Force ABI profile (`auto|legacy140|modern160`)
     #[clap(long, value_enum, default_value = "auto")]
     abi_profile: AbiProfileMode,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct InputFunction {
+    name: Option<String>,
+    sm: Option<u32>,
+    instrs: Vec<DecodedInstruction>,
+}
+
+impl InputFunction {
+    fn display_name(&self) -> &str {
+        self.name.as_deref().unwrap_or("kernel")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputMode {
+    Structured,
+    CfgDot,
+    SsaDot,
 }
 
 fn load_sass(input: Option<&str>) -> String {
@@ -37,6 +60,80 @@ fn load_sass(input: Option<&str>) -> String {
         Some(path) => fs::read_to_string(path).expect("Failed to read input file"),
         None => SAMPLE_SASS.to_string(),
     }
+}
+
+fn load_input_functions(sass: &str) -> Vec<InputFunction> {
+    let funcs = split_decoded_functions(sass);
+    if funcs.is_empty() {
+        return vec![InputFunction {
+            name: None,
+            sm: parse_sm_version(sass),
+            instrs: decode_sass(sass),
+        }];
+    }
+
+    funcs
+        .into_iter()
+        .map(|f| InputFunction {
+            name: Some(f.name),
+            sm: f.sm,
+            instrs: f.instrs,
+        })
+        .collect()
+}
+
+fn format_available_functions(functions: &[InputFunction]) -> String {
+    let names = functions
+        .iter()
+        .filter_map(|f| f.name.as_deref())
+        .collect::<Vec<_>>();
+    if names.is_empty() {
+        "input has no named `Function :` sections".to_string()
+    } else {
+        names.join(", ")
+    }
+}
+
+fn select_functions(
+    functions: Vec<InputFunction>,
+    requested: Option<&str>,
+) -> Result<Vec<InputFunction>, String> {
+    if let Some(name) = requested {
+        let available = format_available_functions(&functions);
+        let selected = functions
+            .into_iter()
+            .filter(|f| f.name.as_deref() == Some(name))
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
+            return Err(format!(
+                "Function `{}` not found. Available functions: {}",
+                name, available
+            ));
+        }
+        return Ok(selected);
+    }
+
+    Ok(functions)
+}
+
+fn require_single_function<'a>(
+    functions: &'a [InputFunction],
+    mode: OutputMode,
+) -> Result<&'a InputFunction, String> {
+    if functions.len() == 1 {
+        return Ok(&functions[0]);
+    }
+
+    let flag = match mode {
+        OutputMode::Structured => "structured output",
+        OutputMode::CfgDot => "--cfg-dot",
+        OutputMode::SsaDot => "--ssa-dot",
+    };
+    Err(format!(
+        "{} requires a single function, but the input resolved to {} functions. Use `--function <name>` to choose one.",
+        flag,
+        functions.len()
+    ))
 }
 
 fn resolve_abi_profile(
@@ -61,39 +158,59 @@ fn optimize_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
     ir_dce(&copyprop)
 }
 
-fn emit_ssa_dot(cfg: &ControlFlowGraph, abi_profile: AbiProfile, output: Option<&str>) {
+fn build_ssa_dot(cfg: &ControlFlowGraph, abi_profile: AbiProfile) -> String {
     let fir = optimize_ssa(cfg);
     let anns = annotate_function_ir_constmem(&fir, abi_profile);
     let aliases = infer_arg_aliases(&fir, &anns);
     let display = AbiDisplay::with_aliases(abi_profile, aliases);
-    let dot = fir.to_dot(cfg, &display);
-    emit_output(&dot, output);
+    fir.to_dot(cfg, &display)
 }
 
-fn emit_struct_code(cfg: &ControlFlowGraph, abi_profile: AbiProfile, output: Option<&str>) {
+fn append_abi_summary(
+    out: &mut String,
+    abi_annotations: &AbiAnnotations,
+    abi_aliases: &AbiArgAliases,
+) {
+    if !abi_annotations.is_empty() {
+        out.push_str("// ABI const-memory mapping (sample):\n");
+        for line in abi_annotations.summarize_lines(16) {
+            out.push_str("// ");
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    if !abi_aliases.is_empty() {
+        out.push_str("// ABI arg aliases (heuristic):\n");
+        for line in abi_aliases.summarize_lines(12) {
+            out.push_str("// ");
+            out.push_str(&line);
+            out.push('\n');
+        }
+        out.push_str("// Typed signature inferred from ABI aliases:\n");
+        for line in abi_aliases.summarize_lines(12) {
+            out.push_str("// ");
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+}
+
+fn build_structured_output(cfg: &ControlFlowGraph, abi_profile: AbiProfile) -> String {
     let fir = optimize_ssa(cfg);
     let abi_annotations = annotate_function_ir_constmem(&fir, abi_profile);
     let abi_aliases = infer_arg_aliases(&fir, &abi_annotations);
-    let local_decls = infer_local_typed_declarations_with_abi(
-        &fir,
-        Some(&abi_annotations),
-        Some(&abi_aliases),
-    );
+    let local_decls =
+        infer_local_typed_declarations_with_abi(&fir, Some(&abi_annotations), Some(&abi_aliases));
 
-    println!("// --- Structured Output ---");
-    print_abi_summary(&abi_annotations, &abi_aliases);
-    if !abi_aliases.is_empty() {
-        println!("// Typed signature inferred from ABI aliases:");
-        for line in abi_aliases.summarize_lines(12) {
-            println!("// {}", line);
-        }
-    }
+    let mut out = String::new();
+    out.push_str("// --- Structured Output ---\n");
+    append_abi_summary(&mut out, &abi_annotations, &abi_aliases);
 
     let mut structurizer = Structurizer::new(cfg, &fir);
     let Some(structured_body) = structurizer.structure_function() else {
-        println!("// Failed to structure function or function is empty.");
-        println!("// --- End Structured Output ---");
-        return;
+        out.push_str("// Failed to structure function or function is empty.\n");
+        out.push_str("// --- End Structured Output ---\n");
+        return out;
     };
 
     let display = AbiDisplay::with_aliases(abi_profile, abi_aliases.clone());
@@ -105,22 +222,31 @@ fn emit_struct_code(cfg: &ControlFlowGraph, abi_profile: AbiProfile, output: Opt
     let lifted = lift_function_ir(&fir, &lift_cfg);
     let preview_output =
         structurizer.pretty_print_with_lift_cleanup(&structured_body, &display, 0, Some(&lifted));
+    let has_unstructured = preview_output.contains("goto BB");
     let plan = plan_structured_name_recovery_with_lift(
         &fir,
         &preview_output,
         Some(&lifted),
         &NameRecoveryConfig {
-            style: NameStyle::Temp,
-            rewrite_control_predicates: true,
+            style: if has_unstructured {
+                NameStyle::VerbatimSsa
+            } else {
+                NameStyle::Temp
+            },
+            rewrite_control_predicates: !has_unstructured,
             semantic_symbolization: true,
         },
     );
+    let enable_post_name_addr64_fold = !has_unstructured
+        && preview_output.len() <= 30_000
+        && preview_output.matches("((uintptr_t)").count() >= 8;
     let named_output = structurizer.pretty_print_with_lift_cleanup_and_names(
         &structured_body,
         &display,
         0,
         Some(&lifted),
         &plan.token_map,
+        enable_post_name_addr64_fold,
     );
     let symbols = filter_recovered_symbols_by_output(&named_output, &plan.symbols);
     let name_type_map = infer_recovered_name_types(&fir, &symbols);
@@ -133,23 +259,59 @@ fn emit_struct_code(cfg: &ControlFlowGraph, abi_profile: AbiProfile, output: Opt
         collect_shared_memory_decls(Some(&lifted)),
     );
 
-    emit_output(&final_output, output);
-    println!("// --- End Structured Output ---");
+    out.push_str(&final_output);
+    if !final_output.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str("// --- End Structured Output ---\n");
+    out
 }
 
-fn print_abi_summary(abi_annotations: &AbiAnnotations, abi_aliases: &AbiArgAliases) {
-    if !abi_annotations.is_empty() {
-        println!("// ABI const-memory mapping (sample):");
-        for line in abi_annotations.summarize_lines(16) {
-            println!("// {}", line);
+fn build_empty_stub() -> String {
+    "// --- Structured Output ---\n// Warning: no parseable SASS instruction lines were found.\n// Returning an empty stub to keep the pipeline non-fatal.\n__global__ void kernel(void) {\n}\n// --- End Structured Output ---\n".to_string()
+}
+
+fn build_function_output(
+    function: &InputFunction,
+    mode: OutputMode,
+    abi_mode: &AbiProfileMode,
+) -> String {
+    let abi_profile = resolve_abi_profile(abi_mode, &function.instrs, function.sm);
+    let cfg = build_cfg(function.instrs.clone());
+
+    match mode {
+        OutputMode::Structured => {
+            if cfg.node_count() == 0 {
+                build_empty_stub()
+            } else {
+                build_structured_output(&cfg, abi_profile)
+            }
         }
+        OutputMode::CfgDot => graph_to_dot(&cfg),
+        OutputMode::SsaDot => build_ssa_dot(&cfg, abi_profile),
     }
-    if !abi_aliases.is_empty() {
-        println!("// ABI arg aliases (heuristic):");
-        for line in abi_aliases.summarize_lines(12) {
-            println!("// {}", line);
+}
+
+fn build_multi_function_output(functions: &[InputFunction], abi_mode: &AbiProfileMode) -> String {
+    if functions.len() == 1 {
+        return build_function_output(&functions[0], OutputMode::Structured, abi_mode);
+    }
+
+    let mut out = String::new();
+    for (idx, function) in functions.iter().enumerate() {
+        if idx > 0 {
+            out.push('\n');
         }
+        out.push_str("// === Function: ");
+        out.push_str(function.display_name());
+        out.push_str(" ===\n");
+        out.push_str(&build_function_output(
+            function,
+            OutputMode::Structured,
+            abi_mode,
+        ));
     }
+    out
 }
 
 fn emit_output(content: &str, output: Option<&str>) {
@@ -162,34 +324,126 @@ fn emit_output(content: &str, output: Option<&str>) {
     }
 }
 
-fn emit_empty_stub(output: Option<&str>) {
-    let stub = "// Warning: no parseable SASS instruction lines were found.\n// Returning an empty stub to keep the pipeline non-fatal.\n__global__ void kernel(void) {\n}\n";
-    println!("// --- Structured Output ---");
-    emit_output(stub, output);
-    println!("// --- End Structured Output ---");
+fn exit_with_error(message: &str) -> ! {
+    eprintln!("error: {}", message);
+    process::exit(2);
 }
 
 fn main() {
     let args = Args::parse();
     let sass = load_sass(args.input.as_deref());
-    let instrs = decode_sass(&sass);
-    let sm_version = parse_sm_version(&sass);
-    let abi_profile = resolve_abi_profile(&args.abi_profile, &instrs, sm_version);
-    let cfg = build_cfg(instrs);
+    let functions = load_input_functions(&sass);
+    let functions = select_functions(functions, args.function.as_deref())
+        .unwrap_or_else(|e| exit_with_error(&e));
 
-    if args.cfg_dot {
-        println!("{}", graph_to_dot(&cfg));
-        return;
-    }
-
-    if args.ssa_dot {
-        emit_ssa_dot(&cfg, abi_profile, args.output.as_deref());
-        return;
-    }
-
-    if cfg.node_count() == 0 {
-        emit_empty_stub(args.output.as_deref());
+    let mode = if args.cfg_dot {
+        OutputMode::CfgDot
+    } else if args.ssa_dot {
+        OutputMode::SsaDot
     } else {
-        emit_struct_code(&cfg, abi_profile, args.output.as_deref());
+        OutputMode::Structured
+    };
+
+    match mode {
+        OutputMode::Structured => {
+            let content = build_multi_function_output(&functions, &args.abi_profile);
+            emit_output(&content, args.output.as_deref());
+        }
+        OutputMode::CfgDot | OutputMode::SsaDot => {
+            let function =
+                require_single_function(&functions, mode).unwrap_or_else(|e| exit_with_error(&e));
+            let content = build_function_output(function, mode, &args.abi_profile);
+            emit_output(&content, args.output.as_deref());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_input_functions_falls_back_for_single_function_input() {
+        let sample = "/*0000*/ MOV R0, RZ ;\n/*0010*/ EXIT ;\n";
+        let funcs = load_input_functions(sample);
+        assert_eq!(funcs.len(), 1);
+        assert_eq!(funcs[0].name, None);
+        assert_eq!(funcs[0].instrs.len(), 2);
+    }
+
+    #[test]
+    fn load_input_functions_splits_multi_function_dump() {
+        let sample = r#"
+        code for sm_89
+        Function : first
+        /*0000*/ MOV R0, RZ ;
+        /*0010*/ EXIT ;
+        Function : second
+        /*0000*/ MOV R1, RZ ;
+        /*0010*/ EXIT ;
+        "#;
+        let funcs = load_input_functions(sample);
+        assert_eq!(funcs.len(), 2);
+        assert_eq!(funcs[0].name.as_deref(), Some("first"));
+        assert_eq!(funcs[1].name.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn select_functions_filters_requested_name() {
+        let funcs = vec![
+            InputFunction {
+                name: Some("first".to_string()),
+                sm: None,
+                instrs: Vec::new(),
+            },
+            InputFunction {
+                name: Some("second".to_string()),
+                sm: None,
+                instrs: Vec::new(),
+            },
+        ];
+        let selected = select_functions(funcs, Some("second")).expect("selected function");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn select_functions_reports_available_names() {
+        let funcs = vec![
+            InputFunction {
+                name: Some("first".to_string()),
+                sm: None,
+                instrs: Vec::new(),
+            },
+            InputFunction {
+                name: Some("second".to_string()),
+                sm: None,
+                instrs: Vec::new(),
+            },
+        ];
+        let err =
+            select_functions(funcs, Some("missing")).expect_err("missing function should error");
+        assert!(err.contains("missing"));
+        assert!(err.contains("first"));
+        assert!(err.contains("second"));
+    }
+
+    #[test]
+    fn require_single_function_rejects_multi_function_cfg_dot() {
+        let funcs = vec![
+            InputFunction {
+                name: Some("first".to_string()),
+                sm: None,
+                instrs: Vec::new(),
+            },
+            InputFunction {
+                name: Some("second".to_string()),
+                sm: None,
+                instrs: Vec::new(),
+            },
+        ];
+        let err = require_single_function(&funcs, OutputMode::CfgDot)
+            .expect_err("cfg dot should require one function");
+        assert!(err.contains("--function <name>"));
     }
 }

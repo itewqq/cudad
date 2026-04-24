@@ -89,7 +89,8 @@ fn run_structured_output_full_pass(sass: &str) -> String {
         strict: true,
     };
     let lifted = lift_function_ir(&fir, &lift_cfg);
-    let preview_output = structurizer.pretty_print_with_lift_cleanup(&tree, display_ctx, 0, Some(&lifted));
+    let preview_output =
+        structurizer.pretty_print_with_lift_cleanup(&tree, display_ctx, 0, Some(&lifted));
     let plan = plan_structured_name_recovery_with_lift(
         &fir,
         &preview_output,
@@ -106,6 +107,7 @@ fn run_structured_output_full_pass(sass: &str) -> String {
         0,
         Some(&lifted),
         &plan.token_map,
+        false,
     );
     let symbols = filter_recovered_symbols_by_output(&named_output, &plan.symbols);
     let name_type_map = infer_recovered_name_types(&fir, &symbols);

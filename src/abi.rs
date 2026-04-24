@@ -6,7 +6,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ir::{DisplayCtx, FunctionIR, IRExpr, IRStatement, RValue, RegId};
 use crate::parser::{DecodedInstruction, DecodedOperand};
-use crate::type_inference::infer_types;
+use crate::type_inference::{
+    infer_arg_types_from_opcode, infer_ssa_types, infer_types, InferredType,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AbiGeneration {
@@ -105,12 +107,38 @@ pub enum ArgAliasKind {
     Ptr64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArgScalarKind {
+    U32,
+    I32,
+    F32,
+}
+
+impl ArgScalarKind {
+    fn summary_label(self) -> &'static str {
+        match self {
+            ArgScalarKind::U32 => "u32",
+            ArgScalarKind::I32 => "i32",
+            ArgScalarKind::F32 => "f32",
+        }
+    }
+
+    fn c_type(self) -> &'static str {
+        match self {
+            ArgScalarKind::U32 => "uint32_t",
+            ArgScalarKind::I32 => "int32_t",
+            ArgScalarKind::F32 => "float",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArgAlias {
     pub param_idx: u32,
     pub kind: ArgAliasKind,
     pub confidence: AliasConfidence,
     pub observed_words: BTreeSet<u32>,
+    pub scalar_kind: Option<ArgScalarKind>,
     pub signed_words: BTreeSet<u32>,
     pub pointee_ty: Option<&'static str>,
 }
@@ -212,7 +240,10 @@ impl AbiArgAliases {
                 let kind = match alias.kind {
                     ArgAliasKind::Ptr64 => "ptr64",
                     ArgAliasKind::U64 => "u64",
-                    ArgAliasKind::Word32 => "word32",
+                    ArgAliasKind::Word32 => alias
+                        .scalar_kind
+                        .map(ArgScalarKind::summary_label)
+                        .unwrap_or("word32"),
                 };
                 format!(
                     "param_{} -> arg{} ({}, confidence: {}, words: {:?})",
@@ -255,11 +286,9 @@ impl AbiArgAliases {
                     ));
                 }
                 ArgAliasKind::Word32 => {
-                    let is_signed = alias.signed_words.contains(&0);
-                    let scalar_ty = if is_signed { "int32_t" } else { "uint32_t" };
                     out.push(format!(
                         "{} arg{}; // confidence: {}",
-                        scalar_ty,
+                        alias_scalar_c_type(alias),
                         alias.param_idx,
                         alias.confidence.as_str()
                     ));
@@ -284,14 +313,26 @@ impl AbiArgAliases {
                     out.push(format!("uint64_t arg{}_u64", alias.param_idx));
                 }
                 ArgAliasKind::Word32 => {
-                    let is_signed = alias.signed_words.contains(&0);
-                    let scalar_ty = if is_signed { "int32_t" } else { "uint32_t" };
-                    out.push(format!("{} arg{}", scalar_ty, alias.param_idx));
+                    out.push(format!("{} arg{}", alias_scalar_c_type(alias), alias.param_idx));
                 }
             }
         }
         out
     }
+}
+
+fn alias_scalar_kind(alias: &ArgAlias) -> ArgScalarKind {
+    alias.scalar_kind.unwrap_or_else(|| {
+        if alias.signed_words.contains(&0) {
+            ArgScalarKind::I32
+        } else {
+            ArgScalarKind::U32
+        }
+    })
+}
+
+fn alias_scalar_c_type(alias: &ArgAlias) -> &'static str {
+    alias_scalar_kind(alias).c_type()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -411,7 +452,7 @@ fn hint_from_def_stmt(dest: &RegId, stmt: &IRStatement) -> Option<LocalTypeHint>
 }
 
 fn hint_from_dest_opcode(opcode: &str) -> Option<LocalTypeHint> {
-    if opcode.starts_with("IMAD.WIDE") || opcode == "LEA" {
+    if opcode.starts_with("IMAD.WIDE") || opcode.starts_with("IADD.64") || opcode == "LEA" {
         return Some(LocalTypeHint::PtrStrong);
     }
     if opcode.starts_with("I2F")
@@ -428,6 +469,7 @@ fn hint_from_dest_opcode(opcode: &str) -> Option<LocalTypeHint> {
 
 fn is_pointer_arith_opcode(opcode: &str) -> bool {
     opcode.starts_with("IMAD")
+        || opcode.starts_with("IADD.64")
         || opcode.starts_with("LEA")
         || opcode.starts_with("IADD3")
         || opcode.starts_with("UIADD3")
@@ -480,6 +522,10 @@ fn collect_pointer_hints_from_expr(
     hints: &mut BTreeMap<(String, i32), BTreeSet<LocalTypeHint>>,
 ) {
     match expr {
+        IRExpr::Addr64 { lo, hi } => {
+            collect_pointer_hints_from_expr(lo, hints);
+            collect_pointer_hints_from_expr(hi, hints);
+        }
         IRExpr::Mem {
             base,
             offset,
@@ -841,6 +887,9 @@ impl DisplayCtx for AbiDisplay {
             IRExpr::Reg(r) => self.reg(r),
             IRExpr::ImmI(i) => format!("{}", i),
             IRExpr::ImmF(f) => format!("{}", f),
+            IRExpr::Addr64 { lo, hi } => {
+                format!("addr64({}, {})", self.expr(lo), self.expr(hi))
+            }
             IRExpr::Mem {
                 base,
                 offset,
@@ -895,7 +944,9 @@ where
     match op {
         DecodedOperand::ConstMem { bank, offset } => f(*bank, *offset),
         DecodedOperand::Address { base, .. } => collect_constmem_hits(base.as_ref(), f),
-        DecodedOperand::DescriptorMem { descriptor, addr, .. } => {
+        DecodedOperand::DescriptorMem {
+            descriptor, addr, ..
+        } => {
             collect_constmem_hits(descriptor.as_ref(), f);
             collect_constmem_hits(addr.as_ref(), f);
         }
@@ -970,33 +1021,34 @@ pub fn infer_arg_aliases(function_ir: &FunctionIR, annotations: &AbiAnnotations)
     struct WordUsage {
         pointer_like_hits: usize,
         total_hits: usize,
-        pointer_data_widths: BTreeSet<u32>,
         signed_hits: usize,
     }
 
+    let flow = build_param_word_flow(function_ir, annotations);
+
     // ---- 1. Build opcode index ----
     let mut opcode_by_stmt: BTreeMap<StatementRef, String> = BTreeMap::new();
+    let mut param_word_span_by_stmt: BTreeMap<StatementRef, usize> = BTreeMap::new();
     for block in &function_ir.blocks {
         for (stmt_idx, stmt) in block.stmts.iter().enumerate() {
+            let stmt_ref = StatementRef {
+                block_id: block.id,
+                stmt_idx,
+            };
             let opcode = match &stmt.value {
                 RValue::Op { opcode, .. } => opcode.clone(),
                 RValue::Phi(_) => "phi".to_string(),
                 RValue::ImmI(_) | RValue::ImmF(_) => "imm".to_string(),
             };
-            opcode_by_stmt.insert(
-                StatementRef {
-                    block_id: block.id,
-                    stmt_idx,
-                },
-                opcode,
-            );
-        }
-    }
-
-    let mut function_pointer_widths = BTreeSet::<u32>::new();
-    for opcode in opcode_by_stmt.values() {
-        if let Some(width) = pointer_data_width_opcode(opcode) {
-            function_pointer_widths.insert(width);
+            opcode_by_stmt.insert(stmt_ref, opcode);
+            let span = rvalue_op_parts(stmt)
+                .map(|(opcode, args)| {
+                    constmem_load_word_span(opcode).max(constmem_copy_word_span(opcode, args))
+                })
+                .unwrap_or(0);
+            if span > 0 {
+                param_word_span_by_stmt.insert(stmt_ref, span);
+            }
         }
     }
 
@@ -1009,22 +1061,34 @@ pub fn infer_arg_aliases(function_ir: &FunctionIR, annotations: &AbiAnnotations)
             .get(stmt_ref)
             .map(String::as_str)
             .unwrap_or("");
+        let span = param_word_span_by_stmt.get(stmt_ref).copied().unwrap_or(1);
+        let mut touched_words = BTreeSet::new();
         for ann in anns {
             if let ConstMemSemantic::ParamWord { param_idx, .. } = ann.semantic {
-                let usage = by_word.entry(param_idx).or_default();
-                usage.total_hits += 1;
-                if is_pointer_context_opcode(opcode) {
-                    usage.pointer_like_hits += 1;
-                }
-                if is_signed_word_context_opcode(opcode) {
-                    usage.signed_hits += 1;
-                }
-                if let Some(width) = pointer_data_width_opcode(opcode) {
-                    usage.pointer_data_widths.insert(width);
+                if span > 1 {
+                    for lane in 0..span {
+                        touched_words.insert(param_idx + lane as u32);
+                    }
+                } else {
+                    touched_words.insert(param_idx);
                 }
             }
         }
+        for param_idx in touched_words {
+            let usage = by_word.entry(param_idx).or_default();
+            usage.total_hits += 1;
+            if is_pointer_context_opcode(opcode) {
+                usage.pointer_like_hits += 1;
+            }
+            if is_signed_word_context_opcode(opcode) {
+                usage.signed_hits += 1;
+            }
+        }
     }
+
+    let scalar_evidence_by_word = collect_param_scalar_evidence(function_ir, &flow);
+    let addr64_pair_bases = collect_param_loaded_addr64_pair_bases(function_ir, annotations);
+    let pointer_pointee_tys = collect_param_pointer_pointee_types(function_ir, annotations, &flow);
 
     // ---- 3. Merge consecutive even/odd pairs into Ptr64 when evidence supports it ----
     let word_indices: Vec<u32> = by_word.keys().copied().collect();
@@ -1037,26 +1101,19 @@ pub fn infer_arg_aliases(function_ir: &FunctionIR, annotations: &AbiAnnotations)
             continue; // only start pairs on even-numbered words
         }
         let hi = lo + 1;
-        let lo_usage = match by_word.get(&lo) {
-            Some(u) => u,
-            None => continue,
-        };
-        let hi_usage = match by_word.get(&hi) {
-            Some(u) => u,
-            None => continue,
-        };
-        // Both words of the natural pair exist — check if they form a pointer.
-        let lo_ptr = lo_usage.pointer_like_hits > 0;
-        let hi_ptr = hi_usage.pointer_like_hits > 0;
-        if lo_ptr && hi_ptr {
+        if !by_word.contains_key(&lo) {
+            continue;
+        }
+        // Only merge into a ptr64 when we have explicit pair evidence from the
+        // SSA/address pipeline. Broad "both words appeared near pointer math"
+        // heuristics over-merge scalar pairs like (W, H) or (N, eps2) into fake
+        // pointers, which then leak `.lo32/.hi32` machine detail into final AST.
+        let addr64_pair = addr64_pair_bases.contains(&lo);
+        if addr64_pair {
             // Merge into Ptr64 keyed by the even (lo) word index.
-            let mut data_widths = lo_usage.pointer_data_widths.clone();
-            data_widths.extend(hi_usage.pointer_data_widths.iter().copied());
-            let pointee_ty = if data_widths.is_empty() {
-                infer_pointer_pointee_ty(&function_pointer_widths)
-            } else {
-                infer_pointer_pointee_ty(&data_widths)
-            };
+            let pointee_ty = pointer_pointee_tys
+                .get(&lo)
+                .and_then(infer_pointer_pointee_ty_from_evidence);
             out.by_param.insert(
                 lo,
                 ArgAlias {
@@ -1064,6 +1121,7 @@ pub fn infer_arg_aliases(function_ir: &FunctionIR, annotations: &AbiAnnotations)
                     kind: ArgAliasKind::Ptr64,
                     confidence: AliasConfidence::High,
                     observed_words: [0u32, 1].iter().copied().collect(),
+                    scalar_kind: None,
                     signed_words: BTreeSet::new(),
                     pointee_ty,
                 },
@@ -1077,14 +1135,21 @@ pub fn infer_arg_aliases(function_ir: &FunctionIR, annotations: &AbiAnnotations)
         if out.by_param.contains_key(&word_idx) || merged_as_hi.contains(&word_idx) {
             continue; // already handled as part of a Ptr64 pair
         }
-        let is_signed = usage.signed_hits > 0;
+        let scalar_evidence = scalar_evidence_by_word.get(&word_idx).copied().unwrap_or_default();
+        let scalar_kind = select_word_scalar_kind(&scalar_evidence);
+        let is_signed = matches!(scalar_kind, ArgScalarKind::I32) || usage.signed_hits > 0;
         out.by_param.insert(
             word_idx,
             ArgAlias {
                 param_idx: word_idx,
                 kind: ArgAliasKind::Word32,
-                confidence: AliasConfidence::Low,
+                confidence: if scalar_evidence.has_signal() {
+                    AliasConfidence::Medium
+                } else {
+                    AliasConfidence::Low
+                },
                 observed_words: [0u32].iter().copied().collect(),
+                scalar_kind: Some(scalar_kind),
                 signed_words: if is_signed {
                     [0u32].iter().copied().collect()
                 } else {
@@ -1097,8 +1162,1548 @@ pub fn infer_arg_aliases(function_ir: &FunctionIR, annotations: &AbiAnnotations)
     out
 }
 
+#[derive(Debug, Default)]
+struct ParamWordFlow {
+    loaded_param_by_reg: BTreeMap<RegId, u32>,
+    constmem_word_by_pair: BTreeMap<(u32, u32), u32>,
+    copy_source_by_reg: BTreeMap<RegId, RegId>,
+    phi_sources_by_reg: BTreeMap<RegId, Vec<IRExpr>>,
+    def_by_reg: BTreeMap<RegId, (String, Vec<IRExpr>, usize)>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ScalarEvidence {
+    float_hits: usize,
+    signed_int_hits: usize,
+    unsigned_int_hits: usize,
+}
+
+impl ScalarEvidence {
+    fn has_signal(self) -> bool {
+        self.float_hits > 0 || self.signed_int_hits > 0 || self.unsigned_int_hits > 0
+    }
+}
+
+fn select_word_scalar_kind(evidence: &ScalarEvidence) -> ArgScalarKind {
+    if evidence.float_hits > 0 {
+        ArgScalarKind::F32
+    } else if evidence.signed_int_hits > 0 {
+        ArgScalarKind::I32
+    } else {
+        ArgScalarKind::U32
+    }
+}
+
+fn build_param_word_flow(function_ir: &FunctionIR, annotations: &AbiAnnotations) -> ParamWordFlow {
+    let mut flow = ParamWordFlow::default();
+
+    for (_stmt, anns) in annotations.iter() {
+        for ann in anns {
+            if let ConstMemSemantic::ParamWord { param_idx, .. } = ann.semantic {
+                flow.constmem_word_by_pair
+                    .insert((ann.bank, ann.offset), param_idx);
+            }
+        }
+    }
+
+    for block in &function_ir.blocks {
+        for (stmt_idx, stmt) in block.stmts.iter().enumerate() {
+            let stmt_ref = StatementRef {
+                block_id: block.id,
+                stmt_idx,
+            };
+            let opcode = match &stmt.value {
+                RValue::Op { opcode, .. } => Some(opcode.as_str()),
+                _ => None,
+            };
+            if let Some(opcode) = opcode {
+                if let Some(src) = extract_copy_source_expr(opcode, rvalue_args(stmt)) {
+                    if stmt.defs.len() == 1 {
+                        if let Some(IRExpr::Reg(dst)) = stmt.defs.first() {
+                            flow.copy_source_by_reg.insert(dst.clone(), src.clone());
+                        }
+                    }
+                }
+            }
+            if let Some((opcode, args)) = rvalue_op_parts(stmt) {
+                for (def_idx, def) in stmt.defs.iter().enumerate() {
+                    if let IRExpr::Reg(reg) = def {
+                        flow.def_by_reg
+                            .insert(reg.clone(), (opcode.to_string(), args.to_vec(), def_idx));
+                    }
+                }
+            } else if let RValue::Phi(args) = &stmt.value {
+                for def in &stmt.defs {
+                    if let IRExpr::Reg(reg) = def {
+                        flow.phi_sources_by_reg.insert(reg.clone(), args.to_vec());
+                    }
+                }
+            }
+
+            let Some(base_param) = annotations
+                .constmem_by_stmt
+                .get(&stmt_ref)
+                .and_then(|anns| {
+                    anns.iter().find_map(|ann| match ann.semantic {
+                        ConstMemSemantic::ParamWord { param_idx, .. } => Some(param_idx),
+                        _ => None,
+                    })
+                })
+            else {
+                continue;
+            };
+            let Some(opcode) = opcode else {
+                continue;
+            };
+            let word_span = constmem_load_word_span(opcode)
+                .max(constmem_copy_word_span(opcode, rvalue_args(stmt)));
+            if word_span == 0 {
+                continue;
+            }
+            for lane in 0..word_span.min(stmt.defs.len()) {
+                if let Some(IRExpr::Reg(reg)) = stmt.defs.get(lane) {
+                    flow.loaded_param_by_reg
+                        .insert(reg.clone(), base_param + lane as u32);
+                }
+            }
+        }
+    }
+
+    flow
+}
+
+fn collect_param_scalar_evidence(
+    function_ir: &FunctionIR,
+    flow: &ParamWordFlow,
+) -> BTreeMap<u32, ScalarEvidence> {
+    let mut evidence_by_word = BTreeMap::<u32, ScalarEvidence>::new();
+
+    for block in &function_ir.blocks {
+        for stmt in &block.stmts {
+            let Some((opcode, args)) = rvalue_op_parts(stmt) else {
+                continue;
+            };
+            let arg_types = infer_arg_types_from_opcode(opcode, args.len());
+            for (arg, inferred_ty) in args.iter().zip(arg_types.into_iter()) {
+                let Some(word) = resolve_param_word_from_expr(
+                    arg,
+                    &flow.loaded_param_by_reg,
+                    &flow.constmem_word_by_pair,
+                    &flow.copy_source_by_reg,
+                    &flow.phi_sources_by_reg,
+                    &flow.def_by_reg,
+                    &mut BTreeSet::new(),
+                ) else {
+                    continue;
+                };
+                let Some(kind) = scalar_kind_from_inferred_type(inferred_ty) else {
+                    continue;
+                };
+                let entry = evidence_by_word.entry(word).or_default();
+                match kind {
+                    ArgScalarKind::F32 => entry.float_hits += 1,
+                    ArgScalarKind::I32 => entry.signed_int_hits += 1,
+                    ArgScalarKind::U32 => entry.unsigned_int_hits += 1,
+                }
+            }
+        }
+    }
+
+    evidence_by_word
+}
+
+fn scalar_kind_from_inferred_type(ty: Option<InferredType>) -> Option<ArgScalarKind> {
+    match ty? {
+        InferredType::I32 => Some(ArgScalarKind::I32),
+        InferredType::F16 | InferredType::F32 | InferredType::AnyFloat => Some(ArgScalarKind::F32),
+        InferredType::U8 | InferredType::U16 | InferredType::U32 | InferredType::AnyInt => {
+            Some(ArgScalarKind::U32)
+        }
+        InferredType::Bottom
+        | InferredType::U64
+        | InferredType::Ptr64
+        | InferredType::Top => None,
+    }
+}
+
+fn collect_param_pointer_pointee_types(
+    function_ir: &FunctionIR,
+    _annotations: &AbiAnnotations,
+    flow: &ParamWordFlow,
+) -> BTreeMap<u32, BTreeSet<&'static str>> {
+    let ssa_types = infer_ssa_types(function_ir);
+    let shared_reg_fallback_tys = infer_shared_word_reg_fallback_types(function_ir, &ssa_types);
+    let copy_phi_predecessors = build_copy_phi_predecessors(function_ir);
+    let copy_phi_successors = reverse_reg_edges(&copy_phi_predecessors);
+    let mut evidence = BTreeMap::<u32, BTreeSet<&'static str>>::new();
+
+    for block in &function_ir.blocks {
+        for stmt in &block.stmts {
+            let RValue::Op { opcode, args } = &stmt.value else {
+                continue;
+            };
+            let Some(mem_expr) = stmt.mem_addr_args.as_ref().and_then(|args| args.first()) else {
+                continue;
+            };
+            let Some(base_word) = resolve_param_pair_base_from_mem_expr(mem_expr, flow) else {
+                continue;
+            };
+            let Some(pointee_ty) = memory_pointee_type_from_stmt(
+                stmt,
+                opcode,
+                args,
+                &ssa_types,
+                Some(&shared_reg_fallback_tys),
+                Some(&copy_phi_predecessors),
+                Some(&copy_phi_successors),
+            ) else {
+                continue;
+            };
+            evidence.entry(base_word).or_default().insert(pointee_ty);
+        }
+    }
+
+    evidence
+}
+
+fn resolve_param_pair_base_from_mem_expr(mem_expr: &IRExpr, flow: &ParamWordFlow) -> Option<u32> {
+    let IRExpr::Mem { base, width, .. } = mem_expr else {
+        return None;
+    };
+    if !matches!(width, Some(64)) {
+        return None;
+    }
+    resolve_param_pair_base_from_addr_base_expr(base, flow)
+}
+
+fn resolve_param_pair_base_from_addr_base_expr(
+    base: &IRExpr,
+    flow: &ParamWordFlow,
+) -> Option<u32> {
+    match base {
+        IRExpr::Addr64 { lo, hi } => resolve_param_pair_base_from_lo_hi_exprs(
+            lo,
+            hi,
+            &flow.loaded_param_by_reg,
+            &flow.constmem_word_by_pair,
+            &flow.copy_source_by_reg,
+            &flow.phi_sources_by_reg,
+            &flow.def_by_reg,
+            &mut BTreeSet::new(),
+        ),
+        IRExpr::Op { op, args } if op == "addr64" && args.len() >= 2 => {
+            resolve_param_pair_base_from_lo_hi_exprs(
+                &args[0],
+                &args[1],
+                &flow.loaded_param_by_reg,
+                &flow.constmem_word_by_pair,
+                &flow.copy_source_by_reg,
+                &flow.phi_sources_by_reg,
+                &flow.def_by_reg,
+                &mut BTreeSet::new(),
+            )
+        }
+        IRExpr::Reg(reg) => {
+            let lo_word = resolve_param_word_from_reg(
+                reg,
+                &flow.loaded_param_by_reg,
+                &flow.constmem_word_by_pair,
+                &flow.copy_source_by_reg,
+                &flow.phi_sources_by_reg,
+                &flow.def_by_reg,
+                &mut BTreeSet::new(),
+            )?;
+            if lo_word % 2 != 0 {
+                return None;
+            }
+            let mut hi = reg.clone();
+            hi.idx += 1;
+            let hi_word = resolve_param_word_from_reg(
+                &hi,
+                &flow.loaded_param_by_reg,
+                &flow.constmem_word_by_pair,
+                &flow.copy_source_by_reg,
+                &flow.phi_sources_by_reg,
+                &flow.def_by_reg,
+                &mut BTreeSet::new(),
+            )?;
+            (hi_word == lo_word + 1).then_some(lo_word)
+        }
+        _ => None,
+    }
+}
+
+fn memory_pointee_type_from_stmt(
+    stmt: &IRStatement,
+    opcode: &str,
+    args: &[IRExpr],
+    ssa_types: &BTreeMap<RegId, InferredType>,
+    reg_fallback_tys: Option<&BTreeMap<RegId, &'static str>>,
+    copy_phi_predecessors: Option<&BTreeMap<RegId, Vec<RegId>>>,
+    copy_phi_successors: Option<&BTreeMap<RegId, Vec<RegId>>>,
+) -> Option<&'static str> {
+    let expected_width = memory_scalar_width_bytes(opcode);
+    if let Some(ty) = scalar_pointee_type_from_opcode(opcode) {
+        return Some(ty);
+    }
+
+    let mnem = opcode.split('.').next().unwrap_or(opcode);
+    if opcode.starts_with("LD") && !matches!(mnem, "LDC" | "LDCU" | "ULDC" | "LDS") {
+        return stmt
+            .defs
+            .first()
+            .and_then(IRExpr::get_reg)
+            .and_then(|reg| {
+                reg_pointee_type(
+                    reg,
+                    ssa_types,
+                    reg_fallback_tys,
+                    copy_phi_successors,
+                    expected_width,
+                )
+            })
+            .or_else(|| default_pointee_ty_for_width(expected_width));
+    }
+
+    if opcode.starts_with("ST") {
+        return args
+            .get(1)
+            .and_then(|expr| {
+                expr_pointee_type(
+                    expr,
+                    ssa_types,
+                    reg_fallback_tys,
+                    copy_phi_predecessors,
+                    expected_width,
+                )
+            })
+            .or_else(|| default_pointee_ty_for_width(expected_width));
+    }
+
+    if opcode.starts_with("ATOM")
+        || opcode.starts_with("ATOMG")
+        || opcode.starts_with("RED")
+        || opcode.starts_with("REDG")
+    {
+        return args
+            .iter()
+            .find(|arg| !matches!(arg, IRExpr::Mem { .. }))
+            .and_then(|expr| {
+                expr_pointee_type(
+                    expr,
+                    ssa_types,
+                    reg_fallback_tys,
+                    copy_phi_predecessors,
+                    expected_width,
+                )
+            })
+            .or_else(|| default_pointee_ty_for_width(expected_width));
+    }
+
+    None
+}
+
+fn infer_shared_word_reg_fallback_types(
+    function_ir: &FunctionIR,
+    ssa_types: &BTreeMap<RegId, InferredType>,
+) -> BTreeMap<RegId, &'static str> {
+    let Some(shared_word_ty) = infer_shared_word_pointee_type(function_ir, ssa_types) else {
+        return BTreeMap::new();
+    };
+
+    let predecessors = build_copy_phi_predecessors(function_ir);
+    let successors = reverse_reg_edges(&predecessors);
+    let mut map = BTreeMap::new();
+    for block in &function_ir.blocks {
+        for stmt in &block.stmts {
+            let RValue::Op { opcode, args } = &stmt.value else {
+                continue;
+            };
+            if memory_scalar_width_bytes(opcode) != 4 {
+                continue;
+            }
+            if opcode.starts_with("STS") {
+                for src in args.iter().skip(1) {
+                    let Some(reg) = src.get_reg() else {
+                        continue;
+                    };
+                    mark_reg_and_predecessors_with_type(
+                        reg,
+                        shared_word_ty,
+                        &predecessors,
+                        &mut map,
+                        &mut BTreeSet::new(),
+                    );
+                }
+            } else if opcode.starts_with("LDS") {
+                for def in &stmt.defs {
+                    let Some(reg) = def.get_reg() else {
+                        continue;
+                    };
+                    mark_reg_and_predecessors_with_type(
+                        reg,
+                        shared_word_ty,
+                        &successors,
+                        &mut map,
+                        &mut BTreeSet::new(),
+                    );
+                }
+            }
+        }
+    }
+    map
+}
+
+fn build_copy_phi_predecessors(function_ir: &FunctionIR) -> BTreeMap<RegId, Vec<RegId>> {
+    let mut predecessors = BTreeMap::<RegId, Vec<RegId>>::new();
+    for block in &function_ir.blocks {
+        for stmt in &block.stmts {
+            match &stmt.value {
+                RValue::Op { opcode, args } => {
+                    let Some(src) = extract_copy_source_expr(opcode, args) else {
+                        continue;
+                    };
+                    if stmt.defs.len() != 1 {
+                        continue;
+                    }
+                    let Some(dst) = stmt.defs.first().and_then(IRExpr::get_reg) else {
+                        continue;
+                    };
+                    if is_immutable_reg(dst) || is_immutable_reg(&src) {
+                        continue;
+                    }
+                    predecessors.entry(dst.clone()).or_default().push(src);
+                }
+                RValue::Phi(args) => {
+                    let phi_srcs: Vec<RegId> = args
+                        .iter()
+                        .filter_map(|arg| arg.get_reg())
+                        .filter(|reg| !is_immutable_reg(reg))
+                        .cloned()
+                        .collect();
+                    if phi_srcs.is_empty() {
+                        continue;
+                    }
+                    for def in &stmt.defs {
+                        let Some(dst) = def.get_reg() else {
+                            continue;
+                        };
+                        if is_immutable_reg(dst) {
+                            continue;
+                        }
+                        predecessors
+                            .entry(dst.clone())
+                            .or_default()
+                            .extend(phi_srcs.iter().cloned());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    predecessors
+}
+
+fn reverse_reg_edges(edges: &BTreeMap<RegId, Vec<RegId>>) -> BTreeMap<RegId, Vec<RegId>> {
+    let mut reversed = BTreeMap::<RegId, Vec<RegId>>::new();
+    for (dst, srcs) in edges {
+        for src in srcs {
+            reversed.entry(src.clone()).or_default().push(dst.clone());
+        }
+    }
+    reversed
+}
+
+fn mark_reg_and_predecessors_with_type(
+    reg: &RegId,
+    ty: &'static str,
+    predecessors: &BTreeMap<RegId, Vec<RegId>>,
+    out: &mut BTreeMap<RegId, &'static str>,
+    visiting: &mut BTreeSet<RegId>,
+) {
+    if !visiting.insert(reg.clone()) {
+        return;
+    }
+    out.insert(reg.clone(), ty);
+    if let Some(preds) = predecessors.get(reg) {
+        for pred in preds {
+            mark_reg_and_predecessors_with_type(pred, ty, predecessors, out, visiting);
+        }
+    }
+}
+
+fn infer_shared_word_pointee_type(
+    function_ir: &FunctionIR,
+    ssa_types: &BTreeMap<RegId, InferredType>,
+) -> Option<&'static str> {
+    let mut shared_ty = InferredType::Bottom;
+
+    for block in &function_ir.blocks {
+        for stmt in &block.stmts {
+            let RValue::Op { opcode, args } = &stmt.value else {
+                continue;
+            };
+            if memory_scalar_width_bytes(opcode) != 4 {
+                continue;
+            }
+            if opcode.starts_with("LDS") {
+                for def in &stmt.defs {
+                    let Some(reg) = def.get_reg() else {
+                        continue;
+                    };
+                    if let Some(ty) = ssa_types.get(reg).copied() {
+                        shared_ty = shared_ty.join(ty);
+                    }
+                }
+                continue;
+            }
+            if opcode.starts_with("STS") {
+                for src in args.iter().skip(1) {
+                    if let Some(ty) = expr_inferred_type(src, ssa_types) {
+                        shared_ty = shared_ty.join(ty);
+                    }
+                }
+            }
+        }
+    }
+
+    inferred_type_to_pointee_ty_for_width(shared_ty, 4)
+}
+
+fn expr_inferred_type(
+    expr: &IRExpr,
+    ssa_types: &BTreeMap<RegId, InferredType>,
+) -> Option<InferredType> {
+    match expr {
+        IRExpr::ImmF(_) => Some(InferredType::F32),
+        IRExpr::ImmI(_) => None,
+        _ => expr.get_reg().and_then(|reg| ssa_types.get(reg).copied()),
+    }
+}
+
+fn expr_pointee_type(
+    expr: &IRExpr,
+    ssa_types: &BTreeMap<RegId, InferredType>,
+    reg_fallback_tys: Option<&BTreeMap<RegId, &'static str>>,
+    copy_phi_edges: Option<&BTreeMap<RegId, Vec<RegId>>>,
+    expected_width: usize,
+) -> Option<&'static str> {
+    match expr {
+        IRExpr::ImmF(_) => (expected_width == 4).then_some("float"),
+        IRExpr::ImmI(_) => None,
+        _ => expr
+            .get_reg()
+            .and_then(|reg| {
+                reg_pointee_type(
+                    reg,
+                    ssa_types,
+                    reg_fallback_tys,
+                    copy_phi_edges,
+                    expected_width,
+                )
+            }),
+    }
+}
+
+fn reg_pointee_type(
+    reg: &RegId,
+    ssa_types: &BTreeMap<RegId, InferredType>,
+    reg_fallback_tys: Option<&BTreeMap<RegId, &'static str>>,
+    copy_phi_edges: Option<&BTreeMap<RegId, Vec<RegId>>>,
+    expected_width: usize,
+) -> Option<&'static str> {
+    ssa_types
+        .get(reg)
+        .copied()
+        .and_then(|ty| inferred_type_to_pointee_ty_for_width(ty, expected_width))
+        .or_else(|| reg_fallback_tys.and_then(|map| map.get(reg).copied()))
+        .or_else(|| {
+            reg_reachable_pointee_type(
+                reg,
+                ssa_types,
+                reg_fallback_tys,
+                copy_phi_edges,
+                expected_width,
+            )
+        })
+}
+
+fn reg_reachable_pointee_type(
+    reg: &RegId,
+    ssa_types: &BTreeMap<RegId, InferredType>,
+    reg_fallback_tys: Option<&BTreeMap<RegId, &'static str>>,
+    copy_phi_edges: Option<&BTreeMap<RegId, Vec<RegId>>>,
+    expected_width: usize,
+) -> Option<&'static str> {
+    let edges = copy_phi_edges?;
+    let mut stack = vec![reg.clone()];
+    let mut visited = BTreeSet::<RegId>::new();
+    let mut evidence = BTreeSet::<&'static str>::new();
+
+    while let Some(current) = stack.pop() {
+        if !visited.insert(current.clone()) {
+            continue;
+        }
+        if let Some(ty) = ssa_types
+            .get(&current)
+            .copied()
+            .and_then(|ty| inferred_type_to_pointee_ty_for_width(ty, expected_width))
+        {
+            evidence.insert(ty);
+        }
+        if let Some(ty) = reg_fallback_tys.and_then(|map| map.get(&current).copied()) {
+            if pointee_type_width_bytes(ty) == Some(expected_width) {
+                evidence.insert(ty);
+            }
+        }
+        if let Some(next_regs) = edges.get(&current) {
+            stack.extend(next_regs.iter().cloned());
+        }
+    }
+
+    infer_pointer_pointee_ty_from_evidence(&evidence)
+}
+
+fn inferred_type_to_pointee_ty_for_width(
+    ty: InferredType,
+    expected_width: usize,
+) -> Option<&'static str> {
+    match ty {
+        InferredType::U8 if expected_width == 1 => Some("uint8_t"),
+        InferredType::U16 if expected_width == 2 => Some("uint16_t"),
+        InferredType::U32 | InferredType::AnyInt if expected_width == 4 => Some("uint32_t"),
+        InferredType::I32 if expected_width == 4 => Some("int32_t"),
+        InferredType::F16 if expected_width == 2 => Some("__half"),
+        InferredType::F32 | InferredType::AnyFloat if expected_width == 4 => Some("float"),
+        InferredType::U64 if expected_width == 8 => Some("uint64_t"),
+        InferredType::Bottom | InferredType::Ptr64 | InferredType::Top => None,
+        _ => None,
+    }
+}
+
+fn default_pointee_ty_for_width(width: usize) -> Option<&'static str> {
+    match width {
+        1 => Some("uint8_t"),
+        2 => Some("uint16_t"),
+        4 => Some("uint32_t"),
+        8 => Some("uint64_t"),
+        _ => None,
+    }
+}
+
+fn memory_scalar_width_bytes(opcode: &str) -> usize {
+    for tok in opcode.split('.') {
+        match tok {
+            "U8" | "S8" => return 1,
+            "U16" | "S16" | "F16" => return 2,
+            "U32" | "S32" | "F32" => return 4,
+            "U64" | "S64" => return 8,
+            _ => {}
+        }
+    }
+    if opcode.contains(".64") || opcode.contains(".128") {
+        return 4;
+    }
+    4
+}
+
+fn scalar_pointee_type_from_opcode(opcode: &str) -> Option<&'static str> {
+    for tok in opcode.split('.') {
+        match tok {
+            "U8" => return Some("uint8_t"),
+            "S8" => return Some("int8_t"),
+            "U16" => return Some("uint16_t"),
+            "S16" => return Some("int16_t"),
+            "U32" => return Some("uint32_t"),
+            "S32" => return Some("int32_t"),
+            "U64" => return Some("uint64_t"),
+            "S64" => return Some("int64_t"),
+            "F16" => return Some("__half"),
+            "F32" => return Some("float"),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn infer_pointer_pointee_ty_from_evidence(types: &BTreeSet<&'static str>) -> Option<&'static str> {
+    if types.len() == 1 {
+        return types.iter().next().copied();
+    }
+    for preferred in ["float", "__half"] {
+        if !types.contains(preferred) {
+            continue;
+        }
+        let Some(width) = pointee_type_width_bytes(preferred) else {
+            continue;
+        };
+        if types.iter().all(|ty| {
+            pointee_type_width_bytes(ty) == Some(width)
+                && (*ty == preferred || is_integer_pointee_type(ty))
+        }) {
+            return Some(preferred);
+        }
+    }
+    let width = pointee_type_width_bytes(*types.iter().next()?)?;
+    if types.iter().all(|ty| {
+        pointee_type_width_bytes(ty) == Some(width) && is_integer_pointee_type(ty)
+    }) {
+        return preferred_integer_pointee_type(types, width);
+    }
+    None
+}
+
+fn pointee_type_width_bytes(ty: &str) -> Option<usize> {
+    match ty {
+        "uint8_t" | "int8_t" => Some(1),
+        "uint16_t" | "int16_t" | "__half" => Some(2),
+        "uint32_t" | "int32_t" | "float" => Some(4),
+        "uint64_t" | "int64_t" => Some(8),
+        _ => None,
+    }
+}
+
+fn is_integer_pointee_type(ty: &str) -> bool {
+    matches!(
+        ty,
+        "uint8_t"
+            | "int8_t"
+            | "uint16_t"
+            | "int16_t"
+            | "uint32_t"
+            | "int32_t"
+            | "uint64_t"
+            | "int64_t"
+    )
+}
+
+fn preferred_integer_pointee_type(
+    types: &BTreeSet<&'static str>,
+    width: usize,
+) -> Option<&'static str> {
+    match width {
+        1 => {
+            if types.contains("int8_t") {
+                Some("int8_t")
+            } else if types.contains("uint8_t") {
+                Some("uint8_t")
+            } else {
+                None
+            }
+        }
+        2 => {
+            if types.contains("int16_t") {
+                Some("int16_t")
+            } else if types.contains("uint16_t") {
+                Some("uint16_t")
+            } else {
+                None
+            }
+        }
+        4 => {
+            if types.contains("int32_t") {
+                Some("int32_t")
+            } else if types.contains("uint32_t") {
+                Some("uint32_t")
+            } else {
+                None
+            }
+        }
+        8 => {
+            if types.contains("int64_t") {
+                Some("int64_t")
+            } else if types.contains("uint64_t") {
+                Some("uint64_t")
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn collect_param_loaded_addr64_pair_bases(
+    function_ir: &FunctionIR,
+    annotations: &AbiAnnotations,
+) -> BTreeSet<u32> {
+    let flow = build_param_word_flow(function_ir, annotations);
+
+    let mut pair_bases = BTreeSet::new();
+    for block in &function_ir.blocks {
+        for stmt in &block.stmts {
+            collect_stmt_param_loaded_addr64_pairs(
+                stmt,
+                &flow.loaded_param_by_reg,
+                &flow.constmem_word_by_pair,
+                &flow.copy_source_by_reg,
+                &flow.phi_sources_by_reg,
+                &flow.def_by_reg,
+                &mut pair_bases,
+            );
+            visit_expr_for_param_loaded_addr64_pairs(
+                stmt,
+                &flow.loaded_param_by_reg,
+                &flow.constmem_word_by_pair,
+                &flow.copy_source_by_reg,
+                &flow.phi_sources_by_reg,
+                &flow.def_by_reg,
+                &mut pair_bases,
+            );
+        }
+    }
+    pair_bases
+}
+
+fn collect_stmt_param_loaded_addr64_pairs(
+    stmt: &IRStatement,
+    loaded_param_by_reg: &BTreeMap<RegId, u32>,
+    constmem_word_by_pair: &BTreeMap<(u32, u32), u32>,
+    copy_source_by_reg: &BTreeMap<RegId, RegId>,
+    phi_sources_by_reg: &BTreeMap<RegId, Vec<IRExpr>>,
+    def_by_reg: &BTreeMap<RegId, (String, Vec<IRExpr>, usize)>,
+    pair_bases: &mut BTreeSet<u32>,
+) {
+    let Some((opcode, args)) = rvalue_op_parts(stmt) else {
+        return;
+    };
+    if let Some(lo) = detect_param_loaded_wide_pair(
+        opcode,
+        args,
+        loaded_param_by_reg,
+        constmem_word_by_pair,
+        copy_source_by_reg,
+        phi_sources_by_reg,
+        def_by_reg,
+    ) {
+        pair_bases.insert(lo);
+    }
+    if let Some(lo) = detect_param_loaded_addx_pair(
+        opcode,
+        args,
+        loaded_param_by_reg,
+        constmem_word_by_pair,
+        copy_source_by_reg,
+        phi_sources_by_reg,
+        def_by_reg,
+    ) {
+        pair_bases.insert(lo);
+    }
+    if let Some(lo) = detect_param_loaded_lea_hi_pair(
+        opcode,
+        args,
+        loaded_param_by_reg,
+        constmem_word_by_pair,
+        copy_source_by_reg,
+        phi_sources_by_reg,
+        def_by_reg,
+    ) {
+        pair_bases.insert(lo);
+    }
+}
+
+fn rvalue_op_parts(stmt: &IRStatement) -> Option<(&str, &[IRExpr])> {
+    match &stmt.value {
+        RValue::Op { opcode, args } => Some((opcode.as_str(), args.as_slice())),
+        _ => None,
+    }
+}
+
+fn rvalue_args(stmt: &IRStatement) -> &[IRExpr] {
+    match &stmt.value {
+        RValue::Op { args, .. } | RValue::Phi(args) => args.as_slice(),
+        RValue::ImmI(_) | RValue::ImmF(_) => &[],
+    }
+}
+
+fn constmem_load_word_span(opcode: &str) -> usize {
+    let mnem = opcode.split('.').next().unwrap_or(opcode);
+    if !matches!(mnem, "ULDC" | "LDC" | "LDCU") {
+        return 0;
+    }
+    if opcode.split('.').any(|tok| tok == "128") {
+        4
+    } else if opcode.split('.').any(|tok| tok == "64") {
+        2
+    } else {
+        1
+    }
+}
+
+fn constmem_copy_word_span(opcode: &str, args: &[IRExpr]) -> usize {
+    if opcode.starts_with("IMAD.MOV") && args.len() >= 3 {
+        return 1;
+    }
+    if opcode == "MOV" || opcode.starts_with("MOV.") {
+        return 1;
+    }
+    0
+}
+
+fn extract_copy_source_expr(opcode: &str, args: &[IRExpr]) -> Option<RegId> {
+    if opcode.starts_with("IMAD.MOV") && args.len() >= 3 {
+        if is_zero_ir_expr(&args[0]) && is_zero_ir_expr(&args[1]) {
+            return args[2].get_reg().cloned();
+        }
+    }
+    if (opcode == "MOV" || opcode.starts_with("MOV.")) && args.len() == 1 {
+        return args[0].get_reg().cloned();
+    }
+    None
+}
+
+fn is_zero_ir_expr(expr: &IRExpr) -> bool {
+    match expr {
+        IRExpr::ImmI(value) => *value == 0,
+        IRExpr::ImmF(value) => *value == 0.0,
+        IRExpr::Reg(reg) => matches!(reg.class.as_str(), "RZ" | "URZ"),
+        _ => false,
+    }
+}
+
+fn visit_expr_for_param_loaded_addr64_pairs(
+    stmt: &IRStatement,
+    loaded_param_by_reg: &BTreeMap<RegId, u32>,
+    constmem_word_by_pair: &BTreeMap<(u32, u32), u32>,
+    copy_source_by_reg: &BTreeMap<RegId, RegId>,
+    phi_sources_by_reg: &BTreeMap<RegId, Vec<IRExpr>>,
+    def_by_reg: &BTreeMap<RegId, (String, Vec<IRExpr>, usize)>,
+    pair_bases: &mut BTreeSet<u32>,
+) {
+    if let Some(pred) = &stmt.pred {
+        scan_expr_for_param_loaded_addr64_pairs(
+            pred,
+            loaded_param_by_reg,
+            constmem_word_by_pair,
+            copy_source_by_reg,
+            phi_sources_by_reg,
+            def_by_reg,
+            pair_bases,
+        );
+    }
+    for def in &stmt.defs {
+        scan_expr_for_param_loaded_addr64_pairs(
+            def,
+            loaded_param_by_reg,
+            constmem_word_by_pair,
+            copy_source_by_reg,
+            phi_sources_by_reg,
+            def_by_reg,
+            pair_bases,
+        );
+    }
+    for arg in rvalue_args(stmt) {
+        scan_expr_for_param_loaded_addr64_pairs(
+            arg,
+            loaded_param_by_reg,
+            constmem_word_by_pair,
+            copy_source_by_reg,
+            phi_sources_by_reg,
+            def_by_reg,
+            pair_bases,
+        );
+    }
+    if let Some(mem_args) = &stmt.mem_addr_args {
+        for arg in mem_args {
+            scan_expr_for_param_loaded_addr64_pairs(
+                arg,
+                loaded_param_by_reg,
+                constmem_word_by_pair,
+                copy_source_by_reg,
+                phi_sources_by_reg,
+                def_by_reg,
+                pair_bases,
+            );
+        }
+    }
+}
+
+fn scan_expr_for_param_loaded_addr64_pairs(
+    expr: &IRExpr,
+    loaded_param_by_reg: &BTreeMap<RegId, u32>,
+    constmem_word_by_pair: &BTreeMap<(u32, u32), u32>,
+    copy_source_by_reg: &BTreeMap<RegId, RegId>,
+    phi_sources_by_reg: &BTreeMap<RegId, Vec<IRExpr>>,
+    def_by_reg: &BTreeMap<RegId, (String, Vec<IRExpr>, usize)>,
+    pair_bases: &mut BTreeSet<u32>,
+) {
+    match expr {
+        IRExpr::Addr64 { lo, hi } => {
+            let lo_word = resolve_param_word_from_expr(
+                lo.as_ref(),
+                loaded_param_by_reg,
+                constmem_word_by_pair,
+                copy_source_by_reg,
+                phi_sources_by_reg,
+                def_by_reg,
+                &mut BTreeSet::new(),
+            );
+            let hi_word = resolve_param_word_from_expr(
+                hi.as_ref(),
+                loaded_param_by_reg,
+                constmem_word_by_pair,
+                copy_source_by_reg,
+                phi_sources_by_reg,
+                def_by_reg,
+                &mut BTreeSet::new(),
+            );
+            if let (Some(lo_word), Some(hi_word)) = (lo_word, hi_word) {
+                if lo_word % 2 == 0 && hi_word == lo_word + 1 {
+                    pair_bases.insert(lo_word);
+                }
+            }
+            scan_expr_for_param_loaded_addr64_pairs(
+                lo.as_ref(),
+                loaded_param_by_reg,
+                constmem_word_by_pair,
+                copy_source_by_reg,
+                phi_sources_by_reg,
+                def_by_reg,
+                pair_bases,
+            );
+            scan_expr_for_param_loaded_addr64_pairs(
+                hi.as_ref(),
+                loaded_param_by_reg,
+                constmem_word_by_pair,
+                copy_source_by_reg,
+                phi_sources_by_reg,
+                def_by_reg,
+                pair_bases,
+            );
+        }
+        IRExpr::Op { args, .. } => {
+            for arg in args {
+                scan_expr_for_param_loaded_addr64_pairs(
+                    arg,
+                    loaded_param_by_reg,
+                    constmem_word_by_pair,
+                    copy_source_by_reg,
+                    phi_sources_by_reg,
+                    def_by_reg,
+                    pair_bases,
+                );
+            }
+        }
+        IRExpr::Mem {
+            base,
+            offset,
+            width: _,
+        } => {
+            scan_expr_for_param_loaded_addr64_pairs(
+                base,
+                loaded_param_by_reg,
+                constmem_word_by_pair,
+                copy_source_by_reg,
+                phi_sources_by_reg,
+                def_by_reg,
+                pair_bases,
+            );
+            if let Some(offset) = offset {
+                scan_expr_for_param_loaded_addr64_pairs(
+                    offset,
+                    loaded_param_by_reg,
+                    constmem_word_by_pair,
+                    copy_source_by_reg,
+                    phi_sources_by_reg,
+                    def_by_reg,
+                    pair_bases,
+                );
+            }
+        }
+        IRExpr::Reg(_) | IRExpr::ImmI(_) | IRExpr::ImmF(_) => {}
+    }
+}
+
+fn detect_param_loaded_wide_pair(
+    opcode: &str,
+    args: &[IRExpr],
+    loaded_param_by_reg: &BTreeMap<RegId, u32>,
+    constmem_word_by_pair: &BTreeMap<(u32, u32), u32>,
+    copy_source_by_reg: &BTreeMap<RegId, RegId>,
+    phi_sources_by_reg: &BTreeMap<RegId, Vec<IRExpr>>,
+    def_by_reg: &BTreeMap<RegId, (String, Vec<IRExpr>, usize)>,
+) -> Option<u32> {
+    if opcode.starts_with("IADD.64") && args.len() >= 4 {
+        let lhs_pair = resolve_param_pair_base_from_lo_hi_exprs(
+            &args[0],
+            &args[2],
+            loaded_param_by_reg,
+            constmem_word_by_pair,
+            copy_source_by_reg,
+            phi_sources_by_reg,
+            def_by_reg,
+            &mut BTreeSet::new(),
+        );
+        let rhs_pair = resolve_param_pair_base_from_lo_hi_exprs(
+            &args[1],
+            &args[3],
+            loaded_param_by_reg,
+            constmem_word_by_pair,
+            copy_source_by_reg,
+            phi_sources_by_reg,
+            def_by_reg,
+            &mut BTreeSet::new(),
+        );
+        return choose_unique_param_pair_base(lhs_pair, rhs_pair);
+    }
+    None
+}
+
+fn detect_param_loaded_addx_pair(
+    opcode: &str,
+    args: &[IRExpr],
+    loaded_param_by_reg: &BTreeMap<RegId, u32>,
+    constmem_word_by_pair: &BTreeMap<(u32, u32), u32>,
+    copy_source_by_reg: &BTreeMap<RegId, RegId>,
+    phi_sources_by_reg: &BTreeMap<RegId, Vec<IRExpr>>,
+    def_by_reg: &BTreeMap<RegId, (String, Vec<IRExpr>, usize)>,
+) -> Option<u32> {
+    if !(opcode.starts_with("IADD3.X") || opcode.starts_with("UIADD3.X")) {
+        return None;
+    }
+
+    if args.len() == 3 {
+        let mut hi_word = None;
+        for arg in args {
+            if is_zero_ir_expr(arg) {
+                continue;
+            }
+            let Some(word) = resolve_param_word_from_expr(
+                arg,
+                loaded_param_by_reg,
+                constmem_word_by_pair,
+                copy_source_by_reg,
+                phi_sources_by_reg,
+                def_by_reg,
+                &mut BTreeSet::new(),
+            ) else {
+                continue;
+            };
+            match hi_word {
+                None => hi_word = Some(word),
+                Some(existing) if existing == word => {}
+                Some(_) => return None,
+            }
+        }
+        let hi_word = hi_word?;
+        return (hi_word % 2 == 1).then_some(hi_word - 1);
+    }
+
+    if args.len() < 5 {
+        return None;
+    }
+    let carry_expr = &args[args.len() - 2];
+    if !is_pred_reg_expr(carry_expr) {
+        return None;
+    }
+    let lo_word = resolve_param_word_from_expr(
+        carry_expr,
+        loaded_param_by_reg,
+        constmem_word_by_pair,
+        copy_source_by_reg,
+        phi_sources_by_reg,
+        def_by_reg,
+        &mut BTreeSet::new(),
+    )?;
+
+    let mut hi_word = None;
+    for arg in &args[..args.len() - 2] {
+        if is_zero_ir_expr(arg) {
+            continue;
+        }
+        let Some(word) = resolve_param_word_from_expr(
+            arg,
+            loaded_param_by_reg,
+            constmem_word_by_pair,
+            copy_source_by_reg,
+            phi_sources_by_reg,
+            def_by_reg,
+            &mut BTreeSet::new(),
+        ) else {
+            continue;
+        };
+        if word == lo_word {
+            continue;
+        }
+        match hi_word {
+            None => hi_word = Some(word),
+            Some(existing) if existing == word => {}
+            Some(_) => return None,
+        }
+    }
+
+    let hi_word = hi_word?;
+    if lo_word % 2 == 0 && hi_word == lo_word + 1 {
+        Some(lo_word)
+    } else {
+        None
+    }
+}
+
+fn detect_param_loaded_lea_hi_pair(
+    opcode: &str,
+    args: &[IRExpr],
+    loaded_param_by_reg: &BTreeMap<RegId, u32>,
+    constmem_word_by_pair: &BTreeMap<(u32, u32), u32>,
+    copy_source_by_reg: &BTreeMap<RegId, RegId>,
+    phi_sources_by_reg: &BTreeMap<RegId, Vec<IRExpr>>,
+    def_by_reg: &BTreeMap<RegId, (String, Vec<IRExpr>, usize)>,
+) -> Option<u32> {
+    if !(opcode.starts_with("LEA.HI.X") || opcode.starts_with("ULEA.HI.X")) {
+        return None;
+    }
+
+    let (hi_base_expr, carry_expr) = if args.len() >= 5
+        && matches!(args[3], IRExpr::ImmI(_))
+        && is_pred_reg_expr(&args[4])
+    {
+        (&args[1], &args[4])
+    } else if args.len() == 4 && matches!(args[2], IRExpr::ImmI(_)) && is_pred_reg_expr(&args[3]) {
+        (&args[1], &args[3])
+    } else {
+        return None;
+    };
+
+    let lo_word = resolve_param_word_from_expr(
+        carry_expr,
+        loaded_param_by_reg,
+        constmem_word_by_pair,
+        copy_source_by_reg,
+        phi_sources_by_reg,
+        def_by_reg,
+        &mut BTreeSet::new(),
+    )?;
+    let hi_word = resolve_param_word_from_expr(
+        hi_base_expr,
+        loaded_param_by_reg,
+        constmem_word_by_pair,
+        copy_source_by_reg,
+        phi_sources_by_reg,
+        def_by_reg,
+        &mut BTreeSet::new(),
+    )?;
+
+    if lo_word % 2 == 0 && hi_word == lo_word + 1 {
+        Some(lo_word)
+    } else {
+        None
+    }
+}
+
+fn resolve_param_word_from_expr(
+    expr: &IRExpr,
+    loaded_param_by_reg: &BTreeMap<RegId, u32>,
+    constmem_word_by_pair: &BTreeMap<(u32, u32), u32>,
+    copy_source_by_reg: &BTreeMap<RegId, RegId>,
+    phi_sources_by_reg: &BTreeMap<RegId, Vec<IRExpr>>,
+    def_by_reg: &BTreeMap<RegId, (String, Vec<IRExpr>, usize)>,
+    visited: &mut BTreeSet<RegId>,
+) -> Option<u32> {
+    if let IRExpr::Op { op, args } = expr {
+        if op == "ConstMem" && args.len() == 2 {
+            let bank = imm_as_u32(&args[0])?;
+            let offset = imm_as_u32(&args[1])?;
+            if let Some(word) = constmem_word_by_pair.get(&(bank, offset)) {
+                return Some(*word);
+            }
+        }
+    }
+    let reg = expr.get_reg()?;
+    resolve_param_word_from_reg(
+        reg,
+        loaded_param_by_reg,
+        constmem_word_by_pair,
+        copy_source_by_reg,
+        phi_sources_by_reg,
+        def_by_reg,
+        visited,
+    )
+}
+
+fn resolve_param_pair_base_from_lo_hi_exprs(
+    lo_expr: &IRExpr,
+    hi_expr: &IRExpr,
+    loaded_param_by_reg: &BTreeMap<RegId, u32>,
+    constmem_word_by_pair: &BTreeMap<(u32, u32), u32>,
+    copy_source_by_reg: &BTreeMap<RegId, RegId>,
+    phi_sources_by_reg: &BTreeMap<RegId, Vec<IRExpr>>,
+    def_by_reg: &BTreeMap<RegId, (String, Vec<IRExpr>, usize)>,
+    visited: &mut BTreeSet<RegId>,
+) -> Option<u32> {
+    let lo_word = resolve_param_word_from_expr(
+        lo_expr,
+        loaded_param_by_reg,
+        constmem_word_by_pair,
+        copy_source_by_reg,
+        phi_sources_by_reg,
+        def_by_reg,
+        visited,
+    )?;
+    let hi_word = resolve_param_word_from_expr(
+        hi_expr,
+        loaded_param_by_reg,
+        constmem_word_by_pair,
+        copy_source_by_reg,
+        phi_sources_by_reg,
+        def_by_reg,
+        visited,
+    )?;
+    if lo_word % 2 == 0 && hi_word == lo_word + 1 {
+        Some(lo_word)
+    } else {
+        None
+    }
+}
+
+fn choose_unique_param_pair_base(a: Option<u32>, b: Option<u32>) -> Option<u32> {
+    match (a, b) {
+        (Some(x), Some(y)) if x == y => Some(x),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        _ => None,
+    }
+}
+
+fn resolve_param_word_from_reg(
+    reg: &RegId,
+    loaded_param_by_reg: &BTreeMap<RegId, u32>,
+    constmem_word_by_pair: &BTreeMap<(u32, u32), u32>,
+    copy_source_by_reg: &BTreeMap<RegId, RegId>,
+    phi_sources_by_reg: &BTreeMap<RegId, Vec<IRExpr>>,
+    def_by_reg: &BTreeMap<RegId, (String, Vec<IRExpr>, usize)>,
+    visited: &mut BTreeSet<RegId>,
+) -> Option<u32> {
+    if let Some(word) = loaded_param_by_reg.get(reg) {
+        return Some(*word);
+    }
+    if !visited.insert(reg.clone()) {
+        return None;
+    }
+    if let Some(src) = copy_source_by_reg.get(reg) {
+        if let Some(word) = resolve_param_word_from_reg(
+            src,
+            loaded_param_by_reg,
+            constmem_word_by_pair,
+            copy_source_by_reg,
+            phi_sources_by_reg,
+            def_by_reg,
+            visited,
+        ) {
+            return Some(word);
+        }
+    }
+    if let Some(phi_args) = phi_sources_by_reg.get(reg) {
+        let mut resolved = None;
+        for arg in phi_args {
+            let Some(word) = resolve_param_word_from_expr(
+                arg,
+                loaded_param_by_reg,
+                constmem_word_by_pair,
+                copy_source_by_reg,
+                phi_sources_by_reg,
+                def_by_reg,
+                &mut visited.clone(),
+            ) else {
+                continue;
+            };
+            match resolved {
+                None => resolved = Some(word),
+                Some(existing) if existing == word => {}
+                Some(_) => return None,
+            }
+        }
+        if let Some(word) = resolved {
+            return Some(word);
+        }
+    }
+    let (opcode, args, def_idx) = def_by_reg.get(reg)?;
+    if (opcode.starts_with("IMAD.WIDE") || opcode.starts_with("UIMAD.WIDE")) && *def_idx <= 1 {
+        let base_word = resolve_param_word_from_expr(
+            args.get(2)?,
+            loaded_param_by_reg,
+            constmem_word_by_pair,
+            copy_source_by_reg,
+            phi_sources_by_reg,
+            def_by_reg,
+            visited,
+        )?;
+        return Some(base_word + *def_idx as u32);
+    }
+    if opcode.starts_with("IADD.64") && *def_idx <= 1 && args.len() >= 4 {
+        let lhs_pair = resolve_param_pair_base_from_lo_hi_exprs(
+            &args[0],
+            &args[2],
+            loaded_param_by_reg,
+            constmem_word_by_pair,
+            copy_source_by_reg,
+            phi_sources_by_reg,
+            def_by_reg,
+            &mut visited.clone(),
+        );
+        let rhs_pair = resolve_param_pair_base_from_lo_hi_exprs(
+            &args[1],
+            &args[3],
+            loaded_param_by_reg,
+            constmem_word_by_pair,
+            copy_source_by_reg,
+            phi_sources_by_reg,
+            def_by_reg,
+            &mut visited.clone(),
+        );
+        let base_word = choose_unique_param_pair_base(lhs_pair, rhs_pair)?;
+        return Some(base_word + *def_idx as u32);
+    }
+    if (opcode.starts_with("IADD3.X") || opcode.starts_with("UIADD3.X")) && *def_idx == 0 {
+        if args.len() == 3 {
+            let mut hi_word = None;
+            for arg in args {
+                if is_zero_ir_expr(arg) {
+                    continue;
+                }
+                let Some(word) = resolve_param_word_from_expr(
+                    arg,
+                    loaded_param_by_reg,
+                    constmem_word_by_pair,
+                    copy_source_by_reg,
+                    phi_sources_by_reg,
+                    def_by_reg,
+                    &mut visited.clone(),
+                ) else {
+                    continue;
+                };
+                match hi_word {
+                    None => hi_word = Some(word),
+                    Some(existing) if existing == word => {}
+                    Some(_) => return None,
+                }
+            }
+            let hi_word = hi_word?;
+            if hi_word % 2 == 1 {
+                return Some(hi_word);
+            }
+        } else if args.len() >= 5 {
+            let carry_expr = &args[args.len() - 2];
+            if is_pred_reg_expr(carry_expr) {
+                let lo_word = resolve_param_word_from_expr(
+                    carry_expr,
+                    loaded_param_by_reg,
+                    constmem_word_by_pair,
+                    copy_source_by_reg,
+                    phi_sources_by_reg,
+                    def_by_reg,
+                    &mut visited.clone(),
+                )?;
+                let mut hi_word = None;
+                for arg in &args[..args.len() - 2] {
+                    if is_zero_ir_expr(arg) {
+                        continue;
+                    }
+                    let Some(word) = resolve_param_word_from_expr(
+                        arg,
+                        loaded_param_by_reg,
+                        constmem_word_by_pair,
+                        copy_source_by_reg,
+                        phi_sources_by_reg,
+                        def_by_reg,
+                        &mut visited.clone(),
+                    ) else {
+                        continue;
+                    };
+                    if word == lo_word {
+                        continue;
+                    }
+                    match hi_word {
+                        None => hi_word = Some(word),
+                        Some(existing) if existing == word => {}
+                        Some(_) => return None,
+                    }
+                }
+                let hi_word = hi_word?;
+                if lo_word % 2 == 0 && hi_word == lo_word + 1 {
+                    return Some(hi_word);
+                }
+            }
+        }
+    }
+    if (opcode.starts_with("LEA.HI.X") || opcode.starts_with("ULEA.HI.X")) && *def_idx == 0 {
+        let (hi_base_expr, carry_expr) = if args.len() >= 5
+            && matches!(args[3], IRExpr::ImmI(_))
+            && is_pred_reg_expr(&args[4])
+        {
+            (&args[1], &args[4])
+        } else if args.len() == 4 && matches!(args[2], IRExpr::ImmI(_)) && is_pred_reg_expr(&args[3]) {
+            (&args[1], &args[3])
+        } else {
+            return None;
+        };
+        let lo_word = resolve_param_word_from_expr(
+            carry_expr,
+            loaded_param_by_reg,
+            constmem_word_by_pair,
+            copy_source_by_reg,
+            phi_sources_by_reg,
+            def_by_reg,
+            &mut visited.clone(),
+        )?;
+        let hi_word = resolve_param_word_from_expr(
+            hi_base_expr,
+            loaded_param_by_reg,
+            constmem_word_by_pair,
+            copy_source_by_reg,
+            phi_sources_by_reg,
+            def_by_reg,
+            &mut visited.clone(),
+        )?;
+        if lo_word % 2 == 0 && hi_word == lo_word + 1 {
+            return Some(hi_word);
+        }
+    }
+    if !opcode_preserves_param_word(opcode) {
+        return None;
+    }
+    let mut resolved = None;
+    for arg in args {
+        let Some(word) = resolve_param_word_from_expr(
+            arg,
+            loaded_param_by_reg,
+            constmem_word_by_pair,
+            copy_source_by_reg,
+            phi_sources_by_reg,
+            def_by_reg,
+            visited,
+        ) else {
+            continue;
+        };
+        match resolved {
+            None => resolved = Some(word),
+            Some(existing) if existing == word => {}
+            Some(_) => return None,
+        }
+    }
+    resolved
+}
+
+fn is_pred_reg_expr(expr: &IRExpr) -> bool {
+    matches!(
+        expr.get_reg(),
+        Some(reg) if reg.class == "P" || reg.class == "UP"
+    )
+}
+
+fn opcode_preserves_param_word(opcode: &str) -> bool {
+    opcode.starts_with("IADD.64")
+        || opcode.starts_with("IADD3")
+        || opcode.starts_with("UIADD3")
+        || opcode.starts_with("IMAD.X")
+        || opcode.starts_with("LEA")
+        || opcode == "MOV"
+        || opcode.starts_with("MOV.")
+}
+
 fn collect_constmem_from_expr(expr: &IRExpr, out: &mut Vec<(u32, u32)>) {
     match expr {
+        IRExpr::Addr64 { lo, hi } => {
+            collect_constmem_from_expr(lo, out);
+            collect_constmem_from_expr(hi, out);
+        }
         IRExpr::Op { op, args } => {
             if op == "ConstMem" && args.len() == 2 {
                 if let (Some(bank), Some(offset)) = (imm_as_u32(&args[0]), imm_as_u32(&args[1])) {
@@ -1120,45 +2725,20 @@ fn collect_constmem_from_expr(expr: &IRExpr, out: &mut Vec<(u32, u32)>) {
 }
 
 fn is_pointer_context_opcode(opcode: &str) -> bool {
+    let mnem = opcode.split('.').next().unwrap_or(opcode);
+    let is_memory_data = (opcode.starts_with("LD") || opcode.starts_with("ST"))
+        && !matches!(mnem, "LDC" | "LDCU" | "ULDC");
     opcode.starts_with("IMAD.WIDE")
+        || opcode.starts_with("UIMAD.WIDE")
+        || opcode.starts_with("IADD.64")
         || opcode.starts_with("IADD3")
         || opcode.starts_with("UIADD3")
-        || opcode.starts_with("LD")
-        || opcode.starts_with("ST")
+        || is_memory_data
         || opcode.contains("LEA")
 }
 
 fn is_signed_word_context_opcode(opcode: &str) -> bool {
     opcode.starts_with("IABS")
-}
-
-fn pointer_data_width_opcode(opcode: &str) -> Option<u32> {
-    if !(opcode.starts_with("LD") || opcode.starts_with("ST")) {
-        return None;
-    }
-    for tok in opcode.split('.') {
-        match tok {
-            "U8" | "S8" => return Some(8),
-            "U16" | "S16" => return Some(16),
-            "U32" | "S32" => return Some(32),
-            "U64" | "S64" => return Some(64),
-            _ => {}
-        }
-    }
-    None
-}
-
-fn infer_pointer_pointee_ty(widths: &BTreeSet<u32>) -> Option<&'static str> {
-    if widths.len() != 1 {
-        return None;
-    }
-    match widths.iter().next().copied() {
-        Some(8) => Some("uint8_t"),
-        Some(16) => Some("uint16_t"),
-        Some(32) => Some("uint32_t"),
-        Some(64) => Some("uint64_t"),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
@@ -1492,6 +3072,134 @@ mod tests {
     }
 
     #[test]
+    fn infers_pointer_alias_for_imad_wide_base_used_by_memory_op() {
+        let sass = r#"
+            /*0000*/ IMAD.WIDE R6, R3, 0x4, c[0x0][0x160] ;
+            /*0010*/ LDG.E.U32 R11, [R6.64] ;
+            /*0020*/ EXIT ;
+        "#;
+        let cfg = build_cfg(decode_sass(sass));
+        let fir = build_ssa(&cfg);
+        let anns = annotate_function_ir_constmem(&fir, AbiProfile::modern_param_160());
+        let pairs = collect_param_loaded_addr64_pair_bases(&fir, &anns);
+        assert!(pairs.contains(&0), "expected arg0 pair, got {pairs:?}");
+        let aliases = infer_arg_aliases(&fir, &anns);
+        let alias = aliases.by_param.get(&0).expect("missing alias for param 0");
+        assert_eq!(alias.kind, ArgAliasKind::Ptr64);
+        assert_eq!(aliases.render_param_word(0, 0).unwrap(), "arg0_ptr.lo32");
+        assert_eq!(aliases.render_param_word(0, 1).unwrap(), "arg0_ptr.hi32");
+    }
+
+    #[test]
+    fn infers_pointer_alias_for_atomic_with_implicit_global_addr_pair() {
+        let sass = r#"
+            /*0000*/ IMAD.WIDE R6, R3, 0x4, c[0x0][0x160] ;
+            /*0010*/ ATOMG.E.CAS.STRONG.GPU PT, R4, [R6], -0x1, R5 ;
+            /*0020*/ EXIT ;
+        "#;
+        let cfg = build_cfg(decode_sass(sass));
+        let fir = build_ssa(&cfg);
+        let anns = annotate_function_ir_constmem(&fir, AbiProfile::modern_param_160());
+        let pairs = collect_param_loaded_addr64_pair_bases(&fir, &anns);
+        assert!(pairs.contains(&0), "expected arg0 pair, got {pairs:?}");
+        let aliases = infer_arg_aliases(&fir, &anns);
+        let alias = aliases.by_param.get(&0).expect("missing alias for param 0");
+        assert_eq!(alias.kind, ArgAliasKind::Ptr64);
+    }
+
+    #[test]
+    fn infers_pointer_alias_for_ldc64_pointer_pair_used_by_memory_op() {
+        let sass = r#"
+            /*0000*/ LDC.64 R2, c[0x0][0x160] ;
+            /*0010*/ IMAD.WIDE R2, R0, 0x4, R2 ;
+            /*0020*/ LDG.E.U32 R8, [R2.64] ;
+            /*0030*/ EXIT ;
+        "#;
+        let cfg = build_cfg(decode_sass(sass));
+        let fir = build_ssa(&cfg);
+        let anns = annotate_function_ir_constmem(&fir, AbiProfile::modern_param_160());
+        let aliases = infer_arg_aliases(&fir, &anns);
+        let alias = aliases.by_param.get(&0).expect("missing alias for param 0");
+        assert_eq!(alias.kind, ArgAliasKind::Ptr64);
+        assert_eq!(alias.confidence, AliasConfidence::High);
+        assert_eq!(alias.pointee_ty, Some("uint32_t"));
+    }
+
+    #[test]
+    fn infers_pointer_alias_for_ldcu64_lea_pair() {
+        let sass = r#"
+            /*0000*/ LDCU.64 UR8, c[0x0][0x160] ;
+            /*0010*/ LEA R18, P0, R4, UR8, 0x2 ;
+            /*0020*/ LEA.HI.X R19, R4, UR9, R5, 0x2, P0 ;
+            /*0030*/ EXIT ;
+        "#;
+        let cfg = build_cfg(decode_sass(sass));
+        let fir = build_ssa(&cfg);
+        let anns = annotate_function_ir_constmem(&fir, AbiProfile::modern_param_160());
+        let aliases = infer_arg_aliases(&fir, &anns);
+        let alias = aliases.by_param.get(&0).expect("missing alias for param 0");
+        assert_eq!(alias.kind, ArgAliasKind::Ptr64);
+        assert_eq!(alias.confidence, AliasConfidence::High);
+    }
+
+    #[test]
+    fn topk_per_row_ldcu_pointer_pairs_infer_ptr64_aliases() {
+        let funcs = crate::parser::split_decoded_functions(include_str!(
+            "../test_cu/corpus_sm100/ml_kernels.sass"
+        ));
+        let func = funcs
+            .into_iter()
+            .find(|func| func.name == "topk_per_row")
+            .expect("missing topk_per_row fixture");
+        let cfg = build_cfg(func.instrs.clone());
+        let fir = build_ssa(&cfg);
+        let profile = AbiProfile::detect_with_sm(&func.instrs, func.sm);
+        let anns = annotate_function_ir_constmem(&fir, profile);
+        let pairs = collect_param_loaded_addr64_pair_bases(&fir, &anns);
+        assert!(pairs.contains(&0), "expected arg0 pair, got {pairs:?}");
+        assert!(pairs.contains(&4), "expected arg4 pair, got {pairs:?}");
+
+        let aliases = infer_arg_aliases(&fir, &anns);
+        assert_eq!(
+            aliases.by_param.get(&0).map(|a| a.kind),
+            Some(ArgAliasKind::Ptr64)
+        );
+        assert_eq!(
+            aliases.by_param.get(&4).map(|a| a.kind),
+            Some(ArgAliasKind::Ptr64)
+        );
+    }
+
+    #[test]
+    fn topk_per_row_infers_pointer_pointee_types() {
+        let funcs = crate::parser::split_decoded_functions(include_str!(
+            "../test_cu/corpus_sm120/ml_kernels.sass"
+        ));
+        let func = funcs
+            .into_iter()
+            .find(|func| func.name == "topk_per_row")
+            .expect("missing topk_per_row fixture");
+        let cfg = build_cfg(func.instrs.clone());
+        let fir = build_ssa(&cfg);
+        let profile = AbiProfile::detect_with_sm(&func.instrs, func.sm);
+        let anns = annotate_function_ir_constmem(&fir, profile);
+        let aliases = infer_arg_aliases(&fir, &anns);
+
+        assert_eq!(
+            aliases.by_param.get(&0).and_then(|a| a.pointee_ty),
+            Some("float")
+        );
+        assert_eq!(
+            aliases.by_param.get(&2).and_then(|a| a.pointee_ty),
+            Some("float")
+        );
+        assert_eq!(
+            aliases.by_param.get(&4).and_then(|a| a.pointee_ty),
+            Some("int32_t")
+        );
+    }
+
+    #[test]
     fn mixed_lo_hi_usage_does_not_force_ptr64_alias() {
         let sass = r#"
             /*0000*/ IMAD.WIDE R4, R0, R7, c[0x0][0x180] ;
@@ -1515,6 +3223,96 @@ mod tests {
     }
 
     #[test]
+    fn nbody_scalar_param_pair_does_not_merge_into_ptr64() {
+        let funcs = crate::parser::split_decoded_functions(include_str!(
+            "../test_cu/corpus_sm100/simulation_kernels.sass"
+        ));
+        let func = funcs
+            .into_iter()
+            .find(|func| func.name == "nbody_forces")
+            .expect("missing nbody_forces fixture");
+        let cfg = build_cfg(func.instrs.clone());
+        let fir = build_ssa(&cfg);
+        let profile = AbiProfile::detect_with_sm(&func.instrs, func.sm);
+        let anns = annotate_function_ir_constmem(&fir, profile);
+        let pairs = collect_param_loaded_addr64_pair_bases(&fir, &anns);
+        assert!(
+            pairs.contains(&0),
+            "expected arg0 pointer pair, got {pairs:?}"
+        );
+        assert!(
+            pairs.contains(&2),
+            "expected arg2 pointer pair, got {pairs:?}"
+        );
+        assert!(
+            !pairs.contains(&4),
+            "scalar N/eps2 words were misclassified as a pointer pair: {pairs:?}"
+        );
+
+        let aliases = infer_arg_aliases(&fir, &anns);
+        let alias4 = aliases.by_param.get(&4).expect("missing alias for param 4");
+        let alias5 = aliases.by_param.get(&5).expect("missing alias for param 5");
+        assert_eq!(alias4.kind, ArgAliasKind::Word32);
+        assert_eq!(alias5.kind, ArgAliasKind::Word32);
+    }
+
+    #[test]
+    fn infers_real_power_series_scalar_param_types() {
+        let funcs =
+            crate::parser::split_decoded_functions(include_str!("../test_cu/corpus/loop_kernels.sass"));
+        let func = funcs
+            .into_iter()
+            .find(|func| func.name == "power_series")
+            .expect("missing power_series fixture");
+        let cfg = build_cfg(func.instrs.clone());
+        let fir = build_ssa(&cfg);
+        let profile = AbiProfile::detect_with_sm(&func.instrs, func.sm);
+        let anns = annotate_function_ir_constmem(&fir, profile);
+        let aliases = infer_arg_aliases(&fir, &anns);
+
+        assert_eq!(
+            aliases.by_param.get(&0).and_then(|alias| alias.scalar_kind),
+            Some(ArgScalarKind::F32)
+        );
+        assert_eq!(
+            aliases.by_param.get(&1).and_then(|alias| alias.scalar_kind),
+            Some(ArgScalarKind::I32)
+        );
+        assert!(aliases.render_typed_param_list().contains(&"float arg0".to_string()));
+        assert!(aliases
+            .render_typed_param_list()
+            .contains(&"int32_t arg1".to_string()));
+    }
+
+    #[test]
+    fn infers_real_pic_charge_deposit_float_params() {
+        let funcs = crate::parser::split_decoded_functions(include_str!(
+            "../test_cu/corpus/simulation_kernels.sass"
+        ));
+        let func = funcs
+            .into_iter()
+            .find(|func| func.name == "pic_charge_deposit")
+            .expect("missing pic_charge_deposit fixture");
+        let cfg = build_cfg(func.instrs.clone());
+        let fir = build_ssa(&cfg);
+        let profile = AbiProfile::detect_with_sm(&func.instrs, func.sm);
+        let anns = annotate_function_ir_constmem(&fir, profile);
+        let aliases = infer_arg_aliases(&fir, &anns);
+
+        assert_eq!(
+            aliases.by_param.get(&11).and_then(|alias| alias.scalar_kind),
+            Some(ArgScalarKind::F32)
+        );
+        assert_eq!(
+            aliases.by_param.get(&12).and_then(|alias| alias.scalar_kind),
+            Some(ArgScalarKind::F32)
+        );
+        let params = aliases.render_typed_param_list();
+        assert!(params.contains(&"float arg11".to_string()));
+        assert!(params.contains(&"float arg12".to_string()));
+    }
+
+    #[test]
     fn abi_display_prefers_inferred_arg_aliases_for_param_words() {
         let mut aliases = AbiArgAliases::default();
         // Legacy param_base = 0x140. Offset 0x148 → word 2.
@@ -1526,6 +3324,7 @@ mod tests {
                 kind: ArgAliasKind::Word32,
                 confidence: AliasConfidence::Low,
                 observed_words: [0].into_iter().collect(),
+                scalar_kind: Some(ArgScalarKind::U32),
                 signed_words: BTreeSet::new(),
                 pointee_ty: None,
             },
@@ -1548,6 +3347,7 @@ mod tests {
                 kind: ArgAliasKind::Ptr64,
                 confidence: AliasConfidence::High,
                 observed_words: [0, 1].into_iter().collect(),
+                scalar_kind: None,
                 signed_words: BTreeSet::new(),
                 pointee_ty: None,
             },
@@ -1559,6 +3359,7 @@ mod tests {
                 kind: ArgAliasKind::Word32,
                 confidence: AliasConfidence::Low,
                 observed_words: [0].into_iter().collect(),
+                scalar_kind: Some(ArgScalarKind::U32),
                 signed_words: BTreeSet::new(),
                 pointee_ty: None,
             },
@@ -1579,6 +3380,7 @@ mod tests {
                 kind: ArgAliasKind::Ptr64,
                 confidence: AliasConfidence::High,
                 observed_words: [0, 1].into_iter().collect(),
+                scalar_kind: None,
                 signed_words: BTreeSet::new(),
                 pointee_ty: None,
             },
@@ -1590,6 +3392,7 @@ mod tests {
                 kind: ArgAliasKind::Word32,
                 confidence: AliasConfidence::Low,
                 observed_words: [0].into_iter().collect(),
+                scalar_kind: Some(ArgScalarKind::U32),
                 signed_words: BTreeSet::new(),
                 pointee_ty: None,
             },
@@ -1613,6 +3416,56 @@ mod tests {
         let aliases = infer_arg_aliases(&fir, &anns);
         let params = aliases.render_typed_param_list();
         assert!(params.iter().any(|p| p == "uint8_t* arg0_ptr"));
+    }
+
+    #[test]
+    fn infers_float_pointer_from_shared_roundtrip_consumed_as_float() {
+        let sass = r#"
+            /*0000*/ IMAD.MOV.U32 R4, RZ, RZ, c[0x0][0x160] ;
+            /*0010*/ IMAD.MOV.U32 R5, RZ, RZ, c[0x0][0x164] ;
+            /*0020*/ LDG.E.CONSTANT R8, [R4.64] ;
+            /*0030*/ STS [R0], R8 ;
+            /*0040*/ LDS R9, [R0] ;
+            /*0050*/ FADD R10, R9, 0f00000000 ;
+            /*0060*/ EXIT ;
+        "#;
+        let cfg = build_cfg(decode_sass(sass));
+        let fir = build_ssa(&cfg);
+        let anns = annotate_function_ir_constmem(&fir, AbiProfile::modern_param_160());
+        let aliases = infer_arg_aliases(&fir, &anns);
+        let params = aliases.render_typed_param_list();
+        assert!(
+            params.iter().any(|p| p == "float* arg0_ptr"),
+            "expected float pointee recovered from LDS->FADD shared-memory roundtrip, got {:?}",
+            params
+        );
+    }
+
+    #[test]
+    fn infers_float_store_pointer_from_shared_roundtrip_through_copy_chain() {
+        let sass = r#"
+            /*0000*/ IMAD.MOV.U32 R4, RZ, RZ, c[0x0][0x160] ;
+            /*0010*/ IMAD.MOV.U32 R5, RZ, RZ, c[0x0][0x164] ;
+            /*0020*/ IMAD.MOV.U32 R6, RZ, RZ, c[0x0][0x168] ;
+            /*0030*/ IMAD.MOV.U32 R7, RZ, RZ, c[0x0][0x16c] ;
+            /*0040*/ LDG.E.CONSTANT R8, [R4.64] ;
+            /*0050*/ STS [R0], R8 ;
+            /*0060*/ LDS R9, [R0] ;
+            /*0070*/ MOV R10, R9 ;
+            /*0080*/ FADD R11, R9, 0f00000000 ;
+            /*0090*/ STG.E [R6.64], R10 ;
+            /*00a0*/ EXIT ;
+        "#;
+        let cfg = build_cfg(decode_sass(sass));
+        let fir = build_ssa(&cfg);
+        let anns = annotate_function_ir_constmem(&fir, AbiProfile::modern_param_160());
+        let aliases = infer_arg_aliases(&fir, &anns);
+        let params = aliases.render_typed_param_list();
+        assert!(
+            params.iter().any(|p| p == "float* arg2_ptr"),
+            "expected float pointee recovered through LDS->MOV->STG shared-memory roundtrip, got {:?}",
+            params
+        );
     }
 
     #[test]

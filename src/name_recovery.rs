@@ -11,6 +11,7 @@ use crate::ast::Expr;
 use crate::ir::{FunctionIR, IRCond, IRExpr, IRStatement, RValue, RegId};
 use crate::semantic_lift::SemanticLiftResult;
 use crate::semantic_propagation::{propagate_semantic_labels, SsaRegKey};
+use crate::type_inference::{infer_ssa_types, InferredType};
 
 // ---------------------------------------------------------------------------
 // Cached regex objects — compiled once, reused across all calls.
@@ -46,19 +47,11 @@ fn nr_pred_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"\b(?:P|UP)\d+\b").unwrap())
 }
 
-
-
-
-
-fn nr_arg_ptr_lane_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^arg(?P<idx>\d+)_ptr\.(?P<lane>lo32|hi32)$").unwrap())
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NameStyle {
     Temp,
     RegisterFamily,
+    VerbatimSsa,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -78,15 +71,14 @@ impl Default for NameRecoveryConfig {
     }
 }
 
-
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RecoveredSymbol {
     pub name: String,
     pub reg_base: (String, i32),
+    pub ty_hint: Option<&'static str>,
     pub live_in: bool,
     pub order: usize,
 }
-
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StructuralNameRecoveryPlan {
@@ -177,43 +169,65 @@ pub(crate) fn build_name_map(
     BTreeMap<RegBase, usize>,
 ) {
     let (tokens, first_seen, mut uf, idx_of) = collect_tokens(function_ir);
+    let ssa_types = infer_ssa_types(function_ir);
+    let semantic_labels = propagate_semantic_labels(function_ir);
 
-    // Build conservative congruence edges.
-    for block in &function_ir.blocks {
-        for stmt in &block.stmts {
-            for def in &stmt.defs {
-                let IRExpr::Reg(dest) = def else {
-                    continue;
-                };
-                let Some(dest_key) = reg_ssa(dest) else {
-                    continue;
-                };
-                let Some(dest_uf_idx) = idx_of.get(&dest_key).copied() else {
-                    continue;
-                };
+    if !matches!(config.style, NameStyle::VerbatimSsa) {
+        // Build conservative congruence edges.
+        for block in &function_ir.blocks {
+            for stmt in &block.stmts {
+                for def in &stmt.defs {
+                    let IRExpr::Reg(dest) = def else {
+                        continue;
+                    };
+                    let Some(dest_key) = reg_ssa(dest) else {
+                        continue;
+                    };
+                    let Some(dest_uf_idx) = idx_of.get(&dest_key).copied() else {
+                        continue;
+                    };
 
-                if let RValue::Phi(args) = &stmt.value {
-                    for arg in args {
-                        if let Some(arg_key) = reg_ssa_from_expr(arg) {
-                            if arg_key.base == dest_key.base {
-                                if let Some(arg_idx) = idx_of.get(&arg_key).copied() {
-                                    uf.union(dest_uf_idx, arg_idx);
+                        if let RValue::Phi(args) = &stmt.value {
+                            for arg in args {
+                                if let Some(arg_key) = reg_ssa_from_expr(arg) {
+                                    if arg_key.base == dest_key.base {
+                                        if !ssa_name_union_compatible(
+                                            &dest_key,
+                                            &arg_key,
+                                            &ssa_types,
+                                            &semantic_labels,
+                                            NameUnionEdge::Phi,
+                                        ) {
+                                            continue;
+                                        }
+                                        if let Some(arg_idx) = idx_of.get(&arg_key).copied() {
+                                            uf.union(dest_uf_idx, arg_idx);
+                                        }
+                                    }
                                 }
-                            }
                         }
-                    }
-                } else if let RValue::Op { opcode, args } = &stmt.value {
-                    if let Some(src_key) = conservative_copy_source(opcode, args) {
-                        // For true copy instructions (MOV, IMAD.MOV) we can
-                        // safely unify across different register bases since
-                        // the value is identical.  For other ops we keep the
-                        // same-base restriction as a safety measure.
-                        let is_true_copy = opcode.starts_with("MOV")
-                            || opcode.starts_with("UMOV")
-                            || opcode.starts_with("IMAD.MOV");
-                        if is_true_copy || src_key.base == dest_key.base {
-                            if let Some(src_idx) = idx_of.get(&src_key).copied() {
-                                uf.union(dest_uf_idx, src_idx);
+                    } else if let RValue::Op { opcode, args } = &stmt.value {
+                        if let Some(src_key) = conservative_copy_source(opcode, args) {
+                            // For true copy instructions (MOV, IMAD.MOV) we can
+                            // safely unify across different register bases since
+                            // the value is identical. For other ops we keep the
+                            // same-base restriction as a safety measure.
+                            let is_true_copy = opcode.starts_with("MOV")
+                                || opcode.starts_with("UMOV")
+                                || opcode.starts_with("IMAD.MOV");
+                            if is_true_copy || src_key.base == dest_key.base {
+                                if !ssa_name_union_compatible(
+                                    &dest_key,
+                                    &src_key,
+                                    &ssa_types,
+                                    &semantic_labels,
+                                    NameUnionEdge::Copy,
+                                ) {
+                                    continue;
+                                }
+                                if let Some(src_idx) = idx_of.get(&src_key).copied() {
+                                    uf.union(dest_uf_idx, src_idx);
+                                }
                             }
                         }
                     }
@@ -303,6 +317,16 @@ pub(crate) fn build_name_map(
                     base_name
                 }
             }
+            NameStyle::VerbatimSsa => {
+                let token = &row.2;
+                token
+                    .chars()
+                    .map(|c| match c {
+                        '.' => '_',
+                        other => other.to_ascii_lowercase(),
+                    })
+                    .collect()
+            }
         };
         component_name.push(name);
     }
@@ -331,23 +355,25 @@ pub(crate) fn build_name_map(
     // false). Prefer mapping old-value tokens to the same recovered name as the
     // dest, but never overwrite an existing conflicting mapping: preserving a
     // stable one-to-one token map is correctness-critical.
-    for block in &function_ir.blocks {
-        for stmt in &block.stmts {
-            if stmt.pred.is_none() || stmt.pred_old_defs.is_empty() {
-                continue;
-            }
-            for (def_idx, def) in stmt.defs.iter().enumerate() {
-                let Some(dest_key) = reg_ssa_from_expr(def) else {
+    if !matches!(config.style, NameStyle::VerbatimSsa) {
+        for block in &function_ir.blocks {
+            for stmt in &block.stmts {
+                if stmt.pred.is_none() || stmt.pred_old_defs.is_empty() {
                     continue;
-                };
-                let dest_tok = reg_token_core(&dest_key);
-                let Some(dest_name) = token_map.get(&dest_tok).cloned() else {
-                    continue;
-                };
-                if let Some(old_expr) = stmt.pred_old_defs.get(def_idx) {
-                    if let Some(old_key) = reg_ssa_from_expr(old_expr) {
-                        let old_tok = reg_token_core(&old_key);
-                        merge_pred_old_token_mapping(&mut token_map, old_tok, &dest_name);
+                }
+                for (def_idx, def) in stmt.defs.iter().enumerate() {
+                    let Some(dest_key) = reg_ssa_from_expr(def) else {
+                        continue;
+                    };
+                    let dest_tok = reg_token_core(&dest_key);
+                    let Some(dest_name) = token_map.get(&dest_tok).cloned() else {
+                        continue;
+                    };
+                    if let Some(old_expr) = stmt.pred_old_defs.get(def_idx) {
+                        if let Some(old_key) = reg_ssa_from_expr(old_expr) {
+                            let old_tok = reg_token_core(&old_key);
+                            merge_pred_old_token_mapping(&mut token_map, old_tok, &dest_name);
+                        }
                     }
                 }
             }
@@ -355,6 +381,67 @@ pub(crate) fn build_name_map(
     }
 
     (token_map, comp_rows, component_name, fam_count)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NameUnionEdge {
+    Phi,
+    Copy,
+}
+
+fn ssa_name_union_compatible(
+    lhs: &RegSsa,
+    rhs: &RegSsa,
+    ssa_types: &BTreeMap<RegId, InferredType>,
+    semantic_labels: &HashMap<SsaRegKey, String>,
+    edge: NameUnionEdge,
+) -> bool {
+    let lhs_label = semantic_labels.get(&SsaRegKey {
+        class: lhs.base.class.clone(),
+        idx: lhs.base.idx,
+        ssa: Some(lhs.ssa),
+    });
+    let rhs_label = semantic_labels.get(&SsaRegKey {
+        class: rhs.base.class.clone(),
+        idx: rhs.base.idx,
+        ssa: Some(rhs.ssa),
+    });
+    match (lhs_label, rhs_label) {
+        (Some(lhs), Some(rhs)) if lhs != rhs => return false,
+        (Some(_), None) | (None, Some(_)) if matches!(edge, NameUnionEdge::Phi) => return false,
+        _ => {}
+    }
+
+    let lhs_ty = ssa_types.get(&RegId {
+        class: lhs.base.class.clone(),
+        idx: lhs.base.idx,
+        sign: 1,
+        ssa: Some(lhs.ssa),
+    });
+    let rhs_ty = ssa_types.get(&RegId {
+        class: rhs.base.class.clone(),
+        idx: rhs.base.idx,
+        sign: 1,
+        ssa: Some(rhs.ssa),
+    });
+    match (lhs_ty.copied(), rhs_ty.copied()) {
+        (Some(lhs), Some(rhs)) => inferred_name_family(lhs) == inferred_name_family(rhs),
+        (Some(_), None) | (None, Some(_)) => matches!(edge, NameUnionEdge::Copy),
+        (None, None) => true,
+    }
+}
+
+fn inferred_name_family(ty: InferredType) -> u8 {
+    match ty {
+        InferredType::F16 | InferredType::F32 | InferredType::AnyFloat => 0,
+        InferredType::Ptr64 | InferredType::U64 => 1,
+        InferredType::U8
+        | InferredType::U16
+        | InferredType::U32
+        | InferredType::I32
+        | InferredType::AnyInt => 2,
+        InferredType::Bottom | InferredType::Top => 3,
+    }
 }
 
 pub fn plan_structured_name_recovery_with_lift(
@@ -406,7 +493,6 @@ pub fn plan_structured_name_recovery_with_lift(
     }
 }
 
-
 fn semantic_symbolize_output(
     function_ir: &FunctionIR,
     output: &str,
@@ -441,6 +527,7 @@ fn build_ir_semantic_rename_map(
     component_name: &[String],
 ) -> BTreeMap<String, String> {
     let ir_labels = propagate_semantic_labels(function_ir);
+    let ssa_types = infer_ssa_types(function_ir);
     let mut used = collect_code_identifiers(output);
     let mut rename = BTreeMap::<String, String>::new();
 
@@ -476,6 +563,9 @@ fn build_ir_semantic_rename_map(
         let Some(seed) = label else {
             continue;
         };
+        if !component_accepts_semantic_seed(&row.4, seed, &ssa_types) {
+            continue;
+        }
         if rename.contains_key(temp_name) {
             continue;
         }
@@ -507,6 +597,7 @@ fn build_lifted_seed_rename_map(
     component_name: &[String],
 ) -> BTreeMap<String, String> {
     let row_of = build_row_index_map(comp_rows);
+    let ssa_types = infer_ssa_types(function_ir);
     let mut used = collect_code_identifiers(output);
     let mut rename = BTreeMap::<String, String>::new();
 
@@ -531,6 +622,9 @@ fn build_lifted_seed_rename_map(
         let Some(seed) = semantic_seed_from_lifted_expr(&stmt.rhs) else {
             continue;
         };
+        if !component_accepts_semantic_seed(&comp_rows[row_idx].4, &seed, &ssa_types) {
+            continue;
+        }
         if name_matches_seed(current_name, &seed) {
             continue;
         }
@@ -583,6 +677,49 @@ fn name_matches_seed(name: &str, seed: &str) -> bool {
         })
 }
 
+fn component_accepts_semantic_seed(
+    members: &[RegSsa],
+    seed: &str,
+    ssa_types: &BTreeMap<RegId, InferredType>,
+) -> bool {
+    let Some(expected_family) = semantic_seed_name_family(seed) else {
+        return true;
+    };
+    members.iter().all(|member| {
+        let key = RegId {
+            class: member.base.class.clone(),
+            idx: member.base.idx,
+            sign: 1,
+            ssa: Some(member.ssa),
+        };
+        ssa_types
+            .get(&key)
+            .copied()
+            .map(inferred_name_family)
+            .is_none_or(|family| family == expected_family)
+    })
+}
+
+fn semantic_seed_name_family(seed: &str) -> Option<u8> {
+    match seed {
+        "tid_x"
+        | "tid_y"
+        | "tid_z"
+        | "ctaid_x"
+        | "ctaid_y"
+        | "ctaid_z"
+        | "block_dim_x"
+        | "block_dim_y"
+        | "block_dim_z"
+        | "grid_dim_x"
+        | "grid_dim_y"
+        | "grid_dim_z"
+        | "lane_id"
+        | "cga_cta_id" => Some(inferred_name_family(InferredType::U32)),
+        _ => None,
+    }
+}
+
 fn apply_identifier_renames(output: &str, rename: &BTreeMap<String, String>) -> String {
     if rename.is_empty() {
         return output.to_string();
@@ -609,6 +746,7 @@ fn collect_recovered_symbol_metadata(
     comp_rows: &[(Group, Loc, String, RegBase, Vec<RegSsa>)],
     recovered_names: &[String],
 ) -> Vec<RecoveredSymbol> {
+    let ssa_types = infer_ssa_types(function_ir);
     let mut row_of = HashMap::<RegSsa, usize>::new();
     for (row_idx, row) in comp_rows.iter().enumerate() {
         for member in &row.4 {
@@ -666,9 +804,25 @@ fn collect_recovered_symbol_metadata(
         .enumerate()
         .filter_map(|(row_idx, row)| {
             let name = recovered_names.get(row_idx)?.clone();
+            let mut row_ty = InferredType::Bottom;
+            for member in &row.4 {
+                let key = RegId {
+                    class: member.base.class.clone(),
+                    idx: member.base.idx,
+                    sign: 1,
+                    ssa: Some(member.ssa),
+                };
+                if let Some(ty) = ssa_types.get(&key).copied() {
+                    row_ty = row_ty.join(ty);
+                }
+            }
             Some(RecoveredSymbol {
                 name,
                 reg_base: (row.3.class.clone(), row.3.idx),
+                ty_hint: match row_ty {
+                    InferredType::Bottom | InferredType::Top => None,
+                    other => Some(other.to_c_type()),
+                },
                 live_in: live_in.contains(&row_idx),
                 order: first_touch.get(&row_idx).copied().unwrap_or(usize::MAX),
             })
@@ -685,9 +839,15 @@ pub fn filter_recovered_symbols_by_output(
     let used_names = collect_code_identifiers(output);
     symbols
         .iter()
-        .filter(|symbol| used_names.contains(&symbol.name))
+        .filter(|symbol| {
+            used_names.contains(&symbol.name) && !is_reserved_rendered_builtin_name(&symbol.name)
+        })
         .cloned()
         .collect()
+}
+
+fn is_reserved_rendered_builtin_name(name: &str) -> bool {
+    matches!(name, "shmem" | "shmem_u8")
 }
 
 fn row_index_for_reg_id(reg: &RegId, row_of: &HashMap<RegSsa, usize>) -> Option<usize> {
@@ -731,6 +891,10 @@ fn collect_expr_rows(expr: &IRExpr, row_of: &HashMap<RegSsa, usize>, out: &mut V
             if let Some(row_idx) = row_index_for_reg_id(reg, row_of) {
                 out.push(row_idx);
             }
+        }
+        IRExpr::Addr64 { lo, hi } => {
+            collect_expr_rows(lo, row_of, out);
+            collect_expr_rows(hi, row_of, out);
         }
         IRExpr::Mem { base, offset, .. } => {
             collect_expr_rows(base, row_of, out);
@@ -827,14 +991,6 @@ fn semantic_name_seed(rhs: &str) -> Option<String> {
     };
     if let Some(name) = fixed {
         return Some(name.to_string());
-    }
-    let arg_ptr_lane = nr_arg_ptr_lane_re();
-    if let Some(cap) = arg_ptr_lane.captures(rhs) {
-        return Some(format!(
-            "arg{}_ptr_{}",
-            cap.name("idx").expect("idx").as_str(),
-            cap.name("lane").expect("lane").as_str()
-        ));
     }
     None
 }
@@ -1159,6 +1315,10 @@ fn collect_expr_tokens(
                     .or_insert(loc);
             }
         }
+        IRExpr::Addr64 { lo, hi } => {
+            collect_expr_tokens(lo, block_id, stmt_idx, order_in_stmt, tokens, first_seen);
+            collect_expr_tokens(hi, block_id, stmt_idx, order_in_stmt, tokens, first_seen);
+        }
         IRExpr::Mem { base, offset, .. } => {
             collect_expr_tokens(base, block_id, stmt_idx, order_in_stmt, tokens, first_seen);
             if let Some(off) = offset {
@@ -1356,7 +1516,10 @@ mod tests {
         "#;
         let fir = build_fir(sass);
         let (_, plan) = apply_plan(&fir, "if (P0) {\n}\n", &NameRecoveryConfig::default());
-        assert!(plan.token_map.get("P0").is_some_and(|name| name.starts_with('b')));
+        assert!(plan
+            .token_map
+            .get("P0")
+            .is_some_and(|name| name.starts_with('b')));
     }
 
     #[test]
@@ -1498,5 +1661,19 @@ mod tests {
         assert!(name_to_reg_base.contains_key("tid_x"));
         assert!(!name_to_reg_base.contains_key("v0"));
         assert!(plan.symbols.iter().any(|symbol| symbol.name == "tid_x"));
+    }
+
+    #[test]
+    fn filter_recovered_symbols_drops_shared_memory_builtins() {
+        let symbols = vec![RecoveredSymbol {
+            name: "shmem".to_string(),
+            reg_base: ("R".to_string(), 0),
+            ty_hint: Some("uint32_t"),
+            live_in: false,
+            order: 0,
+        }];
+
+        let filtered = filter_recovered_symbols_by_output("v0 = shmem[idx];\n", &symbols);
+        assert!(filtered.is_empty(), "got {:?}", filtered);
     }
 }

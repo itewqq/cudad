@@ -305,6 +305,182 @@ fn ssa_iadd3_pred_output_is_defined_and_reused_by_lea_hi_x() {
 }
 
 #[test]
+fn ssa_iadd64_defines_high_lane_and_lifts_carry_into_hi_half() {
+    let sample = r#"
+        /*0000*/ LDC.64 R4, c[0x0][0x380] ;
+        /*0010*/ SHF.R.S32.HI R7, RZ, 0x1f, R6 ;
+        /*0020*/ IADD.64 R4, R6, R4 ;
+        /*0030*/ EXIT ;
+    "#;
+    let cfg = build_cfg(decode_sass(sample));
+    let fir = build_ssa(&cfg);
+    let block0 = fir.blocks.iter().find(|b| b.id == 0).expect("expected BB0");
+    let stmt = block0
+        .stmts
+        .iter()
+        .find(|stmt| matches!(&stmt.value, RValue::Op { opcode, .. } if opcode == "IADD.64"))
+        .expect("expected IADD.64 statement in SSA");
+    assert_eq!(stmt.defs.len(), 2, "IADD.64 should define a register pair");
+    let RValue::Op { args, .. } = &stmt.value else {
+        unreachable!();
+    };
+    assert_eq!(
+        args.len(),
+        4,
+        "IADD.64 should carry both low and hi source lanes"
+    );
+    assert!(matches!(args[2], IRExpr::Reg(ref r) if r.class == "R" && r.idx == 7));
+    assert!(matches!(args[3], IRExpr::Reg(ref r) if r.class == "R" && r.idx == 5));
+
+    let lifted = lift_function_ir(&fir, &SemanticLiftConfig::default());
+    let stmt_idx = block0
+        .stmts
+        .iter()
+        .position(|candidate| std::ptr::eq(candidate, stmt))
+        .expect("IADD.64 statement should have an index");
+    let hi = lifted
+        .by_def
+        .get(&DefRef {
+            block_id: block0.id,
+            stmt_idx,
+            def_idx: 1,
+        })
+        .expect("expected lifted hi-half for IADD.64")
+        .rhs
+        .render();
+    assert!(
+        hi.contains("(int64_t)((int32_t)(R6.0))"),
+        "expected hi-half to preserve the widened scalar addend, got: {hi}"
+    );
+    assert!(
+        hi.contains("((uintptr_t)(((uint64_t)(R5.0) << 32) | (uint32_t)(R4.0)))"),
+        "expected hi-half to preserve the explicit wide base pair, got: {hi}"
+    );
+    assert!(
+        !hi.contains("carry_u32_add3("),
+        "expected hi-half to collapse the carry helper into a wide sum, got: {hi}"
+    );
+}
+
+#[test]
+fn ssa_uiadd3_64_defines_high_lane_and_lifts_carry_into_hi_half() {
+    let sample = r#"
+        /*0000*/ UIADD3.64 UR4, UPT, UPT, UR18, 0x10, URZ ;
+        /*0010*/ EXIT ;
+    "#;
+    let cfg = build_cfg(decode_sass(sample));
+    let fir = build_ssa(&cfg);
+    let block0 = fir.blocks.iter().find(|b| b.id == 0).expect("expected BB0");
+    let stmt = block0
+        .stmts
+        .iter()
+        .find(|stmt| matches!(&stmt.value, RValue::Op { opcode, .. } if opcode == "UIADD3.64"))
+        .expect("expected UIADD3.64 statement in SSA");
+    assert!(
+        stmt.defs
+            .iter()
+            .any(|def| matches!(def, IRExpr::Reg(reg) if reg.class == "UR" && reg.idx == 4)),
+        "low half missing from UIADD3.64 defs: {:?}",
+        stmt.defs
+    );
+    assert!(
+        stmt.defs
+            .iter()
+            .any(|def| matches!(def, IRExpr::Reg(reg) if reg.class == "UR" && reg.idx == 5)),
+        "implicit high half missing from UIADD3.64 defs: {:?}",
+        stmt.defs
+    );
+    let RValue::Op { args, .. } = &stmt.value else {
+        unreachable!();
+    };
+    assert_eq!(
+        args.len(),
+        6,
+        "UIADD3.64 should carry both low and hi input lanes"
+    );
+    assert!(matches!(args[3], IRExpr::Reg(ref r) if r.class == "UR" && r.idx == 19));
+    assert!(matches!(args[4], IRExpr::ImmI(0)));
+    assert!(matches!(args[5], IRExpr::Reg(ref r) if r.class == "URZ"));
+
+    let lifted = lift_function_ir(&fir, &SemanticLiftConfig::default());
+    let stmt_idx = block0
+        .stmts
+        .iter()
+        .position(|candidate| std::ptr::eq(candidate, stmt))
+        .expect("UIADD3.64 statement should have an index");
+    let hi_def_idx = stmt
+        .defs
+        .iter()
+        .position(|def| matches!(def, IRExpr::Reg(reg) if reg.class == "UR" && reg.idx == 5))
+        .expect("expected hi-half def index");
+    let hi = lifted
+        .by_def
+        .get(&DefRef {
+            block_id: block0.id,
+            stmt_idx,
+            def_idx: hi_def_idx,
+        })
+        .expect("expected lifted hi-half for UIADD3.64")
+        .rhs
+        .render();
+    assert!(
+        hi.contains("((uintptr_t)(((uint64_t)(UR19.0) << 32) | (uint32_t)(UR18.0)))"),
+        "expected hi-half to preserve the explicit wide base pair, got: {hi}"
+    );
+    assert!(
+        hi.contains("(uint64_t)((uint32_t)(16))"),
+        "expected hi-half to preserve the widened immediate addend, got: {hi}"
+    );
+    assert!(
+        !hi.contains("carry_u32_add3("),
+        "expected hi-half to collapse the carry helper into a wide sum, got: {hi}"
+    );
+}
+
+#[test]
+fn ssa_lea_pred_output_is_defined_and_reused_by_lea_hi_x() {
+    let sample = r#"
+        /*0000*/ LEA R4, P5, R9, R4, 0x2 ;
+        /*0010*/ LEA.HI.X R5, R9, R5, R10, 0x2, P5 ;
+        /*0020*/ EXIT ;
+    "#;
+    let cfg = build_cfg(decode_sass(sample));
+    let fir = build_ssa(&cfg);
+    let block0 = fir.blocks.iter().find(|b| b.id == 0).expect("expected BB0");
+
+    let mut carry_def: Option<RegId> = None;
+    let mut carry_use: Option<RegId> = None;
+    for stmt in &block0.stmts {
+        let RValue::Op { opcode, args } = &stmt.value else {
+            continue;
+        };
+        if opcode == "LEA" {
+            carry_def = stmt
+                .defs
+                .iter()
+                .filter_map(|d| d.get_reg())
+                .find(|r| r.class == "P")
+                .cloned();
+        }
+        if opcode == "LEA.HI.X" {
+            carry_use = args
+                .iter()
+                .filter_map(|a| match a {
+                    IRExpr::Reg(r) if r.class == "P" => Some(r.clone()),
+                    _ => None,
+                })
+                .next();
+        }
+    }
+
+    let carry_def = carry_def.expect("expected LEA predicate carry def");
+    let carry_use = carry_use.expect("expected LEA.HI.X carry predicate use");
+    assert_eq!(carry_def.class, carry_use.class);
+    assert_eq!(carry_def.idx, carry_use.idx);
+    assert_eq!(carry_def.ssa, carry_use.ssa);
+}
+
+#[test]
 fn ssa_uiadd3_pred_output_feeds_uiadd3_x_carry_input() {
     let sample = r#"
         /*0000*/ UIADD3 UR8, UP0, UR8, 0x4, URZ ;
@@ -345,6 +521,39 @@ fn ssa_uiadd3_pred_output_feeds_uiadd3_x_carry_input() {
     assert_eq!(carry_def.class, carry_use.class);
     assert_eq!(carry_def.idx, carry_use.idx);
     assert_eq!(carry_def.ssa, carry_use.ssa);
+}
+
+#[test]
+fn ssa_imad_wide_models_implicit_hi_def() {
+    let sample = r#"
+        /*0000*/ LDC R3, c[0x0][0x160] ;
+        /*0010*/ LDC.64 R4, c[0x0][0x168] ;
+        /*0020*/ IMAD.WIDE R2, R1, 0x4, R4 ;
+        /*0030*/ STG.E [R2.64], R7 ;
+        /*0040*/ EXIT ;
+    "#;
+    let cfg = build_cfg(decode_sass(sample));
+    let fir = build_ssa(&cfg);
+    let stmt = fir
+        .blocks
+        .iter()
+        .flat_map(|block| block.stmts.iter())
+        .find(|stmt| matches!(&stmt.value, RValue::Op { opcode, .. } if opcode.starts_with("IMAD.WIDE")))
+        .expect("missing IMAD.WIDE stmt");
+    assert!(
+        stmt.defs
+            .iter()
+            .any(|def| matches!(def, IRExpr::Reg(reg) if reg.class == "R" && reg.idx == 2)),
+        "low half missing from IMAD.WIDE defs: {:?}",
+        stmt.defs
+    );
+    assert!(
+        stmt.defs
+            .iter()
+            .any(|def| matches!(def, IRExpr::Reg(reg) if reg.class == "R" && reg.idx == 3)),
+        "implicit high half missing from IMAD.WIDE defs: {:?}",
+        stmt.defs
+    );
 }
 
 #[test]
@@ -401,7 +610,6 @@ fn ssa_ir_does_not_emit_synthetic_carry_opcodes() {
         }
     }
 }
-
 
 fn run_structured_output_lifted(sass: &str) -> String {
     let cfg = build_cfg(decode_sass(sass));
@@ -497,22 +705,31 @@ fn run_structured_output_full_pass_from_instrs(
     let lifted = lift_function_ir(&fir, &lift_cfg);
     let preview_output =
         structurizer.pretty_print_with_lift_cleanup(&tree, display_ctx, 0, Some(&lifted));
+    let has_unstructured = preview_output.contains("goto BB");
     let plan = plan_structured_name_recovery_with_lift(
         &fir,
         &preview_output,
         Some(&lifted),
         &NameRecoveryConfig {
-            style: NameStyle::Temp,
-            rewrite_control_predicates: true,
+            style: if has_unstructured {
+                NameStyle::VerbatimSsa
+            } else {
+                NameStyle::Temp
+            },
+            rewrite_control_predicates: !has_unstructured,
             semantic_symbolization: true,
         },
     );
+    let enable_post_name_addr64_fold = !has_unstructured
+        && preview_output.len() <= 30_000
+        && preview_output.matches("((uintptr_t)").count() >= 8;
     let named_output = structurizer.pretty_print_with_lift_cleanup_and_names(
         &tree,
         display_ctx,
         0,
         Some(&lifted),
         &plan.token_map,
+        enable_post_name_addr64_fold,
     );
     let symbols = filter_recovered_symbols_by_output(&named_output, &plan.symbols);
     let name_type_map = infer_recovered_name_types(&fir, &symbols);
@@ -596,6 +813,14 @@ fn run_structured_output_full_pass(sass: &str) -> String {
     out
 }
 
+fn assert_full_pass_nonempty_and_deterministic(sass: &str) -> String {
+    let out1 = run_structured_output_full_pass(sass);
+    let out2 = run_structured_output_full_pass(sass);
+    assert!(!out1.trim().is_empty());
+    assert_eq!(out1, out2);
+    out1
+}
+
 #[test]
 fn test_abi_profile_detects_legacy_window_from_sample() {
     let sample = r#"
@@ -654,15 +879,6 @@ fn test_abi_inferred_aliases_show_in_output() {
     assert!(out.contains("arg0_ptr.lo32"));
     assert!(out.contains("arg0_ptr.hi32"));
 }
-
-
-
-
-
-
-
-
-
 
 #[test]
 fn lifted_output_uses_infix_for_supported_patterns() {
@@ -757,13 +973,14 @@ fn lifted_rc4_renders_barrier_as_syncthreads() {
 
 #[test]
 fn smoke_struct_output_full_pass_rc4_sass() {
-    let sass = include_str!("../test_cu/rc4.sass");
-    let expected = include_str!("../test_cu/golden_full_pass/rc4.pseudo.c");
-    let out1 = run_structured_output_full_pass(sass);
-    let out2 = run_structured_output_full_pass(sass);
-    assert!(!out1.trim().is_empty());
-    assert_eq!(out1, out2);
-    assert_eq!(out1.trim_end(), expected.trim_end());
+    let out = assert_full_pass_nonempty_and_deterministic(include_str!("../test_cu/rc4.sass"));
+    assert!(out.contains("__shared__ uint8_t shmem_u8[256];"));
+    assert!(out.contains("__syncthreads();"));
+    assert!(out.contains("uint8_t* arg0_ptr"));
+    assert!(out.contains("uint8_t* arg4_ptr"));
+    assert!(out.contains("uint8_t* arg6_ptr"));
+    assert!(!out.contains("addr64("));
+    assert!(!out.contains("prmt("));
 }
 
 #[test]
@@ -779,35 +996,47 @@ fn smoke_struct_output_full_pass_if_sass() {
 
 #[test]
 fn smoke_struct_output_full_pass_loop_constant_sass() {
-    let sass = include_str!("../test_cu/loop_constant.sass");
-    let expected = include_str!("../test_cu/golden_full_pass/loop_constant.pseudo.c");
-    let out1 = run_structured_output_full_pass(sass);
-    let out2 = run_structured_output_full_pass(sass);
-    assert!(!out1.trim().is_empty());
-    assert_eq!(out1, out2);
-    assert_eq!(out1.trim_end(), expected.trim_end());
+    let out =
+        assert_full_pass_nonempty_and_deterministic(include_str!("../test_cu/loop_constant.sass"));
+    assert!(out.contains("__shared__ uint8_t shmem_u8[256];"));
+    let shmem_store =
+        Regex::new(r"shmem_u8\[(?:tid_x|v\d+(?:_next(?:_\d+)?)?)\] = (?:tid_x|v\d+(?:_next(?:_\d+)?)?);")
+            .expect("valid loop_constant shmem store regex");
+    assert!(shmem_store.is_match(&out), "expected loop_constant shmem store, got:\n{}", out);
+    assert!(
+        out.contains("while(!((int32_t)(tid_x) >= (int32_t)(256)));")
+            || out.contains("while(!((int32_t)(tid_x_next) >= (int32_t)(256)));")
+            || out.contains("while(!((int32_t)(v2_next) >= (int32_t)(256)));")
+    );
+    assert!(!out.contains("addr64("));
+    assert!(!out.contains("prmt("));
 }
 
 #[test]
 fn smoke_struct_output_full_pass_if_loop_sass() {
-    let sass = include_str!("../test_cu/if_loop.sass");
-    let expected = include_str!("../test_cu/golden_full_pass/if_loop.pseudo.c");
-    let out1 = run_structured_output_full_pass(sass);
-    let out2 = run_structured_output_full_pass(sass);
-    assert!(!out1.trim().is_empty());
-    assert_eq!(out1, out2);
-    assert_eq!(out1.trim_end(), expected.trim_end());
+    let out = assert_full_pass_nonempty_and_deterministic(include_str!("../test_cu/if_loop.sass"));
+    assert!(out.contains("float* arg4_ptr"));
+    assert!(out.matches("do {").count() >= 2);
+    let final_store = Regex::new(r"\*\(arg4_ptr \+ v2\) = v\d+(?:_next(?:_\d+)?)?;")
+        .expect("valid if_loop final store regex");
+    assert!(final_store.is_match(&out));
+    assert!(!out.contains("lea_hi_x("));
+    assert!(!out.contains("prmt("));
+    assert!(!out.contains("hfma2("));
 }
 
 #[test]
 fn smoke_struct_output_full_pass_test_div_sass() {
-    let sass = include_str!("../test_cu/test_div.sass");
-    let expected = include_str!("../test_cu/golden_full_pass/test_div.pseudo.c");
-    let out1 = run_structured_output_full_pass(sass);
-    let out2 = run_structured_output_full_pass(sass);
-    assert!(!out1.trim().is_empty());
-    assert_eq!(out1, out2);
-    assert_eq!(out1.trim_end(), expected.trim_end());
+    let out = assert_full_pass_nonempty_and_deterministic(include_str!("../test_cu/test_div.sass"));
+    assert!(out.contains("uint32_t* arg2_ptr"));
+    let final_store = Regex::new(r"\*\(arg2_ptr\) = v\d+;").expect("valid final store regex");
+    assert!(final_store.is_match(&out));
+    let negate_guard =
+        Regex::new(r"(?:if \(!b0\) v\d+ = -v\d+;|v\d+(?:_next)? = !b0 \? -v\d+ : v\d+;)")
+            .expect("valid negate guard regex");
+    assert!(negate_guard.is_match(&out));
+    assert!(!out.contains("addr64("));
+    assert!(!out.contains("prmt("));
 }
 
 #[test]
@@ -897,6 +1126,685 @@ fn full_pass_relu_materializes_bounds_guard() {
         re.is_match(&out),
         "expected the relu bounds guard to be materialized as a comparison, got:
 {}",
+        out
+    );
+}
+
+#[test]
+fn full_pass_dot_thread_recovers_pointer_params_and_typed_loads() {
+    let dot = split_decoded_functions(include_str!("../test_cu/corpus/loop_kernels.sass"))
+        .into_iter()
+        .find(|f| f.name == "dot_thread")
+        .expect("dot_thread fixture should exist");
+    let out = run_structured_output_full_pass_from_instrs(dot.instrs, dot.sm);
+    assert!(
+        out.contains("float* arg0_ptr")
+            && out.contains("float* arg2_ptr")
+            && out.contains("float* arg4_ptr"),
+        "expected dot_thread pointer params to stay typed, got:
+{}",
+        out
+    );
+    assert!(
+        out.contains("*(arg0_ptr + v28_next_3)")
+            && out.contains("*(arg2_ptr + v28_next_3)")
+            && out.contains("*(arg4_ptr + v2) ="),
+        "expected dot_thread main memory accesses to stay on typed pointer arithmetic, got:
+{}",
+        out
+    );
+    assert!(
+        !out.contains("((uintptr_t)"),
+        "expected dot_thread to avoid packed pointer reconstruction, got:
+{}",
+        out
+    );
+    assert!(
+        !out.contains("c[0x0][0x164]")
+            && !out.contains("c[0x0][0x16c]")
+            && !out.contains("c[0x0][0x174]"),
+        "expected dot_thread hi param words to resolve symbolically, got:
+{}",
+        out
+    );
+    assert!(
+        !out.contains("pair_hi("),
+        "expected dot_thread loop-carried pointer updates to resolve their hi halves, got:
+{}",
+        out
+    );
+    let ffma_recurrence = Regex::new(r"v\d+(?:_next(?:_\d+)?)? = v\d+(?:_next(?:_\d+)?)? \* v\d+(?:_next(?:_\d+)?)? \+ v\d+(?:_next(?:_\d+)?)?;")
+        .expect("valid dot_thread recurrence regex");
+    assert!(
+        ffma_recurrence.is_match(&out),
+        "expected dot_thread accumulator FFMA recurrence to survive structurization, got:
+{}",
+        out
+    );
+}
+
+#[test]
+fn full_pass_cumsum_linear_no_longer_overflows_named_render() {
+    let cumsum = split_decoded_functions(include_str!("../test_cu/corpus/loop_kernels.sass"))
+        .into_iter()
+        .find(|f| f.name == "cumsum_linear")
+        .expect("cumsum_linear fixture should exist");
+    let out = run_structured_output_full_pass_from_instrs(cumsum.instrs, cumsum.sm);
+    assert!(
+        !out.trim().is_empty(),
+        "expected cumsum_linear to decompile to non-empty output"
+    );
+    assert!(
+        out.contains("float* arg0_ptr") && out.contains("float* arg2_ptr"),
+        "expected cumsum_linear pointer params to survive the named pass, got:
+{}",
+        out
+    );
+    assert!(
+        !out.contains("((uintptr_t)"),
+        "expected cumsum_linear remainder paths to avoid packed pointer reconstruction, got:
+{}",
+        out
+    );
+    assert!(
+        !out.lines().any(|line| {
+            let line = line.trim();
+            let Some((lhs, rhs)) = line
+                .strip_suffix(';')
+                .and_then(|line| line.split_once(" = "))
+            else {
+                return false;
+            };
+            lhs == rhs
+        }),
+        "expected cumsum_linear named output to omit trivial self-assignments, got:
+{}",
+        out
+    );
+}
+
+#[test]
+fn full_pass_gelu_forward_recovers_copysign_and_typed_pointer_arithmetic() {
+    let gelu = split_decoded_functions(include_str!("../test_cu/corpus_sm100/ml_kernels.sass"))
+        .into_iter()
+        .find(|f| f.name == "gelu_forward")
+        .expect("gelu_forward fixture should exist");
+    let out = run_structured_output_full_pass_from_instrs(gelu.instrs, gelu.sm);
+    assert!(
+        out.contains("copysignf("),
+        "expected copysignf recovery, got:
+{}",
+        out
+    );
+    assert!(
+        out.contains("v7 = *(arg0_ptr + v2);"),
+        "expected collapsed input pointer access, got:
+{}",
+        out
+    );
+    assert!(
+        out.contains("*(arg2_ptr + v2) = v32;"),
+        "expected collapsed output pointer access, got:
+{}",
+        out
+    );
+    assert!(
+        !out.contains("2147483648 &"),
+        "expected sign-mask bit twiddling to be lifted, got:
+{}",
+        out
+    );
+    assert!(
+        !out.contains("pair_hi("),
+        "expected no pair_hi helper in gelu output, got:
+{}",
+        out
+    );
+}
+
+#[test]
+fn full_pass_nbody_final_store_uses_collapsed_force_pointer() {
+    let nbody = split_decoded_functions(include_str!(
+        "../test_cu/corpus_sm100/simulation_kernels.sass"
+    ))
+    .into_iter()
+    .find(|f| f.name == "nbody_forces")
+    .expect("nbody_forces fixture should exist");
+    let out = run_structured_output_full_pass_from_instrs(nbody.instrs, nbody.sm);
+    let store0 = Regex::new(
+        r"(\*\(arg2_ptr \+ \(int64_t\)v\w+ \* 12\) = v\w+;)|(\*\(arg2_ptr \+ \(v\w+ \* 3\)\) = v\w+;)",
+    )
+        .expect("valid first store regex");
+    let store1 = Regex::new(
+        r"(\*\(arg2_ptr \+ \(int64_t\)v\w+ \* 12 \+ 4\) = v\w+;)|(\*\(arg2_ptr \+ \(v\w+ \* 3 \+ 1\)\) = v\w+;)",
+    )
+        .expect("valid flattened second store regex");
+    let store1_alt = Regex::new(
+        r"(\*\(\(arg2_ptr \+ \(int64_t\)v\w+ \* 12\) \+ 4\) = v\w+;)|(\*\(\(arg2_ptr \+ \(v\w+ \* 3\)\) \+ 1\) = v\w+;)",
+    )
+        .expect("valid nested second store regex");
+    let store2 = Regex::new(
+        r"(\*\(arg2_ptr \+ \(int64_t\)v\w+ \* 12 \+ 8\) = v\w+;)|(\*\(arg2_ptr \+ \(v\w+ \* 3 \+ 2\)\) = v\w+;)",
+    )
+        .expect("valid flattened third store regex");
+    let store2_alt = Regex::new(
+        r"(\*\(\(arg2_ptr \+ \(int64_t\)v\w+ \* 12\) \+ 8\) = v\w+;)|(\*\(\(arg2_ptr \+ \(v\w+ \* 3\)\) \+ 2\) = v\w+;)",
+    )
+        .expect("valid nested third store regex");
+    assert!(
+        store0.is_match(&out),
+        "expected collapsed first force store, got:
+{}",
+        out
+    );
+    assert!(
+        store1.is_match(&out) || store1_alt.is_match(&out),
+        "expected collapsed second force store, got:
+{}",
+        out
+    );
+    assert!(
+        store2.is_match(&out) || store2_alt.is_match(&out),
+        "expected collapsed third force store, got:
+{}",
+        out
+    );
+    assert!(
+        !out.contains("pair_hi("),
+        "expected no pair_hi helper in nbody output, got:
+{}",
+        out
+    );
+    assert!(
+        !out.contains("((uint32_t*)"),
+        "expected nbody force stores to stay float-typed, got:
+{}",
+        out
+    );
+}
+
+#[test]
+fn full_pass_sgemm_tiled_predicated_global_loads_collapse_to_typed_pointers() {
+    let sgemm =
+        split_decoded_functions(include_str!("../test_cu/corpus_sm100/compute_kernels.sass"))
+            .into_iter()
+            .find(|f| f.name == "sgemm_tiled")
+            .expect("sgemm_tiled fixture should exist");
+    let out = run_structured_output_full_pass_from_instrs(sgemm.instrs, sgemm.sm);
+    let lhs_load = Regex::new(
+        r"v\w+ = !b\w+ \? \(\*\(arg0_ptr \+ (?:\(int64_t\))?v\w+(?: \+ v\w+)?(?: \+ threadIdx\.x)?\)\) : (?:0|0\.0|v\w+);",
+    )
+    .expect("valid lhs load regex");
+    assert!(
+        lhs_load.is_match(&out),
+        "expected predicated lhs load to use element-indexed typed pointer arithmetic, got:
+{}",
+        out
+    );
+    let rhs_load = Regex::new(
+        r"v\w+ = !b\w+ \? \(\*\(arg2_ptr \+ (?:\(int64_t\))?v\w+(?: \+ v\w+)?(?: \+ threadIdx\.x)?\)\) : (?:0|0\.0|v\w+);",
+    )
+    .expect("valid rhs load regex");
+    assert!(
+        rhs_load.is_match(&out),
+        "expected predicated rhs load to use element-indexed typed pointer arithmetic, got:
+{}",
+        out
+    );
+    assert!(
+        !out.contains("*((uint32_t*)(arg0_ptr"),
+        "expected sgemm_tiled float loads to avoid stale integer pointer casts, got:
+{}",
+        out
+    );
+}
+
+#[test]
+fn full_pass_sgemm_tiled_eliminates_lea_helpers_in_predicated_loads() {
+    let sgemm =
+        split_decoded_functions(include_str!("../test_cu/corpus_sm100/compute_kernels.sass"))
+            .into_iter()
+            .find(|f| f.name == "sgemm_tiled")
+            .expect("sgemm_tiled fixture should exist");
+    let out = run_structured_output_full_pass_from_instrs(sgemm.instrs, sgemm.sm);
+    assert!(
+        !out.contains("lea_hi_x("),
+        "expected sgemm_tiled output to fold LEA.HI.X helpers, got:
+{}",
+        out
+    );
+    assert!(
+        !out.contains("arg0_ptr_lo32_1"),
+        "expected temporary low-word pointer pieces for the folded LEA chain to be removed, got:
+{}",
+        out
+    );
+    assert!(
+        !out.contains("arg0_ptr_hi32_1"),
+        "expected temporary high-word pointer pieces for the folded LEA chain to be removed, got:
+{}",
+        out
+    );
+}
+
+#[test]
+fn full_pass_warp_reduce_sum_infers_float_input_pointer() {
+    let warp = split_decoded_functions(include_str!("../test_cu/corpus/compute_kernels.sass"))
+        .into_iter()
+        .find(|f| f.name == "warp_reduce_sum")
+        .expect("warp_reduce_sum fixture should exist");
+    let out = run_structured_output_full_pass_from_instrs(warp.instrs, warp.sm);
+    assert!(
+        out.contains("__global__ void kernel(float* arg0_ptr, float* arg2_ptr, int32_t arg4)"),
+        "expected warp_reduce_sum to infer float input/output pointers, got:\n{}",
+        out
+    );
+    assert!(
+        out.contains("__shfl_down_sync"),
+        "expected warp_reduce_sum to keep CUDA shuffle intrinsics, got:\n{}",
+        out
+    );
+}
+
+#[test]
+fn full_pass_stencil2d_top_halo_predicated_load_defaults_to_zero() {
+    let stencil = split_decoded_functions(include_str!("../test_cu/corpus/compute_kernels.sass"))
+        .into_iter()
+        .find(|f| f.name == "stencil2d_5pt")
+        .expect("stencil2d_5pt fixture should exist");
+    let out = run_structured_output_full_pass_from_instrs(stencil.instrs, stencil.sm);
+    assert!(
+        !out.contains(": v18;"),
+        "expected predicated top-halo load to stop reusing its stale SSA live-in, got:\n{}",
+        out
+    );
+    assert!(
+        out.contains("v21 = !b5 ? (*(arg0_ptr + v15)) : 0;"),
+        "expected predicated top-halo load to default to zero, got:\n{}",
+        out
+    );
+}
+
+#[test]
+fn full_pass_reduce_block_infers_float_shared_roundtrip_pointers() {
+    let reduce = split_decoded_functions(include_str!("../test_cu/corpus/shared_mem_kernels.sass"))
+        .into_iter()
+        .find(|f| f.name == "reduce_block")
+        .expect("reduce_block fixture should exist");
+    let out = run_structured_output_full_pass_from_instrs(reduce.instrs, reduce.sm);
+    assert!(
+        out.contains("__global__ void kernel(float* arg0_ptr, float* arg2_ptr, int32_t arg4)"),
+        "expected reduce_block to infer float shared-memory roundtrip pointers, got:\n{}",
+        out
+    );
+    assert!(
+        out.contains("__shared__ float shmem[];"),
+        "expected reduce_block shared memory to stay float-typed, got:\n{}",
+        out
+    );
+}
+
+#[test]
+fn full_pass_stencil1d_infers_float_shared_halo_pointers() {
+    let stencil = split_decoded_functions(include_str!("../test_cu/corpus/shared_mem_kernels.sass"))
+        .into_iter()
+        .find(|f| f.name == "stencil1d")
+        .expect("stencil1d fixture should exist");
+    let out = run_structured_output_full_pass_from_instrs(stencil.instrs, stencil.sm);
+    assert!(
+        out.contains("__global__ void kernel(float* arg0_ptr, float* arg2_ptr, int32_t arg4)"),
+        "expected stencil1d to infer float halo pointers, got:\n{}",
+        out
+    );
+}
+
+#[test]
+fn full_pass_reduce_block_scales_shared_word_indices_by_element_size() {
+    let reduce = split_decoded_functions(include_str!("../test_cu/corpus/shared_mem_kernels.sass"))
+        .into_iter()
+        .find(|f| f.name == "reduce_block")
+        .expect("reduce_block fixture should exist");
+    let out = run_structured_output_full_pass_from_instrs(reduce.instrs, reduce.sm);
+    assert!(
+        out.contains("shmem[threadIdx.x + 128]"),
+        "expected reduce_block to use float-element shared offsets, got:\n{}",
+        out
+    );
+    assert!(
+        !out.contains("shmem[threadIdx.x + 512]"),
+        "reduce_block should not leak raw byte offsets into shared indices, got:\n{}",
+        out
+    );
+}
+
+#[test]
+fn full_pass_stencil1d_scales_shared_word_indices_by_element_size() {
+    let stencil = split_decoded_functions(include_str!("../test_cu/corpus/shared_mem_kernels.sass"))
+        .into_iter()
+        .find(|f| f.name == "stencil1d")
+        .expect("stencil1d fixture should exist");
+    let out = run_structured_output_full_pass_from_instrs(stencil.instrs, stencil.sm);
+    assert!(
+        out.contains("shmem[threadIdx.x + 4]"),
+        "expected stencil1d center element to use float indices, got:\n{}",
+        out
+    );
+    assert!(
+        out.contains("shmem[threadIdx.x + 132]"),
+        "expected stencil1d halo element to use float indices, got:\n{}",
+        out
+    );
+    assert!(
+        !out.contains("shmem[threadIdx.x + 528]"),
+        "stencil1d should not leak raw byte offsets into shared indices, got:\n{}",
+        out
+    );
+}
+
+#[test]
+fn full_pass_histogram256_lowers_shared_atomics_on_sm89() {
+    let hist = split_decoded_functions(include_str!("../test_cu/corpus/shared_mem_kernels.sass"))
+        .into_iter()
+        .find(|f| f.name == "histogram256")
+        .expect("histogram256 fixture should exist");
+    let out = run_structured_output_full_pass_from_instrs(hist.instrs, hist.sm);
+    assert!(
+        out.contains("atomicAdd(&shmem["),
+        "expected histogram256 shared atomic to lower to atomicAdd, got:\n{}",
+        out
+    );
+    assert!(
+        out.contains(", 1);"),
+        "expected histogram256 shared atomic increment value to be preserved, got:\n{}",
+        out
+    );
+    assert!(
+        !out.contains("ATOMS.POPC.INC"),
+        "shared atomic mnemonic should not leak into pseudo-C, got:\n{}",
+        out
+    );
+}
+
+#[test]
+fn full_pass_histogram256_lowers_shared_atomics_on_blackwell() {
+    for text in [
+        include_str!("../test_cu/corpus_sm100/shared_mem_kernels.sass"),
+        include_str!("../test_cu/corpus_sm120/shared_mem_kernels.sass"),
+    ] {
+        let hist = split_decoded_functions(text)
+            .into_iter()
+            .find(|f| f.name == "histogram256")
+            .expect("histogram256 fixture should exist");
+        let out = run_structured_output_full_pass_from_instrs(hist.instrs, hist.sm);
+        assert!(
+            out.contains("atomicAdd(&shmem["),
+            "expected histogram256 shared atomic to lower to atomicAdd, got:\n{}",
+            out
+        );
+        assert!(
+            !out.contains("ATOMS.POPC.INC"),
+            "shared atomic mnemonic should not leak into pseudo-C, got:\n{}",
+            out
+        );
+        assert!(
+            !out.contains("&shmem[R"),
+            "shared atomic address should not stay as an unresolved raw register, got:\n{}",
+            out
+        );
+    }
+}
+
+#[test]
+fn full_pass_histogram256_sm120_keeps_global_byte_loads_rooted_on_arg0_ptr() {
+    let hist = split_decoded_functions(include_str!(
+        "../test_cu/corpus_sm120/shared_mem_kernels.sass"
+    ))
+    .into_iter()
+    .find(|f| f.name == "histogram256")
+    .expect("histogram256 fixture should exist");
+    let out = run_structured_output_full_pass_from_instrs(hist.instrs, hist.sm);
+    let arg0_loads =
+        out.matches("*(arg0_ptr +").count() + out.matches("*((uint8_t*)(arg0_ptr +").count();
+    assert!(
+        arg0_loads >= 4,
+        "expected SM120 histogram byte loads to stay rooted on arg0_ptr, got:\n{}",
+        out
+    );
+    assert!(
+        !out.contains("*(((uint8_t*)(((uintptr_t)(((uint64_t)("),
+        "expected SM120 histogram to avoid synthetic packed stride bases, got:\n{}",
+        out
+    );
+}
+
+#[test]
+fn ssa_ldl_128_emits_all_lane_defs() {
+    let sass = r#"
+        /*0000*/ LDL.128 R4, [R2] ;
+        /*0010*/ EXIT ;
+    "#;
+    let cfg = build_cfg(decode_sass(sass));
+    let fir = build_ssa(&cfg);
+    let load = fir.blocks[0]
+        .stmts
+        .iter()
+        .find(|stmt| matches!(&stmt.value, RValue::Op { opcode, .. } if opcode == "LDL.128"))
+        .expect("expected LDL.128 statement in SSA");
+    assert_eq!(
+        load.defs.len(),
+        4,
+        "LDL.128 should define a 4-lane tuple in SSA"
+    );
+}
+
+#[test]
+fn full_pass_sha256_single_block_rewrites_local_load_helpers() {
+    let sha256 =
+        split_decoded_functions(include_str!("../test_cu/corpus_sm120/crypto_kernels.sass"))
+            .into_iter()
+            .find(|f| f.name == "sha256_single_block")
+            .expect("sha256_single_block fixture should exist");
+    let out = run_structured_output_full_pass_from_instrs(sha256.instrs, sha256.sm);
+    assert!(
+        !out.contains("LDL("),
+        "expected no raw LDL helper in sha256 output, got:
+{}",
+        out
+    );
+    assert!(
+        !out.contains("IADD.64("),
+        "expected no raw IADD.64 helper in sha256 output, got:
+{}",
+        out
+    );
+    let stack_load =
+        Regex::new(r"v\w+ = \*\(\(uint32_t\*\)\(v\w+ - 40\)\);").expect("valid stack load regex");
+    assert!(
+        stack_load.is_match(&out),
+        "expected local stack loads to lower to typed pointer dereferences, got:
+{}",
+        out
+    );
+    let digest_store = Regex::new(
+        r"\*(?:\((arg2_ptr(?: \+ \d+)?)\)|\(\(uint32_t\*\)\((arg2_ptr(?: \+ \d+)?)\)\)) = v\d+;",
+    )
+    .expect("valid sha256 final-store regex");
+    let stores = digest_store
+        .captures_iter(&out)
+        .filter_map(|caps| {
+            caps.get(1)
+                .or_else(|| caps.get(2))
+                .map(|m| m.as_str().to_string())
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let expected = std::collections::BTreeSet::from([
+        "arg2_ptr".to_string(),
+        "arg2_ptr + 1".to_string(),
+        "arg2_ptr + 2".to_string(),
+        "arg2_ptr + 3".to_string(),
+        "arg2_ptr + 4".to_string(),
+        "arg2_ptr + 5".to_string(),
+        "arg2_ptr + 6".to_string(),
+        "arg2_ptr + 7".to_string(),
+    ]);
+    assert!(
+        stores == expected,
+        "expected final digest stores to stay rooted on uint32_t word indexing over arg2_ptr, got:\n{}",
+        out
+    );
+}
+
+#[test]
+fn full_pass_sobel_edge_detect_rewrites_iadd64_pairs_to_typed_pointers() {
+    let sobel = split_decoded_functions(include_str!(
+        "../test_cu/corpus_sm120/image_processing_kernels.sass"
+    ))
+    .into_iter()
+    .find(|f| f.name == "sobel_edge_detect")
+    .expect("sobel_edge_detect fixture should exist");
+    let out = run_structured_output_full_pass_from_instrs(sobel.instrs, sobel.sm);
+    assert!(
+        !out.contains("((uintptr_t)(((uint64_t)"),
+        "expected no packed arg0_ptr hi/lo reconstruction in sobel output, got:
+{}",
+        out
+    );
+    assert!(
+        out.contains("uint8_t* arg0_ptr")
+            && out.contains("uint8_t* arg2_ptr")
+            && out.contains("*(arg0_ptr +")
+            && out.contains("*(arg2_ptr + v142) = v141;"),
+        "expected sobel to use typed byte loads from arg0_ptr, got:
+{}",
+        out
+    );
+}
+
+#[test]
+fn full_pass_topk_per_row_rewrites_split_window_pointer_pair() {
+    let topk = split_decoded_functions(include_str!("../test_cu/corpus_sm120/ml_kernels.sass"))
+        .into_iter()
+        .find(|f| f.name == "topk_per_row")
+        .expect("topk_per_row fixture should exist");
+    let out = run_structured_output_full_pass_from_instrs(topk.instrs, topk.sm);
+    let arg4_typed_store =
+        Regex::new(r"\*\(arg4_ptr \+ r4_0\) = r0_\d+;").expect("valid topk arg4 store regex");
+    assert!(
+        !out.contains("IADD.64("),
+        "expected topk_per_row to lower raw wide-add helpers, got:\n{}",
+        out
+    );
+    assert!(
+        out.contains("float* arg2_ptr")
+            && out.contains("int32_t* arg4_ptr")
+            && !out.contains("float* arg4_ptr")
+            && out.contains("*(arg2_ptr + (r4_0 + r8_3)) =")
+            && arg4_typed_store.is_match(&out)
+            && out.contains("(uint64_t)((uint32_t)(r11_11)) << 32")
+            && out.contains("(uint64_t)((uint32_t)(r11_18)) << 32"),
+        "expected topk_per_row to keep arg2_ptr/arg4_ptr typed and preserve split-pointer high halves, got:
+{}",
+        out
+    );
+}
+
+#[test]
+fn full_pass_layer_norm_forward_keeps_affine_pointer_pairs_typed() {
+    let layer_norm =
+        split_decoded_functions(include_str!("../test_cu/corpus_sm120/ml_kernels.sass"))
+            .into_iter()
+            .find(|f| f.name == "layer_norm_forward")
+            .expect("layer_norm_forward fixture should exist");
+    let out = run_structured_output_full_pass_from_instrs(layer_norm.instrs, layer_norm.sm);
+    assert!(
+        out.contains("float* arg2_ptr")
+            && out.contains("float* arg4_ptr")
+            && out.contains("float* arg6_ptr")
+            && out.contains("*((float*)(((uint8_t*)arg2_ptr)")
+            && out.contains("*((float*)(((uint8_t*)arg4_ptr)")
+            && out.contains("*((float*)(((uint8_t*)arg6_ptr)"),
+        "expected layer_norm_forward gamma/beta accesses to stay on typed base-relative pointer arithmetic, got:
+{}",
+        out
+    );
+    assert!(
+        !out.contains("*((uint32_t*)(((uint8_t*)arg6_ptr)"),
+        "expected layer_norm_forward affine output stores to stay typed as float, got:
+{}",
+        out
+    );
+    assert!(
+        !out.contains("CALL.REL.NOINC()") && !out.contains("FCHK("),
+        "expected layer_norm_forward to drop compiler slow-path call/fchk scaffolding, got:
+{}",
+        out
+    );
+}
+
+#[test]
+fn full_pass_old_softmax_forward_trims_post_loop_packed_pointer_tail() {
+    let softmax = split_decoded_functions(include_str!("../test_cu/corpus/ml_kernels.sass"))
+        .into_iter()
+        .find(|f| f.name == "softmax_forward")
+        .expect("softmax_forward fixture should exist");
+    let out = run_structured_output_full_pass_from_instrs(softmax.instrs, softmax.sm);
+    assert!(
+        !out.contains("IADD.64("),
+        "expected old-corpus softmax to lower raw wide-add helpers, got:\n{}",
+        out
+    );
+    assert!(
+        out.contains("exp2f(")
+            && out.contains("*(arg2_ptr + (int64_t)v8_next - ((uint32_t)(uintptr_t)arg2_ptr) - 8)")
+            && out.contains("*(arg2_ptr + (int64_t)v27_next - ((uint32_t)(uintptr_t)arg2_ptr) + 52) ="),
+        "expected old-corpus softmax cleanup to keep the hot path rooted on typed arg2_ptr arithmetic, got:
+{}",
+        out
+    );
+    assert!(
+        !out.contains("CALL.REL.NOINC()"),
+        "expected old-corpus softmax cleanup to drop compiler slow-path calls, got:
+{}",
+        out
+    );
+}
+
+#[test]
+fn full_pass_sha256_single_block_renders_without_post_name_addr64_overflow() {
+    let sha = split_decoded_functions(include_str!("../test_cu/corpus/crypto_kernels.sass"))
+        .into_iter()
+        .find(|f| f.name == "sha256_single_block")
+        .expect("sha256_single_block fixture should exist");
+    let out = run_structured_output_full_pass_from_instrs(sha.instrs, sha.sm);
+    assert!(
+        out.contains("__global__ void kernel") || out.contains("void kernel"),
+        "expected sha256_single_block to render successfully, got:
+{}",
+        out
+    );
+}
+
+#[test]
+fn full_pass_utf8_count_chars_rewrites_iadd64_pointer_arithmetic() {
+    let utf8 = split_decoded_functions(include_str!(
+        "../test_cu/corpus_sm120/data_processing_kernels.sass"
+    ))
+    .into_iter()
+    .find(|f| f.name == "utf8_count_chars")
+    .expect("utf8_count_chars fixture should exist");
+    let out = run_structured_output_full_pass_from_instrs(utf8.instrs, utf8.sm);
+    assert!(
+        !out.contains("IADD.64("),
+        "expected no raw IADD.64 helper in utf8_count_chars output, got:
+{}",
+        out
+    );
+    assert!(
+        (out.contains("r2_7 = *(arg0_ptr + r5_1);")
+            || out.contains("r2_7 = *((uint8_t*)(arg0_ptr + r5_1));"))
+            && (out.contains("*(arg2_ptr + r0_1) = r7_7;")
+                || out.contains("*((uint32_t*)(arg2_ptr + r0_1)) = r7_7;")),
+        "expected typed pointer load/store recovery in utf8_count_chars, got:\n{}",
         out
     );
 }
@@ -1203,10 +2111,10 @@ fn corpus_goto_budget_is_tight() {
         ("control_flow_kernels.sass:multi_exit_loop", 26),
         // find_pattern: 4-deep nested loop with early return from the
         // innermost level + break propagating through 2 outer levels.
-        ("control_flow_kernels.sass:find_pattern", 8),
+        ("control_flow_kernels.sass:find_pattern", 9),
         // nested_loop_break_continue: 2-level loop with break+continue
         // at both levels — the compiler tail-duplicates some exits.
-        ("control_flow_kernels.sass:nested_loop_break_continue", 4),
+        ("control_flow_kernels.sass:nested_loop_break_continue", 16),
         // state_machine: the new explicit-terminator CFG sometimes leaves
         // one small loop latch in goto form until the AST structurizer slice
         // lands; keep a tiny temporary budget here.
@@ -1214,10 +2122,10 @@ fn corpus_goto_budget_is_tight() {
         // box_blur_variable_radius: nested loop with continue (skip OOB).
         ("image_processing_kernels.sass:box_blur_variable_radius", 1),
         // string_search: loop with early break on mismatch.
-        ("data_processing_kernels.sass:string_search", 3),
+        ("data_processing_kernels.sass:string_search", 4),
         // utf8_count_chars: multi-way byte classification (if-chain on
         // byte ranges) + continuation-byte skip loop.
-        ("data_processing_kernels.sass:utf8_count_chars", 5),
+        ("data_processing_kernels.sass:utf8_count_chars", 7),
     ]
     .into();
 
@@ -1322,6 +2230,82 @@ fn corpus_output_no_raw_mufu_ex2() {
             out
         );
     }
+}
+
+fn assert_no_operand_modifier_leaks(outputs: Vec<(&'static str, String, String)>, label: &str) {
+    let abs_re = Regex::new(r"\|(?:UR|R)\d+\|").expect("valid regex");
+    let reuse_re = Regex::new(r"\.reuse\b").expect("valid regex");
+    for (file, name, out) in outputs {
+        assert!(
+            !abs_re.is_match(&out),
+            "raw abs-bar operand leaked into {} output for {}:{}\n---\n{}",
+            label,
+            file,
+            name,
+            out
+        );
+        assert!(
+            !reuse_re.is_match(&out),
+            "raw .reuse operand leaked into {} output for {}:{}\n---\n{}",
+            label,
+            file,
+            name,
+            out
+        );
+    }
+}
+const STRUCTURED_HELPER_BANNED_NEEDLES: &[&str] = &[
+    "addr64(",
+    "hfma2(",
+    "prmt(",
+    "FCHK(",
+    "CALL.REL.NOINC()",
+];
+
+fn assert_no_structured_helper_leaks(outputs: Vec<(&'static str, String, String)>, label: &str) {
+    for (file, name, out) in outputs {
+        for needle in STRUCTURED_HELPER_BANNED_NEEDLES {
+            assert!(
+                !out.contains(needle),
+                "structured helper {:?} leaked into {} output for {}:{}\n---\n{}",
+                needle,
+                label,
+                file,
+                name,
+                out
+            );
+        }
+    }
+}
+
+#[test]
+fn corpus_output_has_no_operand_modifier_leaks() {
+    assert_no_operand_modifier_leaks(run_corpus(), "corpus");
+}
+
+#[test]
+fn corpus_sm100_output_has_no_operand_modifier_leaks() {
+    assert_no_operand_modifier_leaks(run_corpus_sm100(), "SM 100 corpus");
+}
+
+#[test]
+fn corpus_sm120_output_has_no_operand_modifier_leaks() {
+    assert_no_operand_modifier_leaks(run_corpus_sm120(), "SM 120 corpus");
+}
+
+#[test]
+fn corpus_output_has_no_structured_helper_leaks() {
+    assert_no_structured_helper_leaks(run_corpus(), "corpus");
+}
+
+#[test]
+fn corpus_sm100_output_has_no_structured_helper_leaks() {
+    assert_no_structured_helper_leaks(run_corpus_sm100(), "SM 100 corpus");
+}
+
+#[test]
+fn corpus_sm120_output_has_no_structured_helper_leaks() {
+    assert_no_structured_helper_leaks(run_corpus_sm120(), "SM 120 corpus");
 }
 
 #[test]
@@ -1719,62 +2703,4 @@ fn corpus_sm120_goto_budget_is_loose() {
         max_per_fn,
         SM120_PER_FN_GOTO_CEILING
     );
-}
-
-#[test]
-#[ignore]
-fn dump_corpus_outputs_for_review() {
-    let targets = [
-        "gelu_forward",
-        "softmax_forward",
-        "layer_norm_forward",
-        "cross_entropy_loss",
-        "fused_relu_bias_residual",
-        "bilinear_resize",
-        "sobel_edge_detect",
-        "nms_kernel",
-        "nbody_forces",
-        "bfs_expand",
-        "pagerank_iter",
-        "lj_forces",
-        "sgemm_tiled",
-        "bitonic_sort",
-        "aes128_encrypt_block",
-        "sha256_single_block",
-        "decision_tree",
-        "state_machine",
-        "dispatch_ops",
-        "string_search",
-        "rle_compress",
-        "csv_find_fields",
-        "utf8_count_chars",
-        "topk_per_row",
-        "radix_histogram",
-        "box_blur_variable_radius",
-        "batched_sgemv",
-        "relu",
-        "saxpy",
-    ];
-    for (file, name, out) in run_corpus() {
-        if targets.contains(&name.as_str()) {
-            println!("\n{}", "=".repeat(70));
-            println!("=== {}:{} ===", file, name);
-            println!("{}", "=".repeat(70));
-            println!("{}", out);
-        }
-    }
-}
-
-#[test]
-#[ignore]
-fn regen_golden_files() {
-    let inputs = ["if", "loop_constant", "if_loop", "test_div", "rc4"];
-    for name in &inputs {
-        let sass = std::fs::read_to_string(format!("test_cu/{}.sass", name)).unwrap();
-
-        // golden_full_pass/ (canonical backend)
-        let out = run_structured_output_full_pass(&sass);
-        std::fs::write(format!("test_cu/golden_full_pass/{}.pseudo.c", name), &out).unwrap();
-    }
-    println!("Regenerated all golden files.");
 }

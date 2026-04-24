@@ -35,12 +35,16 @@ pub enum DecodedOperand {
         class: String,
         idx: i32,
         sign: i32,
+        abs: bool,
+        reuse: bool,
         ty: Option<RegType>,
     },
     UniformRegister {
         class: String,
         idx: i32,
         sign: i32,
+        abs: bool,
+        reuse: bool,
         ty: Option<RegType>,
     },
     PredicateRegister {
@@ -101,9 +105,6 @@ pub struct DecodedFunction {
     pub instrs: Vec<DecodedInstruction>,
 }
 
-
-
-
 lazy_static! {
     static ref RE_REG_NUM: Regex = Regex::new(r"^(?P<cls>UP|UR|R|P)(?P<idx>\d+)$").unwrap();
     static ref RE_CONST: Regex =
@@ -115,8 +116,6 @@ lazy_static! {
     static ref RE_TARGET_SM: Regex = Regex::new(r"\bsm_(?P<sm>\d+)\b").unwrap();
     static ref RE_FUNCTION: Regex = Regex::new(r"^\s*Function\s*:\s*(?P<name>\S+)\s*$").unwrap();
 }
-
-
 
 fn parse_hex(s: &str) -> Option<i64> {
     let s = s.trim();
@@ -273,12 +272,16 @@ fn extract_scheduling_info(s: &str) -> SchedulingInfo {
     }
 }
 
-fn parse_register_like_components(core: &str) -> Option<(String, i32, Option<RegType>)> {
+fn parse_register_like_components(core: &str) -> Option<(String, i32, Option<RegType>, bool)> {
     let mut ty = None;
+    let mut reuse = false;
     let mut parts = core.split('.');
     let base = parts.next()?.to_ascii_uppercase();
     for suffix in parts {
-        if let Ok(bits) = suffix.to_ascii_lowercase().parse::<u32>() {
+        let suffix_lower = suffix.to_ascii_lowercase();
+        if suffix_lower == "reuse" {
+            reuse = true;
+        } else if let Ok(bits) = suffix_lower.parse::<u32>() {
             ty = Some(RegType::BitWidth(bits));
         }
     }
@@ -296,7 +299,7 @@ fn parse_register_like_components(core: &str) -> Option<(String, i32, Option<Reg
         }
     };
 
-    Some((class, idx, ty))
+    Some((class, idx, ty, reuse))
 }
 
 fn decode_predicate_operand(tok: &str) -> Option<DecodedOperand> {
@@ -355,18 +358,32 @@ fn decode_register_operand(tok: &str) -> Option<DecodedOperand> {
         return None;
     }
 
-    let (class, idx, ty) = parse_register_like_components(core)?;
+    let (abs, normalized) = if let Some(rest) = core.strip_prefix('|') {
+        let end = rest.find('|')?;
+        let mut normalized = String::with_capacity(core.len().saturating_sub(2));
+        normalized.push_str(&rest[..end]);
+        normalized.push_str(&rest[end + 1..]);
+        (true, normalized)
+    } else {
+        (false, core.to_string())
+    };
+
+    let (class, idx, ty, reuse) = parse_register_like_components(&normalized)?;
     match class.as_str() {
         "UR" | "URZ" => Some(DecodedOperand::UniformRegister {
             class,
             idx,
             sign,
+            abs,
+            reuse,
             ty,
         }),
         "R" | "RZ" => Some(DecodedOperand::Register {
             class,
             idx,
             sign,
+            abs,
+            reuse,
             ty,
         }),
         _ => None,
@@ -449,8 +466,6 @@ fn decode_descriptor_operand(tok: &str) -> Option<DecodedOperand> {
         raw: t.to_string(),
     })
 }
-
-
 
 fn decode_operand(tok: &str) -> DecodedOperand {
     let t = tok.trim();
@@ -583,7 +598,6 @@ pub fn decode_instruction_line(line: &str) -> Option<DecodedInstruction> {
     })
 }
 
-
 pub fn decode_sass(text: &str) -> Vec<DecodedInstruction> {
     let mut instrs = text
         .lines()
@@ -592,7 +606,6 @@ pub fn decode_sass(text: &str) -> Vec<DecodedInstruction> {
     finalize_terminators(&mut instrs);
     instrs
 }
-
 
 pub fn split_decoded_functions(text: &str) -> Vec<DecodedFunction> {
     let lines: Vec<&str> = text.lines().collect();
@@ -639,7 +652,6 @@ pub fn split_decoded_functions(text: &str) -> Vec<DecodedFunction> {
 
     out
 }
-
 
 pub fn parse_sm_version(text: &str) -> Option<u32> {
     for line in text.lines() {
@@ -724,6 +736,8 @@ mod tests {
                 idx: 1,
                 ty: None,
                 sign: 1,
+                abs: false,
+                reuse: false,
             }
         );
         assert_eq!(
@@ -733,6 +747,8 @@ mod tests {
                 idx: 0,
                 ty: None,
                 sign: 1,
+                abs: false,
+                reuse: false,
             }
         );
         assert_eq!(
@@ -755,6 +771,8 @@ mod tests {
                 idx: 12,
                 ty: None,
                 sign: 1,
+                abs: false,
+                reuse: false,
             }
         );
         assert!(matches!(
@@ -866,6 +884,38 @@ mod tests {
     fn split_top_level_preserves_nested_commas() {
         let parts = split_top_level("R1, desc[UR6][R4.64+0x4], &req={1,0}", ',');
         assert_eq!(parts, vec!["R1", "desc[UR6][R4.64+0x4]", "&req={1,0}"]);
+    }
+
+    #[test]
+    fn decode_abs_reuse_register_operand() {
+        let decoded = decode_operand("|R7|.reuse");
+        assert_eq!(
+            decoded,
+            DecodedOperand::Register {
+                class: "R".into(),
+                idx: 7,
+                sign: 1,
+                abs: true,
+                reuse: true,
+                ty: None,
+            }
+        );
+    }
+
+    #[test]
+    fn decode_negated_abs_uniform_register_operand() {
+        let decoded = decode_operand("-|UR4|.reuse");
+        assert_eq!(
+            decoded,
+            DecodedOperand::UniformRegister {
+                class: "UR".into(),
+                idx: 4,
+                sign: -1,
+                abs: true,
+                reuse: true,
+                ty: None,
+            }
+        );
     }
 
     #[test]

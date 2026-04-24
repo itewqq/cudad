@@ -25,7 +25,15 @@ pub struct OpSemantics {
 fn is_pred_operand(op: &DecodedOperand) -> bool {
     matches!(
         op,
-        DecodedOperand::PredicateRegister { class, .. } if class == "P" || class == "UP"
+        DecodedOperand::PredicateRegister { class, .. }
+            if matches!(class.as_str(), "P" | "UP" | "PT" | "UPT")
+    )
+}
+
+fn is_mem_operand(op: &DecodedOperand) -> bool {
+    matches!(
+        op,
+        DecodedOperand::Address { .. } | DecodedOperand::DescriptorMem { .. }
     )
 }
 
@@ -96,6 +104,19 @@ fn build_op_table() -> Vec<(fn(&str) -> bool, OpDesc)> {
                 use_tail_overrides: vec![(0, UseRole::PredCtrl), (1, UseRole::PredIn)],
             },
         ),
+        // LEA / ULEA (non-.HI): first operand is the data def, and an
+        // optional predicate operand immediately after it is the carry-out def.
+        (
+            |op: &str| {
+                let m = opcode_mnemonic(op);
+                matches!(m, "LEA" | "ULEA") && !opcode_has_mod(op, "HI")
+            },
+            OpDesc {
+                data_defs: 1,
+                pred_defs_after_first: true,
+                use_tail_overrides: Vec::new(),
+            },
+        ),
         // LEA.HI.X / ULEA.HI.X: last use is PredIn (carry)
         (
             |op: &str| op.starts_with("LEA.HI.X") || op.starts_with("ULEA.HI.X"),
@@ -164,8 +185,94 @@ pub fn derive_op_semantics(
         };
     }
 
-    // SETP family: special case — first two operands are pred defs.
     let mnem = opcode_mnemonic(opcode);
+    if mnem.starts_with("RED") {
+        let mut use_operand_indices = Vec::new();
+        let mut use_roles = Vec::new();
+        let addr_idx = operands.iter().position(is_mem_operand);
+        for idx in 0..operands.len() {
+            use_operand_indices.push(idx);
+            use_roles.push(if Some(idx) == addr_idx {
+                UseRole::Addr
+            } else {
+                UseRole::Data
+            });
+        }
+        return OpSemantics {
+            def_operand_indices: Vec::new(),
+            def_roles: Vec::new(),
+            use_operand_indices,
+            use_roles,
+        };
+    }
+
+    if mnem.starts_with("ATOM") {
+        let mut def_operand_indices = Vec::new();
+        let mut def_roles = Vec::new();
+        let mut use_operand_indices = Vec::new();
+        let mut use_roles = Vec::new();
+
+        let addr_idx = operands.iter().position(is_mem_operand);
+        let mut cursor = 0;
+        if operands.first().is_some_and(is_pred_operand) {
+            def_operand_indices.push(0);
+            def_roles.push(DefRole::Pred);
+            cursor = 1;
+        }
+        if let Some(addr_idx) = addr_idx {
+            if cursor < addr_idx {
+                def_operand_indices.push(cursor);
+                def_roles.push(DefRole::Data);
+            }
+            for idx in 0..operands.len() {
+                if def_operand_indices.contains(&idx) {
+                    continue;
+                }
+                use_operand_indices.push(idx);
+                use_roles.push(if idx == addr_idx {
+                    UseRole::Addr
+                } else {
+                    UseRole::Data
+                });
+            }
+            return OpSemantics {
+                def_operand_indices,
+                def_roles,
+                use_operand_indices,
+                use_roles,
+            };
+        }
+    }
+
+    // SHFL.* family: optional predicate output in operand 0, data output in
+    // operand 1, then the source/lane/clamp inputs.
+    if matches!(mnem, "SHFL" | "USHFL") {
+        let mut def_operand_indices = Vec::new();
+        let mut def_roles = Vec::new();
+        let mut first_use_idx = 0usize;
+
+        if operands.first().is_some_and(is_pred_operand) {
+            def_operand_indices.push(0);
+            def_roles.push(DefRole::Pred);
+            first_use_idx = 1;
+        }
+        if operands.len() > first_use_idx {
+            def_operand_indices.push(first_use_idx);
+            def_roles.push(DefRole::Data);
+            first_use_idx += 1;
+        }
+
+        let use_operand_indices = (first_use_idx..operands.len()).collect::<Vec<_>>();
+        let use_roles = vec![UseRole::Data; use_operand_indices.len()];
+        return OpSemantics {
+            def_operand_indices,
+            def_roles,
+            use_operand_indices,
+            use_roles,
+        };
+    }
+
+    // SETP family: special case — first two operands are pred defs.
     if matches!(mnem, "ISETP" | "FSETP" | "DSETP" | "HSETP2" | "UISETP") {
         return derive_setp_semantics(operands);
     }
@@ -271,12 +378,16 @@ mod tests {
                 class: class.to_string(),
                 idx,
                 sign: 1,
+                abs: false,
+                reuse: false,
                 ty: None,
             },
             _ => DecodedOperand::Register {
                 class: class.to_string(),
                 idx,
                 sign: 1,
+                abs: false,
+                reuse: false,
                 ty: None,
             },
         }
@@ -335,6 +446,47 @@ mod tests {
     }
 
     #[test]
+    fn atomg_tracks_pred_and_data_defs_with_address_use() {
+        let ops = vec![
+            DecodedOperand::PredicateRegister {
+                class: "PT".into(),
+                idx: 0,
+                sense: true,
+            },
+            reg("R", 7),
+            DecodedOperand::Address {
+                base: Box::new(reg("R", 4)),
+                offset: None,
+                width: Some(64),
+                raw: "[R4.64]".into(),
+            },
+            reg("R", 13),
+        ];
+        let sem = derive_op_semantics("ATOMG.E.ADD.STRONG.GPU", &ops, false, false);
+        assert_eq!(sem.def_operand_indices, vec![0, 1]);
+        assert_eq!(sem.def_roles, vec![DefRole::Pred, DefRole::Data]);
+        assert_eq!(sem.use_operand_indices, vec![2, 3]);
+        assert_eq!(sem.use_roles, vec![UseRole::Addr, UseRole::Data]);
+    }
+
+    #[test]
+    fn red_has_no_defs_and_marks_memory_operand_as_address() {
+        let ops = vec![
+            DecodedOperand::Address {
+                base: Box::new(reg("R", 2)),
+                offset: None,
+                width: Some(64),
+                raw: "[R2.64]".into(),
+            },
+            reg("R", 7),
+        ];
+        let sem = derive_op_semantics("RED.E.ADD.F32.FTZ.RN.STRONG.GPU", &ops, false, false);
+        assert!(sem.def_operand_indices.is_empty());
+        assert_eq!(sem.use_operand_indices, vec![0, 1]);
+        assert_eq!(sem.use_roles, vec![UseRole::Addr, UseRole::Data]);
+    }
+
+    #[test]
     fn default_first_is_def_rest_are_uses() {
         let ops = vec![reg("R", 2), reg("R", 0), reg("R", 1)];
         let sem = derive_op_semantics("FADD", &ops, false, false);
@@ -348,5 +500,31 @@ mod tests {
         let ops = vec![reg("R", 5), reg("R", 0), reg("R", 1), imm(2), reg("P", 0)];
         let sem = derive_op_semantics("LEA.HI.X", &ops, false, false);
         assert_eq!(*sem.use_roles.last().unwrap(), UseRole::PredIn);
+    }
+
+    #[test]
+    fn lea_predicate_output_is_modeled_as_a_def() {
+        let ops = vec![reg("R", 4), reg("P", 5), reg("R", 9), reg("R", 4), imm(2)];
+        let sem = derive_op_semantics("LEA", &ops, false, false);
+        assert_eq!(sem.def_operand_indices, vec![0, 1]);
+        assert_eq!(sem.def_roles, vec![DefRole::Data, DefRole::Pred]);
+        assert_eq!(sem.use_operand_indices, vec![2, 3, 4]);
+        assert_eq!(
+            sem.use_roles,
+            vec![UseRole::Data, UseRole::Data, UseRole::Data]
+        );
+    }
+
+    #[test]
+    fn shfl_tracks_predicate_and_data_outputs() {
+        let ops = vec![reg("PT", 0), reg("R", 0), reg("R", 3), imm(16), imm(31)];
+        let sem = derive_op_semantics("SHFL.DOWN", &ops, false, false);
+        assert_eq!(sem.def_operand_indices, vec![0, 1]);
+        assert_eq!(sem.def_roles, vec![DefRole::Pred, DefRole::Data]);
+        assert_eq!(sem.use_operand_indices, vec![2, 3, 4]);
+        assert_eq!(
+            sem.use_roles,
+            vec![UseRole::Data, UseRole::Data, UseRole::Data]
+        );
     }
 }

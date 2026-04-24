@@ -2,7 +2,8 @@
 
 use crate::parser::{DecodedInstruction, TerminatorKind};
 use petgraph::graph::{Graph, NodeIndex};
-use std::collections::{BTreeMap, BTreeSet};
+use petgraph::visit::EdgeRef;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 #[derive(Debug, Clone)]
 pub struct BasicBlock {
@@ -156,24 +157,107 @@ pub fn build_cfg(mut instrs: Vec<DecodedInstruction>) -> ControlFlowGraph {
     graph
 }
 
+fn opcode_mnemonic(opcode: &str) -> &str {
+    opcode.split('.').next().unwrap_or(opcode)
+}
+
+fn has_conditional_exit(block: &BasicBlock) -> bool {
+    let Some(last) = block.instrs.last() else {
+        return false;
+    };
+    last.pred.is_some() && matches!(opcode_mnemonic(&last.opcode), "EXIT" | "RET")
+}
+
+fn reachable_nodes(cfg: &ControlFlowGraph) -> BTreeSet<NodeIndex> {
+    let mut reachable = BTreeSet::new();
+    let Some(entry) = cfg.node_indices().next() else {
+        return reachable;
+    };
+
+    let mut queue = VecDeque::from([entry]);
+    while let Some(node) = queue.pop_front() {
+        if !reachable.insert(node) {
+            continue;
+        }
+        for succ in cfg.neighbors(node) {
+            if !reachable.contains(&succ) {
+                queue.push_back(succ);
+            }
+        }
+    }
+
+    reachable
+}
+
+fn edge_label(kind: EdgeKind) -> &'static str {
+    match kind {
+        EdgeKind::FallThrough => "fallthrough",
+        EdgeKind::CondBranch => "cond",
+        EdgeKind::UncondBranch => "jump",
+    }
+}
+
 pub fn graph_to_dot(cfg: &ControlFlowGraph) -> String {
     use std::fmt::Write;
 
-    let mut out = String::from(
-        "digraph CFG {
-",
-    );
-    for idx in cfg.node_indices() {
-        let block = &cfg[idx];
+    let reachable = reachable_nodes(cfg);
+    let mut nodes = reachable.iter().copied().collect::<Vec<_>>();
+    nodes.sort_by_key(|idx| cfg[*idx].id);
+
+    let needs_exit = nodes.iter().any(|idx| {
+        let block = &cfg[*idx];
+        matches!(
+            block.instrs.last().map(|instr| &instr.terminator),
+            Some(TerminatorKind::Return)
+        ) || has_conditional_exit(block)
+    });
+
+    let mut out = String::from("digraph CFG {\n");
+    for idx in &nodes {
+        let block = &cfg[*idx];
         let _ = writeln!(
             out,
             r#"  {} [label="BB{}\n0x{:04x}"];"#,
             block.id, block.id, block.start
         );
     }
-    for edge in cfg.edge_indices() {
-        let (src, dst) = cfg.edge_endpoints(edge).unwrap();
-        let _ = writeln!(out, "  {} -> {};", cfg[src].id, cfg[dst].id);
+    if needs_exit {
+        let _ = writeln!(out, r#"  exit [shape=doublecircle,label="EXIT"];"#);
+    }
+
+    let mut edges = Vec::new();
+    for idx in &nodes {
+        for edge in cfg.edges(*idx) {
+            if reachable.contains(&edge.target()) {
+                edges.push((
+                    cfg[*idx].id,
+                    cfg[edge.target()].id,
+                    edge_label(*edge.weight()).to_string(),
+                ));
+            }
+        }
+
+        let block = &cfg[*idx];
+        if let Some(last) = block.instrs.last() {
+            match last.terminator {
+                TerminatorKind::Return => {
+                    edges.push((cfg[*idx].id, usize::MAX, "return".to_string()));
+                }
+                TerminatorKind::CondBranch { .. } if has_conditional_exit(block) => {
+                    edges.push((cfg[*idx].id, usize::MAX, "cond-exit".to_string()));
+                }
+                _ => {}
+            }
+        }
+    }
+    edges.sort();
+
+    for (src, dst, label) in edges {
+        if dst == usize::MAX {
+            let _ = writeln!(out, r#"  {} -> exit [label="{}"];"#, src, label);
+        } else {
+            let _ = writeln!(out, r#"  {} -> {} [label="{}"];"#, src, dst, label);
+        }
     }
     out.push('}');
     out
@@ -237,5 +321,21 @@ mod tests {
         let cfg = build_cfg(decode_sass(sass));
         assert_eq!(cfg.node_count(), 2);
         assert!(outgoing(&cfg, 0x0).is_empty());
+    }
+
+    #[test]
+    fn dot_adds_exit_edges_and_prunes_unreachable_tail_blocks() {
+        let sass = r#"
+            /*0000*/ @P0 EXIT ;
+            /*0010*/ EXIT ;
+            /*0020*/ BRA 0x0020 ;
+        "#;
+        let cfg = build_cfg(decode_sass(sass));
+        let dot = graph_to_dot(&cfg);
+        assert!(dot.contains("exit [shape=doublecircle,label=\"EXIT\"]"));
+        assert!(dot.contains("0 -> 1 [label=\"fallthrough\"]"));
+        assert!(dot.contains("0 -> exit [label=\"cond-exit\"]"));
+        assert!(dot.contains("1 -> exit [label=\"return\"]"));
+        assert!(!dot.contains("BB2\n0x0020"));
     }
 }

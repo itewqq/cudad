@@ -3,7 +3,8 @@
 //! no string cached inside nodes; all printing via DisplayCtx
 
 use crate::cfg::{ControlFlowGraph, EdgeKind};
-use crate::op_semantics::derive_op_semantics;
+use crate::op_semantics::{derive_op_semantics, OpSemantics};
+use crate::op_semantics::UseRole;
 use crate::parser::DecodedOperand;
 use petgraph::visit::EdgeRef;
 use petgraph::{graph::NodeIndex, Direction};
@@ -20,6 +21,9 @@ pub trait DisplayCtx {
             IRExpr::Reg(r) => self.reg(r),
             IRExpr::ImmI(i) => format!("{}", i),
             IRExpr::ImmF(f) => format!("{}", f),
+            IRExpr::Addr64 { lo, hi } => {
+                format!("addr64({}, {})", self.expr(lo), self.expr(hi))
+            }
             IRExpr::Mem {
                 base,
                 offset,
@@ -116,6 +120,10 @@ pub enum IRExpr {
     Reg(RegId),
     ImmI(i64),
     ImmF(f64),
+    Addr64 {
+        lo: Box<IRExpr>,
+        hi: Box<IRExpr>,
+    },
     Mem {
         base: Box<IRExpr>,
         offset: Option<Box<IRExpr>>,
@@ -146,6 +154,10 @@ impl IRExpr {
     pub fn collect_reg_uses(&self, out: &mut Vec<RegId>) {
         match self {
             IRExpr::Reg(r) => out.push(r.clone()),
+            IRExpr::Addr64 { lo, hi } => {
+                lo.collect_reg_uses(out);
+                hi.collect_reg_uses(out);
+            }
             IRExpr::Mem { base, offset, .. } => {
                 base.collect_reg_uses(out);
                 if let Some(off) = offset {
@@ -297,16 +309,119 @@ fn phys_reg_of(op: &DecodedOperand) -> Option<RegId> {
         _ => None,
     }
 }
+
+fn parse_raw_inline_expr(text: &str) -> Option<IRExpr> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = text.split('+').map(str::trim).collect();
+    if parts.len() > 1 {
+        let mut iter = parts.into_iter();
+        let first = parse_raw_inline_expr(iter.next()?)?;
+        return iter.try_fold(first, |lhs, part| {
+            Some(IRExpr::Op {
+                op: "+".to_string(),
+                args: vec![lhs, parse_raw_inline_expr(part)?],
+            })
+        });
+    }
+
+    let (negated, core) = text
+        .strip_prefix('-')
+        .map(|rest| (true, rest.trim()))
+        .unwrap_or((false, text));
+    let expr = parse_raw_scaled_reg(core)
+        .or_else(|| core.parse::<i64>().ok().map(IRExpr::ImmI))?;
+    if negated {
+        Some(IRExpr::Op {
+            op: "-".to_string(),
+            args: vec![expr],
+        })
+    } else {
+        Some(expr)
+    }
+}
+
+fn parse_raw_scaled_reg(text: &str) -> Option<IRExpr> {
+    let (base, scale) = if let Some((base, scale)) = text.split_once(".X") {
+        (base, scale.parse::<i64>().ok()?)
+    } else {
+        (text, 1)
+    };
+    let reg = parse_raw_reg_token(base)?;
+    let expr = IRExpr::Reg(reg);
+    if scale == 1 {
+        Some(expr)
+    } else {
+        Some(IRExpr::Op {
+            op: "*".to_string(),
+            args: vec![expr, IRExpr::ImmI(scale)],
+        })
+    }
+}
+
+fn parse_raw_reg_token(text: &str) -> Option<RegId> {
+    let text = text.trim();
+    if matches!(text, "RZ" | "URZ" | "PT" | "UPT") {
+        return Some(RegId::new(text, 0, 1));
+    }
+    let (class, digits) = if let Some(rest) = text.strip_prefix("UR") {
+        ("UR", rest)
+    } else if let Some(rest) = text.strip_prefix("UP") {
+        ("UP", rest)
+    } else if let Some(rest) = text.strip_prefix('R') {
+        ("R", rest)
+    } else if let Some(rest) = text.strip_prefix('P') {
+        ("P", rest)
+    } else {
+        return None;
+    };
+    let idx = digits.parse::<i32>().ok()?;
+    Some(RegId::new(class, idx, 1))
+}
+
 fn lower_operand(op: &DecodedOperand) -> IRExpr {
     match op {
-        DecodedOperand::Register { .. } | DecodedOperand::UniformRegister { .. } => {
-            if let Some(r) = phys_reg_of(op) {
-                IRExpr::Reg(r)
+        DecodedOperand::Register { sign, abs, .. }
+        | DecodedOperand::UniformRegister { sign, abs, .. } => {
+            if !*abs {
+                if let Some(r) = phys_reg_of(op) {
+                    IRExpr::Reg(r)
+                } else {
+                    IRExpr::ImmI(0)
+                }
             } else {
-                IRExpr::ImmI(0)
+                let mut base = op.clone();
+                match &mut base {
+                    DecodedOperand::Register { sign, abs, .. }
+                    | DecodedOperand::UniformRegister { sign, abs, .. } => {
+                        *sign = 1;
+                        *abs = false;
+                    }
+                    _ => {}
+                }
+                let reg = phys_reg_of(&base)
+                    .map(IRExpr::Reg)
+                    .unwrap_or(IRExpr::ImmI(0));
+                let mut expr = IRExpr::Op {
+                    op: "abs".into(),
+                    args: vec![reg],
+                };
+                if *sign < 0 {
+                    expr = IRExpr::Op {
+                        op: "-".into(),
+                        args: vec![expr],
+                    };
+                }
+                expr
             }
         }
-        DecodedOperand::PredicateRegister { class, idx: _, sense } => {
+        DecodedOperand::PredicateRegister {
+            class,
+            idx: _,
+            sense,
+        } => {
             if *sense {
                 phys_reg_of(op).map(IRExpr::Reg).unwrap_or(IRExpr::ImmI(0))
             } else if matches!(class.as_str(), "PT" | "UPT") {
@@ -337,9 +452,9 @@ fn lower_operand(op: &DecodedOperand) -> IRExpr {
             let mut base_expr = lower_operand(base.as_ref());
             if matches!(width, Some(64)) {
                 if let Some(hi_expr) = infer_64bit_pair_hi_expr(base.as_ref()) {
-                    base_expr = IRExpr::Op {
-                        op: "addr64".into(),
-                        args: vec![base_expr, hi_expr],
+                    base_expr = IRExpr::Addr64 {
+                        lo: Box::new(base_expr),
+                        hi: Box::new(hi_expr),
                     };
                 }
             }
@@ -368,6 +483,9 @@ fn lower_operand(op: &DecodedOperand) -> IRExpr {
                 }
                 return cm;
             }
+            if let Some(expr) = parse_raw_inline_expr(s) {
+                return expr;
+            }
             if let Ok(i) = s.parse::<i64>() {
                 IRExpr::ImmI(i)
             } else if let Ok(f) = s.parse::<f64>() {
@@ -380,6 +498,254 @@ fn lower_operand(op: &DecodedOperand) -> IRExpr {
             }
         }
     }
+}
+
+fn opcode_has_implicit_global_addr64(opcode: &str) -> bool {
+    let mnem = opcode.split('.').next().unwrap_or(opcode);
+    matches!(mnem, "ATOM" | "ATOMG")
+}
+
+fn lower_addr_operand_with_implicit_width(op: &DecodedOperand) -> Option<IRExpr> {
+    match op {
+        DecodedOperand::Address {
+            base,
+            offset,
+            width: None,
+            ..
+        } => {
+            let lo = lower_operand(base.as_ref());
+            let hi = infer_64bit_pair_hi_expr(base.as_ref())?;
+            Some(IRExpr::Mem {
+                base: Box::new(IRExpr::Addr64 {
+                    lo: Box::new(lo),
+                    hi: Box::new(hi),
+                }),
+                offset: offset.as_ref().map(|v| Box::new(IRExpr::ImmI(*v))),
+                width: Some(64),
+            })
+        }
+        DecodedOperand::DescriptorMem { addr, .. } => {
+            lower_addr_operand_with_implicit_width(addr.as_ref())
+        }
+        _ => None,
+    }
+}
+
+fn lower_operand_for_role(opcode: &str, role: Option<&UseRole>, op: &DecodedOperand) -> IRExpr {
+    if role == Some(&UseRole::Addr) && opcode_has_implicit_global_addr64(opcode) {
+        if let Some(promoted) = lower_addr_operand_with_implicit_width(op) {
+            return promoted;
+        }
+    }
+    lower_operand(op)
+}
+
+fn implicit_extra_data_defs(opcode: &str) -> usize {
+    let mnem = opcode.split('.').next().unwrap_or(opcode);
+    let has_mod = |needle: &str| opcode.split('.').skip(1).any(|t| t == needle);
+    if matches!(mnem, "ULDC" | "LDC" | "LDCU") {
+        if has_mod("128") {
+            return 3;
+        }
+        if has_mod("64") {
+            return 1;
+        }
+        return 0;
+    }
+    // MOV.64 is a true register-pair copy. Model the hi lane explicitly so
+    // SSA, copyprop, and addr64 recovery can track both halves of the tuple.
+    if mnem == "MOV" && has_mod("64") {
+        return 1;
+    }
+    // IADD.64 writes a register-pair result. Model the hi lane explicitly so
+    // later `Rn.64` users bind to the updated high half instead of a stale
+    // live-in value of `R(n+1)`.
+    if mnem == "IADD" && has_mod("64") {
+        return 1;
+    }
+    // IADD3.64 / UIADD3.64 also update the implicit hi lane of the destination
+    // pair. If we fail to model that lane explicitly, later addr64 recovery
+    // sees a stale live-in hi word and reconstructs packed pointers.
+    if matches!(mnem, "IADD3" | "UIADD3") && has_mod("64") {
+        return 1;
+    }
+    if matches!(mnem, "IMAD" | "UIMAD") && has_mod("WIDE") {
+        return 1;
+    }
+    // Model implicit register tuples for wide memory loads so SSA renaming,
+    // lifting, and name recovery do not treat the upper lanes as live-ins.
+    if mnem.starts_with("LD") {
+        if has_mod("128") {
+            return 3;
+        }
+        if has_mod("64") {
+            return 1;
+        }
+    }
+    0
+}
+
+fn sign_extend_i32_hi_word(value: i64) -> i64 {
+    if ((value as u32) & 0x8000_0000) != 0 {
+        -1
+    } else {
+        0
+    }
+}
+
+fn parse_i64_literal(text: &str) -> Option<i64> {
+    let trimmed = text.trim();
+    if let Some(rest) = trimmed.strip_prefix("-0x") {
+        return i64::from_str_radix(rest, 16).ok().map(|v| -v);
+    }
+    if let Some(rest) = trimmed.strip_prefix("0x") {
+        return i64::from_str_radix(rest, 16).ok();
+    }
+    trimmed.parse::<i64>().ok()
+}
+
+fn operand_lane(op: &DecodedOperand, lane: usize) -> Option<DecodedOperand> {
+    match op {
+        DecodedOperand::Register {
+            class,
+            idx,
+            sign,
+            abs,
+            reuse,
+            ty,
+        } => Some(DecodedOperand::Register {
+            class: class.clone(),
+            idx: idx + lane as i32,
+            sign: *sign,
+            abs: *abs,
+            reuse: *reuse,
+            ty: ty.clone(),
+        }),
+        DecodedOperand::UniformRegister {
+            class,
+            idx,
+            sign,
+            abs,
+            reuse,
+            ty,
+        } => Some(DecodedOperand::UniformRegister {
+            class: class.clone(),
+            idx: idx + lane as i32,
+            sign: *sign,
+            abs: *abs,
+            reuse: *reuse,
+            ty: ty.clone(),
+        }),
+        DecodedOperand::ConstMem { bank, offset } => {
+            let delta = u32::try_from(lane).ok()?.checked_mul(4)?;
+            Some(DecodedOperand::ConstMem {
+                bank: *bank,
+                offset: offset.checked_add(delta)?,
+            })
+        }
+        DecodedOperand::ImmediateI(i) => Some(DecodedOperand::ImmediateI(if lane == 0 {
+            *i
+        } else {
+            sign_extend_i32_hi_word(*i)
+        })),
+        DecodedOperand::Raw(text) if lane == 0 => Some(DecodedOperand::Raw(text.clone())),
+        DecodedOperand::Raw(text) => {
+            if let Some((negated, bank, offset)) = parse_raw_constmem_token(text) {
+                if negated {
+                    return None;
+                }
+                let delta = u32::try_from(lane).ok()?.checked_mul(4)?;
+                return Some(DecodedOperand::ConstMem {
+                    bank,
+                    offset: offset.checked_add(delta)?,
+                });
+            }
+            if let Some(value) = parse_i64_literal(text) {
+                return Some(DecodedOperand::ImmediateI(if lane == 0 {
+                    value
+                } else {
+                    sign_extend_i32_hi_word(value)
+                }));
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn lower_operand_lane(op: &DecodedOperand, lane: usize) -> Option<IRExpr> {
+    let lane_op = operand_lane(op, lane)?;
+    Some(lower_operand(&lane_op))
+}
+
+fn implicit_store_source_lane_use_exprs(opcode: &str, operands: &[DecodedOperand]) -> Vec<IRExpr> {
+    if !opcode.starts_with("ST") {
+        return Vec::new();
+    }
+    let extra_defs = if opcode.split('.').skip(1).any(|t| t == "128") {
+        3
+    } else if opcode.split('.').skip(1).any(|t| t == "64") {
+        1
+    } else {
+        0
+    };
+    if extra_defs == 0 {
+        return Vec::new();
+    }
+
+    let Some(src) = operands.get(1) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(extra_defs);
+    for lane in 1..=extra_defs {
+        let Some(expr) = lower_operand_lane(src, lane) else {
+            break;
+        };
+        out.push(expr);
+    }
+    out
+}
+
+fn implicit_extra_use_exprs(
+    opcode: &str,
+    operands: &[DecodedOperand],
+    sem: &OpSemantics,
+) -> Vec<IRExpr> {
+    let mnem = opcode.split('.').next().unwrap_or(opcode);
+    let has_mod = |needle: &str| opcode.split('.').skip(1).any(|t| t == needle);
+    if mnem == "MOV" && has_mod("64") {
+        let Some(src) = operands.get(1) else {
+            return Vec::new();
+        };
+        let Some(src_hi) = lower_operand_lane(src, 1) else {
+            return Vec::new();
+        };
+        return vec![src_hi];
+    }
+    if mnem == "IADD" && has_mod("64") {
+        let (Some(lhs), Some(rhs)) = (operands.get(1), operands.get(2)) else {
+            return Vec::new();
+        };
+        let (Some(lhs_hi), Some(rhs_hi)) = (lower_operand_lane(lhs, 1), lower_operand_lane(rhs, 1))
+        else {
+            return Vec::new();
+        };
+        return vec![lhs_hi, rhs_hi];
+    }
+    if matches!(mnem, "IADD3" | "UIADD3") && has_mod("64") {
+        let mut out = Vec::new();
+        for operand_idx in sem.use_operand_indices.iter().take(3) {
+            let Some(op) = operands.get(*operand_idx) else {
+                return Vec::new();
+            };
+            let Some(expr) = lower_operand_lane(op, 1) else {
+                return Vec::new();
+            };
+            out.push(expr);
+        }
+        return out;
+    }
+    Vec::new()
 }
 
 fn infer_64bit_pair_hi_expr(base: &DecodedOperand) -> Option<IRExpr> {
@@ -533,6 +899,10 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
                 top.sign = use_sign;
                 *r = top;
             }
+            IRExpr::Addr64 { lo, hi } => {
+                rename_expr(lo, stack, cnt);
+                rename_expr(hi, stack, cnt);
+            }
             IRExpr::Mem { base, offset, .. } => {
                 rename_expr(base, stack, cnt);
                 if let Some(off) = offset {
@@ -570,7 +940,7 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
         for ins in &bb.instrs {
             let mut defs = Vec::<IRExpr>::new();
             let mut args = Vec::<IRExpr>::new();
-            let mut mem_addr_args = None::<Vec<IRExpr>>;
+            let mut mem_addr_args = Vec::<IRExpr>::new();
             let sem = derive_op_semantics(
                 &ins.opcode,
                 &ins.operands,
@@ -586,22 +956,10 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
                     }
                 }
             }
-            // ULDC/LDC/LDCU `.64` define a register pair, `.128` define a
-            // 4-wide tuple (`UR8..UR11`).  Model the implicit high halves as
-            // explicit defs so they are not treated as live-ins.  LDCU is the
-            // SM 100+ (Blackwell) rename of ULDC — same operand shape.
-            let mnem = ins.opcode.split('.').next().unwrap_or(ins.opcode.as_str());
-            let extra_defs = if matches!(mnem, "ULDC" | "LDC" | "LDCU") {
-                if ins.opcode.split('.').skip(1).any(|t| t == "128") {
-                    3
-                } else if ins.opcode.split('.').skip(1).any(|t| t == "64") {
-                    1
-                } else {
-                    0
-                }
-            } else {
-                0
-            };
+            // Model implicit multi-register defs explicitly so SSA renaming
+            // does not bind `Rn.64` high halves to an unrelated live value
+            // of `R(n+1)`.
+            let extra_defs = implicit_extra_data_defs(&ins.opcode);
             if extra_defs > 0 {
                 if let Some(base_def) = ins.operands.first().and_then(phys_reg_of) {
                     for k in 1..=extra_defs {
@@ -615,24 +973,21 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
                     }
                 }
             }
-            for idx in &sem.use_operand_indices {
+            for (use_pos, idx) in sem.use_operand_indices.iter().enumerate() {
                 if let Some(op) = ins.operands.get(*idx) {
-                    args.push(lower_operand(op));
+                    let lowered = lower_operand_for_role(&ins.opcode, sem.use_roles.get(use_pos), op);
+                    if sem.use_roles.get(use_pos) == Some(&UseRole::Addr) {
+                        mem_addr_args.push(lowered.clone());
+                    }
+                    args.push(lowered);
                 }
             }
-
-            if is_mem_load(&ins.opcode) {
-                let mut a = Vec::new();
-                for op in ins.operands.iter().skip(1) {
-                    a.push(lower_operand(op));
-                }
-                mem_addr_args = Some(a);
-            } else if is_mem_store(&ins.opcode) {
-                let mut a = Vec::new();
-                if let Some(op0) = ins.operands.first() {
-                    a.push(lower_operand(op0));
-                }
-                mem_addr_args = Some(a);
+            args.extend(implicit_extra_use_exprs(&ins.opcode, &ins.operands, &sem));
+            if is_mem_store(&ins.opcode) {
+                args.extend(implicit_store_source_lane_use_exprs(
+                    &ins.opcode,
+                    &ins.operands,
+                ));
             }
 
             let pred_expr = ins.pred.as_ref().and_then(|p| {
@@ -654,7 +1009,7 @@ pub fn build_ssa(cfg: &ControlFlowGraph) -> FunctionIR {
                     args,
                 },
                 pred: pred_expr,
-                mem_addr_args,
+                mem_addr_args: (!mem_addr_args.is_empty()).then_some(mem_addr_args),
                 pred_old_defs: vec![],
             });
         }

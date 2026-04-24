@@ -71,7 +71,6 @@ pub fn propagate_semantic_labels(fir: &FunctionIR) -> HashMap<SsaRegKey, String>
     }
     struct CopyInfo {
         def_key: SsaRegKey,
-        src_key: SsaRegKey,
     }
 
     let mut phis: Vec<PhiInfo> = Vec::new();
@@ -122,10 +121,7 @@ pub fn propagate_semantic_labels(fir: &FunctionIR) -> HashMap<SsaRegKey, String>
                                     .entry(src.clone())
                                     .or_default()
                                     .push(copy_idx);
-                                copies.push(CopyInfo {
-                                    def_key,
-                                    src_key: src,
-                                });
+                                copies.push(CopyInfo { def_key });
                             }
                         }
                     }
@@ -175,36 +171,6 @@ pub fn propagate_semantic_labels(fir: &FunctionIR) -> HashMap<SsaRegKey, String>
                 if all_same {
                     labels.insert(phi.def_key.clone(), label.clone());
                     worklist.push_back(phi.def_key.clone());
-                }
-            }
-        }
-    }
-
-    // ---- Phase 4: Backward propagation through phis ----
-    // If a phi's def has a label, propagate to inputs that don't have one yet.
-    let mut changed = true;
-    let mut back_iters = 0;
-    while changed && back_iters < 50 {
-        changed = false;
-        back_iters += 1;
-
-        for phi in &phis {
-            if let Some(def_label) = labels.get(&phi.def_key).cloned() {
-                for inp in &phi.input_keys {
-                    if !labels.contains_key(inp) {
-                        labels.insert(inp.clone(), def_label.clone());
-                        changed = true;
-                    }
-                }
-            }
-        }
-
-        // Also forward through copies again after backward propagation
-        for copy in &copies {
-            if let Some(src_label) = labels.get(&copy.src_key).cloned() {
-                if !labels.contains_key(&copy.def_key) {
-                    labels.insert(copy.def_key.clone(), src_label);
-                    changed = true;
                 }
             }
         }
@@ -366,5 +332,39 @@ mod tests {
                 val
             );
         }
+    }
+
+    #[test]
+    fn does_not_backpropagate_semantic_label_through_mixed_phi() {
+        let sass = r#"
+            /*0000*/ S2R R0, SR_CTAID.X ;
+            /*0010*/ ISETP.NE.AND P0, PT, R1, RZ, PT ;
+            /*0020*/ @P0 BRA 0x050 ;
+            /*0030*/ FADD R0, R2, R3 ;
+            /*0040*/ BRA 0x060 ;
+            /*0050*/ NOP ;
+            /*0060*/ FADD R4, R0, R5 ;
+            /*0070*/ EXIT ;
+        "#;
+        let cfg = build_cfg(decode_sass(sass));
+        let fir = build_ssa(&cfg);
+        let labels = propagate_semantic_labels(&fir);
+
+        let float_def = fir
+            .blocks
+            .iter()
+            .flat_map(|block| block.stmts.iter())
+            .find_map(|stmt| match &stmt.value {
+                RValue::Op { opcode, .. } if opcode == "FADD" => {
+                    stmt.defs.first().and_then(IRExpr::get_reg).cloned()
+                }
+                _ => None,
+            })
+            .expect("expected float def");
+
+        assert!(
+            !labels.contains_key(&SsaRegKey::from_reg(&float_def)),
+            "mixed phi/reg-reuse path must not inherit blockIdx semantic labels"
+        );
     }
 }
