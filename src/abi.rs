@@ -1503,6 +1503,13 @@ fn memory_pointee_type_from_stmt(
     None
 }
 
+pub(crate) fn infer_shared_word_pointee_type_for_function(
+    function_ir: &FunctionIR,
+) -> Option<&'static str> {
+    let ssa_types = infer_ssa_types(function_ir);
+    infer_shared_word_pointee_type(function_ir, &ssa_types)
+}
+
 fn infer_shared_word_reg_fallback_types(
     function_ir: &FunctionIR,
     ssa_types: &BTreeMap<RegId, InferredType>,

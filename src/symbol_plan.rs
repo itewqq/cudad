@@ -95,7 +95,7 @@ fn planned_space_decls(analysis: &FunctionAnalysis) -> Vec<Decl> {
         let (array_len, dynamic_extent) = planned_space_decl_shape(analysis, CudaMemorySpace::Shared);
         out.push(Decl {
             name: "shmem".to_string(),
-            ty: "uint32_t".to_string(),
+            ty: analysis.shared_pointee_ty.unwrap_or("uint32_t").to_string(),
             array_len,
             dynamic_extent,
             storage: StorageClass::Shared,
@@ -337,6 +337,7 @@ mod tests {
             has_dynamic_offset: false,
             root: AddressRoot::SharedObject("shmem".to_string()),
         });
+        analysis.shared_pointee_ty = Some("float");
         let function = StructuredFunction {
             params: Vec::new(),
             locals: Vec::new(),
@@ -357,6 +358,7 @@ mod tests {
         assert_eq!(plan.params[0].ty, "float*");
         assert_eq!(plan.params[1].name, "arg4");
         assert_eq!(plan.locals[0].name, "shmem");
+        assert_eq!(plan.locals[0].ty, "float");
         assert_eq!(plan.locals[0].array_len, Some(3));
         assert!(!plan.locals[0].dynamic_extent);
         assert_eq!(plan.locals[0].storage, StorageClass::Shared);

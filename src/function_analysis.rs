@@ -33,8 +33,8 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use crate::abi::{
-    annotate_function_ir_constmem, infer_arg_aliases, AbiAnnotations, AbiArgAliases, AbiProfile,
-    ConstMemSemantic, StatementRef,
+    annotate_function_ir_constmem, infer_arg_aliases, infer_shared_word_pointee_type_for_function,
+    AbiAnnotations, AbiArgAliases, AbiProfile, ConstMemSemantic, StatementRef,
 };
 use crate::ir::{FunctionIR, IRExpr, IRStatement, RValue, RegId};
 use crate::memory_model::{CudaMemorySpace, MemAccessKind};
@@ -68,6 +68,7 @@ pub struct FunctionAnalysis {
     pub abi_profile: Option<AbiProfile>,
     pub abi_annotations: AbiAnnotations,
     pub abi_aliases: AbiArgAliases,
+    pub shared_pointee_ty: Option<&'static str>,
     pub root_by_reg: BTreeMap<RegId, AddressRoot>,
     pub byte_offset_by_reg: BTreeMap<RegId, IRExpr>,
     pub mem_accesses: Vec<MemAccessInfo>,
@@ -98,6 +99,7 @@ pub fn analyze_function_ir_with_profile(
     } else {
         infer_arg_aliases(function_ir, &abi_annotations)
     };
+    let shared_pointee_ty = infer_shared_word_pointee_type_for_function(function_ir);
 
     let (root_by_reg, byte_offset_by_reg) =
         propagate_address_facts(function_ir, &abi_annotations, &abi_aliases);
@@ -108,6 +110,7 @@ pub fn analyze_function_ir_with_profile(
         abi_profile,
         abi_annotations,
         abi_aliases,
+        shared_pointee_ty,
         root_by_reg,
         byte_offset_by_reg,
         mem_accesses,
@@ -886,6 +889,21 @@ mod tests {
         assert_eq!(analysis.mem_accesses.len(), 1);
         assert_eq!(analysis.mem_accesses[0].kind, MemAccessKind::Atomic);
         assert_eq!(analysis.mem_accesses[0].space, CudaMemorySpace::Shared);
+    }
+
+    #[test]
+    fn infers_float_shared_pointee_type_from_roundtrip() {
+        let sass = r#"
+            /*0000*/ IMAD.MOV.U32 R4, RZ, RZ, c[0x0][0x160] ;
+            /*0010*/ IMAD.MOV.U32 R5, RZ, RZ, c[0x0][0x164] ;
+            /*0020*/ LDG.E.CONSTANT R8, [R4.64] ;
+            /*0030*/ STS [R0], R8 ;
+            /*0040*/ LDS R9, [R0] ;
+            /*0050*/ FADD R10, R9, 0f00000000 ;
+            /*0060*/ EXIT ;
+        "#;
+        let analysis = analyze(sass);
+        assert_eq!(analysis.shared_pointee_ty, Some("float"));
     }
 
     #[test]
