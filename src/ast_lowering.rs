@@ -427,10 +427,7 @@ fn lower_scalar_expr(expr: &IRExpr) -> Expr {
             args: vec![lower_scalar_expr(lo), lower_scalar_expr(hi)],
         },
         IRExpr::Mem { .. } => Expr::Raw("/*mem*/".to_string()),
-        IRExpr::Op { op, args } => Expr::CallLike {
-            func: op.clone(),
-            args: args.iter().map(lower_scalar_expr).collect(),
-        },
+        IRExpr::Op { op, args } => lower_ir_op_expr(op, args),
     }
 }
 
@@ -527,6 +524,55 @@ fn lower_add_expr(args: &[IRExpr]) -> Option<Expr> {
         lhs: Box::new(lhs),
         rhs: Box::new(rhs),
     }))
+}
+
+fn lower_ir_op_expr(op: &str, args: &[IRExpr]) -> Expr {
+    if let Some(expr) = lower_simple_ir_op_expr(op, args) {
+        return expr;
+    }
+    Expr::CallLike {
+        func: op.to_string(),
+        args: args.iter().map(lower_scalar_expr).collect(),
+    }
+}
+
+fn lower_simple_ir_op_expr(op: &str, args: &[IRExpr]) -> Option<Expr> {
+    match (op, args) {
+        ("!", [arg]) | ("-", [arg]) => Some(Expr::Unary {
+            op: op.to_string(),
+            arg: Box::new(lower_scalar_expr(arg)),
+        }),
+        (binary_op, [lhs, rhs]) if is_simple_binary_op(binary_op) => Some(Expr::Binary {
+            op: binary_op.to_string(),
+            lhs: Box::new(lower_scalar_expr(lhs)),
+            rhs: Box::new(lower_scalar_expr(rhs)),
+        }),
+        _ => None,
+    }
+}
+
+fn is_simple_binary_op(op: &str) -> bool {
+    matches!(
+        op,
+        "+"
+            | "-"
+            | "*"
+            | "/"
+            | "%"
+            | "&"
+            | "|"
+            | "^"
+            | "<<"
+            | ">>"
+            | "&&"
+            | "||"
+            | "=="
+            | "!="
+            | "<"
+            | "<="
+            | ">"
+            | ">="
+    )
 }
 
 fn lower_reg_expr(reg: &crate::ir::RegId) -> Expr {
@@ -816,5 +862,23 @@ mod tests {
             panic!("expected assignment");
         };
         assert_eq!(src.render(), "r4_0 + 4");
+    }
+
+    #[test]
+    fn lowers_ir_binary_ops_to_ast_binary_exprs() {
+        let expr = IRExpr::Op {
+            op: "*".to_string(),
+            args: vec![
+                IRExpr::Op {
+                    op: "+".to_string(),
+                    args: vec![
+                        IRExpr::Reg(crate::ir::RegId::new("R", 2, 1).with_ssa(0)),
+                        IRExpr::ImmI(1),
+                    ],
+                },
+                IRExpr::ImmI(4),
+            ],
+        };
+        assert_eq!(lower_scalar_expr(&expr).render(), "(r2_0 + 1) * 4");
     }
 }

@@ -36,6 +36,9 @@
 - Non-memory AST lowering now folds trivial `MOV` and add-family ops into
   native AST expressions instead of rendering every scalar op as a call-like
   helper.
+- Scalar IR expressions now lower simple unary/binary operators directly into
+  AST operators, which reduces `+(a, b)` / `*(a, b)` helper leakage in the
+  canonical path.
 - Shared/local declaration planning now distinguishes fixed-size backing
   objects from dynamic-extent objects instead of fabricating small scalar or
   fixed arrays for dynamic offsets.
