@@ -635,7 +635,7 @@ fn empty_cfg_ssa_build_is_non_fatal() {
 
 #[test]
 fn malformed_sass_returns_stub_output() {
-    let out = run_structured_output_full_pass("not sass");
+    let out = run_canonical_output_full_pass("not sass");
     assert_eq!(out, "void kernel(void) {\n}\n");
 }
 
@@ -1220,15 +1220,22 @@ fn full_pass_relu_materializes_bounds_guard() {
         .into_iter()
         .find(|f| f.name == "relu")
         .expect("relu fixture should exist");
-    let out = run_structured_output_full_pass_from_instrs(relu.instrs, relu.sm);
+    let out = run_canonical_output_full_pass_from_instrs(relu.instrs, relu.sm, "relu");
     assert!(
         !out.contains("if (b0) return;"),
         "expected the relu bounds guard to be rendered as a comparison, got:
 {}",
         out
     );
-    let re = Regex::new(r"if \(\(int32_t\)\(v2\) >= \(int32_t\)\([^)]*\)\) return;")
-        .expect("valid regex");
+    assert!(
+        !out.contains("ISETP(") && !out.contains("S2R(") && !out.contains("FMNMX("),
+        "expected relu to avoid raw scalar helper opcodes, got:\n{}",
+        out
+    );
+    let re = Regex::new(
+        r"(if \(\(int32_t\)\(.+\) >= \(int32_t\)\(.+\)\) return;|p\d+_\d+ = \(int32_t\)\(.+\) >= \(int32_t\)\(.+\);)",
+    )
+    .expect("valid regex");
     assert!(
         re.is_match(&out),
         "expected the relu bounds guard to be materialized as a comparison, got:
@@ -1642,7 +1649,7 @@ fn full_pass_histogram256_lowers_shared_atomics_on_blackwell() {
             .into_iter()
             .find(|f| f.name == "histogram256")
             .expect("histogram256 fixture should exist");
-        let out = run_structured_output_full_pass_from_instrs(hist.instrs, hist.sm);
+        let out = run_canonical_output_full_pass_from_instrs(hist.instrs, hist.sm, "histogram256");
         assert!(
             out.contains("atomicAdd(&shmem["),
             "expected histogram256 shared atomic to lower to atomicAdd, got:\n{}",
@@ -1882,9 +1889,10 @@ fn full_pass_sha256_single_block_renders_without_post_name_addr64_overflow() {
         .into_iter()
         .find(|f| f.name == "sha256_single_block")
         .expect("sha256_single_block fixture should exist");
-    let out = run_structured_output_full_pass_from_instrs(sha.instrs, sha.sm);
+    let out = run_canonical_output_full_pass_from_instrs(sha.instrs, sha.sm, "sha256_single_block");
     assert!(
-        out.contains("__global__ void kernel") || out.contains("void kernel"),
+        out.contains("__global__ void sha256_single_block")
+            || out.contains("void sha256_single_block"),
         "expected sha256_single_block to render successfully, got:
 {}",
         out
