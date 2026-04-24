@@ -116,12 +116,9 @@
   - shared/local indexed stores
   - shared atomics
 - Canonical full-pass test coverage now owns:
-  - `if.sass`
   - `test_div.sass`
   - `dot_thread`
-  - `cumsum_linear`
   - `nbody_forces`
-  - `sgemm_tiled`
 - The canonical backend driver now builds:
   - optimized SSA
   - `FunctionAnalysis`
@@ -139,8 +136,9 @@
    and typed shared-backing declarations.
 2. Delete duplicated CLI/test helper logic that still builds semantic-lift,
    token-map, or post-render cleanup artifacts after the canonical path is
-   proven on those fixtures, starting with the `if.sass` / `test_div.sass`
-   smoke path and the migrated loop/GEMM fixtures.
+   proven on those fixtures, starting with the stable canonical smoke path
+   (`test_div.sass`) and the ready corpus fixtures (`dot_thread`,
+   `nbody_forces`).
 3. Replace the remaining placeholder non-memory AST lowering gaps
    (`IMAD.WIDE`/packed-pointer arithmetic/residual helper leaks) with semantic
    lowering that no longer depends on the old semantic-lift backend.

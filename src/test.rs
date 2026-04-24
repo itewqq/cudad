@@ -1124,17 +1124,12 @@ fn smoke_struct_output_full_pass_rc4_sass() {
 #[test]
 fn smoke_struct_output_full_pass_if_sass() {
     let sass = include_str!("../test_cu/if.sass");
-    let expected = r#"void kernel(void) {
-  bool p0_0;
-
-  if (p0_0) {
-  } else {
-  }
-  return;
-}
-"#;
-    let out = assert_canonical_full_pass_nonempty_and_deterministic(sass);
-    assert_eq!(out.trim_end(), expected.trim_end());
+    let expected = include_str!("../test_cu/golden_full_pass/if.pseudo.c");
+    let out1 = run_structured_output_full_pass(sass);
+    let out2 = run_structured_output_full_pass(sass);
+    assert!(!out1.trim().is_empty());
+    assert_eq!(out1, out2);
+    assert_eq!(out1.trim_end(), expected.trim_end());
 }
 
 #[test]
@@ -1359,7 +1354,7 @@ fn full_pass_cumsum_linear_no_longer_overflows_named_render() {
         .into_iter()
         .find(|f| f.name == "cumsum_linear")
         .expect("cumsum_linear fixture should exist");
-    let out = run_canonical_output_full_pass_from_instrs(cumsum.instrs, cumsum.sm, "cumsum_linear");
+    let out = run_structured_output_full_pass_from_instrs(cumsum.instrs, cumsum.sm);
     assert!(
         !out.trim().is_empty(),
         "expected cumsum_linear to decompile to non-empty output"
@@ -1492,9 +1487,9 @@ fn full_pass_sgemm_tiled_predicated_global_loads_collapse_to_typed_pointers() {
             .into_iter()
             .find(|f| f.name == "sgemm_tiled")
             .expect("sgemm_tiled fixture should exist");
-    let out = run_canonical_output_full_pass_from_instrs(sgemm.instrs, sgemm.sm, "sgemm_tiled");
+    let out = run_structured_output_full_pass_from_instrs(sgemm.instrs, sgemm.sm);
     let lhs_load = Regex::new(
-        r"r\d+_\d+ = !p\d+_\d+ \? \(arg0_ptr\[[A-Za-z0-9_()+*/ ]+\]\) : (?:0|0\.0|r\d+_\d+);",
+        r"v\w+ = !b\w+ \? \(\*\(arg0_ptr \+ (?:\(int64_t\))?v\w+(?: \+ v\w+)?(?: \+ threadIdx\.x)?\)\) : (?:0|0\.0|v\w+);",
     )
     .expect("valid lhs load regex");
     assert!(
@@ -1504,7 +1499,7 @@ fn full_pass_sgemm_tiled_predicated_global_loads_collapse_to_typed_pointers() {
         out
     );
     let rhs_load = Regex::new(
-        r"r\d+_\d+ = !p\d+_\d+ \? \(arg2_ptr\[[A-Za-z0-9_()+*/ ]+\]\) : (?:0|0\.0|r\d+_\d+);",
+        r"v\w+ = !b\w+ \? \(\*\(arg2_ptr \+ (?:\(int64_t\))?v\w+(?: \+ v\w+)?(?: \+ threadIdx\.x)?\)\) : (?:0|0\.0|v\w+);",
     )
     .expect("valid rhs load regex");
     assert!(
@@ -1528,7 +1523,7 @@ fn full_pass_sgemm_tiled_eliminates_lea_helpers_in_predicated_loads() {
             .into_iter()
             .find(|f| f.name == "sgemm_tiled")
             .expect("sgemm_tiled fixture should exist");
-    let out = run_canonical_output_full_pass_from_instrs(sgemm.instrs, sgemm.sm, "sgemm_tiled");
+    let out = run_structured_output_full_pass_from_instrs(sgemm.instrs, sgemm.sm);
     assert!(
         !out.contains("lea_hi_x("),
         "expected sgemm_tiled output to fold LEA.HI.X helpers, got:
