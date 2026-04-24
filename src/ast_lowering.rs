@@ -790,7 +790,7 @@ fn lower_add_expr(args: &[IRExpr]) -> Option<Expr> {
 }
 
 fn lower_ffma_expr(opcode: &str, args: &[IRExpr]) -> Option<Expr> {
-    if !opcode.split('.').next().is_some_and(|mnem| mnem == "FFMA") || args.len() != 3 {
+    if opcode != "FFMA" || args.len() != 3 {
         return None;
     }
     Some(Expr::Binary {
@@ -805,7 +805,7 @@ fn lower_ffma_expr(opcode: &str, args: &[IRExpr]) -> Option<Expr> {
 }
 
 fn lower_fmnmx_expr(opcode: &str, args: &[IRExpr]) -> Option<Expr> {
-    if !opcode.split('.').next().is_some_and(|mnem| mnem == "FMNMX") || args.len() != 3 {
+    if opcode != "FMNMX" || args.len() != 3 {
         return None;
     }
     let fmin = Expr::CallLike {
@@ -1437,7 +1437,7 @@ mod tests {
     #[test]
     fn lowers_ffma_fmnmx_and_mufu_ops_semantically() {
         let ffma = lower_op_expr(
-            "FFMA.FTZ",
+            "FFMA",
             &[
                 IRExpr::Reg(crate::ir::RegId::new("R", 1, 1).with_ssa(0)),
                 IRExpr::Reg(crate::ir::RegId::new("R", 2, 1).with_ssa(0)),
@@ -1464,6 +1464,29 @@ mod tests {
             &[IRExpr::Reg(crate::ir::RegId::new("R", 4, 1).with_ssa(0))],
         );
         assert_eq!(mufu.render(), "exp2f(r4_0)");
+    }
+
+    #[test]
+    fn keeps_modifier_bearing_ffma_and_fmnmx_explicit_until_modeled() {
+        let ffma = lower_op_expr(
+            "FFMA.RM",
+            &[
+                IRExpr::Reg(crate::ir::RegId::new("R", 1, 1).with_ssa(0)),
+                IRExpr::Reg(crate::ir::RegId::new("R", 2, 1).with_ssa(0)),
+                IRExpr::Reg(crate::ir::RegId::new("R", 3, 1).with_ssa(0)),
+            ],
+        );
+        assert_eq!(ffma.render(), "FFMA.RM(r1_0, r2_0, r3_0)");
+
+        let fmnmx = lower_op_expr(
+            "FMNMX.NAN",
+            &[
+                IRExpr::Reg(crate::ir::RegId::new("R", 1, 1).with_ssa(0)),
+                IRExpr::Reg(crate::ir::RegId::new("R", 2, 1).with_ssa(0)),
+                IRExpr::Reg(crate::ir::RegId::new("PT", 0, 1)),
+            ],
+        );
+        assert_eq!(fmnmx.render(), "FMNMX.NAN(r1_0, r2_0, true)");
     }
 
     #[test]

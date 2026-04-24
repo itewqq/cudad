@@ -74,10 +74,11 @@
 - Canonical scalar lowering now materializes:
   - `S2R`/`CS2R`/`S2UR` builtin-register reads
   - `ISETP`/`UISETP` comparison predicates
-  - `FFMA`
-  - `FMNMX`
+  - unmodified `FFMA`
+  - unmodified `FMNMX`
   - `MUFU` transcendental helpers
-  before falling back to raw opcode-shaped helpers.
+  before falling back to raw opcode-shaped helpers; modifier-bearing scalar ops
+  stay explicit until their semantics are modeled.
 - Pointer-root propagation now ignores predicate/carry defs and other
   non-address registers, which prevents non-convergent root worklists on
   Blackwell carry-heavy loops while keeping real `R`/`UR` address facts.

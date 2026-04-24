@@ -1232,12 +1232,16 @@ fn full_pass_relu_materializes_bounds_guard() {
         "expected relu to avoid raw scalar helper opcodes, got:\n{}",
         out
     );
-    let re = Regex::new(
-        r"(if \(\(int32_t\)\(.+\) >= \(int32_t\)\(.+\)\) return;|p\d+_\d+ = \(int32_t\)\(.+\) >= \(int32_t\)\(.+\);)",
-    )
-    .expect("valid regex");
+    let re =
+        Regex::new(r"(p\d+_\d+) = \(int32_t\)\(.+\) >= \(int32_t\)\(.+\);").expect("valid regex");
+    let pred_name = re
+        .captures(&out)
+        .and_then(|caps| caps.get(1))
+        .map(|m| m.as_str().to_string());
     assert!(
-        re.is_match(&out),
+        pred_name
+            .as_ref()
+            .is_some_and(|pred_name| out.contains(&format!("if ({pred_name}) return;"))),
         "expected the relu bounds guard to be materialized as a comparison, got:
 {}",
         out
