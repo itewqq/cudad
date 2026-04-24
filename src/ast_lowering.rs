@@ -758,6 +758,7 @@ mod tests {
             bit_width: Some(32),
             vector_width: None,
             constant_byte_offset: Some(0),
+            has_dynamic_offset: true,
             root: AddressRoot::SharedObject("shmem".to_string()),
         });
         let lowered = lower_basic_stmt(0, 0, &stmt, &analysis);

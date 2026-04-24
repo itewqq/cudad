@@ -59,6 +59,7 @@ pub struct MemAccessInfo {
     pub bit_width: Option<u32>,
     pub vector_width: Option<u8>,
     pub constant_byte_offset: Option<i64>,
+    pub has_dynamic_offset: bool,
     pub root: AddressRoot,
 }
 
@@ -370,6 +371,11 @@ fn collect_memory_accesses(
                     .as_ref()
                     .and_then(|args| args.first())
                     .and_then(constant_byte_offset),
+                has_dynamic_offset: stmt
+                    .mem_addr_args
+                    .as_ref()
+                    .and_then(|args| args.first())
+                    .is_some_and(has_dynamic_offset_term),
                 root,
             });
         }
@@ -536,6 +542,23 @@ fn static_immediate_component(expr: &IRExpr) -> i64 {
     }
 }
 
+fn has_dynamic_offset_term(expr: &IRExpr) -> bool {
+    match expr {
+        IRExpr::Mem { base, offset, .. } => {
+            has_dynamic_offset_term(base.as_ref())
+                || offset
+                    .as_deref()
+                    .is_some_and(has_dynamic_offset_term)
+        }
+        IRExpr::Reg(reg) => !matches!(reg.class.as_str(), "RZ" | "URZ"),
+        IRExpr::Addr64 { lo, hi } => {
+            has_dynamic_offset_term(lo.as_ref()) || has_dynamic_offset_term(hi.as_ref())
+        }
+        IRExpr::Op { args, .. } => args.iter().any(has_dynamic_offset_term),
+        IRExpr::ImmI(_) | IRExpr::ImmF(_) => false,
+    }
+}
+
 fn opcode_vector_width(opcode: &str) -> Option<u8> {
     if opcode.split('.').any(|part| part == "128") {
         Some(4)
@@ -615,6 +638,7 @@ mod tests {
         assert_eq!(analysis.mem_accesses.len(), 3);
         assert_eq!(analysis.mem_accesses[0].space, CudaMemorySpace::Param);
         assert_eq!(analysis.mem_accesses[0].root, AddressRoot::ParamWord(0));
+        assert!(!analysis.mem_accesses[0].has_dynamic_offset);
         assert_eq!(analysis.mem_accesses[1].space, CudaMemorySpace::Global);
         assert_eq!(analysis.mem_accesses[2].space, CudaMemorySpace::Global);
     }
@@ -674,5 +698,6 @@ mod tests {
         "#;
         let analysis = analyze(sass);
         assert_eq!(analysis.mem_accesses[0].constant_byte_offset, Some(8));
+        assert!(analysis.mem_accesses[0].has_dynamic_offset);
     }
 }

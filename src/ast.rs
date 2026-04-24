@@ -83,6 +83,7 @@ pub struct Decl {
     pub name: String,
     pub ty: String,
     pub array_len: Option<usize>,
+    pub dynamic_extent: bool,
     pub storage: StorageClass,
     pub live_in: bool,
 }
@@ -633,13 +634,13 @@ fn render_wide_ptr_expr(base: &Expr, offset: &Expr) -> String {
         .filter(|name| !expr_mentions_pointer_base(offset, name))
     {
         let _ = base_name;
-        return format!("{} + (int64_t){}", base.render(), offset.render());
+        return format!("{} + (int64_t){}", base.render(), render_byte_offset_expr(offset));
     }
     let base = match base {
         Expr::Binary { .. } | Expr::Ternary { .. } => format!("({})", base.render()),
         _ => base.render(),
     };
-    format!("((uint8_t*){}) + (int64_t){}", base, offset.render())
+    format!("((uint8_t*){}) + (int64_t){}", base, render_byte_offset_expr(offset))
 }
 
 fn render_typed_deref_expr(ty: &str, addr: &Expr) -> String {
@@ -659,7 +660,9 @@ fn render_typed_pointer_expr(ty: &str, addr: &Expr) -> Option<String> {
     let symbolic_base = expr_is_symbolic_pointer_base(base);
     if symbolic_base {
         let base_render = render_pointer_base_expr(base);
-        if let Some(index) = divide_offset_expr(offset, elem_size) {
+        if let Some(index) =
+            divide_offset_expr(offset, elem_size).filter(looks_like_element_index_expr)
+        {
             let index_render = render_pointer_index_expr(&index);
             return Some(if expr_is_zero(&index) {
                 base_render
@@ -676,7 +679,7 @@ fn render_typed_pointer_expr(ty: &str, addr: &Expr) -> Option<String> {
             });
         }
 
-        let byte_offset = render_pointer_index_expr(offset);
+        let byte_offset = render_byte_offset_expr(offset);
         return Some(format!(
             "({}*)(((uint8_t*){}) + (int64_t){})",
             ty, base_render, byte_offset
@@ -771,6 +774,29 @@ fn render_pointer_index_expr(index: &Expr) -> String {
         | Expr::Builtin(_)
         | Expr::PtrLane { .. } => index.render(),
         _ => format!("({})", index.render()),
+    }
+}
+
+fn render_byte_offset_expr(offset: &Expr) -> String {
+    match strip_index_widen_casts(offset) {
+        Expr::Binary { op, lhs, rhs } if op == "*" => {
+            if expr_integer_value(rhs).is_some() {
+                return format!(
+                    "{} * {}",
+                    render_pointer_index_expr(lhs),
+                    render_pointer_index_expr(rhs)
+                );
+            }
+            if expr_integer_value(lhs).is_some() {
+                return format!(
+                    "{} * {}",
+                    render_pointer_index_expr(rhs),
+                    render_pointer_index_expr(lhs)
+                );
+            }
+            render_pointer_index_expr(offset)
+        }
+        _ => render_pointer_index_expr(offset),
     }
 }
 
@@ -929,25 +955,42 @@ fn binary_prec(op: &str) -> u8 {
 }
 
 fn render_decl_signature(decl: &Decl) -> String {
-    format!("{} {}", decl.ty, render_decl_name(decl))
+    format!("{} {}", render_decl_ty(decl), render_decl_name(decl))
 }
 
 fn render_decl_line(decl: &Decl) -> String {
     let storage = match decl.storage {
         StorageClass::Param | StorageClass::Local => "",
+        StorageClass::Shared if decl.dynamic_extent => "extern __shared__ ",
         StorageClass::Shared => "__shared__ ",
     };
     let live_in = if decl.live_in { " // live-in" } else { "" };
-    format!("{}{} {};{}", storage, decl.ty, render_decl_name(decl), live_in)
+    format!(
+        "{}{} {};{}",
+        storage,
+        render_decl_ty(decl),
+        render_decl_name(decl),
+        live_in
+    )
         .replace(&format!(";{}", live_in), ";")
         + live_in
 }
 
 fn render_decl_name(decl: &Decl) -> String {
+    if decl.dynamic_extent && matches!(decl.storage, StorageClass::Shared) {
+        return format!("{}[]", decl.name);
+    }
     match decl.array_len {
         Some(len) => format!("{}[{}]", decl.name, len),
         None => decl.name.clone(),
     }
+}
+
+fn render_decl_ty(decl: &Decl) -> String {
+    if decl.dynamic_extent && matches!(decl.storage, StorageClass::Local) {
+        return format!("{}*", decl.ty);
+    }
+    decl.ty.clone()
 }
 
 #[cfg(test)]

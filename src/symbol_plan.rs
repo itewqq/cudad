@@ -56,6 +56,7 @@ fn planned_params(analysis: &FunctionAnalysis) -> Vec<Decl> {
             name,
             ty,
             array_len: None,
+            dynamic_extent: false,
             storage: StorageClass::Param,
             live_in: false,
         });
@@ -89,10 +90,12 @@ fn planned_space_decls(analysis: &FunctionAnalysis) -> Vec<Decl> {
         .iter()
         .any(|access| access.space == CudaMemorySpace::Shared)
     {
+        let (array_len, dynamic_extent) = planned_space_decl_shape(analysis, CudaMemorySpace::Shared);
         out.push(Decl {
             name: "shmem".to_string(),
             ty: "uint32_t".to_string(),
-            array_len: Some(planned_space_array_len(analysis, CudaMemorySpace::Shared)),
+            array_len,
+            dynamic_extent,
             storage: StorageClass::Shared,
             live_in: false,
         });
@@ -102,10 +105,12 @@ fn planned_space_decls(analysis: &FunctionAnalysis) -> Vec<Decl> {
         .iter()
         .any(|access| access.space == CudaMemorySpace::Local)
     {
+        let (array_len, dynamic_extent) = planned_space_decl_shape(analysis, CudaMemorySpace::Local);
         out.push(Decl {
             name: "local_mem".to_string(),
             ty: "uint32_t".to_string(),
-            array_len: Some(planned_space_array_len(analysis, CudaMemorySpace::Local)),
+            array_len,
+            dynamic_extent,
             storage: StorageClass::Local,
             live_in: false,
         });
@@ -113,12 +118,22 @@ fn planned_space_decls(analysis: &FunctionAnalysis) -> Vec<Decl> {
     out
 }
 
-fn planned_space_array_len(analysis: &FunctionAnalysis, space: CudaMemorySpace) -> usize {
-    analysis
+fn planned_space_decl_shape(
+    analysis: &FunctionAnalysis,
+    space: CudaMemorySpace,
+) -> (Option<usize>, bool) {
+    let relevant = analysis
         .mem_accesses
         .iter()
         .filter(|access| access.space == space)
-        .fold(1usize, |max_len, access| {
+        .collect::<Vec<_>>();
+    let needs_dynamic_extent = relevant.iter().any(|access| {
+        access.has_dynamic_offset || access.constant_byte_offset.is_some_and(|offset| offset < 0)
+    });
+    if needs_dynamic_extent {
+        return (None, true);
+    }
+    let array_len = relevant.into_iter().fold(1usize, |max_len, access| {
             let elem_bytes = access
                 .bit_width
                 .map(|bits| usize::try_from(bits / 8).unwrap_or(4))
@@ -132,7 +147,8 @@ fn planned_space_array_len(analysis: &FunctionAnalysis, space: CudaMemorySpace) 
                 .map(|offset| offset / elem_bytes)
                 .unwrap_or(0);
             max_len.max(base_index + lanes)
-        })
+        });
+    (Some(array_len), false)
 }
 
 fn collect_declared_locals(stmt: &Stmt, locals: &mut Vec<Decl>, seen: &mut BTreeSet<String>) {
@@ -256,6 +272,7 @@ fn maybe_add_local(name: &str, locals: &mut Vec<Decl>, seen: &mut BTreeSet<Strin
             "uint32_t".to_string()
         },
         array_len: None,
+        dynamic_extent: false,
         storage: StorageClass::Local,
         live_in: false,
     });
@@ -309,6 +326,7 @@ mod tests {
             bit_width: Some(32),
             vector_width: None,
             constant_byte_offset: Some(8),
+            has_dynamic_offset: false,
             root: AddressRoot::SharedObject("shmem".to_string()),
         });
         let function = StructuredFunction {
@@ -332,9 +350,38 @@ mod tests {
         assert_eq!(plan.params[1].name, "arg4");
         assert_eq!(plan.locals[0].name, "shmem");
         assert_eq!(plan.locals[0].array_len, Some(3));
+        assert!(!plan.locals[0].dynamic_extent);
         assert_eq!(plan.locals[0].storage, StorageClass::Shared);
         assert_eq!(plan.locals[1].name, "v0");
         assert_eq!(plan.locals[2].name, "b1");
         assert_eq!(plan.locals[2].ty, "bool");
+    }
+
+    #[test]
+    fn plans_dynamic_shared_objects_without_fake_fixed_extent() {
+        let mut analysis = FunctionAnalysis::default();
+        analysis.mem_accesses.push(MemAccessInfo {
+            block_id: 0,
+            stmt_idx: 0,
+            kind: MemAccessKind::Store,
+            space: CudaMemorySpace::Shared,
+            bit_width: Some(32),
+            vector_width: None,
+            constant_byte_offset: Some(8),
+            has_dynamic_offset: true,
+            root: AddressRoot::SharedObject("shmem".to_string()),
+        });
+
+        let plan = plan_symbols(
+            &StructuredFunction {
+                params: Vec::new(),
+                locals: Vec::new(),
+                body: Stmt::Empty,
+            },
+            &analysis,
+        );
+        assert_eq!(plan.locals[0].name, "shmem");
+        assert_eq!(plan.locals[0].array_len, None);
+        assert!(plan.locals[0].dynamic_extent);
     }
 }
