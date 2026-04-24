@@ -898,6 +898,31 @@ fn canonical_full_pass_lowers_imad_wide_param_roots_through_helper_path() {
 }
 
 #[test]
+fn canonical_full_pass_lowers_iadd64_param_roots_into_typed_loads() {
+    let rendered = run_canonical_output_full_pass_from_instrs(
+        decode_sass(
+            "/*0000*/ LDC.64 R4, c[0x0][0x160] ;\n\
+             /*0010*/ SHF.R.S32.HI R7, RZ, 0x1f, R6 ;\n\
+             /*0020*/ IADD.64 R4, R6, R4 ;\n\
+             /*0030*/ LDG.E.U8 R8, [R4.64] ;\n\
+             /*0040*/ LDC.64 R10, c[0x0][0x168] ;\n\
+             /*0050*/ STG.E.U8 [R10.64], R8 ;\n\
+             /*0060*/ EXIT ;\n",
+        ),
+        None,
+        "kernel",
+    );
+    assert!(
+        rendered.contains("arg0_ptr[((uintptr_t)(((uint64_t)(r7_0) << 32) | (uint32_t)(r6_0)))]"),
+        "expected IADD.64-rooted load to stay on arg0_ptr with a widened byte offset, got:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("addr64("),
+        "expected canonical output to avoid raw addr64 helpers, got:\n{rendered}"
+    );
+}
+
+#[test]
 fn canonical_full_pass_histogram256_lowers_shared_atomic_popc_and_barriers() {
     let hist = split_decoded_functions(include_str!("../test_cu/corpus/shared_mem_kernels.sass"))
         .into_iter()

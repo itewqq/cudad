@@ -87,8 +87,9 @@ pub fn analyze_function_ir_with_profile(
     abi_profile_override: Option<AbiProfile>,
     sm: Option<u32>,
 ) -> FunctionAnalysis {
-    let abi_profile = abi_profile_override
-        .or_else(|| (!instructions.is_empty()).then(|| AbiProfile::detect_with_sm(instructions, sm)));
+    let abi_profile = abi_profile_override.or_else(|| {
+        (!instructions.is_empty()).then(|| AbiProfile::detect_with_sm(instructions, sm))
+    });
     let abi_annotations = abi_profile
         .map(|profile| annotate_function_ir_constmem(function_ir, profile))
         .unwrap_or_default();
@@ -162,13 +163,16 @@ fn propagate_address_facts(
                     .and_then(|annotations| root_from_annotation(0, annotations, abi_aliases));
                 let propagated = match &stmt.value {
                     RValue::Phi(args) => {
-                        let merged = merge_roots(args.iter().filter_map(|expr| expr_root(expr, &roots)));
+                        let merged =
+                            merge_roots(args.iter().filter_map(|expr| expr_root(expr, &roots)));
                         let byte_offset = merge_offsets(
                             args.iter()
                                 .filter_map(|expr| expr_byte_offset(expr, &roots, &byte_offsets)),
                         );
                         match (merged, byte_offset) {
-                            (Some(root), Some(byte_offset)) => Some((root, byte_offset, stmt.defs.clone())),
+                            (Some(root), Some(byte_offset)) => {
+                                Some((root, byte_offset, stmt.defs.clone()))
+                            }
                             _ => None,
                         }
                     }
@@ -187,7 +191,7 @@ fn propagate_address_facts(
                             &roots,
                             &byte_offsets,
                         )
-                            .map(|(root, byte_offset)| (root, byte_offset, stmt.defs.clone()))
+                        .map(|(root, byte_offset)| (root, byte_offset, stmt.defs.clone()))
                     }
                     _ => None,
                 };
@@ -202,9 +206,13 @@ fn propagate_address_facts(
                     if !can_carry_pointer_facts(reg) {
                         continue;
                     }
-                    let changed_root = insert_root_if_changed(&mut roots, reg.clone(), root.clone());
-                    let changed_offset =
-                        insert_offset_if_changed(&mut byte_offsets, reg.clone(), byte_offset.clone());
+                    let changed_root =
+                        insert_root_if_changed(&mut roots, reg.clone(), root.clone());
+                    let changed_offset = insert_offset_if_changed(
+                        &mut byte_offsets,
+                        reg.clone(),
+                        byte_offset.clone(),
+                    );
                     if changed_root || changed_offset {
                         queue.push_back(reg.clone());
                     }
@@ -234,10 +242,16 @@ fn root_from_annotation(
                 return Some(AddressRoot::ConstSymbol((*name).to_string()));
             }
             ConstMemSemantic::AbiInternal(offset) => {
-                return Some(AddressRoot::ConstSymbol(format!("abi_internal_0x{:x}", offset)));
+                return Some(AddressRoot::ConstSymbol(format!(
+                    "abi_internal_0x{:x}",
+                    offset
+                )));
             }
             ConstMemSemantic::Unknown { bank, offset } => {
-                return Some(AddressRoot::ConstSymbol(format!("c[0x{:x}][0x{:x}]", bank, offset)));
+                return Some(AddressRoot::ConstSymbol(format!(
+                    "c[0x{:x}][0x{:x}]",
+                    bank, offset
+                )));
             }
         }
     }
@@ -280,7 +294,10 @@ fn merge_offsets(offsets: impl Iterator<Item = IRExpr>) -> Option<IRExpr> {
 
 fn expr_root(expr: &IRExpr, roots: &BTreeMap<RegId, AddressRoot>) -> Option<AddressRoot> {
     match expr {
-        IRExpr::Reg(reg) => can_carry_pointer_facts(reg).then(|| roots.get(reg)).flatten().cloned(),
+        IRExpr::Reg(reg) => can_carry_pointer_facts(reg)
+            .then(|| roots.get(reg))
+            .flatten()
+            .cloned(),
         IRExpr::Addr64 { lo, hi } => {
             let lo_root = expr_root(lo, roots)?;
             let hi_root = expr_root(hi, roots)?;
@@ -343,6 +360,9 @@ fn propagate_pointer_arith(
     if opcode.starts_with("IMAD.WIDE") || opcode.starts_with("UIMAD.WIDE") {
         return propagate_imad_wide_pointer_arith(args, annotated_root, roots, byte_offsets);
     }
+    if opcode.starts_with("IADD.64") {
+        return propagate_iadd64_pointer_arith(args, roots, byte_offsets);
+    }
     propagate_additive_pointer_arith(args, annotated_root, roots, byte_offsets)
 }
 
@@ -396,6 +416,34 @@ fn propagate_imad_wide_pointer_arith(
     };
     let product = mul_offset_expr(args.first()?.clone(), args.get(1)?.clone());
     Some((root, add_offset_expr(base_offset, product)))
+}
+
+fn propagate_iadd64_pointer_arith(
+    args: &[IRExpr],
+    roots: &BTreeMap<RegId, AddressRoot>,
+    byte_offsets: &BTreeMap<RegId, IRExpr>,
+) -> Option<(AddressRoot, IRExpr)> {
+    let lhs = wide_pair_expr(args.first()?.clone(), args.get(2)?.clone());
+    let rhs = wide_pair_expr(args.get(1)?.clone(), args.get(3)?.clone());
+    let lhs_root = expr_root(&lhs, roots).zip(expr_byte_offset(&lhs, roots, byte_offsets));
+    let rhs_root = expr_root(&rhs, roots).zip(expr_byte_offset(&rhs, roots, byte_offsets));
+    match (lhs_root, rhs_root) {
+        (Some((root, base_offset)), None) => Some((
+            root,
+            add_offset_expr(
+                base_offset,
+                wide_pair_offset_expr(args.get(1)?, args.get(3)?),
+            ),
+        )),
+        (None, Some((root, base_offset))) => Some((
+            root,
+            add_offset_expr(
+                base_offset,
+                wide_pair_offset_expr(args.first()?, args.get(2)?),
+            ),
+        )),
+        _ => None,
+    }
 }
 
 fn collect_memory_accesses(
@@ -543,6 +591,7 @@ fn is_pointer_arith_like(opcode: &str) -> bool {
     let mnem = opcode.split('.').next().unwrap_or(opcode);
     matches!(mnem, "LEA" | "ULEA" | "IADD" | "IADD3" | "UIADD" | "UIADD3")
         || opcode.starts_with("IMAD.WIDE")
+        || opcode.starts_with("IADD.64")
 }
 
 fn add_offset_expr(lhs: IRExpr, rhs: IRExpr) -> IRExpr {
@@ -594,13 +643,26 @@ fn can_carry_pointer_facts(reg: &RegId) -> bool {
     matches!(reg.class.as_str(), "R" | "UR")
 }
 
+fn wide_pair_expr(lo: IRExpr, hi: IRExpr) -> IRExpr {
+    IRExpr::Addr64 {
+        lo: Box::new(lo),
+        hi: Box::new(hi),
+    }
+}
+
+fn wide_pair_offset_expr(lo: &IRExpr, hi: &IRExpr) -> IRExpr {
+    if is_zero_like_expr(hi) {
+        return lo.clone();
+    }
+    wide_pair_expr(lo.clone(), hi.clone())
+}
+
 fn first_reg_in_expr(expr: &IRExpr) -> Option<RegId> {
     match expr {
         IRExpr::Reg(reg) => can_carry_pointer_facts(reg).then_some(reg.clone()),
         IRExpr::Addr64 { lo, hi } => first_reg_in_expr(lo).or_else(|| first_reg_in_expr(hi)),
-        IRExpr::Mem { base, offset, .. } => {
-            first_reg_in_expr(base).or_else(|| offset.as_ref().and_then(|expr| first_reg_in_expr(expr)))
-        }
+        IRExpr::Mem { base, offset, .. } => first_reg_in_expr(base)
+            .or_else(|| offset.as_ref().and_then(|expr| first_reg_in_expr(expr))),
         IRExpr::Op { args, .. } => args.iter().find_map(first_reg_in_expr),
         IRExpr::ImmI(_) | IRExpr::ImmF(_) => None,
     }
@@ -642,9 +704,7 @@ fn has_dynamic_offset_term(expr: &IRExpr) -> bool {
     match expr {
         IRExpr::Mem { base, offset, .. } => {
             has_dynamic_offset_term(base.as_ref())
-                || offset
-                    .as_deref()
-                    .is_some_and(has_dynamic_offset_term)
+                || offset.as_deref().is_some_and(has_dynamic_offset_term)
         }
         IRExpr::Reg(reg) => !matches!(reg.class.as_str(), "RZ" | "URZ"),
         IRExpr::Addr64 { lo, hi } => {
@@ -670,10 +730,16 @@ fn opcode_memory_bit_width(opcode: &str) -> Option<u32> {
     if parts.iter().any(|part| matches!(*part, "U8" | "S8" | "B8")) {
         return Some(8);
     }
-    if parts.iter().any(|part| matches!(*part, "U16" | "S16" | "B16" | "F16")) {
+    if parts
+        .iter()
+        .any(|part| matches!(*part, "U16" | "S16" | "B16" | "F16"))
+    {
         return Some(16);
     }
-    if parts.iter().any(|part| matches!(*part, "64" | "U64" | "S64")) {
+    if parts
+        .iter()
+        .any(|part| matches!(*part, "64" | "U64" | "S64"))
+    {
         return Some(64);
     }
     if parts.iter().any(|part| matches!(*part, "128")) {
@@ -696,7 +762,10 @@ fn stmt_like_memory_opcode(opcode: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{build_cfg, build_ssa, decode_sass, ir_algebra, ir_constprop, ir_copyprop, ir_cse, ir_dce, split_decoded_functions};
+    use crate::{
+        build_cfg, build_ssa, decode_sass, ir_algebra, ir_constprop, ir_copyprop, ir_cse, ir_dce,
+        split_decoded_functions,
+    };
 
     fn analyze(sass: &str) -> FunctionAnalysis {
         let instrs = decode_sass(sass);
@@ -802,11 +871,31 @@ mod tests {
     }
 
     #[test]
+    fn propagates_param_roots_through_iadd64_pairs() {
+        let sass = r#"
+            /*0000*/ LDC.64 R10, c[0x0][0x160] ;
+            /*0010*/ SHF.R.S32.HI R13, RZ, 0x1f, R5 ;
+            /*0020*/ IADD.64 R12, R5, R10 ;
+            /*0030*/ LDG.E.U8 R4, [R12.64] ;
+            /*0040*/ EXIT ;
+        "#;
+        let analysis = analyze(sass);
+        let global = analysis
+            .mem_accesses
+            .iter()
+            .find(|access| access.space == CudaMemorySpace::Global)
+            .expect("global access");
+        assert_eq!(global.root, AddressRoot::ParamWord(0));
+    }
+
+    #[test]
     fn ignores_predicate_carry_defs_during_pointer_propagation() {
-        let hist = split_decoded_functions(include_str!("../test_cu/corpus_sm100/shared_mem_kernels.sass"))
-            .into_iter()
-            .find(|func| func.name == "histogram256")
-            .expect("histogram256 fixture should exist");
+        let hist = split_decoded_functions(include_str!(
+            "../test_cu/corpus_sm100/shared_mem_kernels.sass"
+        ))
+        .into_iter()
+        .find(|func| func.name == "histogram256")
+        .expect("histogram256 fixture should exist");
         let analysis = analyze_optimized_instrs(hist.instrs, hist.sm);
         assert!(
             analysis
@@ -846,7 +935,10 @@ mod tests {
             byte_offset,
             &IRExpr::Op {
                 op: "*".to_string(),
-                args: vec![IRExpr::Reg(crate::ir::RegId::new("R", 3, 1).with_ssa(0)), IRExpr::ImmI(4)],
+                args: vec![
+                    IRExpr::Reg(crate::ir::RegId::new("R", 3, 1).with_ssa(0)),
+                    IRExpr::ImmI(4)
+                ],
             }
         );
         let global = analysis

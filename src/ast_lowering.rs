@@ -559,9 +559,9 @@ fn lower_scalar_expr(expr: &IRExpr) -> Expr {
         IRExpr::Reg(reg) => lower_reg_expr(reg),
         IRExpr::ImmI(value) => Expr::Imm(value.to_string()),
         IRExpr::ImmF(value) => Expr::Imm(value.to_string()),
-        IRExpr::Addr64 { lo, hi } => Expr::CallLike {
-            func: "addr64".to_string(),
-            args: vec![lower_scalar_expr(lo), lower_scalar_expr(hi)],
+        IRExpr::Addr64 { lo, hi } => Expr::Addr64 {
+            lo: Box::new(lower_scalar_expr(lo)),
+            hi: Box::new(lower_scalar_expr(hi)),
         },
         IRExpr::Mem { .. } => Expr::Raw("/*mem*/".to_string()),
         IRExpr::Op { op, args } => lower_ir_op_expr(op, args),

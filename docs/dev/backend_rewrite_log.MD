@@ -82,6 +82,10 @@
 - Pointer-root propagation now ignores predicate/carry defs and other
   non-address registers, which prevents non-convergent root worklists on
   Blackwell carry-heavy loops while keeping real `R`/`UR` address facts.
+- Canonical address recovery now propagates rooted `IADD.64` pairs and lowers
+  `Addr64` AST nodes structurally, which removes raw `addr64(...)` helper leaks
+  from the canonical path and lets more wide-addressed loads/stores render
+  directly from analysis facts.
 - Early AST lowering can now emit space-aware AST for:
   - global param-rooted loads
   - shared/local indexed stores
@@ -98,7 +102,7 @@
 1. Switch the remaining curated full-pass tests and helper entrypoints from the
    old structured-output path onto the canonical driver, starting with the
    fixtures that now pass thanks to semantic scalar lowering and the
-   carry-predicate analysis fix.
+   carry-predicate analysis fix plus rooted `IADD.64` recovery.
 2. Delete duplicated CLI/test helper logic that still builds semantic-lift,
    token-map, or post-render cleanup artifacts after the canonical path is
    proven on those fixtures.
