@@ -82,6 +82,7 @@ impl IntrinsicOp {
 pub struct Decl {
     pub name: String,
     pub ty: String,
+    pub array_len: Option<usize>,
     pub storage: StorageClass,
     pub live_in: bool,
 }
@@ -928,7 +929,7 @@ fn binary_prec(op: &str) -> u8 {
 }
 
 fn render_decl_signature(decl: &Decl) -> String {
-    format!("{} {}", decl.ty, decl.name)
+    format!("{} {}", decl.ty, render_decl_name(decl))
 }
 
 fn render_decl_line(decl: &Decl) -> String {
@@ -937,9 +938,16 @@ fn render_decl_line(decl: &Decl) -> String {
         StorageClass::Shared => "__shared__ ",
     };
     let live_in = if decl.live_in { " // live-in" } else { "" };
-    format!("{}{} {};{}", storage, decl.ty, decl.name, live_in)
+    format!("{}{} {};{}", storage, decl.ty, render_decl_name(decl), live_in)
         .replace(&format!(";{}", live_in), ";")
         + live_in
+}
+
+fn render_decl_name(decl: &Decl) -> String {
+    match decl.array_len {
+        Some(len) => format!("{}[{}]", decl.name, len),
+        None => decl.name.clone(),
+    }
 }
 
 #[cfg(test)]

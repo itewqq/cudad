@@ -55,6 +55,7 @@ fn planned_params(analysis: &FunctionAnalysis) -> Vec<Decl> {
         out.push(Decl {
             name,
             ty,
+            array_len: None,
             storage: StorageClass::Param,
             live_in: false,
         });
@@ -91,6 +92,7 @@ fn planned_space_decls(analysis: &FunctionAnalysis) -> Vec<Decl> {
         out.push(Decl {
             name: "shmem".to_string(),
             ty: "uint32_t".to_string(),
+            array_len: Some(planned_space_array_len(analysis, CudaMemorySpace::Shared)),
             storage: StorageClass::Shared,
             live_in: false,
         });
@@ -103,11 +105,34 @@ fn planned_space_decls(analysis: &FunctionAnalysis) -> Vec<Decl> {
         out.push(Decl {
             name: "local_mem".to_string(),
             ty: "uint32_t".to_string(),
+            array_len: Some(planned_space_array_len(analysis, CudaMemorySpace::Local)),
             storage: StorageClass::Local,
             live_in: false,
         });
     }
     out
+}
+
+fn planned_space_array_len(analysis: &FunctionAnalysis, space: CudaMemorySpace) -> usize {
+    analysis
+        .mem_accesses
+        .iter()
+        .filter(|access| access.space == space)
+        .fold(1usize, |max_len, access| {
+            let elem_bytes = access
+                .bit_width
+                .map(|bits| usize::try_from(bits / 8).unwrap_or(4))
+                .map(|bytes| bytes / usize::from(access.vector_width.unwrap_or(1)).max(1))
+                .filter(|bytes| *bytes > 0)
+                .unwrap_or(4);
+            let lanes = usize::from(access.vector_width.unwrap_or(1)).max(1);
+            let base_index = access
+                .constant_byte_offset
+                .and_then(|offset| usize::try_from(offset).ok())
+                .map(|offset| offset / elem_bytes)
+                .unwrap_or(0);
+            max_len.max(base_index + lanes)
+        })
 }
 
 fn collect_declared_locals(stmt: &Stmt, locals: &mut Vec<Decl>, seen: &mut BTreeSet<String>) {
@@ -230,6 +255,7 @@ fn maybe_add_local(name: &str, locals: &mut Vec<Decl>, seen: &mut BTreeSet<Strin
         } else {
             "uint32_t".to_string()
         },
+        array_len: None,
         storage: StorageClass::Local,
         live_in: false,
     });
@@ -282,6 +308,7 @@ mod tests {
             space: CudaMemorySpace::Shared,
             bit_width: Some(32),
             vector_width: None,
+            constant_byte_offset: Some(8),
             root: AddressRoot::SharedObject("shmem".to_string()),
         });
         let function = StructuredFunction {
@@ -304,6 +331,7 @@ mod tests {
         assert_eq!(plan.params[0].ty, "float*");
         assert_eq!(plan.params[1].name, "arg4");
         assert_eq!(plan.locals[0].name, "shmem");
+        assert_eq!(plan.locals[0].array_len, Some(3));
         assert_eq!(plan.locals[0].storage, StorageClass::Shared);
         assert_eq!(plan.locals[1].name, "v0");
         assert_eq!(plan.locals[2].name, "b1");

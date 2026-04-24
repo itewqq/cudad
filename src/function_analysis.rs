@@ -58,6 +58,7 @@ pub struct MemAccessInfo {
     pub space: CudaMemorySpace,
     pub bit_width: Option<u32>,
     pub vector_width: Option<u8>,
+    pub constant_byte_offset: Option<i64>,
     pub root: AddressRoot,
 }
 
@@ -86,7 +87,8 @@ pub fn analyze_function_ir(
     };
 
     let root_by_reg = propagate_address_roots(function_ir, &abi_annotations, &abi_aliases);
-    let mem_accesses = collect_memory_accesses(function_ir, &root_by_reg);
+    let mem_accesses =
+        collect_memory_accesses(function_ir, &abi_annotations, &abi_aliases, &root_by_reg);
 
     FunctionAnalysis {
         abi_profile,
@@ -221,7 +223,13 @@ fn merge_roots(roots: impl Iterator<Item = AddressRoot>) -> Option<AddressRoot> 
 
 fn expr_root(expr: &IRExpr, roots: &BTreeMap<RegId, AddressRoot>) -> Option<AddressRoot> {
     match expr {
-        IRExpr::Reg(reg) => roots.get(reg).cloned().or_else(|| Some(AddressRoot::RegisterBase(reg.clone()))),
+        IRExpr::Reg(reg) => {
+            if matches!(reg.class.as_str(), "RZ" | "URZ" | "PT" | "UPT") {
+                None
+            } else {
+                roots.get(reg).cloned()
+            }
+        }
         IRExpr::Addr64 { lo, hi } => {
             let lo_root = expr_root(lo, roots)?;
             let hi_root = expr_root(hi, roots)?;
@@ -243,19 +251,31 @@ fn expr_root(expr: &IRExpr, roots: &BTreeMap<RegId, AddressRoot>) -> Option<Addr
 
 fn collect_memory_accesses(
     function_ir: &FunctionIR,
+    abi_annotations: &AbiAnnotations,
+    abi_aliases: &AbiArgAliases,
     root_by_reg: &BTreeMap<RegId, AddressRoot>,
 ) -> Vec<MemAccessInfo> {
     let mut out = Vec::new();
     for block in &function_ir.blocks {
         for (stmt_idx, stmt) in block.stmts.iter().enumerate() {
-            let Some((kind, space)) = classify_stmt_memory(stmt) else {
+            let Some((kind, seed_space)) = classify_stmt_memory(stmt) else {
                 continue;
             };
+            let stmt_ref = StatementRef {
+                block_id: block.id,
+                stmt_idx,
+            };
+            let annotated_root = abi_annotations
+                .constmem_by_stmt
+                .get(&stmt_ref)
+                .and_then(|annotations| root_from_annotation(0, annotations, abi_aliases));
+            let space = refine_memory_space(seed_space, annotated_root.as_ref());
             let root = stmt
                 .mem_addr_args
                 .as_ref()
                 .and_then(|args| args.first())
                 .and_then(|expr| expr_root(expr, root_by_reg))
+                .or(annotated_root)
                 .unwrap_or_else(|| default_root_for_space(space, stmt));
             let bit_width = opcode_memory_bit_width(stmt_opcode(stmt));
             out.push(MemAccessInfo {
@@ -265,11 +285,26 @@ fn collect_memory_accesses(
                 space,
                 bit_width,
                 vector_width: opcode_vector_width(stmt_opcode(stmt)),
+                constant_byte_offset: stmt
+                    .mem_addr_args
+                    .as_ref()
+                    .and_then(|args| args.first())
+                    .and_then(constant_byte_offset),
                 root,
             });
         }
     }
     out
+}
+
+fn refine_memory_space(
+    seed_space: CudaMemorySpace,
+    annotated_root: Option<&AddressRoot>,
+) -> CudaMemorySpace {
+    match (seed_space, annotated_root) {
+        (CudaMemorySpace::Const, Some(AddressRoot::ParamWord(_))) => CudaMemorySpace::Param,
+        _ => seed_space,
+    }
 }
 
 fn classify_stmt_memory(stmt: &IRStatement) -> Option<(MemAccessKind, CudaMemorySpace)> {
@@ -337,11 +372,8 @@ fn is_root_copy_like(opcode: &str) -> bool {
 }
 
 fn is_pointer_arith_like(opcode: &str) -> bool {
-    opcode.starts_with("LEA")
-        || opcode.starts_with("ULEA")
-        || opcode.starts_with("IADD.64")
-        || opcode.starts_with("IADD3.64")
-        || opcode.starts_with("UIADD3.64")
+    let mnem = opcode.split('.').next().unwrap_or(opcode);
+    matches!(mnem, "LEA" | "ULEA" | "IADD" | "IADD3" | "UIADD" | "UIADD3")
         || opcode.starts_with("IMAD.WIDE")
 }
 
@@ -354,6 +386,38 @@ fn first_reg_in_expr(expr: &IRExpr) -> Option<RegId> {
         }
         IRExpr::Op { args, .. } => args.iter().find_map(first_reg_in_expr),
         IRExpr::ImmI(_) | IRExpr::ImmF(_) => None,
+    }
+}
+
+fn constant_byte_offset(expr: &IRExpr) -> Option<i64> {
+    match expr {
+        IRExpr::Mem { base, offset, .. } => Some(
+            static_immediate_component(base.as_ref())
+                + offset
+                    .as_deref()
+                    .map(static_immediate_component)
+                    .unwrap_or(0),
+        ),
+        IRExpr::Op { op, args } if op == "ConstMem" && args.len() == 2 => match args[1] {
+            IRExpr::ImmI(offset) => Some(offset),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn static_immediate_component(expr: &IRExpr) -> i64 {
+    match expr {
+        IRExpr::ImmI(value) => *value,
+        IRExpr::Op { op, args } if op == "+" => args.iter().map(static_immediate_component).sum(),
+        IRExpr::Op { op, args } if op == "-" && args.len() == 2 => {
+            static_immediate_component(&args[0]) - static_immediate_component(&args[1])
+        }
+        IRExpr::Addr64 { lo, hi } => {
+            static_immediate_component(lo)
+                + static_immediate_component(hi).checked_shl(32).unwrap_or(0)
+        }
+        IRExpr::Reg(_) | IRExpr::ImmF(_) | IRExpr::Mem { .. } | IRExpr::Op { .. } => 0,
     }
 }
 
@@ -434,7 +498,8 @@ mod tests {
         "#;
         let analysis = analyze(sass);
         assert_eq!(analysis.mem_accesses.len(), 3);
-        assert_eq!(analysis.mem_accesses[0].space, CudaMemorySpace::Const);
+        assert_eq!(analysis.mem_accesses[0].space, CudaMemorySpace::Param);
+        assert_eq!(analysis.mem_accesses[0].root, AddressRoot::ParamWord(0));
         assert_eq!(analysis.mem_accesses[1].space, CudaMemorySpace::Global);
         assert_eq!(analysis.mem_accesses[2].space, CudaMemorySpace::Global);
     }
@@ -466,5 +531,33 @@ mod tests {
         assert_eq!(analysis.mem_accesses.len(), 1);
         assert_eq!(analysis.mem_accesses[0].kind, MemAccessKind::Atomic);
         assert_eq!(analysis.mem_accesses[0].space, CudaMemorySpace::Shared);
+    }
+
+    #[test]
+    fn propagates_param_roots_through_iadd3_address_arithmetic() {
+        let sass = r#"
+            /*0000*/ MOV R4, c[0x0][0x160] ;
+            /*0010*/ MOV R5, c[0x0][0x164] ;
+            /*0020*/ IADD3 R4, R4, 0x4, RZ ;
+            /*0030*/ LDG.E R6, [R4.64] ;
+            /*0040*/ EXIT ;
+        "#;
+        let analysis = analyze(sass);
+        let global = analysis
+            .mem_accesses
+            .iter()
+            .find(|access| access.space == CudaMemorySpace::Global)
+            .expect("global access");
+        assert_eq!(global.root, AddressRoot::ParamWord(0));
+    }
+
+    #[test]
+    fn tracks_constant_byte_offsets_for_space_objects() {
+        let sass = r#"
+            /*0000*/ STS [R2+0x8], R4 ;
+            /*0010*/ EXIT ;
+        "#;
+        let analysis = analyze(sass);
+        assert_eq!(analysis.mem_accesses[0].constant_byte_offset, Some(8));
     }
 }

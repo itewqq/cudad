@@ -4,7 +4,7 @@
 
 - Branch: `codex/memory-aware-backend-refactor`
 - Checkpoint commit: `f464db3`
-- Current stage: phase 3 early AST lowering on top of memory-aware analysis
+- Current stage: phase 3 hardening of memory-aware analysis and structured AST lowering
 
 ## Landed invariants
 
@@ -19,6 +19,18 @@
   - symbol planning
 - `FunctionAnalysis` now classifies memory accesses by CUDA space and carries
   propagated address-root facts.
+- Canonical AST lowering now emits C/CUDA-safe SSA identifiers instead of raw
+  `R4.0` / `P0.0` register displays.
+- Predicated single-def statements now preserve their false-path value in the
+  structured AST instead of dropping the SSA old-def edge.
+- Atomic statements now preserve return-value defs when the opcode writes back
+  the old memory value.
+- Param-window `LDC` loads now lower to parameter symbols instead of falling
+  back to raw `ConstMem(...)` text.
+- Shared/local backing declarations now emit array objects sized from observed
+  constant offsets instead of invalid scalar placeholders.
+- Address-root propagation now keeps provenance through common `IADD`/`IADD3`
+  pointer arithmetic, including split pointer increments before `LDG`.
 - Early AST lowering can now emit space-aware AST for:
   - global param-rooted loads
   - shared/local indexed stores
@@ -34,9 +46,12 @@
 
 1. Replace the remaining placeholder non-memory AST lowering with semantic
    lowering that no longer depends on the old semantic-lift backend.
-2. Switch CLI/tests/examples to the canonical driver once the new path covers
+2. Teach analysis/lowering to recover dynamic byte offsets relative to rooted
+   global/shared/local objects instead of relying on constant-offset-only
+   indexing.
+3. Switch CLI/tests/examples to the canonical driver once the new path covers
    enough structured statements.
-3. Delete duplicated full-pass driver logic and transitional tests after the
+4. Delete duplicated full-pass driver logic and transitional tests after the
    new path is used by default.
 
 ## Open questions
@@ -45,14 +60,18 @@
 - Which current SSA passes need semantic updates once explicit memory ops land.
 - How much of the existing ABI logic can be lifted directly into
   `FunctionAnalysis`.
+- What the right canonical AST representation is for multi-def memory ops
+  (`LDC.64`, vector loads, etc.) before the big-bang cutover.
 
 ## Files/modules touched
 
 - `docs/dev/backend_rewrite.MD`
 - `docs/dev/backend_rewrite_log.MD`
 - `src/backend_pipeline.rs`
+- `src/backend_names.rs`
 - `src/function_analysis.rs`
 - `src/ast_lowering.rs`
+- `src/ast.rs`
 - `src/memory_model.rs`
 - `src/symbol_plan.rs`
 - `src/lib.rs`

@@ -50,6 +50,14 @@ first cutover and should remain explicit unsupported/special forms.
 - New backend modules must document their inputs, outputs, invariants, and
   forbidden responsibilities in rustdoc headers.
 
+## Canonical identifier contract
+
+- New backend AST lowering must emit legal C/CUDA identifiers directly.
+- SSA register names are normalized structurally from `(class, idx, ssa)`; the
+  renderer must not clean up raw `R4.0`-style names after the fact.
+- Predicate registers must stay recognizable after renaming so symbol planning
+  can type them as `bool`.
+
 ## Deletion bar
 
 The old post-struct backend is removed at cutover. That includes:

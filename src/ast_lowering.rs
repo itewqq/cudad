@@ -22,7 +22,8 @@
 //! - inspect previously rendered code
 //! - repair names or declarations after rendering
 
-use crate::ast::{Expr, LValue, Stmt};
+use crate::abi::ConstMemSemantic;
+use crate::ast::{Expr, LValue, PointerLane, Stmt};
 use crate::backend_names::canonical_reg_ident;
 use crate::function_analysis::{AddressRoot, FunctionAnalysis, MemAccessInfo};
 use crate::ir::{IRExpr, IRStatement, RValue};
@@ -175,6 +176,9 @@ pub fn lower_memory_load_expr(
     access: &MemAccessInfo,
     analysis: &FunctionAnalysis,
 ) -> Option<Expr> {
+    if let Some(special) = lower_constmem_load_expr(access, analysis) {
+        return Some(special);
+    }
     let (base, index) = lower_base_and_index(stmt, access, analysis)?;
     Some(Expr::Index {
         base: Box::new(base),
@@ -203,6 +207,37 @@ fn lookup_mem_access<'a>(
         .mem_accesses
         .iter()
         .find(|access| access.block_id == block_id && access.stmt_idx == stmt_idx)
+}
+
+fn lower_constmem_load_expr(
+    access: &MemAccessInfo,
+    analysis: &FunctionAnalysis,
+) -> Option<Expr> {
+    let stmt_ref = crate::abi::StatementRef {
+        block_id: access.block_id,
+        stmt_idx: access.stmt_idx,
+    };
+    let annotation = analysis
+        .abi_annotations
+        .constmem_by_stmt
+        .get(&stmt_ref)
+        .and_then(|annotations| annotations.first())?;
+    match &annotation.semantic {
+        ConstMemSemantic::ParamWord { param_idx, word_idx } => {
+            let rendered = analysis
+                .abi_aliases
+                .render_param_word(*param_idx, *word_idx)
+                .unwrap_or_else(|| format!("param_{}", param_idx.saturating_add(*word_idx)));
+            Some(named_param_word_expr(&rendered))
+        }
+        ConstMemSemantic::Builtin(name) => Some(Expr::Builtin((*name).to_string())),
+        ConstMemSemantic::AbiInternal(offset) => {
+            Some(Expr::ConstMemSymbol(format!("abi_internal_0x{:x}", offset)))
+        }
+        ConstMemSemantic::Unknown { bank, offset } => {
+            Some(Expr::ConstMemSymbol(format!("c[0x{:x}][0x{:x}]", bank, offset)))
+        }
+    }
 }
 
 fn lower_base_and_index(
@@ -407,6 +442,14 @@ fn lower_reg_name(reg: &crate::ir::RegId) -> String {
     canonical_reg_ident(reg)
 }
 
+fn named_param_word_expr(name: &str) -> Expr {
+    if let Some((base, lane)) = PointerLane::parse_named(name) {
+        Expr::PtrLane { base, lane }
+    } else {
+        Expr::Reg(name.to_string())
+    }
+}
+
 fn apply_stmt_predicate(stmt: &IRStatement, lowered: Stmt) -> Stmt {
     let Some(pred) = &stmt.pred else {
         return lowered;
@@ -501,6 +544,23 @@ mod tests {
     }
 
     #[test]
+    fn lowers_param_window_loads_to_kernel_param_symbols() {
+        let sass = r#"
+            /*0000*/ LDC R4, c[0x0][0x160] ;
+            /*0010*/ LDC R5, c[0x0][0x164] ;
+            /*0020*/ EXIT ;
+        "#;
+        let (analysis, block_id, stmt_idx, stmt) =
+            analyze_stmt(sass, |stmt| stmt_opcode(stmt).starts_with("LDC") && stmt.defs.first().and_then(IRExpr::get_reg).is_some_and(|reg| reg.idx == 4));
+        let lowered = lower_memory_stmt(block_id, stmt_idx, &stmt, &analysis).expect("lowered");
+        let Stmt::Assign { src, .. } = lowered else {
+            panic!("expected assignment");
+        };
+        assert!(src.render().starts_with("arg0"));
+        assert!(!src.render().contains("ConstMem"));
+    }
+
+    #[test]
     fn lowers_predicated_defs_to_ternary_assignments() {
         let stmt = IRStatement {
             defs: vec![IRExpr::Reg(crate::ir::RegId::new("R", 4, 1).with_ssa(2))],
@@ -550,6 +610,7 @@ mod tests {
             space: CudaMemorySpace::Shared,
             bit_width: Some(32),
             vector_width: None,
+            constant_byte_offset: Some(0),
             root: AddressRoot::SharedObject("shmem".to_string()),
         });
         let lowered = lower_basic_stmt(0, 0, &stmt, &analysis);
