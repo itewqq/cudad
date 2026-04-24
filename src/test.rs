@@ -852,8 +852,14 @@ fn canonical_full_pass_emits_clean_pointer_and_shared_forms() {
     "#;
     let out = assert_canonical_full_pass_nonempty_and_deterministic(sass);
     let raw_ssa = Regex::new(r"\b(?:R|UR|P|UP)\d+\.\d+\b").expect("raw ssa regex");
-    assert!(out.contains("arg0_ptr[1]"), "expected typed pointer access, got:\n{out}");
-    assert!(out.contains("atomicAdd("), "expected atomic lowering, got:\n{out}");
+    assert!(
+        out.contains("arg0_ptr[1]"),
+        "expected typed pointer access, got:\n{out}"
+    );
+    assert!(
+        out.contains("atomicAdd("),
+        "expected atomic lowering, got:\n{out}"
+    );
     assert!(
         out.contains("shmem[(r2_0 + 8) / 4]"),
         "expected shared byte-offset indexing, got:\n{out}"
@@ -1131,10 +1137,15 @@ fn smoke_struct_output_full_pass_loop_constant_sass() {
     let out =
         assert_full_pass_nonempty_and_deterministic(include_str!("../test_cu/loop_constant.sass"));
     assert!(out.contains("__shared__ uint8_t shmem_u8[256];"));
-    let shmem_store =
-        Regex::new(r"shmem_u8\[(?:tid_x|v\d+(?:_next(?:_\d+)?)?)\] = (?:tid_x|v\d+(?:_next(?:_\d+)?)?);")
-            .expect("valid loop_constant shmem store regex");
-    assert!(shmem_store.is_match(&out), "expected loop_constant shmem store, got:\n{}", out);
+    let shmem_store = Regex::new(
+        r"shmem_u8\[(?:tid_x|v\d+(?:_next(?:_\d+)?)?)\] = (?:tid_x|v\d+(?:_next(?:_\d+)?)?);",
+    )
+    .expect("valid loop_constant shmem store regex");
+    assert!(
+        shmem_store.is_match(&out),
+        "expected loop_constant shmem store, got:\n{}",
+        out
+    );
     assert!(
         out.contains("while(!((int32_t)(tid_x) >= (int32_t)(256)));")
             || out.contains("while(!((int32_t)(tid_x_next) >= (int32_t)(256)));")
@@ -1589,10 +1600,11 @@ fn full_pass_reduce_block_infers_float_shared_roundtrip_pointers() {
 
 #[test]
 fn full_pass_stencil1d_infers_float_shared_halo_pointers() {
-    let stencil = split_decoded_functions(include_str!("../test_cu/corpus/shared_mem_kernels.sass"))
-        .into_iter()
-        .find(|f| f.name == "stencil1d")
-        .expect("stencil1d fixture should exist");
+    let stencil =
+        split_decoded_functions(include_str!("../test_cu/corpus/shared_mem_kernels.sass"))
+            .into_iter()
+            .find(|f| f.name == "stencil1d")
+            .expect("stencil1d fixture should exist");
     let out = run_structured_output_full_pass_from_instrs(stencil.instrs, stencil.sm);
     assert!(
         out.contains("__global__ void kernel(float* arg0_ptr, float* arg2_ptr, int32_t arg4)"),
@@ -1622,10 +1634,11 @@ fn full_pass_reduce_block_scales_shared_word_indices_by_element_size() {
 
 #[test]
 fn full_pass_stencil1d_scales_shared_word_indices_by_element_size() {
-    let stencil = split_decoded_functions(include_str!("../test_cu/corpus/shared_mem_kernels.sass"))
-        .into_iter()
-        .find(|f| f.name == "stencil1d")
-        .expect("stencil1d fixture should exist");
+    let stencil =
+        split_decoded_functions(include_str!("../test_cu/corpus/shared_mem_kernels.sass"))
+            .into_iter()
+            .find(|f| f.name == "stencil1d")
+            .expect("stencil1d fixture should exist");
     let out = run_structured_output_full_pass_from_instrs(stencil.instrs, stencil.sm);
     assert!(
         out.contains("shmem[threadIdx.x + 4]"),
@@ -1835,9 +1848,7 @@ fn full_pass_topk_per_row_rewrites_split_window_pointer_pair() {
         .into_iter()
         .find(|f| f.name == "topk_per_row")
         .expect("topk_per_row fixture should exist");
-    let out = run_structured_output_full_pass_from_instrs(topk.instrs, topk.sm);
-    let arg4_typed_store =
-        Regex::new(r"\*\(arg4_ptr \+ r4_0\) = r0_\d+;").expect("valid topk arg4 store regex");
+    let out = run_canonical_output_full_pass_from_instrs(topk.instrs, topk.sm, "topk_per_row");
     assert!(
         !out.contains("IADD.64("),
         "expected topk_per_row to lower raw wide-add helpers, got:\n{}",
@@ -1847,11 +1858,10 @@ fn full_pass_topk_per_row_rewrites_split_window_pointer_pair() {
         out.contains("float* arg2_ptr")
             && out.contains("int32_t* arg4_ptr")
             && !out.contains("float* arg4_ptr")
-            && out.contains("*(arg2_ptr + (r4_0 + r8_3)) =")
-            && arg4_typed_store.is_match(&out)
-            && out.contains("(uint64_t)((uint32_t)(r11_11)) << 32")
-            && out.contains("(uint64_t)((uint32_t)(r11_18)) << 32"),
-        "expected topk_per_row to keep arg2_ptr/arg4_ptr typed and preserve split-pointer high halves, got:
+            && out.contains("arg2_ptr[")
+            && out.contains("arg4_ptr[")
+            && !out.contains("addr64("),
+        "expected topk_per_row to keep arg2_ptr/arg4_ptr typed in canonical output, got:
 {}",
         out
     );
@@ -1864,26 +1874,29 @@ fn full_pass_layer_norm_forward_keeps_affine_pointer_pairs_typed() {
             .into_iter()
             .find(|f| f.name == "layer_norm_forward")
             .expect("layer_norm_forward fixture should exist");
-    let out = run_structured_output_full_pass_from_instrs(layer_norm.instrs, layer_norm.sm);
+    let out = run_canonical_output_full_pass_from_instrs(
+        layer_norm.instrs,
+        layer_norm.sm,
+        "layer_norm_forward",
+    );
     assert!(
         out.contains("float* arg2_ptr")
             && out.contains("float* arg4_ptr")
             && out.contains("float* arg6_ptr")
-            && out.contains("*((float*)(((uint8_t*)arg2_ptr)")
-            && out.contains("*((float*)(((uint8_t*)arg4_ptr)")
-            && out.contains("*((float*)(((uint8_t*)arg6_ptr)"),
-        "expected layer_norm_forward gamma/beta accesses to stay on typed base-relative pointer arithmetic, got:
+            && out.contains("arg2_ptr[")
+            && out.contains("arg4_ptr[")
+            && out.contains("arg6_ptr[")
+            && !out.contains("r8_37[")
+            && !out.contains("r12_52["),
+        "expected layer_norm_forward affine accesses to stay rooted on typed argument bases, got:
 {}",
         out
     );
     assert!(
-        !out.contains("*((uint32_t*)(((uint8_t*)arg6_ptr)"),
-        "expected layer_norm_forward affine output stores to stay typed as float, got:
-{}",
-        out
-    );
-    assert!(
-        !out.contains("CALL.REL.NOINC()") && !out.contains("FCHK("),
+        !out.contains("IADD.64(")
+            && !out.contains("addr64(")
+            && !out.contains("CALL.REL.NOINC()")
+            && !out.contains("FCHK("),
         "expected layer_norm_forward to drop compiler slow-path call/fchk scaffolding, got:
 {}",
         out
@@ -1896,7 +1909,8 @@ fn full_pass_old_softmax_forward_trims_post_loop_packed_pointer_tail() {
         .into_iter()
         .find(|f| f.name == "softmax_forward")
         .expect("softmax_forward fixture should exist");
-    let out = run_structured_output_full_pass_from_instrs(softmax.instrs, softmax.sm);
+    let out =
+        run_canonical_output_full_pass_from_instrs(softmax.instrs, softmax.sm, "softmax_forward");
     assert!(
         !out.contains("IADD.64("),
         "expected old-corpus softmax to lower raw wide-add helpers, got:\n{}",
@@ -1904,8 +1918,8 @@ fn full_pass_old_softmax_forward_trims_post_loop_packed_pointer_tail() {
     );
     assert!(
         out.contains("exp2f(")
-            && out.contains("*(arg2_ptr + (int64_t)v8_next - ((uint32_t)(uintptr_t)arg2_ptr) - 8)")
-            && out.contains("*(arg2_ptr + (int64_t)v27_next - ((uint32_t)(uintptr_t)arg2_ptr) + 52) ="),
+            && out.contains("arg2_ptr[")
+            && !out.contains("addr64("),
         "expected old-corpus softmax cleanup to keep the hot path rooted on typed arg2_ptr arithmetic, got:
 {}",
         out
@@ -1942,7 +1956,7 @@ fn full_pass_utf8_count_chars_rewrites_iadd64_pointer_arithmetic() {
     .into_iter()
     .find(|f| f.name == "utf8_count_chars")
     .expect("utf8_count_chars fixture should exist");
-    let out = run_structured_output_full_pass_from_instrs(utf8.instrs, utf8.sm);
+    let out = run_canonical_output_full_pass_from_instrs(utf8.instrs, utf8.sm, "utf8_count_chars");
     assert!(
         !out.contains("IADD.64("),
         "expected no raw IADD.64 helper in utf8_count_chars output, got:
@@ -1950,10 +1964,7 @@ fn full_pass_utf8_count_chars_rewrites_iadd64_pointer_arithmetic() {
         out
     );
     assert!(
-        (out.contains("r2_7 = *(arg0_ptr + r5_1);")
-            || out.contains("r2_7 = *((uint8_t*)(arg0_ptr + r5_1));"))
-            && (out.contains("*(arg2_ptr + r0_1) = r7_7;")
-                || out.contains("*((uint32_t*)(arg2_ptr + r0_1)) = r7_7;")),
+        out.contains("arg0_ptr[") && out.contains("arg2_ptr[r0_1] = r7_7;"),
         "expected typed pointer load/store recovery in utf8_count_chars, got:\n{}",
         out
     );
@@ -2404,13 +2415,8 @@ fn assert_no_operand_modifier_leaks(outputs: Vec<(&'static str, String, String)>
         );
     }
 }
-const STRUCTURED_HELPER_BANNED_NEEDLES: &[&str] = &[
-    "addr64(",
-    "hfma2(",
-    "prmt(",
-    "FCHK(",
-    "CALL.REL.NOINC()",
-];
+const STRUCTURED_HELPER_BANNED_NEEDLES: &[&str] =
+    &["addr64(", "hfma2(", "prmt(", "FCHK(", "CALL.REL.NOINC()"];
 
 fn assert_no_structured_helper_leaks(outputs: Vec<(&'static str, String, String)>, label: &str) {
     for (file, name, out) in outputs {

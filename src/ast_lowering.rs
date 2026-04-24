@@ -22,6 +22,8 @@
 //! - inspect previously rendered code
 //! - repair names or declarations after rendering
 
+use std::collections::BTreeSet;
+
 use crate::abi::ConstMemSemantic;
 use crate::ast::{Expr, LValue, PointerLane, Stmt};
 use crate::backend_names::canonical_reg_ident;
@@ -700,6 +702,7 @@ fn lower_op_expr(opcode: &str, args: &[IRExpr]) -> Expr {
 
 fn lower_semantic_op_expr(opcode: &str, args: &[IRExpr]) -> Option<Expr> {
     lower_setp_expr(opcode, args)
+        .or_else(|| lower_wide_add_lo_expr(opcode, args))
         .or_else(|| lower_ffma_expr(opcode, args))
         .or_else(|| lower_fmnmx_expr(opcode, args))
         .or_else(|| lower_mufu_expr(opcode, args))
@@ -855,6 +858,59 @@ fn lower_mufu_expr(opcode: &str, args: &[IRExpr]) -> Option<Expr> {
     })
 }
 
+fn lower_wide_add_lo_expr(opcode: &str, args: &[IRExpr]) -> Option<Expr> {
+    let wide_value = if opcode == "IADD.64" && args.len() == 4 {
+        Some(add_expr(
+            lower_wide_input_expr(&args[0], &args[2]),
+            lower_wide_input_expr(&args[1], &args[3]),
+        ))
+    } else if matches!(opcode, "IADD3.64" | "UIADD3.64") && args.len() == 6 {
+        Some(add_expr(
+            add_expr(
+                lower_wide_input_expr(&args[0], &args[3]),
+                lower_wide_input_expr(&args[1], &args[4]),
+            ),
+            lower_wide_input_expr(&args[2], &args[5]),
+        ))
+    } else {
+        None
+    }?;
+    Some(Expr::LaneExtract {
+        value: Box::new(wide_value),
+        lane: PointerLane::Lo32,
+    })
+}
+
+fn lower_wide_input_expr(lo: &IRExpr, hi: &IRExpr) -> Expr {
+    if ir_expr_is_zero(hi) {
+        return Expr::Cast {
+            ty: "uint64_t".to_string(),
+            expr: Box::new(Expr::Cast {
+                ty: "uint32_t".to_string(),
+                expr: Box::new(lower_scalar_expr(lo)),
+            }),
+        };
+    }
+    Expr::Addr64 {
+        lo: Box::new(lower_scalar_expr(lo)),
+        hi: Box::new(lower_scalar_expr(hi)),
+    }
+}
+
+fn add_expr(lhs: Expr, rhs: Expr) -> Expr {
+    if matches!(lhs, Expr::Imm(ref text) if text == "0") {
+        return rhs;
+    }
+    if matches!(rhs, Expr::Imm(ref text) if text == "0") {
+        return lhs;
+    }
+    Expr::Binary {
+        op: "+".to_string(),
+        lhs: Box::new(lhs),
+        rhs: Box::new(rhs),
+    }
+}
+
 fn lower_ir_op_expr(op: &str, args: &[IRExpr]) -> Expr {
     if let Some(expr) = lower_builtin_expr(op, args) {
         return expr;
@@ -974,7 +1030,12 @@ fn rooted_global_byte_offset(
     access: &MemAccessInfo,
     analysis: &FunctionAnalysis,
 ) -> Option<IRExpr> {
-    match access.root {
+    let expected_root = match &access.root {
+        AddressRoot::ParamWord(param_idx) => Some(AddressRoot::ParamWord(*param_idx)),
+        AddressRoot::RegisterBase(reg) => analysis.root_by_reg.get(reg).cloned(),
+        _ => None,
+    }?;
+    let byte_offset = match access.root {
         AddressRoot::ParamWord(_) | AddressRoot::RegisterBase(_) => match addr_base {
             IRExpr::Reg(reg) => analysis.byte_offset_by_reg.get(reg).cloned(),
             IRExpr::Addr64 { lo, .. } => lo
@@ -984,7 +1045,80 @@ fn rooted_global_byte_offset(
             _ => None,
         },
         _ => None,
+    }?;
+    Some(expand_rooted_offset_expr(
+        &byte_offset,
+        &expected_root,
+        analysis,
+        &mut BTreeSet::new(),
+    ))
+}
+
+fn expand_rooted_offset_expr(
+    expr: &IRExpr,
+    expected_root: &AddressRoot,
+    analysis: &FunctionAnalysis,
+    seen: &mut BTreeSet<crate::ir::RegId>,
+) -> IRExpr {
+    match expr {
+        IRExpr::Reg(reg) if can_expand_rooted_reg(reg, expected_root, analysis) => {
+            if !seen.insert(reg.clone()) {
+                return IRExpr::Reg(reg.clone());
+            }
+            let expanded = analysis
+                .byte_offset_by_reg
+                .get(reg)
+                .map(|inner| expand_rooted_offset_expr(inner, expected_root, analysis, seen))
+                .unwrap_or_else(|| IRExpr::Reg(reg.clone()));
+            seen.remove(reg);
+            expanded
+        }
+        IRExpr::Addr64 { lo, hi } => IRExpr::Addr64 {
+            lo: Box::new(expand_rooted_offset_expr(lo, expected_root, analysis, seen)),
+            hi: Box::new(expand_rooted_offset_expr(hi, expected_root, analysis, seen)),
+        },
+        IRExpr::Mem {
+            base,
+            offset,
+            width,
+        } => IRExpr::Mem {
+            base: Box::new(expand_rooted_offset_expr(
+                base,
+                expected_root,
+                analysis,
+                seen,
+            )),
+            offset: offset.as_ref().map(|expr| {
+                Box::new(expand_rooted_offset_expr(
+                    expr,
+                    expected_root,
+                    analysis,
+                    seen,
+                ))
+            }),
+            width: *width,
+        },
+        IRExpr::Op { op, args } => IRExpr::Op {
+            op: op.clone(),
+            args: args
+                .iter()
+                .map(|arg| expand_rooted_offset_expr(arg, expected_root, analysis, seen))
+                .collect(),
+        },
+        IRExpr::ImmI(_) | IRExpr::ImmF(_) | IRExpr::Reg(_) => expr.clone(),
     }
+}
+
+fn can_expand_rooted_reg(
+    reg: &crate::ir::RegId,
+    expected_root: &AddressRoot,
+    analysis: &FunctionAnalysis,
+) -> bool {
+    matches!(reg.class.as_str(), "R" | "UR")
+        && analysis
+            .root_by_reg
+            .get(reg)
+            .is_some_and(|root| root == expected_root)
 }
 
 fn select_memory_result_def(stmt: &IRStatement) -> Option<(usize, &crate::ir::RegId)> {
@@ -1090,6 +1224,76 @@ mod tests {
             panic!("expected assign");
         };
         assert_eq!(src.render(), "arg0_ptr[1]");
+    }
+
+    #[test]
+    fn expands_nested_rooted_offsets_in_global_index_lowering() {
+        let rooted = crate::ir::RegId::new("R", 10, 1).with_ssa(0);
+        let nested = crate::ir::RegId::new("R", 8, 1).with_ssa(0);
+        let mem_expr = IRExpr::Mem {
+            base: Box::new(IRExpr::Reg(nested.clone())),
+            offset: Some(Box::new(IRExpr::ImmI(4))),
+            width: Some(32),
+        };
+        let stmt = IRStatement {
+            defs: vec![IRExpr::Reg(crate::ir::RegId::new("R", 2, 1).with_ssa(0))],
+            value: RValue::Op {
+                opcode: "LDG.E".to_string(),
+                args: vec![mem_expr.clone()],
+            },
+            pred: None,
+            mem_addr_args: Some(vec![mem_expr]),
+            pred_old_defs: Vec::new(),
+        };
+        let mut analysis = FunctionAnalysis::default();
+        analysis
+            .root_by_reg
+            .insert(rooted.clone(), AddressRoot::ParamWord(0));
+        analysis.byte_offset_by_reg.insert(
+            rooted.clone(),
+            IRExpr::Op {
+                op: "+".to_string(),
+                args: vec![IRExpr::ImmI(32), IRExpr::ImmI(2)],
+            },
+        );
+        analysis
+            .root_by_reg
+            .insert(nested.clone(), AddressRoot::ParamWord(0));
+        analysis.byte_offset_by_reg.insert(
+            nested,
+            IRExpr::Op {
+                op: "+".to_string(),
+                args: vec![IRExpr::Reg(rooted), IRExpr::ImmI(64)],
+            },
+        );
+        analysis.mem_accesses.push(MemAccessInfo {
+            block_id: 0,
+            stmt_idx: 0,
+            kind: MemAccessKind::Load,
+            space: CudaMemorySpace::Global,
+            bit_width: Some(32),
+            vector_width: None,
+            constant_byte_offset: Some(4),
+            has_dynamic_offset: true,
+            root: AddressRoot::ParamWord(0),
+        });
+        let lowered = lower_memory_stmt(0, 0, &stmt, &analysis).expect("lowered");
+        let Stmt::Assign { src, .. } = lowered else {
+            panic!("expected assignment");
+        };
+        let rendered = src.render();
+        assert!(
+            rendered.contains("arg0_ptr[") || rendered.contains("param_0["),
+            "expected a rooted param base, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("r8_0"),
+            "nested rooted temp leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("r10_0"),
+            "rooted temp leaked: {rendered}"
+        );
     }
 
     #[test]
@@ -1388,6 +1592,41 @@ mod tests {
             panic!("expected assignment");
         };
         assert_eq!(src.render(), "r4_0 + 4");
+    }
+
+    #[test]
+    fn lowers_wide_add_helpers_without_calllike_leaks() {
+        let iadd64 = lower_op_expr(
+            "IADD.64",
+            &[
+                IRExpr::Reg(crate::ir::RegId::new("R", 4, 1).with_ssa(0)),
+                IRExpr::Reg(crate::ir::RegId::new("R", 6, 1).with_ssa(0)),
+                IRExpr::Reg(crate::ir::RegId::new("R", 5, 1).with_ssa(0)),
+                IRExpr::Reg(crate::ir::RegId::new("R", 7, 1).with_ssa(0)),
+            ],
+        );
+        assert!(
+            !iadd64.render().contains("IADD.64("),
+            "got: {}",
+            iadd64.render()
+        );
+
+        let uiadd3_64 = lower_op_expr(
+            "UIADD3.64",
+            &[
+                IRExpr::Reg(crate::ir::RegId::new("UR", 18, 1).with_ssa(0)),
+                IRExpr::ImmI(16),
+                IRExpr::Reg(crate::ir::RegId::new("URZ", 0, 1)),
+                IRExpr::Reg(crate::ir::RegId::new("UR", 19, 1).with_ssa(0)),
+                IRExpr::ImmI(0),
+                IRExpr::Reg(crate::ir::RegId::new("URZ", 0, 1)),
+            ],
+        );
+        assert!(
+            !uiadd3_64.render().contains("UIADD3.64("),
+            "got: {}",
+            uiadd3_64.render()
+        );
     }
 
     #[test]

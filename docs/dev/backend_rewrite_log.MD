@@ -86,6 +86,18 @@
   `Addr64` AST nodes structurally, which removes raw `addr64(...)` helper leaks
   from the canonical path and lets more wide-addressed loads/stores render
   directly from analysis facts.
+- `FunctionAnalysis` now propagates roots through `UIADD3.64` / `IADD3.64`
+  wide-add chains, so canonical lowering can keep more Blackwell pointer loops
+  attached to typed param roots instead of falling back to anonymous register
+  bases.
+- Canonical global-index lowering now recursively expands rooted byte-offset
+  expressions before rendering, which collapses nested rooted temps out of
+  typed global loads/stores instead of leaking intermediate offset registers
+  into the rendered index.
+- Canonical scalar lowering now lowers low-lane results of `IADD.64` and
+  `UIADD3.64` structurally, which removes another class of raw wide-add helper
+  leaks even in functions where structurization still leaves `goto` blocks and
+  the canonical dead-temp pass stays conservative.
 - The canonical AST now runs a local dead-pure-definition pass before symbol
   planning, so analysis-inlined addresses can delete now-unused helper temps
   without reviving the old fixed-point cleanup pipeline.
@@ -104,14 +116,15 @@
 
 1. Switch the remaining curated full-pass tests and helper entrypoints from the
    old structured-output path onto the canonical driver, starting with the
-   fixtures that now pass thanks to semantic scalar lowering and the
-   carry-predicate analysis fix plus rooted `IADD.64` recovery.
+   fixtures that now pass thanks to semantic scalar lowering, recursive rooted
+   offset expansion, `UIADD3.64` root propagation, and the raw `IADD.64`
+   helper-lowering cleanup.
 2. Delete duplicated CLI/test helper logic that still builds semantic-lift,
    token-map, or post-render cleanup artifacts after the canonical path is
    proven on those fixtures.
 3. Replace the remaining placeholder non-memory AST lowering gaps
-   (`IADD.64`/`CALL`/residual helper leaks) with semantic lowering that no
-   longer depends on the old semantic-lift backend.
+   (`IMAD.WIDE`/packed-pointer arithmetic/residual helper leaks) with semantic
+   lowering that no longer depends on the old semantic-lift backend.
 
 ## Open questions
 

@@ -363,6 +363,9 @@ fn propagate_pointer_arith(
     if opcode.starts_with("IADD.64") {
         return propagate_iadd64_pointer_arith(args, roots, byte_offsets);
     }
+    if opcode.starts_with("IADD3.64") || opcode.starts_with("UIADD3.64") {
+        return propagate_iadd3_64_pointer_arith(args, roots, byte_offsets);
+    }
     propagate_additive_pointer_arith(args, annotated_root, roots, byte_offsets)
 }
 
@@ -444,6 +447,37 @@ fn propagate_iadd64_pointer_arith(
         )),
         _ => None,
     }
+}
+
+fn propagate_iadd3_64_pointer_arith(
+    args: &[IRExpr],
+    roots: &BTreeMap<RegId, AddressRoot>,
+    byte_offsets: &BTreeMap<RegId, IRExpr>,
+) -> Option<(AddressRoot, IRExpr)> {
+    let wide_inputs = [(0usize, 3usize), (1usize, 4usize), (2usize, 5usize)];
+    let rooted_inputs = wide_inputs
+        .iter()
+        .filter_map(|(lo_idx, hi_idx)| {
+            let value = wide_pair_expr(args.get(*lo_idx)?.clone(), args.get(*hi_idx)?.clone());
+            let root = expr_root(&value, roots)?;
+            let offset = expr_byte_offset(&value, roots, byte_offsets)?;
+            Some(((*lo_idx, *hi_idx), root, offset))
+        })
+        .collect::<Vec<_>>();
+    let [((root_lo_idx, root_hi_idx), root, base_offset)] = rooted_inputs.as_slice() else {
+        return None;
+    };
+    let mut byte_offset = base_offset.clone();
+    for (lo_idx, hi_idx) in wide_inputs {
+        if lo_idx == *root_lo_idx && hi_idx == *root_hi_idx {
+            continue;
+        }
+        byte_offset = add_offset_expr(
+            byte_offset,
+            wide_pair_offset_expr(args.get(lo_idx)?, args.get(hi_idx)?),
+        );
+    }
+    Some((root.clone(), byte_offset))
 }
 
 fn collect_memory_accesses(
@@ -592,6 +626,8 @@ fn is_pointer_arith_like(opcode: &str) -> bool {
     matches!(mnem, "LEA" | "ULEA" | "IADD" | "IADD3" | "UIADD" | "UIADD3")
         || opcode.starts_with("IMAD.WIDE")
         || opcode.starts_with("IADD.64")
+        || opcode.starts_with("IADD3.64")
+        || opcode.starts_with("UIADD3.64")
 }
 
 fn add_offset_expr(lhs: IRExpr, rhs: IRExpr) -> IRExpr {
@@ -880,6 +916,32 @@ mod tests {
             /*0040*/ EXIT ;
         "#;
         let analysis = analyze(sass);
+        let global = analysis
+            .mem_accesses
+            .iter()
+            .find(|access| access.space == CudaMemorySpace::Global)
+            .expect("global access");
+        assert_eq!(global.root, AddressRoot::ParamWord(0));
+    }
+
+    #[test]
+    fn propagates_param_roots_through_uiadd3_64_pairs() {
+        let sass = r#"
+            /*0000*/ LDC.64 UR18, c[0x0][0x160] ;
+            /*0010*/ UIADD3.64 UR4, UPT, UPT, UR18, 0x10, URZ ;
+            /*0020*/ LDG.E.U32 R0, [UR4.64] ;
+            /*0030*/ EXIT ;
+        "#;
+        let analysis = analyze(sass);
+        let rooted_reg = crate::ir::RegId::new("UR", 4, 1).with_ssa(0);
+        assert_eq!(
+            analysis.root_by_reg.get(&rooted_reg),
+            Some(&AddressRoot::ParamWord(0))
+        );
+        assert_eq!(
+            analysis.byte_offset_by_reg.get(&rooted_reg),
+            Some(&IRExpr::ImmI(16))
+        );
         let global = analysis
             .mem_accesses
             .iter()
