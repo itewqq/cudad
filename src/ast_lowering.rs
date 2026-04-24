@@ -505,6 +505,9 @@ fn lower_op_expr(opcode: &str, args: &[IRExpr]) -> Expr {
 }
 
 fn lower_simple_op_expr(opcode: &str, args: &[IRExpr]) -> Option<Expr> {
+    if opcode.contains('.') {
+        return None;
+    }
     let mnem = opcode.split('.').next().unwrap_or(opcode);
     match mnem {
         "MOV" | "UMOV" | "FMOV" => args.first().map(lower_scalar_expr),
@@ -862,6 +865,29 @@ mod tests {
             panic!("expected assignment");
         };
         assert_eq!(src.render(), "r4_0 + 4");
+    }
+
+    #[test]
+    fn keeps_modifier_bearing_add_ops_explicit() {
+        let stmt = IRStatement {
+            defs: vec![IRExpr::Reg(crate::ir::RegId::new("R", 4, 1).with_ssa(0))],
+            value: RValue::Op {
+                opcode: "IADD3.X".to_string(),
+                args: vec![
+                    IRExpr::Reg(crate::ir::RegId::new("R", 2, 1).with_ssa(0)),
+                    IRExpr::Reg(crate::ir::RegId::new("R", 3, 1).with_ssa(0)),
+                    IRExpr::Reg(crate::ir::RegId::new("RZ", 0, 1)),
+                ],
+            },
+            pred: None,
+            mem_addr_args: None,
+            pred_old_defs: Vec::new(),
+        };
+        let lowered = lower_non_memory_stmt(&stmt);
+        let Stmt::Assign { src, .. } = lowered else {
+            panic!("expected assignment");
+        };
+        assert_eq!(src.render(), "IADD3.X(r2_0, r3_0, 0)");
     }
 
     #[test]
