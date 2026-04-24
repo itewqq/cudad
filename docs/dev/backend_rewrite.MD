@@ -1,0 +1,65 @@
+# Memory-Aware Backend Rewrite
+
+This document is the contract for the backend refactor that replaces the
+string-repair post-struct pipeline with a memory-aware SSA analysis and a
+structured AST lowering pipeline.
+
+## Canonical pipeline
+
+The target backend is:
+
+1. tolerant decode
+2. CFG construction
+3. SSA construction
+4. SSA optimization
+5. `FunctionAnalysis`
+6. structurization
+7. structured AST lowering
+8. symbol/declaration planning
+9. rendering
+
+Only one full-pass driver is allowed once the cutover is complete. The CLI,
+tests, and golden regeneration must all use that driver.
+
+## Front-half contract
+
+- The parser must stay tolerant and lossless.
+- CFG stays control-flow-only.
+- SSA stays the canonical mid-level control/dataflow representation.
+- Memory-space information must become explicit before AST lowering.
+
+## Memory model contract
+
+The core CUDA memory spaces for this rewrite are:
+
+- `Param`
+- `Const`
+- `Global`
+- `Local`
+- `Shared`
+- `Generic`
+
+Texture, surface, sampler, and other special engines are out of scope for the
+first cutover and should remain explicit unsupported/special forms.
+
+## Quality bar
+
+- No post-render text parsing for semantics.
+- No regex-driven semantic reconstruction.
+- Unknown SASS stays representable and conservative.
+- New backend modules must document their inputs, outputs, invariants, and
+  forbidden responsibilities in rustdoc headers.
+
+## Deletion bar
+
+The old post-struct backend is removed at cutover. That includes:
+
+- semantic-lift-as-render-backend behavior
+- rendered-text token rewriting
+- regex declaration synthesis
+- post-render pointer repair
+- fixed-point cleanup loops used as backend repair
+- duplicated full-pass drivers
+
+Only logic that remains valid after translation into decode, SSA analysis, AST
+lowering, or rendering should survive.
