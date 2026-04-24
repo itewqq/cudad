@@ -4,7 +4,7 @@
 
 - Branch: `codex/memory-aware-backend-refactor`
 - Checkpoint commit: `f464db3`
-- Current stage: phase 3 hardening of memory-aware analysis and structured AST lowering
+- Current stage: phase 5 cutover of structured output entrypoints onto the canonical backend
 
 ## Landed invariants
 
@@ -47,6 +47,11 @@
   instead of collapsing them back into element indices too early.
 - The canonical backend driver can now render with an explicit function name,
   which will be required when the CLI/test entrypoints switch over.
+- Forced ABI-profile selection can now be threaded through the canonical
+  backend driver, which keeps the CLI cutover compatible with `--abi-profile`.
+- The CLI structured-output path now goes through the canonical backend driver
+  and ABI summary facts from `FunctionAnalysis` instead of the old lift/name/
+  cleanup pipeline.
 - Canonical backend tests now enforce:
   - semantic pointer-param names (`argN_ptr`)
   - no raw SSA token leaks
@@ -71,12 +76,13 @@
 
 ## Next safe step
 
-1. Replace the remaining placeholder non-memory AST lowering with semantic
+1. Switch the remaining curated full-pass tests and helper entrypoints from the
+   old structured-output path onto the canonical driver.
+2. Delete duplicated CLI/test helper logic that still builds semantic-lift,
+   token-map, or post-render cleanup artifacts after the canonical path is
+   proven on those fixtures.
+3. Replace the remaining placeholder non-memory AST lowering with semantic
    lowering that no longer depends on the old semantic-lift backend.
-2. Switch CLI/tests/examples to the canonical driver once the new path covers
-   enough structured statements.
-3. Delete duplicated full-pass driver logic and transitional tests after the
-   new path is used by default.
 
 ## Open questions
 
@@ -98,6 +104,7 @@
 - `src/ast.rs`
 - `src/memory_model.rs`
 - `src/symbol_plan.rs`
+- `src/bin/main.rs`
 - `src/lib.rs`
 
 ## Interrupt resume note

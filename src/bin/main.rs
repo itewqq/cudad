@@ -195,80 +195,49 @@ fn append_abi_summary(
     }
 }
 
-fn build_structured_output(cfg: &ControlFlowGraph, abi_profile: AbiProfile) -> String {
-    let fir = optimize_ssa(cfg);
-    let abi_annotations = annotate_function_ir_constmem(&fir, abi_profile);
-    let abi_aliases = infer_arg_aliases(&fir, &abi_annotations);
-    let local_decls =
-        infer_local_typed_declarations_with_abi(&fir, Some(&abi_annotations), Some(&abi_aliases));
-
+fn build_empty_stub(function_name: &str, warning: &str) -> String {
     let mut out = String::new();
     out.push_str("// --- Structured Output ---\n");
-    append_abi_summary(&mut out, &abi_annotations, &abi_aliases);
-
-    let mut structurizer = Structurizer::new(cfg, &fir);
-    let Some(structured_body) = structurizer.structure_function() else {
-        out.push_str("// Failed to structure function or function is empty.\n");
-        out.push_str("// --- End Structured Output ---\n");
-        return out;
-    };
-
-    let display = AbiDisplay::with_aliases(abi_profile, abi_aliases.clone());
-    let lift_cfg = SemanticLiftConfig {
-        abi_annotations: Some(&abi_annotations),
-        abi_aliases: Some(&abi_aliases),
-        strict: true,
-    };
-    let lifted = lift_function_ir(&fir, &lift_cfg);
-    let preview_output =
-        structurizer.pretty_print_with_lift_cleanup(&structured_body, &display, 0, Some(&lifted));
-    let has_unstructured = preview_output.contains("goto BB");
-    let plan = plan_structured_name_recovery_with_lift(
-        &fir,
-        &preview_output,
-        Some(&lifted),
-        &NameRecoveryConfig {
-            style: if has_unstructured {
-                NameStyle::VerbatimSsa
-            } else {
-                NameStyle::Temp
-            },
-            rewrite_control_predicates: !has_unstructured,
-            semantic_symbolization: true,
-        },
-    );
-    let enable_post_name_addr64_fold = !has_unstructured
-        && preview_output.len() <= 30_000
-        && preview_output.matches("((uintptr_t)").count() >= 8;
-    let named_output = structurizer.pretty_print_with_lift_cleanup_and_names(
-        &structured_body,
-        &display,
-        0,
-        Some(&lifted),
-        &plan.token_map,
-        enable_post_name_addr64_fold,
-    );
-    let symbols = filter_recovered_symbols_by_output(&named_output, &plan.symbols);
-    let name_type_map = infer_recovered_name_types(&fir, &symbols);
-    let final_output = render_typed_structured_output(
-        &named_output,
-        Some(&abi_aliases),
-        &local_decls,
-        Some(&symbols),
-        &name_type_map,
-        collect_shared_memory_decls(Some(&lifted)),
-    );
-
-    out.push_str(&final_output);
-    if !final_output.ends_with('\n') {
-        out.push('\n');
-    }
+    out.push_str("// Warning: ");
+    out.push_str(warning);
+    out.push('\n');
+    out.push_str(&format!("void {}(void) {{\n}}\n", function_name));
     out.push_str("// --- End Structured Output ---\n");
     out
 }
 
-fn build_empty_stub() -> String {
-    "// --- Structured Output ---\n// Warning: no parseable SASS instruction lines were found.\n// Returning an empty stub to keep the pipeline non-fatal.\n__global__ void kernel(void) {\n}\n// --- End Structured Output ---\n".to_string()
+fn build_canonical_structured_output(
+    function: &InputFunction,
+    abi_profile: AbiProfile,
+) -> String {
+    let function_name = function.display_name();
+    let artifacts = build_named_decompile_artifacts_with_profile(
+        function.instrs.clone(),
+        function.sm,
+        Some(function_name),
+        Some(abi_profile),
+    );
+    let Some(analysis) = artifacts.analysis.as_ref() else {
+        return build_empty_stub(
+            function_name,
+            "no parseable SASS instruction lines were found; returning an empty canonical stub.",
+        );
+    };
+    let Some(rendered) = artifacts.rendered.as_ref() else {
+        return build_empty_stub(
+            function_name,
+            "canonical backend did not produce structured output for this function.",
+        );
+    };
+    let mut out = String::new();
+    out.push_str("// --- Structured Output ---\n");
+    append_abi_summary(&mut out, &analysis.abi_annotations, &analysis.abi_aliases);
+    out.push_str(rendered);
+    if !rendered.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str("// --- End Structured Output ---\n");
+    out
 }
 
 fn build_function_output(
@@ -277,18 +246,17 @@ fn build_function_output(
     abi_mode: &AbiProfileMode,
 ) -> String {
     let abi_profile = resolve_abi_profile(abi_mode, &function.instrs, function.sm);
-    let cfg = build_cfg(function.instrs.clone());
 
     match mode {
-        OutputMode::Structured => {
-            if cfg.node_count() == 0 {
-                build_empty_stub()
-            } else {
-                build_structured_output(&cfg, abi_profile)
-            }
+        OutputMode::Structured => build_canonical_structured_output(function, abi_profile),
+        OutputMode::CfgDot => {
+            let cfg = build_cfg(function.instrs.clone());
+            graph_to_dot(&cfg)
         }
-        OutputMode::CfgDot => graph_to_dot(&cfg),
-        OutputMode::SsaDot => build_ssa_dot(&cfg, abi_profile),
+        OutputMode::SsaDot => {
+            let cfg = build_cfg(function.instrs.clone());
+            build_ssa_dot(&cfg, abi_profile)
+        }
     }
 }
 
@@ -445,5 +413,47 @@ mod tests {
         let err = require_single_function(&funcs, OutputMode::CfgDot)
             .expect_err("cfg dot should require one function");
         assert!(err.contains("--function <name>"));
+    }
+
+    #[test]
+    fn structured_output_uses_canonical_driver_for_named_functions() {
+        let sample = r#"
+        code for sm_89
+        Function : first
+        /*0000*/ MOV R0, RZ ;
+        /*0010*/ EXIT ;
+        Function : second
+        /*0000*/ MOV R1, RZ ;
+        /*0010*/ EXIT ;
+        "#;
+        let funcs = load_input_functions(sample);
+        let rendered = build_multi_function_output(&funcs, &AbiProfileMode::Auto);
+        assert!(rendered.contains("void first("), "missing first function:\n{rendered}");
+        assert!(rendered.contains("void second("), "missing second function:\n{rendered}");
+        assert!(
+            !rendered.contains("__global__ void kernel"),
+            "CLI structured output should use the canonical renderer, got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn structured_output_keeps_canonical_pointer_rendering() {
+        let function = InputFunction {
+            name: Some("kernel".to_string()),
+            sm: None,
+            instrs: decode_sass(
+                "/*0000*/ MOV R4, c[0x0][0x160] ;\n\
+                 /*0010*/ MOV R5, c[0x0][0x164] ;\n\
+                 /*0020*/ IADD3 R4, R4, 0x4, RZ ;\n\
+                 /*0030*/ LDG.E R6, [R4.64] ;\n\
+                 /*0040*/ MOV R8, c[0x0][0x168] ;\n\
+                 /*0050*/ MOV R9, c[0x0][0x16c] ;\n\
+                 /*0060*/ STG.E [R8.64], R6 ;\n\
+                 /*0070*/ EXIT ;\n",
+            ),
+        };
+        let rendered = build_function_output(&function, OutputMode::Structured, &AbiProfileMode::Auto);
+        assert!(rendered.contains("arg0_ptr[1]"), "missing canonical pointer index:\n{rendered}");
+        assert!(rendered.contains("// ABI arg aliases"), "missing ABI summary:\n{rendered}");
     }
 }

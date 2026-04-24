@@ -78,7 +78,17 @@ pub fn analyze_function_ir(
     instructions: &[DecodedInstruction],
     sm: Option<u32>,
 ) -> FunctionAnalysis {
-    let abi_profile = (!instructions.is_empty()).then(|| AbiProfile::detect_with_sm(instructions, sm));
+    analyze_function_ir_with_profile(function_ir, instructions, None, sm)
+}
+
+pub fn analyze_function_ir_with_profile(
+    function_ir: &FunctionIR,
+    instructions: &[DecodedInstruction],
+    abi_profile_override: Option<AbiProfile>,
+    sm: Option<u32>,
+) -> FunctionAnalysis {
+    let abi_profile = abi_profile_override
+        .or_else(|| (!instructions.is_empty()).then(|| AbiProfile::detect_with_sm(instructions, sm)));
     let abi_annotations = abi_profile
         .map(|profile| annotate_function_ir_constmem(function_ir, profile))
         .unwrap_or_default();

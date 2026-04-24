@@ -28,6 +28,7 @@
 
 use crate::ast::StructuredFunction;
 use crate::ast_lowering::lower_structured_function;
+use crate::abi::AbiProfile;
 use crate::cfg::ControlFlowGraph;
 use crate::function_analysis::FunctionAnalysis;
 use crate::ir::FunctionIR;
@@ -49,13 +50,22 @@ pub fn build_decompile_artifacts(
     instrs: Vec<DecodedInstruction>,
     sm: Option<u32>,
 ) -> DecompileArtifacts {
-    build_named_decompile_artifacts(instrs, sm, None)
+    build_named_decompile_artifacts_with_profile(instrs, sm, None, None)
 }
 
 pub fn build_named_decompile_artifacts(
     instrs: Vec<DecodedInstruction>,
     sm: Option<u32>,
     function_name: Option<&str>,
+) -> DecompileArtifacts {
+    build_named_decompile_artifacts_with_profile(instrs, sm, function_name, None)
+}
+
+pub fn build_named_decompile_artifacts_with_profile(
+    instrs: Vec<DecodedInstruction>,
+    sm: Option<u32>,
+    function_name: Option<&str>,
+    abi_profile: Option<AbiProfile>,
 ) -> DecompileArtifacts {
     let mut artifacts = DecompileArtifacts::default();
     if instrs.is_empty() {
@@ -77,7 +87,7 @@ pub fn build_named_decompile_artifacts(
         let copy = crate::ir_copyprop(&cse);
         crate::ir_dce(&copy)
     };
-    let analysis = crate::analyze_function_ir(&optimized_ir, &instrs, sm);
+    let analysis = crate::analyze_function_ir_with_profile(&optimized_ir, &instrs, abi_profile, sm);
     let mut structurizer = Structurizer::new(&cfg, &optimized_ir);
     let structured = structurizer.structure_function();
     let ast = structured
@@ -97,7 +107,7 @@ pub fn build_named_decompile_artifacts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decode_sass;
+    use crate::{decode_sass, AbiProfile};
     use regex::Regex;
 
     #[test]
@@ -180,5 +190,21 @@ mod tests {
             .rendered
             .expect("rendered output");
         assert!(rendered.starts_with("void named_kernel("), "unexpected render:\n{rendered}");
+    }
+
+    #[test]
+    fn explicit_abi_profile_override_is_threaded_into_analysis() {
+        let sass = r#"
+            /*0000*/ IMAD.MOV.U32 R1, RZ, RZ, c[0x0][0x140] ;
+            /*0010*/ EXIT ;
+        "#;
+        let artifacts = build_named_decompile_artifacts_with_profile(
+            decode_sass(sass),
+            None,
+            Some("kernel"),
+            Some(AbiProfile::modern_param_160()),
+        );
+        let analysis = artifacts.analysis.expect("analysis");
+        assert_eq!(analysis.abi_profile, Some(AbiProfile::modern_param_160()));
     }
 }
