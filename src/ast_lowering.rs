@@ -278,6 +278,13 @@ fn lower_base_and_index(
         CudaMemorySpace::Shared | CudaMemorySpace::Local => {
             lower_element_index_expr(addr_base.as_ref(), offset.as_deref(), access.bit_width.or(*width))
         }
+        CudaMemorySpace::Global => lower_global_index_expr(
+            addr_base.as_ref(),
+            offset.as_deref(),
+            access,
+            analysis,
+            access.bit_width.or(*width),
+        ),
         _ => lower_index_expr(offset.as_deref(), access.bit_width.or(*width)),
     };
     Some((base, index))
@@ -340,6 +347,20 @@ fn scale_index_expr(expr: Expr, bit_width: Option<u32>) -> Expr {
         lhs: Box::new(expr),
         rhs: Box::new(Expr::Imm(bytes.to_string())),
     }
+}
+
+fn lower_global_index_expr(
+    addr_base: &IRExpr,
+    offset: Option<&IRExpr>,
+    access: &MemAccessInfo,
+    analysis: &FunctionAnalysis,
+    bit_width: Option<u32>,
+) -> Expr {
+    let Some(rooted_offset) = rooted_global_byte_offset(addr_base, access, analysis) else {
+        return lower_index_expr(offset, bit_width);
+    };
+    let byte_expr = combine_byte_offset_expr(&rooted_offset, offset);
+    scale_index_expr(byte_expr, bit_width)
 }
 
 fn global_param_base_name(param_idx: u32, analysis: &FunctionAnalysis) -> String {
@@ -511,6 +532,24 @@ fn named_param_word_expr(name: &str) -> Expr {
     }
 }
 
+fn rooted_global_byte_offset(
+    addr_base: &IRExpr,
+    access: &MemAccessInfo,
+    analysis: &FunctionAnalysis,
+) -> Option<IRExpr> {
+    match access.root {
+        AddressRoot::ParamWord(_) | AddressRoot::RegisterBase(_) => match addr_base {
+            IRExpr::Reg(reg) => analysis.byte_offset_by_reg.get(reg).cloned(),
+            IRExpr::Addr64 { lo, .. } => lo
+                .get_reg()
+                .and_then(|reg| analysis.byte_offset_by_reg.get(reg))
+                .cloned(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn apply_stmt_predicate(stmt: &IRStatement, lowered: Stmt) -> Stmt {
     let Some(pred) = &stmt.pred else {
         return lowered;
@@ -566,6 +605,24 @@ mod tests {
             /*0030*/ EXIT ;
         "#;
         let (analysis, block_id, stmt_idx, stmt) = analyze_stmt(sass, |stmt| stmt_opcode(stmt).starts_with("LDG"));
+        let lowered = lower_memory_stmt(block_id, stmt_idx, &stmt, &analysis).expect("lowered");
+        let Stmt::Assign { src, .. } = lowered else {
+            panic!("expected assign");
+        };
+        assert_eq!(src.render(), "arg0_ptr[1]");
+    }
+
+    #[test]
+    fn lowers_pointer_arith_global_loads_from_rooted_base_offsets() {
+        let sass = r#"
+            /*0000*/ MOV R4, c[0x0][0x160] ;
+            /*0010*/ MOV R5, c[0x0][0x164] ;
+            /*0020*/ IADD3 R4, R4, 0x4, RZ ;
+            /*0030*/ LDG.E R6, [R4.64] ;
+            /*0040*/ EXIT ;
+        "#;
+        let (analysis, block_id, stmt_idx, stmt) =
+            analyze_stmt(sass, |stmt| stmt_opcode(stmt).starts_with("LDG"));
         let lowered = lower_memory_stmt(block_id, stmt_idx, &stmt, &analysis).expect("lowered");
         let Stmt::Assign { src, .. } = lowered else {
             panic!("expected assign");

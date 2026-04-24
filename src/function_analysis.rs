@@ -62,12 +62,13 @@ pub struct MemAccessInfo {
     pub root: AddressRoot,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct FunctionAnalysis {
     pub abi_profile: Option<AbiProfile>,
     pub abi_annotations: AbiAnnotations,
     pub abi_aliases: AbiArgAliases,
     pub root_by_reg: BTreeMap<RegId, AddressRoot>,
+    pub byte_offset_by_reg: BTreeMap<RegId, IRExpr>,
     pub mem_accesses: Vec<MemAccessInfo>,
 }
 
@@ -86,7 +87,8 @@ pub fn analyze_function_ir(
         infer_arg_aliases(function_ir, &abi_annotations)
     };
 
-    let root_by_reg = propagate_address_roots(function_ir, &abi_annotations, &abi_aliases);
+    let (root_by_reg, byte_offset_by_reg) =
+        propagate_address_facts(function_ir, &abi_annotations, &abi_aliases);
     let mem_accesses =
         collect_memory_accesses(function_ir, &abi_annotations, &abi_aliases, &root_by_reg);
 
@@ -95,16 +97,18 @@ pub fn analyze_function_ir(
         abi_annotations,
         abi_aliases,
         root_by_reg,
+        byte_offset_by_reg,
         mem_accesses,
     }
 }
 
-fn propagate_address_roots(
+fn propagate_address_facts(
     function_ir: &FunctionIR,
     abi_annotations: &AbiAnnotations,
     abi_aliases: &AbiArgAliases,
-) -> BTreeMap<RegId, AddressRoot> {
+) -> (BTreeMap<RegId, AddressRoot>, BTreeMap<RegId, IRExpr>) {
     let mut roots = BTreeMap::<RegId, AddressRoot>::new();
+    let mut byte_offsets = BTreeMap::<RegId, IRExpr>::new();
     let mut queue = VecDeque::<RegId>::new();
 
     for block in &function_ir.blocks {
@@ -124,6 +128,7 @@ fn propagate_address_roots(
                     continue;
                 };
                 if insert_root_if_changed(&mut roots, reg.clone(), root) {
+                    insert_offset_if_changed(&mut byte_offsets, reg.clone(), IRExpr::ImmI(0));
                     queue.push_back(reg.clone());
                 }
             }
@@ -136,29 +141,40 @@ fn propagate_address_roots(
                 let propagated = match &stmt.value {
                     RValue::Phi(args) => {
                         let merged = merge_roots(args.iter().filter_map(|expr| expr_root(expr, &roots)));
-                        merged.map(|root| (root, stmt.defs.clone()))
+                        let byte_offset = merge_offsets(
+                            args.iter()
+                                .filter_map(|expr| expr_byte_offset(expr, &roots, &byte_offsets)),
+                        );
+                        match (merged, byte_offset) {
+                            (Some(root), Some(byte_offset)) => Some((root, byte_offset, stmt.defs.clone())),
+                            _ => None,
+                        }
                     }
                     RValue::Op { opcode, args } if is_root_copy_like(opcode) => {
-                        args.iter()
-                            .find_map(|expr| expr_root(expr, &roots))
-                            .map(|source| (source, stmt.defs.clone()))
+                        args.iter().find_map(|expr| {
+                            let root = expr_root(expr, &roots)?;
+                            let byte_offset = expr_byte_offset(expr, &roots, &byte_offsets)?;
+                            Some((root, byte_offset, stmt.defs.clone()))
+                        })
                     }
                     RValue::Op { opcode, args } if is_pointer_arith_like(opcode) => {
-                        args.iter()
-                            .find_map(|expr| expr_root(expr, &roots))
-                            .map(|source| (source, stmt.defs.clone()))
+                        propagate_pointer_arith(args, &roots, &byte_offsets)
+                            .map(|(root, byte_offset)| (root, byte_offset, stmt.defs.clone()))
                     }
                     _ => None,
                 };
 
-                let Some((root, defs)) = propagated else {
+                let Some((root, byte_offset, defs)) = propagated else {
                     continue;
                 };
                 for def in defs {
                     let Some(reg) = def.get_reg() else {
                         continue;
                     };
-                    if insert_root_if_changed(&mut roots, reg.clone(), root.clone()) {
+                    let changed_root = insert_root_if_changed(&mut roots, reg.clone(), root.clone());
+                    let changed_offset =
+                        insert_offset_if_changed(&mut byte_offsets, reg.clone(), byte_offset.clone());
+                    if changed_root || changed_offset {
                         queue.push_back(reg.clone());
                     }
                 }
@@ -166,7 +182,7 @@ fn propagate_address_roots(
         }
     }
 
-    roots
+    (roots, byte_offsets)
 }
 
 fn root_from_annotation(
@@ -221,6 +237,16 @@ fn merge_roots(roots: impl Iterator<Item = AddressRoot>) -> Option<AddressRoot> 
     }
 }
 
+fn merge_offsets(offsets: impl Iterator<Item = IRExpr>) -> Option<IRExpr> {
+    let mut iter = offsets.peekable();
+    let first = iter.peek()?.clone();
+    if iter.all(|offset| offset == first) {
+        Some(first)
+    } else {
+        None
+    }
+}
+
 fn expr_root(expr: &IRExpr, roots: &BTreeMap<RegId, AddressRoot>) -> Option<AddressRoot> {
     match expr {
         IRExpr::Reg(reg) => {
@@ -247,6 +273,60 @@ fn expr_root(expr: &IRExpr, roots: &BTreeMap<RegId, AddressRoot>) -> Option<Addr
         IRExpr::Op { args, .. } => args.iter().find_map(|arg| expr_root(arg, roots)),
         IRExpr::ImmI(_) | IRExpr::ImmF(_) => None,
     }
+}
+
+fn expr_byte_offset(
+    expr: &IRExpr,
+    roots: &BTreeMap<RegId, AddressRoot>,
+    byte_offsets: &BTreeMap<RegId, IRExpr>,
+) -> Option<IRExpr> {
+    match expr {
+        IRExpr::Reg(reg) => roots.get(reg).and_then(|_| byte_offsets.get(reg)).cloned(),
+        IRExpr::Addr64 { lo, hi } => {
+            let lo_reg = lo.get_reg()?;
+            let hi_reg = hi.get_reg()?;
+            let lo_root = roots.get(lo_reg)?;
+            let hi_root = roots.get(hi_reg)?;
+            if compatible_addr64_roots(lo_root, hi_root) {
+                byte_offsets.get(lo_reg).cloned()
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn compatible_addr64_roots(lo_root: &AddressRoot, hi_root: &AddressRoot) -> bool {
+    matches!(
+        (lo_root, hi_root),
+        (AddressRoot::ParamWord(lo_idx), AddressRoot::ParamWord(hi_idx))
+            if *hi_idx == lo_idx.saturating_add(1)
+    ) || lo_root == hi_root
+}
+
+fn propagate_pointer_arith(
+    args: &[IRExpr],
+    roots: &BTreeMap<RegId, AddressRoot>,
+    byte_offsets: &BTreeMap<RegId, IRExpr>,
+) -> Option<(AddressRoot, IRExpr)> {
+    let rooted_args = args
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, expr)| expr_root(expr, roots).map(|root| (idx, root)))
+        .collect::<Vec<_>>();
+    if rooted_args.len() != 1 {
+        return None;
+    }
+    let (root_idx, root) = rooted_args.into_iter().next()?;
+    let mut byte_offset = expr_byte_offset(&args[root_idx], roots, byte_offsets)?;
+    for (idx, expr) in args.iter().enumerate() {
+        if idx == root_idx || is_zero_like_expr(expr) {
+            continue;
+        }
+        byte_offset = add_offset_expr(byte_offset, expr.clone());
+    }
+    Some((root, byte_offset))
 }
 
 fn collect_memory_accesses(
@@ -304,6 +384,20 @@ fn refine_memory_space(
     match (seed_space, annotated_root) {
         (CudaMemorySpace::Const, Some(AddressRoot::ParamWord(_))) => CudaMemorySpace::Param,
         _ => seed_space,
+    }
+}
+
+fn insert_offset_if_changed(
+    offsets: &mut BTreeMap<RegId, IRExpr>,
+    reg: RegId,
+    byte_offset: IRExpr,
+) -> bool {
+    match offsets.get(&reg) {
+        Some(existing) if existing == &byte_offset => false,
+        _ => {
+            offsets.insert(reg, byte_offset);
+            true
+        }
     }
 }
 
@@ -375,6 +469,27 @@ fn is_pointer_arith_like(opcode: &str) -> bool {
     let mnem = opcode.split('.').next().unwrap_or(opcode);
     matches!(mnem, "LEA" | "ULEA" | "IADD" | "IADD3" | "UIADD" | "UIADD3")
         || opcode.starts_with("IMAD.WIDE")
+}
+
+fn add_offset_expr(lhs: IRExpr, rhs: IRExpr) -> IRExpr {
+    if is_zero_like_expr(&lhs) {
+        return rhs;
+    }
+    if is_zero_like_expr(&rhs) {
+        return lhs;
+    }
+    IRExpr::Op {
+        op: "+".to_string(),
+        args: vec![lhs, rhs],
+    }
+}
+
+fn is_zero_like_expr(expr: &IRExpr) -> bool {
+    match expr {
+        IRExpr::ImmI(0) => true,
+        IRExpr::Reg(reg) => matches!(reg.class.as_str(), "RZ" | "URZ"),
+        _ => false,
+    }
 }
 
 fn first_reg_in_expr(expr: &IRExpr) -> Option<RegId> {

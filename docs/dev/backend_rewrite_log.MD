@@ -31,6 +31,8 @@
   constant offsets instead of invalid scalar placeholders.
 - Address-root propagation now keeps provenance through common `IADD`/`IADD3`
   pointer arithmetic, including split pointer increments before `LDG`.
+- AST lowering now keeps byte-offset expressions for rooted global/shared
+  accesses instead of dropping the dynamic address component.
 - Early AST lowering can now emit space-aware AST for:
   - global param-rooted loads
   - shared/local indexed stores
@@ -46,12 +48,9 @@
 
 1. Replace the remaining placeholder non-memory AST lowering with semantic
    lowering that no longer depends on the old semantic-lift backend.
-2. Teach analysis/lowering to recover dynamic byte offsets relative to rooted
-   global/shared/local objects instead of relying on constant-offset-only
-   indexing.
-3. Switch CLI/tests/examples to the canonical driver once the new path covers
+2. Switch CLI/tests/examples to the canonical driver once the new path covers
    enough structured statements.
-4. Delete duplicated full-pass driver logic and transitional tests after the
+3. Delete duplicated full-pass driver logic and transitional tests after the
    new path is used by default.
 
 ## Open questions
