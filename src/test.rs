@@ -1592,14 +1592,14 @@ fn full_pass_reduce_block_infers_float_shared_roundtrip_pointers() {
         .into_iter()
         .find(|f| f.name == "reduce_block")
         .expect("reduce_block fixture should exist");
-    let out = run_structured_output_full_pass_from_instrs(reduce.instrs, reduce.sm);
+    let out = run_canonical_output_full_pass_from_instrs(reduce.instrs, reduce.sm, "reduce_block");
     assert!(
-        out.contains("__global__ void kernel(float* arg0_ptr, float* arg2_ptr, int32_t arg4)"),
+        out.contains("void reduce_block(float* arg0_ptr, float* arg2_ptr, int32_t arg4)"),
         "expected reduce_block to infer float shared-memory roundtrip pointers, got:\n{}",
         out
     );
     assert!(
-        out.contains("__shared__ float shmem[];"),
+        out.contains("extern __shared__ float shmem[];"),
         "expected reduce_block shared memory to stay float-typed, got:\n{}",
         out
     );
@@ -1612,9 +1612,10 @@ fn full_pass_stencil1d_infers_float_shared_halo_pointers() {
             .into_iter()
             .find(|f| f.name == "stencil1d")
             .expect("stencil1d fixture should exist");
-    let out = run_structured_output_full_pass_from_instrs(stencil.instrs, stencil.sm);
+    let out = run_canonical_output_full_pass_from_instrs(stencil.instrs, stencil.sm, "stencil1d");
     assert!(
-        out.contains("__global__ void kernel(float* arg0_ptr, float* arg2_ptr, int32_t arg4)"),
+        out.contains("void stencil1d(float* arg0_ptr, float* arg2_ptr, int32_t arg4)")
+            && out.contains("extern __shared__ float shmem[];"),
         "expected stencil1d to infer float halo pointers, got:\n{}",
         out
     );

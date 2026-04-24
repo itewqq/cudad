@@ -98,6 +98,10 @@
   `UIADD3.64` structurally, which removes another class of raw wide-add helper
   leaks even in functions where structurization still leaves `goto` blocks and
   the canonical dead-temp pass stays conservative.
+- Shared-memory declaration planning now carries the pointee type recovered
+  from SSA/shared round-trips into canonical symbol planning, so canonical
+  `shmem` backing objects can render as `float` instead of a hard-coded
+  `uint32_t` storage type when the dataflow proves the element type.
 - The canonical AST now runs a local dead-pure-definition pass before symbol
   planning, so analysis-inlined addresses can delete now-unused helper temps
   without reviving the old fixed-point cleanup pipeline.
@@ -118,7 +122,7 @@
    old structured-output path onto the canonical driver, starting with the
    fixtures that now pass thanks to semantic scalar lowering, recursive rooted
    offset expansion, `UIADD3.64` root propagation, and the raw `IADD.64`
-   helper-lowering cleanup.
+   helper-lowering cleanup plus typed shared-backing declarations.
 2. Delete duplicated CLI/test helper logic that still builds semantic-lift,
    token-map, or post-render cleanup artifacts after the canonical path is
    proven on those fixtures.
