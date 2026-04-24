@@ -15,6 +15,7 @@ pub mod ir_copyprop;
 pub mod ir_cse;
 pub mod ir_dce;
 pub mod name_recovery;
+pub mod memory_model;
 pub mod op_semantics;
 pub mod parser;
 pub mod ptr_verification;
@@ -42,6 +43,7 @@ pub use ir_copyprop::*;
 pub use ir_cse::*;
 pub use ir_dce::*;
 pub use name_recovery::*;
+pub use memory_model::*;
 pub use op_semantics::*;
 pub use parser::{
     decode_instruction_line, decode_sass, parse_sm_version, split_decoded_functions,

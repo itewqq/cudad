@@ -4,19 +4,28 @@
 
 - Branch: `codex/memory-aware-backend-refactor`
 - Checkpoint commit: `f464db3`
-- Current stage: phase 0 / phase 1 scaffolding
+- Current stage: phase 2 memory-aware analysis on top of the current SSA IR
 
 ## Landed invariants
 
 - A pre-refactor checkpoint commit exists.
 - The refactor is expected to proceed in atomic commits.
 - Periodic sub-agent review should run after every 3 implementation commits.
+- The canonical backend scaffolding now has dedicated modules for:
+  - pipeline orchestration
+  - memory model vocabulary
+  - function analysis
+  - symbol planning
+- `FunctionAnalysis` now classifies memory accesses by CUDA space and carries
+  propagated address-root facts.
 
 ## Next safe step
 
-1. Add canonical rewrite scaffolding modules with explicit rustdoc contracts.
-2. Add the memory-aware analysis data model.
-3. Add stage-local tests for memory-space classification.
+1. Start rewriting the lowering path to consume `FunctionAnalysis`.
+2. Introduce a canonical AST lowering module that removes the semantic-lift
+   dependency from the full pass.
+3. Keep stage-local tests close to the new lowering path instead of extending
+   old backend tests.
 
 ## Open questions
 
@@ -29,6 +38,11 @@
 
 - `docs/dev/backend_rewrite.MD`
 - `docs/dev/backend_rewrite_log.MD`
+- `src/backend_pipeline.rs`
+- `src/function_analysis.rs`
+- `src/memory_model.rs`
+- `src/symbol_plan.rs`
+- `src/lib.rs`
 
 ## Interrupt resume note
 

@@ -44,8 +44,30 @@ pub struct DecompileArtifacts {
 }
 
 pub fn build_decompile_artifacts(
-    _instrs: Vec<DecodedInstruction>,
-    _sm: Option<u32>,
+    instrs: Vec<DecodedInstruction>,
+    sm: Option<u32>,
 ) -> DecompileArtifacts {
-    DecompileArtifacts::default()
+    let mut artifacts = DecompileArtifacts::default();
+    if instrs.is_empty() {
+        return artifacts;
+    }
+    let cfg = crate::build_cfg(instrs.clone());
+    if cfg.node_count() == 0 {
+        artifacts.cfg = Some(cfg);
+        return artifacts;
+    }
+    let optimized_ir = {
+        let ssa = crate::build_ssa(&cfg);
+        let dce1 = crate::ir_dce(&ssa);
+        let cp = crate::ir_constprop(&dce1);
+        let alg = crate::ir_algebra(&cp);
+        let cse = crate::ir_cse(&alg, &cfg);
+        let copy = crate::ir_copyprop(&cse);
+        crate::ir_dce(&copy)
+    };
+    let analysis = crate::analyze_function_ir(&optimized_ir, &instrs, sm);
+    artifacts.cfg = Some(cfg);
+    artifacts.optimized_ir = Some(optimized_ir);
+    artifacts.analysis = Some(analysis);
+    artifacts
 }
