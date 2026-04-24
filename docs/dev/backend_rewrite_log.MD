@@ -78,6 +78,9 @@
   - `FMNMX`
   - `MUFU` transcendental helpers
   before falling back to raw opcode-shaped helpers.
+- Pointer-root propagation now ignores predicate/carry defs and other
+  non-address registers, which prevents non-convergent root worklists on
+  Blackwell carry-heavy loops while keeping real `R`/`UR` address facts.
 - Early AST lowering can now emit space-aware AST for:
   - global param-rooted loads
   - shared/local indexed stores
@@ -93,7 +96,8 @@
 
 1. Switch the remaining curated full-pass tests and helper entrypoints from the
    old structured-output path onto the canonical driver, starting with the
-   fixtures that now pass thanks to semantic scalar lowering.
+   fixtures that now pass thanks to semantic scalar lowering and the
+   carry-predicate analysis fix.
 2. Delete duplicated CLI/test helper logic that still builds semantic-lift,
    token-map, or post-render cleanup artifacts after the canonical path is
    proven on those fixtures.
@@ -124,6 +128,7 @@
 - `src/bin/main.rs`
 - `src/lib.rs`
 - `src/test.rs`
+- `src/function_analysis.rs`
 
 ## Interrupt resume note
 

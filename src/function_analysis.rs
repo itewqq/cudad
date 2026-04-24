@@ -135,6 +135,9 @@ fn propagate_address_facts(
                 let Some(reg) = def.get_reg() else {
                     continue;
                 };
+                if !can_carry_pointer_facts(reg) {
+                    continue;
+                }
                 let Some(root) = root_from_annotation(def_idx, annotations, abi_aliases) else {
                     continue;
                 };
@@ -196,6 +199,9 @@ fn propagate_address_facts(
                     let Some(reg) = def.get_reg() else {
                         continue;
                     };
+                    if !can_carry_pointer_facts(reg) {
+                        continue;
+                    }
                     let changed_root = insert_root_if_changed(&mut roots, reg.clone(), root.clone());
                     let changed_offset =
                         insert_offset_if_changed(&mut byte_offsets, reg.clone(), byte_offset.clone());
@@ -274,13 +280,7 @@ fn merge_offsets(offsets: impl Iterator<Item = IRExpr>) -> Option<IRExpr> {
 
 fn expr_root(expr: &IRExpr, roots: &BTreeMap<RegId, AddressRoot>) -> Option<AddressRoot> {
     match expr {
-        IRExpr::Reg(reg) => {
-            if matches!(reg.class.as_str(), "RZ" | "URZ" | "PT" | "UPT") {
-                None
-            } else {
-                roots.get(reg).cloned()
-            }
-        }
+        IRExpr::Reg(reg) => can_carry_pointer_facts(reg).then(|| roots.get(reg)).flatten().cloned(),
         IRExpr::Addr64 { lo, hi } => {
             let lo_root = expr_root(lo, roots)?;
             let hi_root = expr_root(hi, roots)?;
@@ -306,7 +306,10 @@ fn expr_byte_offset(
     byte_offsets: &BTreeMap<RegId, IRExpr>,
 ) -> Option<IRExpr> {
     match expr {
-        IRExpr::Reg(reg) => roots.get(reg).and_then(|_| byte_offsets.get(reg)).cloned(),
+        IRExpr::Reg(reg) => can_carry_pointer_facts(reg)
+            .then(|| roots.get(reg).and_then(|_| byte_offsets.get(reg)))
+            .flatten()
+            .cloned(),
         IRExpr::Addr64 { lo, hi } => {
             let lo_reg = lo.get_reg()?;
             let hi_reg = hi.get_reg()?;
@@ -587,9 +590,13 @@ fn is_constmem_like_expr(expr: &IRExpr) -> bool {
     matches!(expr, IRExpr::Op { op, args } if op == "ConstMem" && args.len() == 2)
 }
 
+fn can_carry_pointer_facts(reg: &RegId) -> bool {
+    matches!(reg.class.as_str(), "R" | "UR")
+}
+
 fn first_reg_in_expr(expr: &IRExpr) -> Option<RegId> {
     match expr {
-        IRExpr::Reg(reg) => Some(reg.clone()),
+        IRExpr::Reg(reg) => can_carry_pointer_facts(reg).then_some(reg.clone()),
         IRExpr::Addr64 { lo, hi } => first_reg_in_expr(lo).or_else(|| first_reg_in_expr(hi)),
         IRExpr::Mem { base, offset, .. } => {
             first_reg_in_expr(base).or_else(|| offset.as_ref().and_then(|expr| first_reg_in_expr(expr)))
@@ -689,13 +696,28 @@ fn stmt_like_memory_opcode(opcode: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{build_cfg, build_ssa, decode_sass};
+    use crate::{build_cfg, build_ssa, decode_sass, ir_algebra, ir_constprop, ir_copyprop, ir_cse, ir_dce, split_decoded_functions};
 
     fn analyze(sass: &str) -> FunctionAnalysis {
         let instrs = decode_sass(sass);
         let cfg = build_cfg(instrs.clone());
         let fir = build_ssa(&cfg);
         analyze_function_ir(&fir, &instrs, None)
+    }
+
+    fn analyze_optimized_instrs(
+        instrs: Vec<DecodedInstruction>,
+        sm: Option<u32>,
+    ) -> FunctionAnalysis {
+        let cfg = build_cfg(instrs.clone());
+        let ssa = build_ssa(&cfg);
+        let dce1 = ir_dce(&ssa);
+        let cp = ir_constprop(&dce1);
+        let alg = ir_algebra(&cp);
+        let cse = ir_cse(&alg, &cfg);
+        let copy = ir_copyprop(&cse);
+        let optimized = ir_dce(&copy);
+        analyze_function_ir(&optimized, &instrs, sm)
     }
 
     #[test]
@@ -777,6 +799,30 @@ mod tests {
             .find(|access| access.space == CudaMemorySpace::Global)
             .expect("global access");
         assert_eq!(global.root, AddressRoot::ParamWord(0));
+    }
+
+    #[test]
+    fn ignores_predicate_carry_defs_during_pointer_propagation() {
+        let hist = split_decoded_functions(include_str!("../test_cu/corpus_sm100/shared_mem_kernels.sass"))
+            .into_iter()
+            .find(|func| func.name == "histogram256")
+            .expect("histogram256 fixture should exist");
+        let analysis = analyze_optimized_instrs(hist.instrs, hist.sm);
+        assert!(
+            analysis
+                .root_by_reg
+                .keys()
+                .all(|reg| matches!(reg.class.as_str(), "R" | "UR")),
+            "predicate/carry defs must not participate in pointer propagation: {:?}",
+            analysis.root_by_reg.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            analysis
+                .mem_accesses
+                .iter()
+                .any(|access| access.space == CudaMemorySpace::Global),
+            "expected global accesses to remain analyzable after skipping carry predicates"
+        );
     }
 
     #[test]
