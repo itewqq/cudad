@@ -1705,12 +1705,18 @@ fn full_pass_histogram256_sm120_keeps_global_byte_loads_rooted_on_arg0_ptr() {
     .into_iter()
     .find(|f| f.name == "histogram256")
     .expect("histogram256 fixture should exist");
-    let out = run_structured_output_full_pass_from_instrs(hist.instrs, hist.sm);
-    let arg0_loads =
-        out.matches("*(arg0_ptr +").count() + out.matches("*((uint8_t*)(arg0_ptr +").count();
+    let out = run_canonical_output_full_pass_from_instrs(hist.instrs, hist.sm, "histogram256");
+    let arg0_loads = out.matches("*(arg0_ptr +").count()
+        + out.matches("*((uint8_t*)(arg0_ptr +").count()
+        + out.matches("arg0_ptr[((uintptr_t)").count();
     assert!(
         arg0_loads >= 4,
         "expected SM120 histogram byte loads to stay rooted on arg0_ptr, got:\n{}",
+        out
+    );
+    assert!(
+        !out.contains("IADD.64("),
+        "expected SM120 histogram to drop dead rooted wide-add helpers, got:\n{}",
         out
     );
     assert!(

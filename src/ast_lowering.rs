@@ -25,6 +25,7 @@
 use crate::abi::ConstMemSemantic;
 use crate::ast::{Expr, LValue, PointerLane, Stmt};
 use crate::backend_names::canonical_reg_ident;
+use crate::canonical_ast_passes::prune_dead_pure_defs;
 use crate::function_analysis::{AddressRoot, FunctionAnalysis, MemAccessInfo};
 use crate::ir::{IRExpr, IRStatement, RValue};
 use crate::memory_model::{CudaMemorySpace, MemAccessKind};
@@ -125,11 +126,11 @@ pub fn lower_structured_function(
     analysis: &FunctionAnalysis,
 ) -> crate::ast::StructuredFunction {
     let body = lower_structured_stmt(structured, analysis);
-    let seed = crate::ast::StructuredFunction {
+    let seed = prune_dead_pure_defs(crate::ast::StructuredFunction {
         params: Vec::new(),
         locals: Vec::new(),
         body,
-    };
+    });
     let plan = plan_symbols(&seed, analysis);
     crate::ast::StructuredFunction {
         params: plan.params,

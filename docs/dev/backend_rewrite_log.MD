@@ -86,6 +86,9 @@
   `Addr64` AST nodes structurally, which removes raw `addr64(...)` helper leaks
   from the canonical path and lets more wide-addressed loads/stores render
   directly from analysis facts.
+- The canonical AST now runs a local dead-pure-definition pass before symbol
+  planning, so analysis-inlined addresses can delete now-unused helper temps
+  without reviving the old fixed-point cleanup pipeline.
 - Early AST lowering can now emit space-aware AST for:
   - global param-rooted loads
   - shared/local indexed stores
