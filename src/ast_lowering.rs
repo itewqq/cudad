@@ -300,11 +300,12 @@ fn lower_base_and_index(
         }
     };
     let index = match access.space {
-        CudaMemorySpace::Shared | CudaMemorySpace::Local => lower_element_index_expr(
+        CudaMemorySpace::Shared | CudaMemorySpace::Local => lower_rooted_element_index_expr(
             addr_base.as_ref(),
             offset.as_deref(),
+            access,
+            analysis,
             Some(space_backing_bit_width(access.space)),
-            Some(analysis),
         ),
         CudaMemorySpace::Global => lower_global_index_expr(
             addr_base.as_ref(),
@@ -415,6 +416,20 @@ fn lower_element_index_expr(
     scale_index_expr(byte_expr, bit_width)
 }
 
+fn lower_rooted_element_index_expr(
+    base: &IRExpr,
+    offset: Option<&IRExpr>,
+    access: &MemAccessInfo,
+    analysis: &FunctionAnalysis,
+    bit_width: Option<u32>,
+) -> Expr {
+    if let Some(rooted_offset) = rooted_space_byte_offset(base, access, analysis) {
+        let byte_expr = combine_byte_offset_expr(&rooted_offset, offset, Some(analysis));
+        return scale_index_expr(byte_expr, bit_width);
+    }
+    lower_element_index_expr(base, offset, bit_width, Some(analysis))
+}
+
 fn combine_byte_offset_expr(
     base: &IRExpr,
     offset: Option<&IRExpr>,
@@ -452,7 +467,7 @@ fn scale_index_expr(expr: Expr, bit_width: Option<u32>) -> Expr {
             }
         }
     }
-    if let Some(simplified) = cancel_scale_factor(&expr, i64::from(bytes)) {
+    if let Some(simplified) = divide_expr_by_const(&expr, i64::from(bytes)) {
         return simplified;
     }
     Expr::Binary {
@@ -462,20 +477,29 @@ fn scale_index_expr(expr: Expr, bit_width: Option<u32>) -> Expr {
     }
 }
 
-fn cancel_scale_factor(expr: &Expr, bytes: i64) -> Option<Expr> {
-    let Expr::Binary { op, lhs, rhs } = expr else {
-        return None;
-    };
-    if op != "*" {
-        return None;
+fn divide_expr_by_const(expr: &Expr, bytes: i64) -> Option<Expr> {
+    match expr {
+        Expr::Imm(text) => text
+            .parse::<i64>()
+            .ok()
+            .filter(|value| value % bytes == 0)
+            .map(|value| Expr::Imm((value / bytes).to_string())),
+        Expr::Binary { op, lhs, rhs } if op == "*" => {
+            if expr_is_imm_i64(lhs, bytes) {
+                return Some((**rhs).clone());
+            }
+            if expr_is_imm_i64(rhs, bytes) {
+                return Some((**lhs).clone());
+            }
+            None
+        }
+        Expr::Binary { op, lhs, rhs } if op == "+" || op == "-" => Some(Expr::Binary {
+            op: op.clone(),
+            lhs: Box::new(divide_expr_by_const(lhs, bytes)?),
+            rhs: Box::new(divide_expr_by_const(rhs, bytes)?),
+        }),
+        _ => None,
     }
-    if expr_is_imm_i64(lhs, bytes) {
-        return Some((**rhs).clone());
-    }
-    if expr_is_imm_i64(rhs, bytes) {
-        return Some((**lhs).clone());
-    }
-    None
 }
 
 fn expr_is_imm_i64(expr: &Expr, expected: i64) -> bool {
@@ -489,7 +513,7 @@ fn lower_global_index_expr(
     analysis: &FunctionAnalysis,
     bit_width: Option<u32>,
 ) -> Expr {
-    let Some(rooted_offset) = rooted_global_byte_offset(addr_base, access, analysis) else {
+    let Some(rooted_offset) = rooted_space_byte_offset(addr_base, access, analysis) else {
         return lower_index_expr(offset, bit_width, Some(analysis));
     };
     let byte_expr = combine_byte_offset_expr(&rooted_offset, offset, Some(analysis));
@@ -1181,25 +1205,29 @@ fn named_param_word_expr(name: &str) -> Expr {
     }
 }
 
-fn rooted_global_byte_offset(
+fn rooted_space_byte_offset(
     addr_base: &IRExpr,
     access: &MemAccessInfo,
     analysis: &FunctionAnalysis,
 ) -> Option<IRExpr> {
     let expected_root = match &access.root {
-        AddressRoot::ParamWord(param_idx) => Some(AddressRoot::ParamWord(*param_idx)),
-        AddressRoot::RegisterBase(reg) => analysis.root_by_reg.get(reg).cloned(),
-        _ => None,
-    }?;
-    let byte_offset = match access.root {
-        AddressRoot::ParamWord(_) | AddressRoot::RegisterBase(_) => match addr_base {
-            IRExpr::Reg(reg) => analysis.byte_offset_by_reg.get(reg).cloned(),
-            IRExpr::Addr64 { lo, .. } => lo
-                .get_reg()
-                .and_then(|reg| analysis.byte_offset_by_reg.get(reg))
-                .cloned(),
-            _ => None,
-        },
+        AddressRoot::ParamWord(param_idx) => AddressRoot::ParamWord(*param_idx),
+        AddressRoot::RegisterBase(reg) => analysis
+            .root_by_reg
+            .get(reg)
+            .cloned()
+            .unwrap_or_else(|| AddressRoot::RegisterBase(reg.clone())),
+        AddressRoot::SharedObject(name) => AddressRoot::SharedObject(name.clone()),
+        AddressRoot::LocalObject(name) => AddressRoot::LocalObject(name.clone()),
+        AddressRoot::ConstSymbol(name) => AddressRoot::ConstSymbol(name.clone()),
+        AddressRoot::Generic => AddressRoot::Generic,
+    };
+    let byte_offset = match addr_base {
+        IRExpr::Reg(reg) => analysis.byte_offset_by_reg.get(reg).cloned(),
+        IRExpr::Addr64 { lo, .. } => lo
+            .get_reg()
+            .and_then(|reg| analysis.byte_offset_by_reg.get(reg))
+            .cloned(),
         _ => None,
     }?;
     Some(expand_rooted_offset_expr(
@@ -1486,6 +1514,59 @@ mod tests {
             !rendered.contains("r10_0"),
             "rooted temp leaked: {rendered}"
         );
+    }
+
+    #[test]
+    fn expands_rooted_shared_offsets_before_scaling_indices() {
+        let rooted = crate::ir::RegId::new("R", 19, 1).with_ssa(0);
+        let mem_expr = IRExpr::Mem {
+            base: Box::new(IRExpr::Reg(rooted.clone())),
+            offset: Some(Box::new(IRExpr::ImmI(528))),
+            width: Some(32),
+        };
+        let stmt = IRStatement {
+            defs: vec![IRExpr::Reg(crate::ir::RegId::new("R", 0, 1).with_ssa(0))],
+            value: RValue::Op {
+                opcode: "LDS".to_string(),
+                args: vec![mem_expr.clone()],
+            },
+            pred: None,
+            mem_addr_args: Some(vec![mem_expr]),
+            pred_old_defs: Vec::new(),
+        };
+        let mut analysis = FunctionAnalysis::default();
+        analysis
+            .root_by_reg
+            .insert(rooted.clone(), AddressRoot::SharedObject("shmem".to_string()));
+        analysis.byte_offset_by_reg.insert(
+            rooted,
+            IRExpr::Op {
+                op: "*".to_string(),
+                args: vec![
+                    IRExpr::Op {
+                        op: "SR_TID.X".to_string(),
+                        args: Vec::new(),
+                    },
+                    IRExpr::ImmI(4),
+                ],
+            },
+        );
+        analysis.mem_accesses.push(MemAccessInfo {
+            block_id: 0,
+            stmt_idx: 0,
+            kind: MemAccessKind::Load,
+            space: CudaMemorySpace::Shared,
+            bit_width: Some(32),
+            vector_width: None,
+            constant_byte_offset: Some(528),
+            has_dynamic_offset: true,
+            root: AddressRoot::SharedObject("shmem".to_string()),
+        });
+        let lowered = lower_memory_stmt(0, 0, &stmt, &analysis).expect("lowered");
+        let Stmt::Assign { src, .. } = lowered else {
+            panic!("expected assignment");
+        };
+        assert_eq!(src.render(), "shmem[threadIdx.x + 132]");
     }
 
     #[test]

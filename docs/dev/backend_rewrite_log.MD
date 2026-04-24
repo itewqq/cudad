@@ -112,6 +112,9 @@
   dead-code cleanup, which removes uninitialized-predicate scaffolding from
   trivial kernels like `if.sass` without reviving the old whole-function repair
   pipeline.
+- `FunctionAnalysis` now treats `UIMAD.WIDE` as pointer arithmetic, so
+  uniform-rooted address loops keep their param provenance instead of degrading
+  into anonymous register-backed pointer casts on the canonical path.
 - Shared-memory declaration planning now carries the pointee type recovered
   from SSA/shared round-trips into canonical symbol planning, so canonical
   `shmem` backing objects can render as `float` instead of a hard-coded
@@ -128,6 +131,10 @@
   - `test_div.sass`
   - `dot_thread`
   - `nbody_forces`
+- Canonical targeted regression tests now also pin:
+  - `cumsum_linear` arg-rooted uniform tail-loop loads/stores
+  - `sgemm_tiled` predicated typed global loads
+  - `sgemm_tiled` absence of `lea_hi_x` / split-pointer helper artifacts
 - The canonical backend driver now builds:
   - optimized SSA
   - `FunctionAnalysis`
@@ -149,9 +156,10 @@
    proven on those fixtures, starting with the stable canonical smoke path
    (`if.sass`, `test_div.sass`) and the ready corpus fixtures (`dot_thread`,
    `nbody_forces`).
-3. Replace the remaining placeholder non-memory AST lowering gaps
-   (`IMAD.WIDE`/packed-pointer arithmetic/residual helper leaks) with semantic
-   lowering that no longer depends on the old semantic-lift backend.
+3. Replace the remaining placeholder non-memory AST lowering gaps and remaining
+   canonical full-pass correctness holes (notably broader `sgemm_tiled` / warp
+   reduction control predicates and unresolved generic pointer loops) with
+   semantic lowering that no longer depends on the old semantic-lift backend.
 
 ## Open questions
 

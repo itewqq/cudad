@@ -1399,6 +1399,17 @@ fn canonical_full_pass_cumsum_linear_avoids_register_pseudo_pointers() {
         "expected canonical cumsum_linear output to avoid raw register pseudo-pointers, got:\n{}",
         out
     );
+    assert!(
+        !out.contains("((uint32_t*)(ur"),
+        "expected arg-rooted uniform pointer loops to stay on typed params, got:\n{}",
+        out
+    );
+    assert!(
+        out.contains("arg0_ptr[ur4_9 * ur5_0 / 4]")
+            && out.contains("arg2_ptr[ur4_9 * ur5_0 / 4] ="),
+        "expected canonical cumsum_linear tail loop to stay rooted on arg pointers, got:\n{}",
+        out
+    );
 }
 
 #[test]
@@ -1553,6 +1564,62 @@ fn full_pass_sgemm_tiled_eliminates_lea_helpers_in_predicated_loads() {
         !out.contains("arg0_ptr_hi32_1"),
         "expected temporary high-word pointer pieces for the folded LEA chain to be removed, got:
 {}",
+        out
+    );
+}
+
+#[test]
+fn canonical_full_pass_sgemm_tiled_keeps_predicated_typed_global_loads() {
+    let sgemm =
+        split_decoded_functions(include_str!("../test_cu/corpus_sm100/compute_kernels.sass"))
+            .into_iter()
+            .find(|f| f.name == "sgemm_tiled")
+            .expect("sgemm_tiled fixture should exist");
+    let out = run_canonical_output_full_pass_from_instrs(sgemm.instrs, sgemm.sm, "sgemm_tiled");
+    let lhs_load = Regex::new(
+        r"r\d+_\d+ = !p\d+_\d+ \? \(arg0_ptr\[[A-Za-z0-9_()+*/ ]+\]\) : (?:0|0\.0|r\d+_\d+);",
+    )
+    .expect("valid canonical lhs load regex");
+    let rhs_load = Regex::new(
+        r"r\d+_\d+ = !p\d+_\d+ \? \(arg2_ptr\[[A-Za-z0-9_()+*/ ]+\]\) : (?:0|0\.0|r\d+_\d+);",
+    )
+    .expect("valid canonical rhs load regex");
+    let raw_reg_index =
+        Regex::new(r"\b(?:r|ur)\d+_\d+\[").expect("valid raw register pseudo-pointer regex");
+    assert!(
+        lhs_load.is_match(&out) && rhs_load.is_match(&out),
+        "expected canonical sgemm_tiled predicated loads to stay on typed pointers, got:\n{}",
+        out
+    );
+    assert!(
+        !raw_reg_index.is_match(&out),
+        "expected canonical sgemm_tiled to avoid raw register pseudo-pointers, got:\n{}",
+        out
+    );
+    assert!(
+        !out.contains("*((uint32_t*)(arg0_ptr") && !out.contains("*((uint32_t*)(arg2_ptr"),
+        "expected canonical sgemm_tiled to avoid stale integer pointer casts, got:\n{}",
+        out
+    );
+}
+
+#[test]
+fn canonical_full_pass_sgemm_tiled_avoids_lea_helper_artifacts() {
+    let sgemm =
+        split_decoded_functions(include_str!("../test_cu/corpus_sm100/compute_kernels.sass"))
+            .into_iter()
+            .find(|f| f.name == "sgemm_tiled")
+            .expect("sgemm_tiled fixture should exist");
+    let out = run_canonical_output_full_pass_from_instrs(sgemm.instrs, sgemm.sm, "sgemm_tiled");
+    assert!(
+        !out.contains("lea_hi_x(")
+            && !out.contains("pair_hi(")
+            && !out.contains("addr64(")
+            && !out.contains("arg0_ptr_lo32")
+            && !out.contains("arg0_ptr_hi32")
+            && !out.contains("arg2_ptr_lo32")
+            && !out.contains("arg2_ptr_hi32"),
+        "expected canonical sgemm_tiled to avoid LEA/pointer-helper artifacts, got:\n{}",
         out
     );
 }

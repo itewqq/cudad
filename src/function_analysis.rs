@@ -628,6 +628,7 @@ fn is_pointer_arith_like(opcode: &str) -> bool {
     let mnem = opcode.split('.').next().unwrap_or(opcode);
     matches!(mnem, "LEA" | "ULEA" | "IADD" | "IADD3" | "UIADD" | "UIADD3")
         || opcode.starts_with("IMAD.WIDE")
+        || opcode.starts_with("UIMAD.WIDE")
         || opcode.starts_with("IADD.64")
         || opcode.starts_with("IADD3.64")
         || opcode.starts_with("UIADD3.64")
@@ -1020,6 +1021,29 @@ mod tests {
                     IRExpr::ImmI(4)
                 ],
             }
+        );
+        let global = analysis
+            .mem_accesses
+            .iter()
+            .find(|access| access.space == CudaMemorySpace::Global)
+            .expect("global access");
+        assert_eq!(global.root, AddressRoot::ParamWord(0));
+    }
+
+    #[test]
+    fn propagates_param_roots_through_uimad_wide_pointer_bases() {
+        let sass = r#"
+            /*0000*/ MOV R8, c[0x0][0x160] ;
+            /*0010*/ MOV R9, c[0x0][0x164] ;
+            /*0020*/ UIMAD.WIDE UR6, UR4, 0x4, R8 ;
+            /*0030*/ LDG.E.U32 R11, [UR6.64] ;
+            /*0040*/ EXIT ;
+        "#;
+        let analysis = analyze(sass);
+        let rooted_reg = crate::ir::RegId::new("UR", 6, 1).with_ssa(0);
+        assert_eq!(
+            analysis.root_by_reg.get(&rooted_reg),
+            Some(&AddressRoot::ParamWord(0))
         );
         let global = analysis
             .mem_accesses
