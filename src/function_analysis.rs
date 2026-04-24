@@ -138,7 +138,15 @@ fn propagate_address_facts(
 
     while queue.pop_front().is_some() {
         for block in &function_ir.blocks {
-            for stmt in &block.stmts {
+            for (stmt_idx, stmt) in block.stmts.iter().enumerate() {
+                let stmt_ref = StatementRef {
+                    block_id: block.id,
+                    stmt_idx,
+                };
+                let annotated_root = abi_annotations
+                    .constmem_by_stmt
+                    .get(&stmt_ref)
+                    .and_then(|annotations| root_from_annotation(0, annotations, abi_aliases));
                 let propagated = match &stmt.value {
                     RValue::Phi(args) => {
                         let merged = merge_roots(args.iter().filter_map(|expr| expr_root(expr, &roots)));
@@ -159,7 +167,13 @@ fn propagate_address_facts(
                         })
                     }
                     RValue::Op { opcode, args } if is_pointer_arith_like(opcode) => {
-                        propagate_pointer_arith(args, &roots, &byte_offsets)
+                        propagate_pointer_arith(
+                            opcode,
+                            args,
+                            annotated_root.as_ref(),
+                            &roots,
+                            &byte_offsets,
+                        )
                             .map(|(root, byte_offset)| (root, byte_offset, stmt.defs.clone()))
                     }
                     _ => None,
@@ -307,7 +321,21 @@ fn compatible_addr64_roots(lo_root: &AddressRoot, hi_root: &AddressRoot) -> bool
 }
 
 fn propagate_pointer_arith(
+    opcode: &str,
     args: &[IRExpr],
+    annotated_root: Option<&AddressRoot>,
+    roots: &BTreeMap<RegId, AddressRoot>,
+    byte_offsets: &BTreeMap<RegId, IRExpr>,
+) -> Option<(AddressRoot, IRExpr)> {
+    if opcode.starts_with("IMAD.WIDE") || opcode.starts_with("UIMAD.WIDE") {
+        return propagate_imad_wide_pointer_arith(args, annotated_root, roots, byte_offsets);
+    }
+    propagate_additive_pointer_arith(args, annotated_root, roots, byte_offsets)
+}
+
+fn propagate_additive_pointer_arith(
+    args: &[IRExpr],
+    annotated_root: Option<&AddressRoot>,
     roots: &BTreeMap<RegId, AddressRoot>,
     byte_offsets: &BTreeMap<RegId, IRExpr>,
 ) -> Option<(AddressRoot, IRExpr)> {
@@ -316,11 +344,19 @@ fn propagate_pointer_arith(
         .enumerate()
         .filter_map(|(idx, expr)| expr_root(expr, roots).map(|root| (idx, root)))
         .collect::<Vec<_>>();
-    if rooted_args.len() != 1 {
-        return None;
-    }
-    let (root_idx, root) = rooted_args.into_iter().next()?;
-    let mut byte_offset = expr_byte_offset(&args[root_idx], roots, byte_offsets)?;
+
+    let (root_idx, root, mut byte_offset) = match rooted_args.as_slice() {
+        [(root_idx, root)] => (
+            *root_idx,
+            root.clone(),
+            expr_byte_offset(&args[*root_idx], roots, byte_offsets)?,
+        ),
+        [] => {
+            let root_idx = args.iter().position(is_constmem_like_expr)?;
+            (root_idx, annotated_root?.clone(), IRExpr::ImmI(0))
+        }
+        _ => return None,
+    };
     for (idx, expr) in args.iter().enumerate() {
         if idx == root_idx || is_zero_like_expr(expr) {
             continue;
@@ -328,6 +364,25 @@ fn propagate_pointer_arith(
         byte_offset = add_offset_expr(byte_offset, expr.clone());
     }
     Some((root, byte_offset))
+}
+
+fn propagate_imad_wide_pointer_arith(
+    args: &[IRExpr],
+    annotated_root: Option<&AddressRoot>,
+    roots: &BTreeMap<RegId, AddressRoot>,
+    byte_offsets: &BTreeMap<RegId, IRExpr>,
+) -> Option<(AddressRoot, IRExpr)> {
+    let base_expr = args.get(2)?;
+    let (root, base_offset) = if let Some(root) = expr_root(base_expr, roots) {
+        let byte_offset = expr_byte_offset(base_expr, roots, byte_offsets)?;
+        (root, byte_offset)
+    } else if is_constmem_like_expr(base_expr) {
+        (annotated_root?.clone(), IRExpr::ImmI(0))
+    } else {
+        return None;
+    };
+    let product = mul_offset_expr(args.first()?.clone(), args.get(1)?.clone());
+    Some((root, add_offset_expr(base_offset, product)))
 }
 
 fn collect_memory_accesses(
@@ -490,12 +545,36 @@ fn add_offset_expr(lhs: IRExpr, rhs: IRExpr) -> IRExpr {
     }
 }
 
+fn mul_offset_expr(lhs: IRExpr, rhs: IRExpr) -> IRExpr {
+    if is_zero_like_expr(&lhs) || is_zero_like_expr(&rhs) {
+        return IRExpr::ImmI(0);
+    }
+    if is_one_like_expr(&lhs) {
+        return rhs;
+    }
+    if is_one_like_expr(&rhs) {
+        return lhs;
+    }
+    IRExpr::Op {
+        op: "*".to_string(),
+        args: vec![lhs, rhs],
+    }
+}
+
 fn is_zero_like_expr(expr: &IRExpr) -> bool {
     match expr {
         IRExpr::ImmI(0) => true,
         IRExpr::Reg(reg) => matches!(reg.class.as_str(), "RZ" | "URZ"),
         _ => false,
     }
+}
+
+fn is_one_like_expr(expr: &IRExpr) -> bool {
+    matches!(expr, IRExpr::ImmI(1))
+}
+
+fn is_constmem_like_expr(expr: &IRExpr) -> bool {
+    matches!(expr, IRExpr::Op { op, args } if op == "ConstMem" && args.len() == 2)
 }
 
 fn first_reg_in_expr(expr: &IRExpr) -> Option<RegId> {
@@ -682,6 +761,38 @@ mod tests {
             /*0040*/ EXIT ;
         "#;
         let analysis = analyze(sass);
+        let global = analysis
+            .mem_accesses
+            .iter()
+            .find(|access| access.space == CudaMemorySpace::Global)
+            .expect("global access");
+        assert_eq!(global.root, AddressRoot::ParamWord(0));
+    }
+
+    #[test]
+    fn propagates_param_roots_through_imad_wide_inline_constmem_bases() {
+        let sass = r#"
+            /*0000*/ IMAD.WIDE R6, R3, 0x4, c[0x0][0x160] ;
+            /*0010*/ LDG.E.U32 R11, [R6.64] ;
+            /*0020*/ EXIT ;
+        "#;
+        let analysis = analyze(sass);
+        let rooted_reg = crate::ir::RegId::new("R", 6, 1).with_ssa(0);
+        assert_eq!(
+            analysis.root_by_reg.get(&rooted_reg),
+            Some(&AddressRoot::ParamWord(0))
+        );
+        let byte_offset = analysis
+            .byte_offset_by_reg
+            .get(&rooted_reg)
+            .expect("missing rooted byte offset");
+        assert_eq!(
+            byte_offset,
+            &IRExpr::Op {
+                op: "*".to_string(),
+                args: vec![IRExpr::Reg(crate::ir::RegId::new("R", 3, 1).with_ssa(0)), IRExpr::ImmI(4)],
+            }
+        );
         let global = analysis
             .mem_accesses
             .iter()
