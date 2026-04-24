@@ -51,6 +51,12 @@
   - no raw SSA token leaks
   - dynamic shared-index rendering
   - named entrypoint rendering
+- Canonical test helpers now fail hard when the new backend does not render,
+  instead of silently substituting a fake `kernel` stub.
+- Dynamic local-memory declarations now stay explicit unresolved backing
+  objects instead of degrading into uninitialized pointer variables.
+- Simple scalar lowering now only rewrites unmodified opcodes; modifier-bearing
+  add-family instructions stay explicit until their semantics are modeled.
 - Early AST lowering can now emit space-aware AST for:
   - global param-rooted loads
   - shared/local indexed stores

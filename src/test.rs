@@ -816,10 +816,11 @@ fn run_structured_output_full_pass(sass: &str) -> String {
 fn run_canonical_output_full_pass_from_instrs(
     instrs: Vec<DecodedInstruction>,
     sm: Option<u32>,
+    function_name: &str,
 ) -> String {
-    build_decompile_artifacts(instrs, sm)
+    build_named_decompile_artifacts(instrs, sm, Some(function_name))
         .rendered
-        .unwrap_or_else(|| "void kernel(void) {\n}\n".to_string())
+        .expect("canonical backend should render")
 }
 
 fn run_canonical_output_full_pass(sass: &str) -> String {
@@ -827,7 +828,7 @@ fn run_canonical_output_full_pass(sass: &str) -> String {
     if instrs.is_empty() {
         return "void kernel(void) {\n}\n".to_string();
     }
-    run_canonical_output_full_pass_from_instrs(instrs, parse_sm_version(sass))
+    run_canonical_output_full_pass_from_instrs(instrs, parse_sm_version(sass), "kernel")
 }
 
 fn assert_canonical_full_pass_nonempty_and_deterministic(sass: &str) -> String {
