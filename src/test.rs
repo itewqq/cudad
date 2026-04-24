@@ -866,12 +866,34 @@ fn canonical_full_pass_emits_clean_pointer_and_shared_forms() {
 
 #[test]
 fn canonical_full_pass_preserves_named_render_entrypoints() {
-    let rendered = build_named_decompile_artifacts(decode_sass("/*0000*/ MOV R0, RZ ;\n/*0010*/ EXIT ;\n"), None, Some("named_kernel"))
-        .rendered
-        .expect("rendered output");
+    let rendered = run_canonical_output_full_pass_from_instrs(
+        decode_sass("/*0000*/ MOV R0, RZ ;\n/*0010*/ EXIT ;\n"),
+        None,
+        "named_kernel",
+    );
     assert!(
         rendered.starts_with("void named_kernel("),
         "expected named render entrypoint, got:\n{rendered}"
+    );
+}
+
+#[test]
+fn canonical_full_pass_lowers_imad_wide_param_roots_through_helper_path() {
+    let rendered = run_canonical_output_full_pass_from_instrs(
+        decode_sass(
+            "/*0000*/ IMAD.WIDE R6, R3, 0x4, c[0x0][0x160] ;\n\
+             /*0010*/ LDG.E.U32 R11, [R6.64] ;\n\
+             /*0020*/ MOV R8, c[0x0][0x168] ;\n\
+             /*0030*/ MOV R9, c[0x0][0x16c] ;\n\
+             /*0040*/ STG.E [R8.64], R11 ;\n\
+             /*0050*/ EXIT ;\n",
+        ),
+        None,
+        "kernel",
+    );
+    assert!(
+        rendered.contains("arg0_ptr[r3_0]"),
+        "expected IMAD.WIDE-rooted access to preserve the computed index, got:\n{rendered}"
     );
 }
 

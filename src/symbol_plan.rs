@@ -27,6 +27,8 @@ use crate::backend_names::is_predicate_ident;
 use crate::function_analysis::FunctionAnalysis;
 use crate::memory_model::CudaMemorySpace;
 
+const SPACE_BACKING_BYTES: usize = 4;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SymbolPlan {
     pub params: Vec<Decl>,
@@ -106,14 +108,16 @@ fn planned_space_decls(analysis: &FunctionAnalysis) -> Vec<Decl> {
         .any(|access| access.space == CudaMemorySpace::Local)
     {
         let (array_len, dynamic_extent) = planned_space_decl_shape(analysis, CudaMemorySpace::Local);
-        out.push(Decl {
-            name: "local_mem".to_string(),
-            ty: "uint32_t".to_string(),
-            array_len,
-            dynamic_extent,
-            storage: StorageClass::Local,
-            live_in: false,
-        });
+        if !dynamic_extent {
+            out.push(Decl {
+                name: "local_mem".to_string(),
+                ty: "uint32_t".to_string(),
+                array_len,
+                dynamic_extent,
+                storage: StorageClass::Local,
+                live_in: false,
+            });
+        }
     }
     out
 }
@@ -128,26 +132,30 @@ fn planned_space_decl_shape(
         .filter(|access| access.space == space)
         .collect::<Vec<_>>();
     let needs_dynamic_extent = relevant.iter().any(|access| {
-        access.has_dynamic_offset || access.constant_byte_offset.is_some_and(|offset| offset < 0)
+        access.has_dynamic_offset
+            || access.constant_byte_offset.is_none()
+            || access.constant_byte_offset.is_some_and(|offset| offset < 0)
     });
     if needs_dynamic_extent {
         return (None, true);
     }
-    let array_len = relevant.into_iter().fold(1usize, |max_len, access| {
-            let elem_bytes = access
+    let Some(array_len) = relevant
+        .into_iter()
+        .try_fold(1usize, |max_len, access| {
+            let base_offset = usize::try_from(access.constant_byte_offset?).ok()?;
+            let access_bytes = access
                 .bit_width
-                .map(|bits| usize::try_from(bits / 8).unwrap_or(4))
-                .map(|bytes| bytes / usize::from(access.vector_width.unwrap_or(1)).max(1))
+                .and_then(|bits| usize::try_from(bits / 8).ok())
                 .filter(|bytes| *bytes > 0)
-                .unwrap_or(4);
+                .unwrap_or(SPACE_BACKING_BYTES);
             let lanes = usize::from(access.vector_width.unwrap_or(1)).max(1);
-            let base_index = access
-                .constant_byte_offset
-                .and_then(|offset| usize::try_from(offset).ok())
-                .map(|offset| offset / elem_bytes)
-                .unwrap_or(0);
-            max_len.max(base_index + lanes)
-        });
+            let end_offset = base_offset.checked_add(access_bytes.checked_mul(lanes)?)?;
+            let storage_len = end_offset.div_ceil(SPACE_BACKING_BYTES).max(1);
+            Some(max_len.max(storage_len))
+        })
+    else {
+        return (None, true);
+    };
     (Some(array_len), false)
 }
 
@@ -266,7 +274,7 @@ fn maybe_add_local(name: &str, locals: &mut Vec<Decl>, seen: &mut BTreeSet<Strin
     seen.insert(name.to_string());
     locals.push(Decl {
         name: name.to_string(),
-        ty: if name.starts_with('b') || is_predicate_ident(name) {
+        ty: if is_predicate_ident(name) {
             "bool".to_string()
         } else {
             "uint32_t".to_string()
@@ -338,7 +346,7 @@ mod tests {
                     src: Expr::Imm("1".to_string()),
                 },
                 Stmt::Assign {
-                    dst: LValue::Var("b1".to_string()),
+                    dst: LValue::Var("p1".to_string()),
                     src: Expr::Reg("v0".to_string()),
                 },
             ]),
@@ -353,7 +361,7 @@ mod tests {
         assert!(!plan.locals[0].dynamic_extent);
         assert_eq!(plan.locals[0].storage, StorageClass::Shared);
         assert_eq!(plan.locals[1].name, "v0");
-        assert_eq!(plan.locals[2].name, "b1");
+        assert_eq!(plan.locals[2].name, "p1");
         assert_eq!(plan.locals[2].ty, "bool");
     }
 
@@ -386,7 +394,7 @@ mod tests {
     }
 
     #[test]
-    fn plans_dynamic_local_objects_as_unresolved_backing_arrays() {
+    fn omits_dynamic_local_backing_decls() {
         let mut analysis = FunctionAnalysis::default();
         analysis.mem_accesses.push(MemAccessInfo {
             block_id: 0,
@@ -408,8 +416,33 @@ mod tests {
             },
             &analysis,
         );
-        assert_eq!(plan.locals[0].name, "local_mem");
-        assert_eq!(plan.locals[0].array_len, None);
-        assert!(plan.locals[0].dynamic_extent);
+        assert!(plan.locals.is_empty());
+    }
+
+    #[test]
+    fn sizes_shared_backing_objects_in_storage_words() {
+        let mut analysis = FunctionAnalysis::default();
+        analysis.mem_accesses.push(MemAccessInfo {
+            block_id: 0,
+            stmt_idx: 0,
+            kind: MemAccessKind::Store,
+            space: CudaMemorySpace::Shared,
+            bit_width: Some(64),
+            vector_width: None,
+            constant_byte_offset: Some(4),
+            has_dynamic_offset: false,
+            root: AddressRoot::SharedObject("shmem".to_string()),
+        });
+
+        let plan = plan_symbols(
+            &StructuredFunction {
+                params: Vec::new(),
+                locals: Vec::new(),
+                body: Stmt::Empty,
+            },
+            &analysis,
+        );
+        assert_eq!(plan.locals[0].name, "shmem");
+        assert_eq!(plan.locals[0].array_len, Some(3));
     }
 }

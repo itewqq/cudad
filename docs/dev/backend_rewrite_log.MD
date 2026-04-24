@@ -27,8 +27,9 @@
   the old memory value.
 - Param-window `LDC` loads now lower to parameter symbols instead of falling
   back to raw `ConstMem(...)` text.
-- Shared/local backing declarations now emit array objects sized from observed
-  constant offsets instead of invalid scalar placeholders.
+- Shared/local backing declarations now use deterministic backing objects when
+  the accessed extent is proven; unresolved local-space cases still require
+  explicit helper lowering instead of a declaration-backed object.
 - Address-root propagation now keeps provenance through common `IADD`/`IADD3`
   pointer arithmetic, including split pointer increments before `LDG`.
 - AST lowering now keeps byte-offset expressions for rooted global/shared
@@ -39,9 +40,9 @@
 - Scalar IR expressions now lower simple unary/binary operators directly into
   AST operators, which reduces `+(a, b)` / `*(a, b)` helper leakage in the
   canonical path.
-- Shared/local declaration planning now distinguishes fixed-size backing
-  objects from dynamic-extent objects instead of fabricating small scalar or
-  fixed arrays for dynamic offsets.
+- Shared/local declaration planning now avoids fake fixed extents for dynamic
+  offsets, but wide/subword declaration planning is still intentionally kept
+  conservative around the shared/local backing model.
 - The renderer now preserves byte-pointer widening for complex rooted offsets
   instead of collapsing them back into element indices too early.
 - The canonical backend driver can now render with an explicit function name,
@@ -53,8 +54,8 @@
   - named entrypoint rendering
 - Canonical test helpers now fail hard when the new backend does not render,
   instead of silently substituting a fake `kernel` stub.
-- Dynamic local-memory declarations now stay explicit unresolved backing
-  objects instead of degrading into uninitialized pointer variables.
+- Dynamic local-memory accesses now stay explicit unresolved operations instead
+  of degrading into invalid local declarations or fake pointer variables.
 - Simple scalar lowering now only rewrites unmodified opcodes; modifier-bearing
   add-family instructions stay explicit until their semantics are modeled.
 - Early AST lowering can now emit space-aware AST for:

@@ -959,6 +959,9 @@ fn render_decl_signature(decl: &Decl) -> String {
 }
 
 fn render_decl_line(decl: &Decl) -> String {
+    if decl.storage == StorageClass::Local && decl.dynamic_extent {
+        return format!("/* dynamic local memory: {} */", decl.name);
+    }
     let storage = match decl.storage {
         StorageClass::Param | StorageClass::Local => "",
         StorageClass::Shared if decl.dynamic_extent => "extern __shared__ ",
@@ -988,7 +991,7 @@ fn render_decl_line(decl: &Decl) -> String {
 }
 
 fn render_decl_name(decl: &Decl) -> String {
-    if decl.dynamic_extent {
+    if decl.dynamic_extent && decl.storage == StorageClass::Shared {
         return format!("{}[]", decl.name);
     }
     match decl.array_len {
@@ -1055,6 +1058,24 @@ mod tests {
     #[test]
     fn sink_literals_include_placeholder_assign_target() {
         assert!(LValue::Raw("_".into()).is_sink_literal());
+    }
+
+    #[test]
+    fn dynamic_local_decls_render_as_comments() {
+        let function = StructuredFunction {
+            params: Vec::new(),
+            locals: vec![Decl {
+                name: "local_mem".into(),
+                ty: "uint32_t".into(),
+                array_len: None,
+                dynamic_extent: true,
+                storage: StorageClass::Local,
+                live_in: false,
+            }],
+            body: Stmt::Empty,
+        };
+        assert!(function.render("kernel").contains("/* dynamic local memory: local_mem */"));
+        assert!(!function.render("kernel").contains("local_mem[]"));
     }
 
     #[test]

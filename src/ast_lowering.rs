@@ -53,6 +53,9 @@ fn lower_memory_stmt_detail(
     analysis: &FunctionAnalysis,
 ) -> Option<LoweredStmt> {
     let access = lookup_mem_access(analysis, block_id, stmt_idx)?;
+    if access.space == CudaMemorySpace::Local && local_space_requires_explicit_ops(analysis) {
+        return lower_explicit_local_stmt(stmt, access);
+    }
     match access.kind {
         MemAccessKind::Load => {
             let dst = stmt.defs.first()?.get_reg()?;
@@ -303,7 +306,11 @@ fn lower_base_and_index(
     };
     let index = match access.space {
         CudaMemorySpace::Shared | CudaMemorySpace::Local => {
-            lower_element_index_expr(addr_base.as_ref(), offset.as_deref(), access.bit_width.or(*width))
+            lower_element_index_expr(
+                addr_base.as_ref(),
+                offset.as_deref(),
+                Some(space_backing_bit_width(access.space)),
+            )
         }
         CudaMemorySpace::Global => lower_global_index_expr(
             addr_base.as_ref(),
@@ -315,6 +322,76 @@ fn lower_base_and_index(
         _ => lower_index_expr(offset.as_deref(), access.bit_width.or(*width)),
     };
     Some((base, index))
+}
+
+fn lower_explicit_local_stmt(stmt: &IRStatement, access: &MemAccessInfo) -> Option<LoweredStmt> {
+    let byte_expr = lower_local_byte_offset_expr(stmt)?;
+    match access.kind {
+        MemAccessKind::Load => {
+            let dst = stmt.defs.first()?.get_reg()?;
+            let src = Expr::CallLike {
+                func: local_space_helper_name("load", access),
+                args: vec![byte_expr],
+            };
+            Some(LoweredStmt {
+                stmt: Stmt::Assign {
+                    dst: LValue::Var(lower_reg_name(dst)),
+                    src,
+                },
+                predicate_def_idx: Some(0),
+            })
+        }
+        MemAccessKind::Store => {
+            let src = store_value_expr(stmt)?;
+            Some(LoweredStmt {
+                stmt: Stmt::ExprStmt(Expr::CallLike {
+                    func: local_space_helper_name("store", access),
+                    args: vec![byte_expr, src],
+                }),
+                predicate_def_idx: None,
+            })
+        }
+        MemAccessKind::Atomic | MemAccessKind::Reduction => None,
+    }
+}
+
+fn lower_local_byte_offset_expr(stmt: &IRStatement) -> Option<Expr> {
+    let mem_expr = stmt.mem_addr_args.as_ref()?.first()?;
+    let IRExpr::Mem {
+        base,
+        offset,
+        ..
+    } = mem_expr
+    else {
+        return None;
+    };
+    Some(combine_byte_offset_expr(base.as_ref(), offset.as_deref()))
+}
+
+fn local_space_helper_name(prefix: &str, access: &MemAccessInfo) -> String {
+    let width = access.bit_width.unwrap_or(32);
+    let lanes = access.vector_width.unwrap_or(1);
+    if lanes > 1 {
+        format!("local_{}_bits{}_x{}", prefix, width, lanes)
+    } else {
+        format!("local_{}_bits{}", prefix, width)
+    }
+}
+
+fn local_space_requires_explicit_ops(analysis: &FunctionAnalysis) -> bool {
+    analysis.mem_accesses.iter().any(|access| {
+        access.space == CudaMemorySpace::Local
+            && (access.has_dynamic_offset
+                || access.constant_byte_offset.is_none()
+                || access.constant_byte_offset.is_some_and(|offset| offset < 0))
+    })
+}
+
+fn space_backing_bit_width(space: CudaMemorySpace) -> u32 {
+    match space {
+        CudaMemorySpace::Shared | CudaMemorySpace::Local => 32,
+        _ => 32,
+    }
 }
 
 fn lower_index_expr(offset: Option<&IRExpr>, bit_width: Option<u32>) -> Expr {
@@ -369,11 +446,34 @@ fn scale_index_expr(expr: Expr, bit_width: Option<u32>) -> Expr {
             }
         }
     }
+    if let Some(simplified) = cancel_scale_factor(&expr, i64::from(bytes)) {
+        return simplified;
+    }
     Expr::Binary {
         op: "/".to_string(),
         lhs: Box::new(expr),
         rhs: Box::new(Expr::Imm(bytes.to_string())),
     }
+}
+
+fn cancel_scale_factor(expr: &Expr, bytes: i64) -> Option<Expr> {
+    let Expr::Binary { op, lhs, rhs } = expr else {
+        return None;
+    };
+    if op != "*" {
+        return None;
+    }
+    if expr_is_imm_i64(lhs, bytes) {
+        return Some((**rhs).clone());
+    }
+    if expr_is_imm_i64(rhs, bytes) {
+        return Some((**lhs).clone());
+    }
+    None
+}
+
+fn expr_is_imm_i64(expr: &Expr, expected: i64) -> bool {
+    matches!(expr, Expr::Imm(text) if text.parse::<i64>().ok() == Some(expected))
 }
 
 fn lower_global_index_expr(
@@ -792,6 +892,20 @@ mod tests {
             panic!("expected assign");
         };
         assert_eq!(dst.render(), "shmem[(r2_0 + 8) / 4]");
+    }
+
+    #[test]
+    fn lowers_dynamic_local_stores_to_explicit_helpers() {
+        let sass = r#"
+            /*0000*/ STL [R2+0x8], R4 ;
+            /*0010*/ EXIT ;
+        "#;
+        let (analysis, block_id, stmt_idx, stmt) = analyze_stmt(sass, |stmt| stmt_opcode(stmt).starts_with("STL"));
+        let lowered = lower_basic_stmt(block_id, stmt_idx, &stmt, &analysis);
+        let Stmt::ExprStmt(expr) = lowered else {
+            panic!("expected explicit helper call");
+        };
+        assert_eq!(expr.render(), "local_store_bits32(r2_0 + 8, r4_0)");
     }
 
     #[test]
