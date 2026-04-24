@@ -1124,12 +1124,17 @@ fn smoke_struct_output_full_pass_rc4_sass() {
 #[test]
 fn smoke_struct_output_full_pass_if_sass() {
     let sass = include_str!("../test_cu/if.sass");
-    let expected = include_str!("../test_cu/golden_full_pass/if.pseudo.c");
-    let out1 = run_structured_output_full_pass(sass);
-    let out2 = run_structured_output_full_pass(sass);
-    assert!(!out1.trim().is_empty());
-    assert_eq!(out1, out2);
-    assert_eq!(out1.trim_end(), expected.trim_end());
+    let expected = r#"void kernel(void) {
+  bool p0_0;
+
+  if (p0_0) {
+  } else {
+  }
+  return;
+}
+"#;
+    let out = assert_canonical_full_pass_nonempty_and_deterministic(sass);
+    assert_eq!(out.trim_end(), expected.trim_end());
 }
 
 #[test]
@@ -1170,18 +1175,21 @@ fn smoke_struct_output_full_pass_if_loop_sass() {
 
 #[test]
 fn smoke_struct_output_full_pass_test_div_sass() {
-    let out = assert_full_pass_nonempty_and_deterministic(include_str!("../test_cu/test_div.sass"));
-    assert!(out.contains("uint32_t* arg2_ptr"));
+    let out = assert_canonical_full_pass_nonempty_and_deterministic(include_str!(
+        "../test_cu/test_div.sass"
+    ));
+    assert!(out.contains("void kernel(int32_t arg0, int32_t arg1, uint32_t* arg2_ptr)"));
     assert!(out.contains("abs(arg1)"), "expected signed-dividend lowering, got:\n{}", out);
     assert!(
         out.contains("rcp_approx("),
         "expected reciprocal approximation helper recovery, got:\n{}",
         out
     );
-    let final_store = Regex::new(r"\*\(arg2_ptr\) = v\d+(?:_next)?;").expect("valid final store regex");
+    let final_store =
+        Regex::new(r"arg2_ptr\[0\] = r\d+_\d+;").expect("valid final store regex");
     assert!(final_store.is_match(&out));
     let negate_guard =
-        Regex::new(r"(?:if \(!b0\) v\d+ = -v\d+;|v\d+(?:_next)? = !b0 \? -v\d+ : v\d+;)")
+        Regex::new(r"r\d+_\d+ = !p\d+_\d+ \? \(-r\d+_\d+\) : r\d+_\d+;")
             .expect("valid negate guard regex");
     assert!(negate_guard.is_match(&out));
     assert!(!out.contains("ConstMem("));
