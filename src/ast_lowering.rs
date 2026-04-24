@@ -31,26 +31,47 @@ use crate::memory_model::{CudaMemorySpace, MemAccessKind};
 use crate::structurizer::{LoopType, StructuredStatement};
 use crate::symbol_plan::plan_symbols;
 
+#[derive(Clone, Debug)]
+struct LoweredStmt {
+    stmt: Stmt,
+    predicate_def_idx: Option<usize>,
+}
+
 pub fn lower_memory_stmt(
     block_id: usize,
     stmt_idx: usize,
     stmt: &IRStatement,
     analysis: &FunctionAnalysis,
 ) -> Option<Stmt> {
+    lower_memory_stmt_detail(block_id, stmt_idx, stmt, analysis).map(|lowered| lowered.stmt)
+}
+
+fn lower_memory_stmt_detail(
+    block_id: usize,
+    stmt_idx: usize,
+    stmt: &IRStatement,
+    analysis: &FunctionAnalysis,
+) -> Option<LoweredStmt> {
     let access = lookup_mem_access(analysis, block_id, stmt_idx)?;
     match access.kind {
         MemAccessKind::Load => {
             let dst = stmt.defs.first()?.get_reg()?;
             let src = lower_memory_load_expr(stmt, access, analysis)?;
-            Some(Stmt::Assign {
-                dst: LValue::Var(lower_reg_name(dst)),
-                src,
+            Some(LoweredStmt {
+                stmt: Stmt::Assign {
+                    dst: LValue::Var(lower_reg_name(dst)),
+                    src,
+                },
+                predicate_def_idx: Some(0),
             })
         }
         MemAccessKind::Store => {
             let dst = lower_memory_store_lvalue(stmt, access, analysis)?;
             let src = store_value_expr(stmt)?;
-            Some(Stmt::Assign { dst, src })
+            Some(LoweredStmt {
+                stmt: Stmt::Assign { dst, src },
+                predicate_def_idx: None,
+            })
         }
         MemAccessKind::Atomic | MemAccessKind::Reduction => {
             let func = atomic_func_name(stmt_opcode(stmt));
@@ -74,13 +95,19 @@ pub fn lower_memory_stmt(
                 func: func.to_string(),
                 args,
             };
-            if let Some(def) = stmt.defs.first().and_then(IRExpr::get_reg) {
-                Some(Stmt::Assign {
-                    dst: LValue::Var(lower_reg_name(def)),
-                    src: call,
+            if let Some((def_idx, def)) = select_memory_result_def(stmt) {
+                Some(LoweredStmt {
+                    stmt: Stmt::Assign {
+                        dst: LValue::Var(lower_reg_name(def)),
+                        src: call,
+                    },
+                    predicate_def_idx: Some(def_idx),
                 })
             } else {
-                Some(Stmt::ExprStmt(call))
+                Some(LoweredStmt {
+                    stmt: Stmt::ExprStmt(call),
+                    predicate_def_idx: None,
+                })
             }
         }
     }
@@ -437,22 +464,28 @@ fn lower_basic_stmt(
     stmt: &IRStatement,
     analysis: &FunctionAnalysis,
 ) -> Stmt {
-    let lowered = lower_memory_stmt(block_id, stmt_idx, stmt, analysis)
+    let lowered = lower_memory_stmt_detail(block_id, stmt_idx, stmt, analysis)
         .unwrap_or_else(|| lower_non_memory_stmt(stmt));
     apply_stmt_predicate(stmt, lowered)
 }
 
-fn lower_non_memory_stmt(stmt: &IRStatement) -> Stmt {
+fn lower_non_memory_stmt(stmt: &IRStatement) -> LoweredStmt {
     match &stmt.value {
         RValue::Op { opcode, args } => {
             let rhs = lower_op_expr(opcode, args);
             if let Some(def) = stmt.defs.first().and_then(|expr| expr.get_reg()) {
-                Stmt::Assign {
-                    dst: LValue::Var(lower_reg_name(def)),
-                    src: rhs,
+                LoweredStmt {
+                    stmt: Stmt::Assign {
+                        dst: LValue::Var(lower_reg_name(def)),
+                        src: rhs,
+                    },
+                    predicate_def_idx: Some(0),
                 }
             } else {
-                Stmt::ExprStmt(rhs)
+                LoweredStmt {
+                    stmt: Stmt::ExprStmt(rhs),
+                    predicate_def_idx: None,
+                }
             }
         }
         RValue::Phi(args) => {
@@ -461,34 +494,52 @@ fn lower_non_memory_stmt(stmt: &IRStatement) -> Stmt {
                 args: args.iter().map(lower_scalar_expr).collect(),
             };
             if let Some(def) = stmt.defs.first().and_then(|expr| expr.get_reg()) {
-                Stmt::Assign {
-                    dst: LValue::Var(lower_reg_name(def)),
-                    src: rhs,
+                LoweredStmt {
+                    stmt: Stmt::Assign {
+                        dst: LValue::Var(lower_reg_name(def)),
+                        src: rhs,
+                    },
+                    predicate_def_idx: Some(0),
                 }
             } else {
-                Stmt::ExprStmt(rhs)
+                LoweredStmt {
+                    stmt: Stmt::ExprStmt(rhs),
+                    predicate_def_idx: None,
+                }
             }
         }
         RValue::ImmI(value) => {
             let src = Expr::Imm(value.to_string());
             if let Some(def) = stmt.defs.first().and_then(|expr| expr.get_reg()) {
-                Stmt::Assign {
-                    dst: LValue::Var(lower_reg_name(def)),
-                    src,
+                LoweredStmt {
+                    stmt: Stmt::Assign {
+                        dst: LValue::Var(lower_reg_name(def)),
+                        src,
+                    },
+                    predicate_def_idx: Some(0),
                 }
             } else {
-                Stmt::ExprStmt(src)
+                LoweredStmt {
+                    stmt: Stmt::ExprStmt(src),
+                    predicate_def_idx: None,
+                }
             }
         }
         RValue::ImmF(value) => {
             let src = Expr::Imm(value.to_string());
             if let Some(def) = stmt.defs.first().and_then(|expr| expr.get_reg()) {
-                Stmt::Assign {
-                    dst: LValue::Var(lower_reg_name(def)),
-                    src,
+                LoweredStmt {
+                    stmt: Stmt::Assign {
+                        dst: LValue::Var(lower_reg_name(def)),
+                        src,
+                    },
+                    predicate_def_idx: Some(0),
                 }
             } else {
-                Stmt::ExprStmt(src)
+                LoweredStmt {
+                    stmt: Stmt::ExprStmt(src),
+                    predicate_def_idx: None,
+                }
             }
         }
     }
@@ -628,25 +679,46 @@ fn rooted_global_byte_offset(
     }
 }
 
-fn apply_stmt_predicate(stmt: &IRStatement, lowered: Stmt) -> Stmt {
+fn select_memory_result_def(stmt: &IRStatement) -> Option<(usize, &crate::ir::RegId)> {
+    stmt.defs
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, def)| {
+            let reg = def.get_reg()?;
+            (!is_sink_or_predicate_reg(reg)).then_some((idx, reg))
+        })
+        .next()
+}
+
+fn is_sink_or_predicate_reg(reg: &crate::ir::RegId) -> bool {
+    matches!(reg.class.as_str(), "PT" | "UPT" | "P" | "UP" | "RZ" | "URZ")
+}
+
+fn apply_stmt_predicate(stmt: &IRStatement, lowered: LoweredStmt) -> Stmt {
+    let LoweredStmt {
+        stmt: lowered_stmt,
+        predicate_def_idx,
+    } = lowered;
     let Some(pred) = &stmt.pred else {
-        return lowered;
+        return lowered_stmt;
     };
-    if stmt.defs.len() == 1 && !stmt.pred_old_defs.is_empty() {
-        if let Stmt::Assign { dst, src } = lowered {
-            return Stmt::Assign {
-                dst,
-                src: Expr::Ternary {
-                    cond: Box::new(lower_scalar_expr(pred)),
-                    then_expr: Box::new(src),
-                    else_expr: Box::new(lower_scalar_expr(&stmt.pred_old_defs[0])),
-                },
-            };
+    if let Some(def_idx) = predicate_def_idx {
+        if let Some(old_def) = stmt.pred_old_defs.get(def_idx) {
+            if let Stmt::Assign { dst, src } = lowered_stmt {
+                return Stmt::Assign {
+                    dst,
+                    src: Expr::Ternary {
+                        cond: Box::new(lower_scalar_expr(pred)),
+                        then_expr: Box::new(src),
+                        else_expr: Box::new(lower_scalar_expr(old_def)),
+                    },
+                };
+            }
         }
     }
     Stmt::If {
         condition: lower_scalar_expr(pred),
-        then_branch: Box::new(lowered),
+        then_branch: Box::new(lowered_stmt),
         else_branch: None,
     }
 }
@@ -818,6 +890,55 @@ mod tests {
     }
 
     #[test]
+    fn lowers_multi_def_atomic_results_to_data_reg_and_preserves_false_path() {
+        let stmt = IRStatement {
+            defs: vec![
+                IRExpr::Reg(crate::ir::RegId::new("PT", 0, 1)),
+                IRExpr::Reg(crate::ir::RegId::new("R", 7, 1).with_ssa(1)),
+            ],
+            value: RValue::Op {
+                opcode: "ATOMG.E.ADD.STRONG.GPU".to_string(),
+                args: vec![
+                    IRExpr::Mem {
+                        base: Box::new(IRExpr::Reg(crate::ir::RegId::new("R", 4, 1))),
+                        offset: None,
+                        width: Some(64),
+                    },
+                    IRExpr::Reg(crate::ir::RegId::new("R", 13, 1)),
+                ],
+            },
+            pred: Some(IRExpr::Reg(crate::ir::RegId::new("P", 2, 1))),
+            mem_addr_args: Some(vec![IRExpr::Mem {
+                base: Box::new(IRExpr::Reg(crate::ir::RegId::new("R", 4, 1))),
+                offset: None,
+                width: Some(64),
+            }]),
+            pred_old_defs: vec![
+                IRExpr::Reg(crate::ir::RegId::new("PT", 0, 1)),
+                IRExpr::Reg(crate::ir::RegId::new("R", 7, 1).with_ssa(0)),
+            ],
+        };
+        let mut analysis = FunctionAnalysis::default();
+        analysis.mem_accesses.push(MemAccessInfo {
+            block_id: 0,
+            stmt_idx: 0,
+            kind: MemAccessKind::Atomic,
+            space: CudaMemorySpace::Global,
+            bit_width: Some(32),
+            vector_width: None,
+            constant_byte_offset: Some(0),
+            has_dynamic_offset: true,
+            root: AddressRoot::RegisterBase(crate::ir::RegId::new("R", 4, 1)),
+        });
+        let lowered = lower_basic_stmt(0, 0, &stmt, &analysis);
+        let Stmt::Assign { dst, src } = lowered else {
+            panic!("expected assignment");
+        };
+        assert_eq!(dst.render(), "r7_1");
+        assert_eq!(src.render(), "p2 ? (atomicAdd(&r4[0], r13)) : r7_0");
+    }
+
+    #[test]
     fn lowers_structured_if_and_memory_load_body() {
         let analysis = FunctionAnalysis::default();
         let structured = StructuredStatement::If {
@@ -861,7 +982,7 @@ mod tests {
             pred_old_defs: Vec::new(),
         };
         let lowered = lower_non_memory_stmt(&stmt);
-        let Stmt::Assign { src, .. } = lowered else {
+        let Stmt::Assign { src, .. } = lowered.stmt else {
             panic!("expected assignment");
         };
         assert_eq!(src.render(), "r4_0 + 4");
@@ -884,7 +1005,7 @@ mod tests {
             pred_old_defs: Vec::new(),
         };
         let lowered = lower_non_memory_stmt(&stmt);
-        let Stmt::Assign { src, .. } = lowered else {
+        let Stmt::Assign { src, .. } = lowered.stmt else {
             panic!("expected assignment");
         };
         assert_eq!(src.render(), "IADD3.X(r2_0, r3_0, 0)");
