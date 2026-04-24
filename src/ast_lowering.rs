@@ -246,7 +246,12 @@ fn lower_base_and_index(
     analysis: &FunctionAnalysis,
 ) -> Option<(Expr, Expr)> {
     let mem_expr = stmt.mem_addr_args.as_ref()?.first()?;
-    let IRExpr::Mem { offset, width, .. } = mem_expr else {
+    let IRExpr::Mem {
+        base: addr_base,
+        offset,
+        width,
+    } = mem_expr
+    else {
         return None;
     };
     let base = match access.space {
@@ -269,7 +274,12 @@ fn lower_base_and_index(
         },
         CudaMemorySpace::Param | CudaMemorySpace::Generic => lower_scalar_expr(mem_expr),
     };
-    let index = lower_index_expr(offset.as_deref(), access.bit_width.or(*width));
+    let index = match access.space {
+        CudaMemorySpace::Shared | CudaMemorySpace::Local => {
+            lower_element_index_expr(addr_base.as_ref(), offset.as_deref(), access.bit_width.or(*width))
+        }
+        _ => lower_index_expr(offset.as_deref(), access.bit_width.or(*width)),
+    };
     Some((base, index))
 }
 
@@ -286,6 +296,49 @@ fn lower_index_expr(offset: Option<&IRExpr>, bit_width: Option<u32>) -> Expr {
             Expr::Imm(value.to_string())
         }
         Some(expr) => lower_scalar_expr(expr),
+    }
+}
+
+fn lower_element_index_expr(base: &IRExpr, offset: Option<&IRExpr>, bit_width: Option<u32>) -> Expr {
+    let byte_expr = combine_byte_offset_expr(base, offset);
+    scale_index_expr(byte_expr, bit_width)
+}
+
+fn combine_byte_offset_expr(base: &IRExpr, offset: Option<&IRExpr>) -> Expr {
+    let mut terms = Vec::new();
+    if !ir_expr_is_zero(base) {
+        terms.push(lower_scalar_expr(base));
+    }
+    if let Some(offset) = offset.filter(|expr| !ir_expr_is_zero(expr)) {
+        terms.push(lower_scalar_expr(offset));
+    }
+    match terms.len() {
+        0 => Expr::Imm("0".to_string()),
+        1 => terms.remove(0),
+        _ => Expr::Binary {
+            op: "+".to_string(),
+            lhs: Box::new(terms.remove(0)),
+            rhs: Box::new(terms.remove(0)),
+        },
+    }
+}
+
+fn scale_index_expr(expr: Expr, bit_width: Option<u32>) -> Expr {
+    let bytes = bit_width.and_then(|bits| bits.checked_div(8)).filter(|bytes| *bytes > 1);
+    let Some(bytes) = bytes else {
+        return expr;
+    };
+    if let Expr::Imm(value) = &expr {
+        if let Ok(value) = value.parse::<i64>() {
+            if value % i64::from(bytes) == 0 {
+                return Expr::Imm((value / i64::from(bytes)).to_string());
+            }
+        }
+    }
+    Expr::Binary {
+        op: "/".to_string(),
+        lhs: Box::new(expr),
+        rhs: Box::new(Expr::Imm(bytes.to_string())),
     }
 }
 
@@ -442,6 +495,14 @@ fn lower_reg_name(reg: &crate::ir::RegId) -> String {
     canonical_reg_ident(reg)
 }
 
+fn ir_expr_is_zero(expr: &IRExpr) -> bool {
+    match expr {
+        IRExpr::ImmI(0) => true,
+        IRExpr::Reg(reg) => matches!(reg.class.as_str(), "RZ" | "URZ"),
+        _ => false,
+    }
+}
+
 fn named_param_word_expr(name: &str) -> Expr {
     if let Some((base, lane)) = PointerLane::parse_named(name) {
         Expr::PtrLane { base, lane }
@@ -523,7 +584,7 @@ mod tests {
         let Stmt::Assign { dst, .. } = lowered else {
             panic!("expected assign");
         };
-        assert_eq!(dst.render(), "shmem[2]");
+        assert_eq!(dst.render(), "shmem[(r2_0 + 8) / 4]");
     }
 
     #[test]
@@ -540,7 +601,7 @@ mod tests {
         };
         assert_eq!(dst.render(), "r0_0");
         assert!(src.render().contains("atomicAdd"));
-        assert!(src.render().contains("&shmem[0]"));
+        assert!(src.render().contains("&shmem[r2_0 / 4]"));
     }
 
     #[test]
@@ -617,7 +678,7 @@ mod tests {
         let Stmt::Assign { src, .. } = lowered else {
             panic!("expected assignment");
         };
-        assert_eq!(src.render(), "p0 ? (atomicAdd(&shmem[0], r4)) : r0_0");
+        assert_eq!(src.render(), "p0 ? (atomicAdd(&shmem[r2 / 4], r4)) : r0_0");
     }
 
     #[test]
