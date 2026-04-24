@@ -69,10 +69,18 @@ pub fn lower_memory_stmt(
                     .filter(|expr| !matches!(expr, IRExpr::Mem { .. }))
                     .map(lower_scalar_expr),
             );
-            Some(Stmt::ExprStmt(Expr::CallLike {
+            let call = Expr::CallLike {
                 func: func.to_string(),
                 args,
-            }))
+            };
+            if let Some(def) = stmt.defs.first().and_then(IRExpr::get_reg) {
+                Some(Stmt::Assign {
+                    dst: LValue::Var(lower_reg_name(def)),
+                    src: call,
+                })
+            } else {
+                Some(Stmt::ExprStmt(call))
+            }
         }
     }
 }
@@ -325,15 +333,7 @@ fn lower_basic_stmt(
 ) -> Stmt {
     let lowered = lower_memory_stmt(block_id, stmt_idx, stmt, analysis)
         .unwrap_or_else(|| lower_non_memory_stmt(stmt));
-    if let Some(pred) = &stmt.pred {
-        Stmt::If {
-            condition: lower_scalar_expr(pred),
-            then_branch: Box::new(lowered),
-            else_branch: None,
-        }
-    } else {
-        lowered
-    }
+    apply_stmt_predicate(stmt, lowered)
 }
 
 fn lower_non_memory_stmt(stmt: &IRStatement) -> Stmt {
@@ -407,6 +407,29 @@ fn lower_reg_name(reg: &crate::ir::RegId) -> String {
     canonical_reg_ident(reg)
 }
 
+fn apply_stmt_predicate(stmt: &IRStatement, lowered: Stmt) -> Stmt {
+    let Some(pred) = &stmt.pred else {
+        return lowered;
+    };
+    if stmt.defs.len() == 1 && !stmt.pred_old_defs.is_empty() {
+        if let Stmt::Assign { dst, src } = lowered {
+            return Stmt::Assign {
+                dst,
+                src: Expr::Ternary {
+                    cond: Box::new(lower_scalar_expr(pred)),
+                    then_expr: Box::new(src),
+                    else_expr: Box::new(lower_scalar_expr(&stmt.pred_old_defs[0])),
+                },
+            };
+        }
+    }
+    Stmt::If {
+        condition: lower_scalar_expr(pred),
+        then_branch: Box::new(lowered),
+        else_branch: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,11 +492,71 @@ mod tests {
         let (analysis, block_id, stmt_idx, stmt) =
             analyze_stmt(sass, |stmt| stmt_opcode(stmt).starts_with("ATOMS"));
         let lowered = lower_memory_stmt(block_id, stmt_idx, &stmt, &analysis).expect("lowered");
-        let Stmt::ExprStmt(expr) = lowered else {
-            panic!("expected expr stmt");
+        let Stmt::Assign { dst, src } = lowered else {
+            panic!("expected assignment");
         };
-        assert!(expr.render().contains("atomicAdd"));
-        assert!(expr.render().contains("&shmem[0]"));
+        assert_eq!(dst.render(), "r0_0");
+        assert!(src.render().contains("atomicAdd"));
+        assert!(src.render().contains("&shmem[0]"));
+    }
+
+    #[test]
+    fn lowers_predicated_defs_to_ternary_assignments() {
+        let stmt = IRStatement {
+            defs: vec![IRExpr::Reg(crate::ir::RegId::new("R", 4, 1).with_ssa(2))],
+            value: RValue::Op {
+                opcode: "MOV".to_string(),
+                args: vec![IRExpr::ImmI(1)],
+            },
+            pred: Some(IRExpr::Reg(crate::ir::RegId::new("P", 0, 1))),
+            mem_addr_args: None,
+            pred_old_defs: vec![IRExpr::Reg(crate::ir::RegId::new("R", 4, 1).with_ssa(1))],
+        };
+        let lowered = lower_basic_stmt(0, 0, &stmt, &FunctionAnalysis::default());
+        let Stmt::Assign { src, .. } = lowered else {
+            panic!("expected assignment");
+        };
+        assert_eq!(src.render(), "p0 ? (MOV(1)) : r4_1");
+    }
+
+    #[test]
+    fn lowers_predicated_atomic_results_with_false_path_value() {
+        let stmt = IRStatement {
+            defs: vec![IRExpr::Reg(crate::ir::RegId::new("R", 0, 1).with_ssa(1))],
+            value: RValue::Op {
+                opcode: "ATOMS.ADD".to_string(),
+                args: vec![
+                    IRExpr::Mem {
+                        base: Box::new(IRExpr::Reg(crate::ir::RegId::new("R", 2, 1))),
+                        offset: None,
+                        width: Some(32),
+                    },
+                    IRExpr::Reg(crate::ir::RegId::new("R", 4, 1)),
+                ],
+            },
+            pred: Some(IRExpr::Reg(crate::ir::RegId::new("P", 0, 1))),
+            mem_addr_args: Some(vec![IRExpr::Mem {
+                base: Box::new(IRExpr::Reg(crate::ir::RegId::new("R", 2, 1))),
+                offset: None,
+                width: Some(32),
+            }]),
+            pred_old_defs: vec![IRExpr::Reg(crate::ir::RegId::new("R", 0, 1).with_ssa(0))],
+        };
+        let mut analysis = FunctionAnalysis::default();
+        analysis.mem_accesses.push(MemAccessInfo {
+            block_id: 0,
+            stmt_idx: 0,
+            kind: MemAccessKind::Atomic,
+            space: CudaMemorySpace::Shared,
+            bit_width: Some(32),
+            vector_width: None,
+            root: AddressRoot::SharedObject("shmem".to_string()),
+        });
+        let lowered = lower_basic_stmt(0, 0, &stmt, &analysis);
+        let Stmt::Assign { src, .. } = lowered else {
+            panic!("expected assignment");
+        };
+        assert_eq!(src.render(), "p0 ? (atomicAdd(&shmem[0], r4)) : r0_0");
     }
 
     #[test]
