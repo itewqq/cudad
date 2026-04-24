@@ -384,4 +384,32 @@ mod tests {
         assert_eq!(plan.locals[0].array_len, None);
         assert!(plan.locals[0].dynamic_extent);
     }
+
+    #[test]
+    fn plans_dynamic_local_objects_as_unresolved_backing_arrays() {
+        let mut analysis = FunctionAnalysis::default();
+        analysis.mem_accesses.push(MemAccessInfo {
+            block_id: 0,
+            stmt_idx: 0,
+            kind: MemAccessKind::Store,
+            space: CudaMemorySpace::Local,
+            bit_width: Some(32),
+            vector_width: None,
+            constant_byte_offset: Some(8),
+            has_dynamic_offset: true,
+            root: AddressRoot::LocalObject("local_mem".to_string()),
+        });
+
+        let plan = plan_symbols(
+            &StructuredFunction {
+                params: Vec::new(),
+                locals: Vec::new(),
+                body: Stmt::Empty,
+            },
+            &analysis,
+        );
+        assert_eq!(plan.locals[0].name, "local_mem");
+        assert_eq!(plan.locals[0].array_len, None);
+        assert!(plan.locals[0].dynamic_extent);
+    }
 }

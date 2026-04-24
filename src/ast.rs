@@ -964,20 +964,31 @@ fn render_decl_line(decl: &Decl) -> String {
         StorageClass::Shared if decl.dynamic_extent => "extern __shared__ ",
         StorageClass::Shared => "__shared__ ",
     };
-    let live_in = if decl.live_in { " // live-in" } else { "" };
+    let mut comments = Vec::new();
+    if decl.dynamic_extent {
+        comments.push("dynamic extent");
+    }
+    if decl.live_in {
+        comments.push("live-in");
+    }
+    let comment_suffix = if comments.is_empty() {
+        String::new()
+    } else {
+        format!(" // {}", comments.join(", "))
+    };
     format!(
         "{}{} {};{}",
         storage,
         render_decl_ty(decl),
         render_decl_name(decl),
-        live_in
+        comment_suffix
     )
-        .replace(&format!(";{}", live_in), ";")
-        + live_in
+        .replace(&format!(";{}", comment_suffix), ";")
+        + &comment_suffix
 }
 
 fn render_decl_name(decl: &Decl) -> String {
-    if decl.dynamic_extent && matches!(decl.storage, StorageClass::Shared) {
+    if decl.dynamic_extent {
         return format!("{}[]", decl.name);
     }
     match decl.array_len {
@@ -987,9 +998,6 @@ fn render_decl_name(decl: &Decl) -> String {
 }
 
 fn render_decl_ty(decl: &Decl) -> String {
-    if decl.dynamic_extent && matches!(decl.storage, StorageClass::Local) {
-        return format!("{}*", decl.ty);
-    }
     decl.ty.clone()
 }
 
