@@ -104,6 +104,10 @@
 - Canonical scalar lowering now handles `IABS` and `MUFU.RCP` semantically,
   which restores `abs(...)` / `rcp_approx(...)` rendering on the canonical path
   without reviving semantic-lift side tables.
+- Canonical memory lowering now wraps unresolved register-backed global/generic
+  bases in explicit typed pointer casts before indexing, which removes raw
+  pseudo-pointer forms like `r2_5[0]` from canonical output while preserving
+  unresolved pointer semantics structurally.
 - Shared-memory declaration planning now carries the pointee type recovered
   from SSA/shared round-trips into canonical symbol planning, so canonical
   `shmem` backing objects can render as `float` instead of a hard-coded
@@ -131,9 +135,10 @@
 1. Switch the remaining curated full-pass tests and helper entrypoints from the
    old structured-output path onto the canonical driver, starting with the
    fixtures that now pass thanks to semantic scalar lowering of `ConstMem`,
-   `IABS`, and `MUFU.RCP`, plus recursive rooted offset expansion,
-   `UIADD3.64` root propagation, the raw `IADD.64` helper-lowering cleanup,
-   and typed shared-backing declarations.
+   `IABS`, and `MUFU.RCP`, recursive rooted offset expansion, typed casts for
+   unresolved register-backed memory bases, `UIADD3.64` root propagation, the
+   raw `IADD.64` helper-lowering cleanup, and typed shared-backing
+   declarations.
 2. Delete duplicated CLI/test helper logic that still builds semantic-lift,
    token-map, or post-render cleanup artifacts after the canonical path is
    proven on those fixtures, starting with the stable canonical smoke path

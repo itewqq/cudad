@@ -217,7 +217,7 @@ impl Expr {
                 format!("({})({})", ty, expr.render())
             }
             Expr::Index { base, index } => {
-                format!("{}[{}]", base.render(), index.render())
+                format!("{}[{}]", render_index_base_expr(base), index.render())
             }
         }
     }
@@ -317,7 +317,7 @@ impl LValue {
                 }
             }
             LValue::Indexed { base, index } => {
-                format!("{}[{}]", base.render(), index.render())
+                format!("{}[{}]", render_index_base_expr(base), index.render())
             }
         }
     }
@@ -910,6 +910,28 @@ fn render_addr_operand(addr: &Expr) -> String {
         | Expr::WidePtr { .. }
         | Expr::Addr64 { .. } => format!("({})", addr.render()),
         _ => addr.render(),
+    }
+}
+
+fn render_index_base_expr(base: &Expr) -> String {
+    match base {
+        Expr::Raw(_)
+        | Expr::Imm(_)
+        | Expr::Reg(_)
+        | Expr::PtrLane { .. }
+        | Expr::LaneExtract { .. }
+        | Expr::CallLike { .. }
+        | Expr::Intrinsic { .. }
+        | Expr::Load { .. }
+        | Expr::WidePtr { .. }
+        | Expr::ConstMemSymbol(_)
+        | Expr::Builtin(_)
+        | Expr::Addr64 { .. }
+        | Expr::Index { .. } => base.render(),
+        Expr::Unary { .. }
+        | Expr::Binary { .. }
+        | Expr::Ternary { .. }
+        | Expr::Cast { .. } => format!("({})", base.render()),
     }
 }
 

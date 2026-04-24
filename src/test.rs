@@ -1389,6 +1389,22 @@ fn full_pass_cumsum_linear_no_longer_overflows_named_render() {
 }
 
 #[test]
+fn canonical_full_pass_cumsum_linear_avoids_register_pseudo_pointers() {
+    let cumsum = split_decoded_functions(include_str!("../test_cu/corpus/loop_kernels.sass"))
+        .into_iter()
+        .find(|f| f.name == "cumsum_linear")
+        .expect("cumsum_linear fixture should exist");
+    let out = run_canonical_output_full_pass_from_instrs(cumsum.instrs, cumsum.sm, "cumsum_linear");
+    let raw_reg_index =
+        Regex::new(r"\b(?:r|ur)\d+_\d+\[").expect("valid raw register pseudo-pointer regex");
+    assert!(
+        !raw_reg_index.is_match(&out),
+        "expected canonical cumsum_linear output to avoid raw register pseudo-pointers, got:\n{}",
+        out
+    );
+}
+
+#[test]
 fn full_pass_gelu_forward_recovers_copysign_and_typed_pointer_arithmetic() {
     let gelu = split_decoded_functions(include_str!("../test_cu/corpus_sm100/ml_kernels.sass"))
         .into_iter()

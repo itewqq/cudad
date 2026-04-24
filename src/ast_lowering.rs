@@ -315,7 +315,7 @@ fn lower_base_and_index(
         ),
         _ => lower_index_expr(offset.as_deref(), access.bit_width.or(*width), Some(analysis)),
     };
-    Some((base, index))
+    Some((normalize_index_base(base, access, analysis), index))
 }
 
 fn lower_explicit_local_stmt(stmt: &IRStatement, access: &MemAccessInfo) -> Option<LoweredStmt> {
@@ -503,6 +503,57 @@ fn global_param_base_name(param_idx: u32, analysis: &FunctionAnalysis) -> String
         }
     }
     format!("param_{}", param_idx)
+}
+
+fn normalize_index_base(base: Expr, access: &MemAccessInfo, analysis: &FunctionAnalysis) -> Expr {
+    if !index_base_requires_pointer_cast(access, &base) {
+        return base;
+    }
+    Expr::Cast {
+        ty: format!("{}*", unresolved_access_scalar_ty(access, analysis)),
+        expr: Box::new(base),
+    }
+}
+
+fn index_base_requires_pointer_cast(access: &MemAccessInfo, base: &Expr) -> bool {
+    matches!(
+        access.space,
+        CudaMemorySpace::Global
+            | CudaMemorySpace::Const
+            | CudaMemorySpace::Param
+            | CudaMemorySpace::Generic
+    ) && !expr_is_indexable_base(base, access)
+}
+
+fn expr_is_indexable_base(expr: &Expr, access: &MemAccessInfo) -> bool {
+    match expr {
+        Expr::Reg(text) | Expr::Raw(text) | Expr::ConstMemSymbol(text) | Expr::Builtin(text) => {
+            text.ends_with("_ptr")
+                || text == "shmem"
+                || text == "shmem_u8"
+                || (matches!(access.root, AddressRoot::ParamWord(_)) && text.starts_with("param_"))
+        }
+        Expr::Cast { ty, .. } => ty.ends_with('*'),
+        _ => false,
+    }
+}
+
+fn unresolved_access_scalar_ty(access: &MemAccessInfo, analysis: &FunctionAnalysis) -> &'static str {
+    match access.space {
+        CudaMemorySpace::Shared => analysis.shared_pointee_ty.unwrap_or("uint32_t"),
+        _ => scalar_ty_for_bit_width(access.bit_width),
+    }
+}
+
+fn scalar_ty_for_bit_width(bit_width: Option<u32>) -> &'static str {
+    match bit_width.unwrap_or(32) {
+        8 => "uint8_t",
+        16 => "uint16_t",
+        32 => "uint32_t",
+        64 => "uint64_t",
+        128 => "uint4",
+        _ => "uint32_t",
+    }
 }
 
 fn store_value_expr(stmt: &IRStatement, analysis: Option<&FunctionAnalysis>) -> Option<Expr> {
@@ -1653,7 +1704,7 @@ mod tests {
             panic!("expected assignment");
         };
         assert_eq!(dst.render(), "r7_1");
-        assert_eq!(src.render(), "p2 ? (atomicAdd(&r4[0], r13)) : r7_0");
+        assert_eq!(src.render(), "p2 ? (atomicAdd(&((uint32_t*)(r4))[0], r13)) : r7_0");
     }
 
     #[test]
@@ -1838,6 +1889,45 @@ mod tests {
             Some(&legacy_analysis),
         );
         assert_eq!(builtin.render(), "blockDim.x");
+    }
+
+    #[test]
+    fn wraps_unresolved_register_bases_before_indexing() {
+        let stmt = IRStatement {
+            defs: vec![IRExpr::Reg(crate::ir::RegId::new("R", 0, 1).with_ssa(0))],
+            value: RValue::Op {
+                opcode: "LDG.E".to_string(),
+                args: vec![IRExpr::Mem {
+                    base: Box::new(IRExpr::Reg(crate::ir::RegId::new("R", 4, 1).with_ssa(0))),
+                    offset: None,
+                    width: Some(32),
+                }],
+            },
+            pred: None,
+            mem_addr_args: Some(vec![IRExpr::Mem {
+                base: Box::new(IRExpr::Reg(crate::ir::RegId::new("R", 4, 1).with_ssa(0))),
+                offset: None,
+                width: Some(32),
+            }]),
+            pred_old_defs: Vec::new(),
+        };
+        let mut analysis = FunctionAnalysis::default();
+        analysis.mem_accesses.push(MemAccessInfo {
+            block_id: 0,
+            stmt_idx: 0,
+            kind: MemAccessKind::Load,
+            space: CudaMemorySpace::Global,
+            bit_width: Some(32),
+            vector_width: None,
+            constant_byte_offset: Some(0),
+            has_dynamic_offset: true,
+            root: AddressRoot::RegisterBase(crate::ir::RegId::new("R", 4, 1).with_ssa(0)),
+        });
+        let lowered = lower_memory_stmt(0, 0, &stmt, &analysis).expect("lowered");
+        let Stmt::Assign { src, .. } = lowered else {
+            panic!("expected assignment");
+        };
+        assert_eq!(src.render(), "((uint32_t*)(r4_0))[0]");
     }
 
     #[test]
