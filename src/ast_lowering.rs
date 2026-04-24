@@ -448,10 +448,7 @@ fn lower_basic_stmt(
 fn lower_non_memory_stmt(stmt: &IRStatement) -> Stmt {
     match &stmt.value {
         RValue::Op { opcode, args } => {
-            let rhs = Expr::CallLike {
-                func: opcode.clone(),
-                args: args.iter().map(lower_scalar_expr).collect(),
-            };
+            let rhs = lower_op_expr(opcode, args);
             if let Some(def) = stmt.defs.first().and_then(|expr| expr.get_reg()) {
                 Stmt::Assign {
                     dst: LValue::Var(lower_reg_name(def)),
@@ -498,6 +495,38 @@ fn lower_non_memory_stmt(stmt: &IRStatement) -> Stmt {
             }
         }
     }
+}
+
+fn lower_op_expr(opcode: &str, args: &[IRExpr]) -> Expr {
+    if let Some(expr) = lower_simple_op_expr(opcode, args) {
+        return expr;
+    }
+    Expr::CallLike {
+        func: opcode.to_string(),
+        args: args.iter().map(lower_scalar_expr).collect(),
+    }
+}
+
+fn lower_simple_op_expr(opcode: &str, args: &[IRExpr]) -> Option<Expr> {
+    let mnem = opcode.split('.').next().unwrap_or(opcode);
+    match mnem {
+        "MOV" | "UMOV" | "FMOV" => args.first().map(lower_scalar_expr),
+        "IADD" | "IADD3" | "UIADD" | "UIADD3" | "FADD" => lower_add_expr(args),
+        _ => None,
+    }
+}
+
+fn lower_add_expr(args: &[IRExpr]) -> Option<Expr> {
+    let mut terms = args
+        .iter()
+        .filter(|expr| !ir_expr_is_zero(expr))
+        .map(lower_scalar_expr);
+    let first = terms.next()?;
+    Some(terms.fold(first, |lhs, rhs| Expr::Binary {
+        op: "+".to_string(),
+        lhs: Box::new(lhs),
+        rhs: Box::new(rhs),
+    }))
 }
 
 fn lower_reg_expr(reg: &crate::ir::RegId) -> Expr {
@@ -694,7 +723,7 @@ mod tests {
         let Stmt::Assign { src, .. } = lowered else {
             panic!("expected assignment");
         };
-        assert_eq!(src.render(), "p0 ? (MOV(1)) : r4_1");
+        assert_eq!(src.render(), "p0 ? 1 : r4_1");
     }
 
     #[test]
@@ -762,6 +791,29 @@ mod tests {
         let lowered = lower_structured_stmt(&structured, &analysis);
         let rendered = lowered.render_with_indent(0);
         assert!(rendered.contains("if (p0)"));
-        assert!(rendered.contains("r4 = MOV(1);"));
+        assert!(rendered.contains("r4 = 1;"));
+    }
+
+    #[test]
+    fn lowers_iadd3_to_addition_chain() {
+        let stmt = IRStatement {
+            defs: vec![IRExpr::Reg(crate::ir::RegId::new("R", 6, 1).with_ssa(0))],
+            value: RValue::Op {
+                opcode: "IADD3".to_string(),
+                args: vec![
+                    IRExpr::Reg(crate::ir::RegId::new("R", 4, 1).with_ssa(0)),
+                    IRExpr::ImmI(4),
+                    IRExpr::Reg(crate::ir::RegId::new("RZ", 0, 1)),
+                ],
+            },
+            pred: None,
+            mem_addr_args: None,
+            pred_old_defs: Vec::new(),
+        };
+        let lowered = lower_non_memory_stmt(&stmt);
+        let Stmt::Assign { src, .. } = lowered else {
+            panic!("expected assignment");
+        };
+        assert_eq!(src.render(), "r4_0 + 4");
     }
 }

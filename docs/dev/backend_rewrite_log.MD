@@ -33,6 +33,9 @@
   pointer arithmetic, including split pointer increments before `LDG`.
 - AST lowering now keeps byte-offset expressions for rooted global/shared
   accesses instead of dropping the dynamic address component.
+- Non-memory AST lowering now folds trivial `MOV` and add-family ops into
+  native AST expressions instead of rendering every scalar op as a call-like
+  helper.
 - Early AST lowering can now emit space-aware AST for:
   - global param-rooted loads
   - shared/local indexed stores
