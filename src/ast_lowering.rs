@@ -669,6 +669,9 @@ fn lower_non_memory_stmt_with_analysis(
     if let Some(lowered) = lower_structural_control_stmt(stmt) {
         return lowered;
     }
+    if let Some(lowered) = lower_multi_def_lop3_stmt(stmt, analysis) {
+        return lowered;
+    }
     match &stmt.value {
         RValue::Op { opcode, args } => {
             let rhs = lower_op_expr_with_analysis(opcode, args, analysis);
@@ -804,6 +807,7 @@ fn lower_semantic_op_expr(
     analysis: Option<&FunctionAnalysis>,
 ) -> Option<Expr> {
     lower_setp_expr(opcode, args, analysis)
+        .or_else(|| lower_lop3_expr(opcode, args, analysis))
         .or_else(|| lower_wide_add_lo_expr(opcode, args, analysis))
         .or_else(|| lower_shf_expr(opcode, args, analysis))
         .or_else(|| lower_shfl_expr(opcode, args, analysis))
@@ -908,6 +912,205 @@ fn lower_add_expr(args: &[IRExpr], analysis: Option<&FunctionAnalysis>) -> Optio
         lhs: Box::new(lhs),
         rhs: Box::new(rhs),
     }))
+}
+
+fn lower_multi_def_lop3_stmt(
+    stmt: &IRStatement,
+    analysis: Option<&FunctionAnalysis>,
+) -> Option<LoweredStmt> {
+    let RValue::Op { opcode, args } = &stmt.value else {
+        return None;
+    };
+    let mnem = opcode.split('.').next().unwrap_or(opcode);
+    if !matches!(mnem, "LOP3" | "ULOP3") || stmt.defs.len() < 2 {
+        return None;
+    }
+    let pred_def = stmt
+        .defs
+        .iter()
+        .filter_map(|expr| expr.get_reg())
+        .find(|reg| matches!(reg.class.as_str(), "P" | "UP"))?;
+    let data_def = stmt
+        .defs
+        .iter()
+        .filter_map(|expr| expr.get_reg())
+        .find(|reg| matches!(reg.class.as_str(), "R" | "UR"))?;
+    let data_expr = lower_lop3_expr(opcode, args, analysis)?;
+    let pred_expr = Expr::Binary {
+        op: "!=".to_string(),
+        lhs: Box::new(data_expr.clone()),
+        rhs: Box::new(Expr::Imm("0".to_string())),
+    };
+    Some(LoweredStmt {
+        stmt: Stmt::Sequence(vec![
+            Stmt::Assign {
+                dst: LValue::Var(lower_reg_name(data_def)),
+                src: data_expr,
+            },
+            Stmt::Assign {
+                dst: LValue::Var(lower_reg_name(pred_def)),
+                src: pred_expr,
+            },
+        ]),
+        predicate_def_idx: None,
+    })
+}
+
+fn is_pred_control_expr(expr: &IRExpr) -> bool {
+    ir_expr_is_true_pred(expr) || ir_expr_is_false_pred(expr)
+}
+
+fn lower_lop3_expr(
+    opcode: &str,
+    args: &[IRExpr],
+    analysis: Option<&FunctionAnalysis>,
+) -> Option<Expr> {
+    let mnem = opcode.split('.').next().unwrap_or(opcode);
+    if !matches!(mnem, "LOP3" | "ULOP3") || args.len() != 5 || !is_pred_control_expr(&args[4]) {
+        return None;
+    }
+    let imm = match args[3] {
+        IRExpr::ImmI(value) => (value & 0xff) as u8,
+        _ => return None,
+    };
+    let a0z = ir_expr_is_zero(&args[0]);
+    let a1z = ir_expr_is_zero(&args[1]);
+    let a2z = ir_expr_is_zero(&args[2]);
+
+    if a0z && a1z {
+        let bits = ((lop3_bit(imm, 0, 0, 0) as u8) << 0) | ((lop3_bit(imm, 0, 0, 1) as u8) << 1);
+        return lower_lop3_unary_expr(lower_scalar_expr_with_analysis(&args[2], analysis), bits);
+    }
+    if a0z && a2z {
+        let bits = ((lop3_bit(imm, 0, 0, 0) as u8) << 0) | ((lop3_bit(imm, 0, 1, 0) as u8) << 1);
+        return lower_lop3_unary_expr(lower_scalar_expr_with_analysis(&args[1], analysis), bits);
+    }
+    if a1z && a2z {
+        let bits = ((lop3_bit(imm, 0, 0, 0) as u8) << 0) | ((lop3_bit(imm, 1, 0, 0) as u8) << 1);
+        return lower_lop3_unary_expr(lower_scalar_expr_with_analysis(&args[0], analysis), bits);
+    }
+    if a2z {
+        let nibble = ((lop3_bit(imm, 0, 0, 0) as u8) << 0)
+            | ((lop3_bit(imm, 0, 1, 0) as u8) << 1)
+            | ((lop3_bit(imm, 1, 0, 0) as u8) << 2)
+            | ((lop3_bit(imm, 1, 1, 0) as u8) << 3);
+        return lower_lop3_binary_expr(
+            lower_scalar_expr_with_analysis(&args[0], analysis),
+            lower_scalar_expr_with_analysis(&args[1], analysis),
+            nibble,
+        );
+    }
+    if a0z {
+        let nibble = ((lop3_bit(imm, 0, 0, 0) as u8) << 0)
+            | ((lop3_bit(imm, 0, 0, 1) as u8) << 1)
+            | ((lop3_bit(imm, 0, 1, 0) as u8) << 2)
+            | ((lop3_bit(imm, 0, 1, 1) as u8) << 3);
+        return lower_lop3_binary_expr(
+            lower_scalar_expr_with_analysis(&args[1], analysis),
+            lower_scalar_expr_with_analysis(&args[2], analysis),
+            nibble,
+        );
+    }
+    if a1z {
+        let nibble = ((lop3_bit(imm, 0, 0, 0) as u8) << 0)
+            | ((lop3_bit(imm, 0, 0, 1) as u8) << 1)
+            | ((lop3_bit(imm, 1, 0, 0) as u8) << 2)
+            | ((lop3_bit(imm, 1, 0, 1) as u8) << 3);
+        return lower_lop3_binary_expr(
+            lower_scalar_expr_with_analysis(&args[0], analysis),
+            lower_scalar_expr_with_analysis(&args[2], analysis),
+            nibble,
+        );
+    }
+    None
+}
+
+fn lop3_bit(imm: u8, a: u8, b: u8, c: u8) -> bool {
+    let idx = (a << 2) | (b << 1) | c;
+    ((imm >> idx) & 1) != 0
+}
+
+fn lower_lop3_unary_expr(x: Expr, bits: u8) -> Option<Expr> {
+    match bits & 0x3 {
+        0x0 => Some(Expr::Imm("0".to_string())),
+        0x1 => Some(Expr::Unary {
+            op: "~".to_string(),
+            arg: Box::new(x),
+        }),
+        0x2 => Some(x),
+        0x3 => Some(Expr::Imm("0xffffffff".to_string())),
+        _ => None,
+    }
+}
+
+fn lower_lop3_binary_expr(x: Expr, y: Expr, nibble: u8) -> Option<Expr> {
+    let x_not = || Expr::Unary {
+        op: "~".to_string(),
+        arg: Box::new(x.clone()),
+    };
+    let y_not = || Expr::Unary {
+        op: "~".to_string(),
+        arg: Box::new(y.clone()),
+    };
+    let x_and_y = || Expr::Binary {
+        op: "&".to_string(),
+        lhs: Box::new(x.clone()),
+        rhs: Box::new(y.clone()),
+    };
+    let x_or_y = || Expr::Binary {
+        op: "|".to_string(),
+        lhs: Box::new(x.clone()),
+        rhs: Box::new(y.clone()),
+    };
+    let x_xor_y = || Expr::Binary {
+        op: "^".to_string(),
+        lhs: Box::new(x.clone()),
+        rhs: Box::new(y.clone()),
+    };
+    match nibble & 0xf {
+        0x0 => Some(Expr::Imm("0".to_string())),
+        0x1 => Some(Expr::Unary {
+            op: "~".to_string(),
+            arg: Box::new(x_or_y()),
+        }),
+        0x2 => Some(Expr::Binary {
+            op: "&".to_string(),
+            lhs: Box::new(x_not()),
+            rhs: Box::new(y.clone()),
+        }),
+        0x3 => Some(x_not()),
+        0x4 => Some(Expr::Binary {
+            op: "&".to_string(),
+            lhs: Box::new(x.clone()),
+            rhs: Box::new(y_not()),
+        }),
+        0x5 => Some(y_not()),
+        0x6 => Some(x_xor_y()),
+        0x7 => Some(Expr::Unary {
+            op: "~".to_string(),
+            arg: Box::new(x_and_y()),
+        }),
+        0x8 => Some(x_and_y()),
+        0x9 => Some(Expr::Unary {
+            op: "~".to_string(),
+            arg: Box::new(x_xor_y()),
+        }),
+        0xa => Some(y.clone()),
+        0xb => Some(Expr::Binary {
+            op: "|".to_string(),
+            lhs: Box::new(x_not()),
+            rhs: Box::new(y.clone()),
+        }),
+        0xc => Some(x.clone()),
+        0xd => Some(Expr::Binary {
+            op: "|".to_string(),
+            lhs: Box::new(x.clone()),
+            rhs: Box::new(y_not()),
+        }),
+        0xe => Some(x_or_y()),
+        0xf => Some(Expr::Imm("0xffffffff".to_string())),
+        _ => None,
+    }
 }
 
 fn lower_shf_expr(
@@ -2105,6 +2308,60 @@ mod tests {
         };
         assert_eq!(dst.render(), "r0_0");
         assert_eq!(src.render(), "__shfl_down_sync(0xffffffff, r3_0, 16)");
+    }
+
+    #[test]
+    fn lowers_lop3_and_mask_to_native_bitwise_expr() {
+        let expr = lower_op_expr(
+            "LOP3.LUT",
+            &[
+                IRExpr::Op {
+                    op: "SR_TID.X".to_string(),
+                    args: Vec::new(),
+                },
+                IRExpr::ImmI(31),
+                IRExpr::Reg(crate::ir::RegId::new("RZ", 0, 1)),
+                IRExpr::ImmI(0xc0),
+                IRExpr::Op {
+                    op: "!PT".to_string(),
+                    args: Vec::new(),
+                },
+            ],
+        );
+        assert_eq!(expr.render(), "threadIdx.x & 31");
+    }
+
+    #[test]
+    fn lowers_multi_def_lop3_to_data_and_predicate_assignments() {
+        let stmt = IRStatement {
+            defs: vec![
+                IRExpr::Reg(crate::ir::RegId::new("P", 0, 1).with_ssa(1)),
+                IRExpr::Reg(crate::ir::RegId::new("R", 8, 1).with_ssa(0)),
+            ],
+            value: RValue::Op {
+                opcode: "LOP3.LUT".to_string(),
+                args: vec![
+                    IRExpr::Op {
+                        op: "SR_TID.X".to_string(),
+                        args: Vec::new(),
+                    },
+                    IRExpr::ImmI(31),
+                    IRExpr::Reg(crate::ir::RegId::new("RZ", 0, 1)),
+                    IRExpr::ImmI(0xc0),
+                    IRExpr::Op {
+                        op: "!PT".to_string(),
+                        args: Vec::new(),
+                    },
+                ],
+            },
+            pred: None,
+            mem_addr_args: None,
+            pred_old_defs: Vec::new(),
+        };
+        let lowered = lower_non_memory_stmt(&stmt);
+        let rendered = lowered.stmt.render_with_indent(0);
+        assert!(rendered.contains("r8_0 = threadIdx.x & 31;"), "got:\n{rendered}");
+        assert!(rendered.contains("p0_1 = (threadIdx.x & 31) != 0;"), "got:\n{rendered}");
     }
 
     #[test]

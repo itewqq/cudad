@@ -1642,8 +1642,18 @@ fn canonical_full_pass_warp_reduce_sum_keeps_shuffle_intrinsics() {
         out
     );
     assert!(
+        !out.contains("LOP3.LUT("),
+        "expected canonical warp_reduce_sum to avoid raw lop3 helpers, got:\n{}",
+        out
+    );
+    assert!(
         !out.contains("SHF.R.U32.HI(") && !out.contains("USHF.R.U32.HI("),
         "expected canonical warp_reduce_sum to avoid raw funnel-shift helpers, got:\n{}",
+        out
+    );
+    assert!(
+        out.contains("r8_0 = threadIdx.x & 31;") && out.contains("p0_1 = (threadIdx.x & 31) != 0;"),
+        "expected canonical warp_reduce_sum to recover lane-mask lop3 semantics, got:\n{}",
         out
     );
 }

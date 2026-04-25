@@ -3,7 +3,7 @@
 ## Status
 
 - Branch: `codex/memory-aware-backend-refactor`
-- Checkpoint commit: `db0e02e`
+- Checkpoint commit: `69b621f`
 - Current stage: phase 5 cutover of structured output entrypoints onto the canonical backend, with front-half address-contract fixes still landing as needed
 
 ## Landed invariants
@@ -168,20 +168,28 @@
   and the broader float-pointer/signature smoke for `warp_reduce_sum` now runs
   on the canonical helper instead of the legacy structured-output path.
 - Remaining legacy helper usage in `src/test.rs`: `18`.
+- `LOP3.LUT` instructions with both predicate and data outputs now keep both
+  defs on the canonical path, which fixes `warp_reduce_sum` lane-mask recovery
+  (`threadIdx.x & 31`) and removes the old undefined `r8_0` artifact from the
+  canonical warp-reduction output.
+- Canonical scalar lowering now recognizes the common `LOP3.LUT(..., 0xc0, !PT)`
+  mask pattern as native bitwise `&`, and canonical statement lowering emits
+  the companion predicate def as a structural `!= 0` assignment when the SASS
+  instruction writes both a predicate and a data register.
 
 ## Next safe step
 
-1. Re-run the canonical full-pass fixtures whose remaining gaps are now mostly
-   structural rather than scalar-expression loss (`warp_reduce_sum`, then the
-   still-partial `sgemm_tiled` / shared-memory kernels) and migrate only the
-   assertions that the canonical backend now proves directly.
-2. Keep shrinking the remaining old helper surface in `src/test.rs` only where
+1. Keep shrinking the remaining old helper surface in `src/test.rs` only where
    canonical semantics are now genuinely stronger, not just cosmetically
    different.
-3. Tackle the next structurally visible canonical holes: shared index/root
+2. Tackle the next structurally visible canonical holes: shared index/root
    recovery beyond direct `threadIdx` forms, unresolved control predicates, and
-   the remaining unmodeled scalar ops (notably `LOP3.LUT` predicate shaping)
-   that still force raw helper-shaped output.
+   the remaining unmodeled scalar ops (including broader `LOP3.LUT` predicate
+   shaping beyond the lane-mask case) that still force raw helper-shaped
+   output.
+3. Revisit the broader `sgemm_tiled` / shared-memory fixtures and migrate any
+   additional smoke coverage that the new shared-scale and scalar-op lowering
+   now makes trustworthy on the canonical driver.
 
 ## Open questions
 

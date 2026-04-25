@@ -272,6 +272,35 @@ pub fn derive_op_semantics(
         };
     }
 
+    // LOP3.* family: some forms expose an optional predicate def in operand 0
+    // and a data def in operand 1, followed by the logic inputs, LUT
+    // immediate, and predicate control operand.
+    if matches!(mnem, "LOP3" | "ULOP3") {
+        let mut def_operand_indices = Vec::new();
+        let mut def_roles = Vec::new();
+        let mut first_use_idx = 0usize;
+
+        if operands.first().is_some_and(is_pred_operand) {
+            def_operand_indices.push(0);
+            def_roles.push(DefRole::Pred);
+            first_use_idx = 1;
+        }
+        if operands.len() > first_use_idx {
+            def_operand_indices.push(first_use_idx);
+            def_roles.push(DefRole::Data);
+            first_use_idx += 1;
+        }
+
+        let use_operand_indices = (first_use_idx..operands.len()).collect::<Vec<_>>();
+        let use_roles = vec![UseRole::Data; use_operand_indices.len()];
+        return OpSemantics {
+            def_operand_indices,
+            def_roles,
+            use_operand_indices,
+            use_roles,
+        };
+    }
+
     // SETP family: special case — first two operands are pred defs.
     if matches!(mnem, "ISETP" | "FSETP" | "DSETP" | "HSETP2" | "UISETP") {
         return derive_setp_semantics(operands);
@@ -527,6 +556,33 @@ mod tests {
         assert_eq!(
             sem.use_roles,
             vec![UseRole::Data, UseRole::Data, UseRole::Data]
+        );
+    }
+
+    #[test]
+    fn lop3_tracks_predicate_and_data_outputs() {
+        let ops = vec![
+            reg("P", 0),
+            reg("R", 8),
+            reg("R", 6),
+            imm(31),
+            reg("RZ", 0),
+            imm(0xc0),
+            reg("PT", 0),
+        ];
+        let sem = derive_op_semantics("LOP3.LUT", &ops, false, false);
+        assert_eq!(sem.def_operand_indices, vec![0, 1]);
+        assert_eq!(sem.def_roles, vec![DefRole::Pred, DefRole::Data]);
+        assert_eq!(sem.use_operand_indices, vec![2, 3, 4, 5, 6]);
+        assert_eq!(
+            sem.use_roles,
+            vec![
+                UseRole::Data,
+                UseRole::Data,
+                UseRole::Data,
+                UseRole::Data,
+                UseRole::Data
+            ]
         );
     }
 }

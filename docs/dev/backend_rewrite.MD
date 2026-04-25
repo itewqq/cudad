@@ -62,6 +62,9 @@ constant array.
 - Multi-def scalar ops must keep their non-sink data results; optional
   predicate/sink defs (for example on `SHFL`) must not cause the canonical path
   to drop the real value-producing def.
+- Optional predicate+data scalar outputs (for example `LOP3.LUT P0, R8, ...`)
+  must preserve both results structurally; the canonical path must not turn the
+  data def into an undefined use or silently drop the predicate fact.
 - New backend modules must document their inputs, outputs, invariants, and
   forbidden responsibilities in rustdoc headers.
 
