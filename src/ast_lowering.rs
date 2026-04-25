@@ -857,6 +857,8 @@ fn lower_semantic_op_expr(
     lower_setp_expr(opcode, args, analysis)
         .or_else(|| lower_fsel_expr(opcode, args, analysis))
         .or_else(|| lower_lop3_expr(opcode, args, analysis))
+        .or_else(|| lower_plop3_expr(opcode, args))
+        .or_else(|| lower_lea_hi_expr(opcode, args, analysis))
         .or_else(|| lower_lea_expr(opcode, args, analysis))
         .or_else(|| lower_imad_wide_expr(opcode, args, analysis))
         .or_else(|| lower_imad_x_expr(opcode, args, analysis))
@@ -1182,6 +1184,13 @@ fn is_pred_control_expr(expr: &IRExpr) -> bool {
     ir_expr_is_true_pred(expr) || ir_expr_is_false_pred(expr)
 }
 
+fn is_predicate_expr(expr: &IRExpr) -> bool {
+    is_pred_control_expr(expr)
+        || expr
+            .get_reg()
+            .is_some_and(|reg| matches!(reg.class.as_str(), "P" | "UP"))
+}
+
 fn lower_lop3_expr(
     opcode: &str,
     args: &[IRExpr],
@@ -1246,6 +1255,20 @@ fn lower_lop3_expr(
             lower_scalar_expr_with_analysis(&args[2], analysis),
             nibble,
         );
+    }
+    None
+}
+
+fn lower_plop3_expr(opcode: &str, args: &[IRExpr]) -> Option<Expr> {
+    let mnem = opcode.split('.').next().unwrap_or(opcode);
+    if !matches!(mnem, "PLOP3" | "UPLOP3") || args.len() != 6 {
+        return None;
+    }
+    if args[..4].iter().all(ir_expr_is_true_pred) {
+        match args[4] {
+            IRExpr::ImmI(8 | 128) => return Some(Expr::Imm("false".to_string())),
+            _ => {}
+        }
     }
     None
 }
@@ -1610,25 +1633,39 @@ fn lower_shf_expr(
     }
     let parts = opcode.split('.').collect::<Vec<_>>();
     let is_right = parts.contains(&"R");
+    let is_left = parts.contains(&"L");
     let is_hi = parts.contains(&"HI");
-    if !(is_right && is_hi) || !ir_expr_is_zero(&args[0]) {
-        return None;
-    }
-    let lhs = lower_scalar_expr_with_analysis(&args[2], analysis);
-    let rhs = lower_scalar_expr_with_analysis(&args[1], analysis);
-    let lhs = if parts.contains(&"S32") {
-        Expr::Cast {
-            ty: "int32_t".to_string(),
-            expr: Box::new(lhs),
+    if is_right && is_hi {
+        if !ir_expr_is_zero(&args[0]) {
+            return None;
         }
-    } else {
-        lhs
-    };
-    Some(Expr::Binary {
-        op: ">>".to_string(),
-        lhs: Box::new(lhs),
-        rhs: Box::new(rhs),
-    })
+        let lhs = lower_scalar_expr_with_analysis(&args[2], analysis);
+        let rhs = lower_scalar_expr_with_analysis(&args[1], analysis);
+        let lhs = if parts.contains(&"S32") {
+            Expr::Cast {
+                ty: "int32_t".to_string(),
+                expr: Box::new(lhs),
+            }
+        } else {
+            lhs
+        };
+        return Some(Expr::Binary {
+            op: ">>".to_string(),
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        });
+    }
+    if is_left && is_hi && parts.contains(&"U64") {
+        return Some(Expr::LaneExtract {
+            value: Box::new(Expr::Binary {
+                op: "<<".to_string(),
+                lhs: Box::new(lower_wide_input_expr(&args[0], &args[2], analysis)),
+                rhs: Box::new(lower_scalar_expr_with_analysis(&args[1], analysis)),
+            }),
+            lane: PointerLane::Hi32,
+        });
+    }
+    None
 }
 
 fn lower_shfl_expr(
@@ -2013,6 +2050,61 @@ fn lower_lea_expr(
     ))
 }
 
+fn lower_lea_hi_expr(
+    opcode: &str,
+    args: &[IRExpr],
+    analysis: Option<&FunctionAnalysis>,
+) -> Option<Expr> {
+    let mnem = opcode.split('.').next().unwrap_or(opcode);
+    if !matches!(mnem, "LEA" | "ULEA") || !opcode.split('.').any(|part| part == "HI") {
+        return None;
+    }
+    let sx32 = opcode.split('.').any(|part| part == "SX32");
+    match args {
+        [base, offset, accum, shift] if matches!(shift, IRExpr::ImmI(_)) => {
+            let wide_sum = add_expr(
+                add_expr(
+                    widen_u32_to_u64_expr(lower_scalar_expr_with_analysis(base, analysis)),
+                    lower_shifted_wide_expr(offset, shift, sx32, analysis)?,
+                ),
+                widen_u32_to_u64_expr(lower_scalar_expr_with_analysis(accum, analysis)),
+            );
+            Some(Expr::LaneExtract {
+                value: Box::new(wide_sum),
+                lane: PointerLane::Hi32,
+            })
+        }
+        [offset, ptr_hi, shift, carry] if matches!(shift, IRExpr::ImmI(_)) && is_predicate_expr(carry) => {
+            Some(add_lea_hi_terms(
+                vec![
+                    Expr::LaneExtract {
+                        value: Box::new(lower_shifted_wide_expr(offset, shift, sx32, analysis)?),
+                        lane: PointerLane::Hi32,
+                    },
+                    lower_scalar_expr_with_analysis(ptr_hi, analysis),
+                    lower_carry_inc_expr(carry, analysis)?,
+                ],
+            ))
+        }
+        [offset, ptr_hi, accum_hi, shift, carry]
+            if matches!(shift, IRExpr::ImmI(_)) && is_predicate_expr(carry) =>
+        {
+            Some(add_lea_hi_terms(
+                vec![
+                    Expr::LaneExtract {
+                        value: Box::new(lower_shifted_wide_expr(offset, shift, sx32, analysis)?),
+                        lane: PointerLane::Hi32,
+                    },
+                    lower_scalar_expr_with_analysis(ptr_hi, analysis),
+                    lower_scalar_expr_with_analysis(accum_hi, analysis),
+                    lower_carry_inc_expr(carry, analysis)?,
+                ],
+            ))
+        }
+        _ => None,
+    }
+}
+
 fn lower_lea_carry_expr(args: &[IRExpr], analysis: Option<&FunctionAnalysis>) -> Option<Expr> {
     let [base, offset, shift] = args else {
         return None;
@@ -2051,6 +2143,31 @@ fn lower_shifted_u32_expr(
     })
 }
 
+fn lower_shifted_wide_expr(
+    value: &IRExpr,
+    shift: &IRExpr,
+    sx32: bool,
+    analysis: Option<&FunctionAnalysis>,
+) -> Option<Expr> {
+    let shift = match shift {
+        IRExpr::ImmI(value) => *value,
+        _ => return None,
+    };
+    let base = if sx32 {
+        widen_sx32_to_i64_expr(lower_scalar_expr_with_analysis(value, analysis))
+    } else {
+        widen_u32_to_u64_expr(lower_scalar_expr_with_analysis(value, analysis))
+    };
+    if shift == 0 {
+        return Some(base);
+    }
+    Some(Expr::Binary {
+        op: "<<".to_string(),
+        lhs: Box::new(base),
+        rhs: Box::new(Expr::Imm(shift.to_string())),
+    })
+}
+
 fn widen_u32_to_u64_expr(expr: Expr) -> Expr {
     Expr::Cast {
         ty: "uint64_t".to_string(),
@@ -2059,6 +2176,23 @@ fn widen_u32_to_u64_expr(expr: Expr) -> Expr {
             expr: Box::new(expr),
         }),
     }
+}
+
+fn widen_sx32_to_i64_expr(expr: Expr) -> Expr {
+    Expr::Cast {
+        ty: "int64_t".to_string(),
+        expr: Box::new(Expr::Cast {
+            ty: "int32_t".to_string(),
+            expr: Box::new(expr),
+        }),
+    }
+}
+
+fn add_lea_hi_terms(mut terms: Vec<Expr>) -> Expr {
+    terms.retain(|expr| !matches!(expr, Expr::Imm(text) if text == "0"));
+    let mut iter = terms.into_iter();
+    let first = iter.next().unwrap_or_else(|| Expr::Imm("0".to_string()));
+    iter.fold(first, add_expr)
 }
 
 fn is_imm_i(expr: &IRExpr, value: i64) -> bool {
@@ -3137,6 +3271,76 @@ mod tests {
             rendered.contains("p0_1 = (threadIdx.x & 31) != 0;"),
             "got:\n{rendered}"
         );
+    }
+
+    #[test]
+    fn lowers_plop3_true_inputs_to_false_predicate() {
+        let expr = lower_op_expr(
+            "PLOP3.LUT",
+            &[
+                IRExpr::Op {
+                    op: "PT".to_string(),
+                    args: Vec::new(),
+                },
+                IRExpr::Op {
+                    op: "PT".to_string(),
+                    args: Vec::new(),
+                },
+                IRExpr::Op {
+                    op: "PT".to_string(),
+                    args: Vec::new(),
+                },
+                IRExpr::Op {
+                    op: "PT".to_string(),
+                    args: Vec::new(),
+                },
+                IRExpr::ImmI(8),
+                IRExpr::ImmI(0),
+            ],
+        );
+        assert_eq!(expr.render(), "false");
+    }
+
+    #[test]
+    fn lowers_lea_hi_and_shift_hi_structurally() {
+        let lea_hi = lower_op_expr(
+            "LEA.HI.X",
+            &[
+                IRExpr::Reg(crate::ir::RegId::new("R", 5, 1).with_ssa(0)),
+                IRExpr::Reg(crate::ir::RegId::new("R", 6, 1).with_ssa(0)),
+                IRExpr::Reg(crate::ir::RegId::new("R", 7, 1).with_ssa(0)),
+                IRExpr::ImmI(2),
+                IRExpr::Reg(crate::ir::RegId::new("P", 1, 1).with_ssa(0)),
+            ],
+        );
+        let rendered = lea_hi.render();
+        assert!(!rendered.contains("LEA.HI.X("), "got: {rendered}");
+        assert!(rendered.contains("r6_0") && rendered.contains("r7_0"), "got: {rendered}");
+
+        let lea_hi_sx32 = lower_op_expr(
+            "LEA.HI.X.SX32",
+            &[
+                IRExpr::Reg(crate::ir::RegId::new("R", 9, 1).with_ssa(0)),
+                IRExpr::Reg(crate::ir::RegId::new("R", 10, 1).with_ssa(0)),
+                IRExpr::ImmI(1),
+                IRExpr::Reg(crate::ir::RegId::new("P", 2, 1).with_ssa(0)),
+            ],
+        );
+        let rendered = lea_hi_sx32.render();
+        assert!(!rendered.contains("LEA.HI.X.SX32("), "got: {rendered}");
+        assert!(rendered.contains("(p2_0 ? 1 : 0)"), "got: {rendered}");
+
+        let shf_hi = lower_op_expr(
+            "SHF.L.U64.HI",
+            &[
+                IRExpr::Reg(crate::ir::RegId::new("R", 11, 1).with_ssa(0)),
+                IRExpr::ImmI(2),
+                IRExpr::Reg(crate::ir::RegId::new("R", 12, 1).with_ssa(0)),
+            ],
+        );
+        let rendered = shf_hi.render();
+        assert!(!rendered.contains("SHF.L.U64.HI("), "got: {rendered}");
+        assert!(rendered.contains(">> 32"), "got: {rendered}");
     }
 
     #[test]

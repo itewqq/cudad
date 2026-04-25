@@ -234,6 +234,13 @@
   `UIMAD.WIDE` expressions structurally, which removes another raw helper leak
   from the canonical path and keeps widened pointer setup readable in kernels
   like `cumsum_linear`.
+- Canonical scalar lowering now also handles the common high-lane address
+  helper surface structurally: `LEA.HI` / `LEA.HI.X(.SX32)` lower to explicit
+  high-word arithmetic, `SHF.L.U64.HI` lowers to a lane extract of a widened
+  shift, and trivial `PLOP3.LUT(PT, PT, PT, PT, imm, 0)` predicates collapse
+  to `false`. This clears those helper leaks from `layer_norm_forward` and
+  `softmax_forward`, and shrinks the remaining `topk_per_row` cleanup down to
+  pointer-root recovery rather than opcode spelling.
 - Canonical targeted coverage now also pins this float-modifier slice:
   `dispatch_ops` no longer leaks raw `FRND.FLOOR(...)` / `FMUL.FTZ(...)`, and
   `softmax_forward` no longer leaks raw `FFMA.SAT(...)` / `FFMA.RM(...)` /
@@ -251,7 +258,7 @@
    pointer-byte-offset cleanup beyond the now-rooted `cumsum_linear`
    remainder paths, the remaining predicate/control outliers beyond the
    now-handled compare/pseudo-op/carry-add/float-modifier/plain-LEA/`IMAD.X`
-   spellings, and the remaining
+   /high-lane-address spellings, and the remaining
    vector/half/special-scalar ops (for example `HFMA2`, `PRMT`, rotate-heavy
    SHA idioms) that still force raw helper-shaped output.
 3. Revisit the broader `sgemm_tiled` / shared-memory fixtures and migrate any

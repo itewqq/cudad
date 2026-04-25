@@ -1952,7 +1952,11 @@ fn full_pass_topk_per_row_rewrites_split_window_pointer_pair() {
         out
     );
     assert!(
-        !out.contains("IMAD.X(") && !out.contains("LEA("),
+        !out.contains("IMAD.X(")
+            && !out.contains("LEA(")
+            && !out.contains("LEA.HI.X(")
+            && !out.contains("SHF.L.U64.HI(")
+            && !out.contains("PLOP3.LUT("),
         "expected topk_per_row to lower carry-imad and plain lea helpers structurally, got:\n{}",
         out
     );
@@ -2013,6 +2017,11 @@ fn canonical_full_pass_layer_norm_forward_lowers_raw_fsetp_compares() {
     assert!(
         !out.contains("FSETP.GEU.AND("),
         "expected canonical layer_norm_forward to avoid raw FSETP compare helpers, got:\n{}",
+        out
+    );
+    assert!(
+        !out.contains("LEA.HI.X(") && !out.contains("SHF.L.U64.HI("),
+        "expected canonical layer_norm_forward to lower hi-lane address helpers structurally, got:\n{}",
         out
     );
 }
@@ -2097,6 +2106,11 @@ fn full_pass_old_softmax_forward_trims_post_loop_packed_pointer_tail() {
     assert!(
         !out.contains("FFMA.SAT(") && !out.contains("FFMA.RM(") && !out.contains("FADD.FTZ("),
         "expected old-corpus softmax to lower modeled float modifier ops structurally, got:\n{}",
+        out
+    );
+    assert!(
+        !out.contains("LEA.HI.X(") && !out.contains("SHF.L.U64.HI("),
+        "expected old-corpus softmax to lower hi-lane address helpers structurally, got:\n{}",
         out
     );
     assert!(
