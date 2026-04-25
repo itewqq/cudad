@@ -2018,6 +2018,11 @@ fn canonical_full_pass_state_machine_avoids_raw_true_predicate_helpers() {
         "expected canonical state_machine to lower predicate pseudo-ops structurally, got:\n{}",
         out
     );
+    assert!(
+        !out.contains("UIADD3.X("),
+        "expected canonical state_machine to lower carry add pseudo-ops structurally, got:\n{}",
+        out
+    );
 }
 
 #[test]

@@ -76,6 +76,9 @@ constant array.
 - Canonical lowering must also normalize zero-operand pseudo-ops such as
   `PT`/`!PT` and `+INF`/`+QNAN` structurally instead of leaking helper-shaped
   call syntax like `PT()` or `+QNAN()` into rendered CUDA.
+- Canonical scalar lowering should treat common carry-chain arithmetic forms
+  (`IADD3.X` / `UIADD3.X`) as real arithmetic on the surviving data result
+  instead of leaving raw helper mnemonics in structured output.
 - New backend modules must document their inputs, outputs, invariants, and
   forbidden responsibilities in rustdoc headers.
 

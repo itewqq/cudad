@@ -811,6 +811,7 @@ fn lower_semantic_op_expr(
         .or_else(|| lower_fsel_expr(opcode, args, analysis))
         .or_else(|| lower_lop3_expr(opcode, args, analysis))
         .or_else(|| lower_imad_expr(opcode, args, analysis))
+        .or_else(|| lower_iadd3_x_expr(opcode, args, analysis))
         .or_else(|| lower_wide_add_lo_expr(opcode, args, analysis))
         .or_else(|| lower_shf_expr(opcode, args, analysis))
         .or_else(|| lower_shfl_expr(opcode, args, analysis))
@@ -1266,6 +1267,69 @@ fn lower_imad_expr(
         },
         lower_scalar_expr_with_analysis(&args[2], analysis),
     ))
+}
+
+fn lower_iadd3_x_expr(
+    opcode: &str,
+    args: &[IRExpr],
+    analysis: Option<&FunctionAnalysis>,
+) -> Option<Expr> {
+    if !matches!(opcode, "IADD3.X" | "UIADD3.X") {
+        return None;
+    }
+    let (a0, a1, a2, carry_pred) = extract_addx_operands(args)?;
+    let mut sum = add_expr(
+        lower_scalar_expr_with_analysis(a0, analysis),
+        lower_scalar_expr_with_analysis(a1, analysis),
+    );
+    if !ir_expr_is_zero(a2) {
+        sum = add_expr(sum, lower_scalar_expr_with_analysis(a2, analysis));
+    }
+    Some(add_expr(sum, lower_carry_inc_expr(carry_pred, analysis)?))
+}
+
+fn extract_addx_operands(args: &[IRExpr]) -> Option<(&IRExpr, &IRExpr, &IRExpr, &IRExpr)> {
+    if args.len() < 4 {
+        return None;
+    }
+    let mut start = 0usize;
+    let mut end = args.len();
+    while end.saturating_sub(start) > 5 {
+        let Some(reg) = args[start].get_reg() else {
+            break;
+        };
+        if !matches!(reg.class.as_str(), "P" | "UP") {
+            break;
+        }
+        start += 1;
+    }
+    while end.saturating_sub(start) > 4 && is_pred_control_expr(&args[end - 1]) {
+        end -= 1;
+    }
+    (end.saturating_sub(start) == 4).then_some((
+        &args[start],
+        &args[start + 1],
+        &args[start + 2],
+        &args[start + 3],
+    ))
+}
+
+fn lower_carry_inc_expr(expr: &IRExpr, analysis: Option<&FunctionAnalysis>) -> Option<Expr> {
+    if ir_expr_is_true_pred(expr) {
+        return Some(Expr::Imm("1".to_string()));
+    }
+    if ir_expr_is_false_pred(expr) {
+        return Some(Expr::Imm("0".to_string()));
+    }
+    let reg = expr.get_reg()?;
+    if !matches!(reg.class.as_str(), "P" | "UP") {
+        return None;
+    }
+    Some(Expr::Ternary {
+        cond: Box::new(lower_scalar_expr_with_analysis(expr, analysis)),
+        then_expr: Box::new(Expr::Imm("1".to_string())),
+        else_expr: Box::new(Expr::Imm("0".to_string())),
+    })
 }
 
 fn lower_shf_expr(
@@ -2701,6 +2765,24 @@ mod tests {
             ],
         );
         assert_eq!(imad_shl.render(), "r8_0 << 4");
+    }
+
+    #[test]
+    fn lowers_iadd3_x_carry_chains_semantically() {
+        let expr = lower_op_expr(
+            "UIADD3.X",
+            &[
+                IRExpr::ImmI(0),
+                IRExpr::Reg(crate::ir::RegId::new("UR", 7, 1).with_ssa(0)),
+                IRExpr::ImmI(0),
+                IRExpr::Reg(crate::ir::RegId::new("UP", 0, 1).with_ssa(0)),
+                IRExpr::Op {
+                    op: "!UPT".to_string(),
+                    args: Vec::new(),
+                },
+            ],
+        );
+        assert_eq!(expr.render(), "ur7_0 + (up0_0 ? 1 : 0)");
     }
 
     #[test]

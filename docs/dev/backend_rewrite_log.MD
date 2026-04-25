@@ -3,7 +3,7 @@
 ## Status
 
 - Branch: `codex/memory-aware-backend-refactor`
-- Checkpoint commit: `9466a9a`
+- Checkpoint commit: `31b1564`
 - Current stage: phase 5 cutover of structured output entrypoints onto the canonical backend, with front-half address-contract fixes still landing as needed
 
 ## Landed invariants
@@ -201,6 +201,10 @@
 - Canonical targeted coverage now also pins the control-flow corpus for this
   cleanup: `state_machine` no longer leaks raw predicate pseudo-ops, and
   `dispatch_ops` lowers `+QNAN` to `NAN`.
+- Canonical scalar lowering now also lowers `IADD3.X` / `UIADD3.X` carry-chain
+  expressions structurally, which removes another raw helper-shaped arithmetic
+  leak from canonical control-flow output (`state_machine` now renders
+  `ur7_2 + (up0_2 ? 1 : 0)` instead of `UIADD3.X(...)`).
 
 ## Next safe step
 
@@ -209,8 +213,8 @@
    different.
 2. Tackle the next structurally visible canonical holes: shared index/root
    recovery beyond direct `threadIdx` forms, the remaining predicate/control
-   outliers beyond the now-handled compare/pseudo-op spellings, and the
-   remaining vector/half/special-scalar ops (for example `HFMA2`, `PRMT`,
+   outliers beyond the now-handled compare/pseudo-op/carry-add spellings, and
+   the remaining vector/half/special-scalar ops (for example `HFMA2`, `PRMT`,
    rotate-heavy SHA idioms) that still force raw helper-shaped output.
 3. Revisit the broader `sgemm_tiled` / shared-memory fixtures and migrate any
    additional smoke coverage that the new shared-scale and scalar-op lowering
