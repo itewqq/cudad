@@ -3,7 +3,7 @@
 ## Status
 
 - Branch: `codex/memory-aware-backend-refactor`
-- Checkpoint commit: `e3794b5`
+- Checkpoint commit: `9466a9a`
 - Current stage: phase 5 cutover of structured output entrypoints onto the canonical backend, with front-half address-contract fixes still landing as needed
 
 ## Landed invariants
@@ -194,6 +194,13 @@
   as `FSETP.GEU.*`, which removes one more raw control-helper leak from the
   canonical `layer_norm_forward` path and gives the canonical backend ownership
   of that compare contract.
+- Canonical scalar lowering now normalizes zero-operand predicate/float
+  pseudo-ops (`PT`, `!PT`, `UPT`, `!UPT`, `+INF`, `-INF`, `+QNAN`, `-QNAN`)
+  into structural constants, which removes helper-shaped leaks like `PT()` and
+  `+QNAN()` from canonical control-flow output.
+- Canonical targeted coverage now also pins the control-flow corpus for this
+  cleanup: `state_machine` no longer leaks raw predicate pseudo-ops, and
+  `dispatch_ops` lowers `+QNAN` to `NAN`.
 
 ## Next safe step
 
@@ -202,9 +209,9 @@
    different.
 2. Tackle the next structurally visible canonical holes: shared index/root
    recovery beyond direct `threadIdx` forms, the remaining predicate/control
-   outliers beyond the now-handled `GEU` compare spelling, and the remaining
-   vector/half/special-scalar ops (for example `HFMA2`, `PRMT`, rotate-heavy
-   SHA idioms) that still force raw helper-shaped output.
+   outliers beyond the now-handled compare/pseudo-op spellings, and the
+   remaining vector/half/special-scalar ops (for example `HFMA2`, `PRMT`,
+   rotate-heavy SHA idioms) that still force raw helper-shaped output.
 3. Revisit the broader `sgemm_tiled` / shared-memory fixtures and migrate any
    additional smoke coverage that the new shared-scale and scalar-op lowering
    now makes trustworthy on the canonical driver.

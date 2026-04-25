@@ -73,6 +73,9 @@ constant array.
   (`EQ`/`EQU`, `NE`/`NEU`, `LT`/`LTU`, `GE`/`GEU`, etc.) so later structured
   stages do not leak raw `FSETP.*` helpers just because the opcode used an
   unordered token spelling.
+- Canonical lowering must also normalize zero-operand pseudo-ops such as
+  `PT`/`!PT` and `+INF`/`+QNAN` structurally instead of leaking helper-shaped
+  call syntax like `PT()` or `+QNAN()` into rendered CUDA.
 - New backend modules must document their inputs, outputs, invariants, and
   forbidden responsibilities in rustdoc headers.
 

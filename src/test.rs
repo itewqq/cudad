@@ -2005,6 +2005,37 @@ fn canonical_full_pass_layer_norm_forward_lowers_raw_fsetp_compares() {
 }
 
 #[test]
+fn canonical_full_pass_state_machine_avoids_raw_true_predicate_helpers() {
+    let state_machine =
+        split_decoded_functions(include_str!("../test_cu/corpus/control_flow_kernels.sass"))
+            .into_iter()
+            .find(|f| f.name == "state_machine")
+            .expect("state_machine fixture should exist");
+    let out =
+        run_canonical_output_full_pass_from_instrs(state_machine.instrs, state_machine.sm, "state_machine");
+    assert!(
+        !out.contains("!UPT()") && !out.contains("PT()"),
+        "expected canonical state_machine to lower predicate pseudo-ops structurally, got:\n{}",
+        out
+    );
+}
+
+#[test]
+fn canonical_full_pass_dispatch_ops_avoids_raw_qnan_helpers() {
+    let dispatch =
+        split_decoded_functions(include_str!("../test_cu/corpus/control_flow_kernels.sass"))
+            .into_iter()
+            .find(|f| f.name == "dispatch_ops")
+            .expect("dispatch_ops fixture should exist");
+    let out = run_canonical_output_full_pass_from_instrs(dispatch.instrs, dispatch.sm, "dispatch_ops");
+    assert!(
+        !out.contains("+QNAN()") && out.contains("NAN"),
+        "expected canonical dispatch_ops to lower QNAN pseudo-immediates structurally, got:\n{}",
+        out
+    );
+}
+
+#[test]
 fn full_pass_old_softmax_forward_trims_post_loop_packed_pointer_tail() {
     let softmax = split_decoded_functions(include_str!("../test_cu/corpus/ml_kernels.sass"))
         .into_iter()

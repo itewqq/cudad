@@ -1556,6 +1556,12 @@ fn lower_builtin_expr(op: &str, args: &[IRExpr]) -> Option<Expr> {
         return None;
     }
     let name = match op {
+        "PT" | "UPT" => return Some(Expr::Imm("true".to_string())),
+        "!PT" | "!UPT" => return Some(Expr::Imm("false".to_string())),
+        "+INF" => return Some(Expr::Raw("INFINITY".to_string())),
+        "-INF" => return Some(Expr::Raw("-INFINITY".to_string())),
+        "+QNAN" => return Some(Expr::Raw("NAN".to_string())),
+        "-QNAN" => return Some(Expr::Raw("-NAN".to_string())),
         "SR_CTAID.X" => "blockIdx.x",
         "SR_CTAID.Y" => "blockIdx.y",
         "SR_CTAID.Z" => "blockIdx.z",
@@ -1641,6 +1647,7 @@ fn ir_expr_is_zero(expr: &IRExpr) -> bool {
 
 fn ir_expr_is_true_pred(expr: &IRExpr) -> bool {
     matches!(expr, IRExpr::Reg(reg) if matches!(reg.class.as_str(), "PT" | "UPT"))
+        || matches!(expr, IRExpr::Op { op, args } if args.is_empty() && matches!(op.as_str(), "PT" | "UPT"))
 }
 
 fn ir_expr_is_false_pred(expr: &IRExpr) -> bool {
@@ -2704,6 +2711,40 @@ mod tests {
                 IRExpr::Reg(crate::ir::RegId::new("R", 1, 1).with_ssa(0)),
                 IRExpr::ImmI(0),
                 IRExpr::Reg(crate::ir::RegId::new("PT", 0, 1)),
+            ],
+        );
+        assert_eq!(expr.render(), "r1_0 >= 0");
+    }
+
+    #[test]
+    fn lowers_special_pseudo_constants_and_predicates() {
+        let qnan = lower_scalar_expr(&IRExpr::Op {
+            op: "+QNAN".to_string(),
+            args: Vec::new(),
+        });
+        assert_eq!(qnan.render(), "NAN");
+
+        let pinf = lower_scalar_expr(&IRExpr::Op {
+            op: "+INF".to_string(),
+            args: Vec::new(),
+        });
+        assert_eq!(pinf.render(), "INFINITY");
+
+        let pred = lower_scalar_expr(&IRExpr::Op {
+            op: "!UPT".to_string(),
+            args: Vec::new(),
+        });
+        assert_eq!(pred.render(), "false");
+
+        let expr = lower_op_expr(
+            "FSETP.GEU.AND",
+            &[
+                IRExpr::Reg(crate::ir::RegId::new("R", 1, 1).with_ssa(0)),
+                IRExpr::ImmI(0),
+                IRExpr::Op {
+                    op: "PT".to_string(),
+                    args: Vec::new(),
+                },
             ],
         );
         assert_eq!(expr.render(), "r1_0 >= 0");
