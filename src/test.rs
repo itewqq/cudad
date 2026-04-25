@@ -1987,11 +1987,11 @@ fn canonical_full_pass_layer_norm_forward_lowers_raw_fsetp_compares() {
         layer_norm.sm,
         "layer_norm_forward",
     );
-    let geu_compare = Regex::new(r"p\d+_\d+ = abs\(r\d+_\d+\) >= ")
+    let geu_compare = Regex::new(r"p\d+_\d+ = abs\(r\d+_\d+\) >= .* \|\| isnan\(abs\(r\d+_\d+\)\)")
         .expect("valid canonical layernorm compare regex");
     assert!(
         geu_compare.is_match(&out),
-        "expected canonical layer_norm_forward to lower GEU compare structurally, got:\n{}",
+        "expected canonical layer_norm_forward to preserve unordered GEU semantics with an isnan disjunct, got:\n{}",
         out
     );
     assert!(

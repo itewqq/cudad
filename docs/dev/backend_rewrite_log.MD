@@ -211,6 +211,10 @@
   to native arithmetic, and modeled `FFMA` variants (`.SAT`, `.RM`, `.RP`,
   `.RZ`, `.RN`) lower to structural CUDA math intrinsics such as
   `__saturatef(...)` / `__fmaf_rd(...)` instead of raw helper-shaped calls.
+- Canonical float compare lowering now preserves unordered predicate semantics
+  instead of treating `GEU`/`GTU`/`LEU`/`LTU`/`EQU`/`NEU` as ordered compares;
+  the canonical path emits explicit `isnan(...)` disjuncts and also lowers
+  `NUM` / `NAN` predicate tokens structurally.
 - Canonical targeted coverage now also pins this float-modifier slice:
   `dispatch_ops` no longer leaks raw `FRND.FLOOR(...)` / `FMUL.FTZ(...)`, and
   `softmax_forward` no longer leaks raw `FFMA.SAT(...)` / `FFMA.RM(...)` /

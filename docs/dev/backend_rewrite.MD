@@ -83,6 +83,10 @@ constant array.
   structurally where CUDA has a direct semantic spelling (`FRND.*`,
   `FADD.FTZ`, `FMUL.*`, `FFMA.SAT`, `FFMA.R*`) instead of leaking raw opcode
   helper calls for routine math code.
+- Canonical compare lowering must preserve unordered floating-point predicate
+  semantics: `*U` compare tokens and `NUM`/`NAN` forms need explicit NaN-aware
+  logic, not ordered C relational operators that silently change branch
+  behavior on NaN inputs.
 - New backend modules must document their inputs, outputs, invariants, and
   forbidden responsibilities in rustdoc headers.
 

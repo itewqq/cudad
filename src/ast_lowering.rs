@@ -865,13 +865,16 @@ fn lower_setp_expr(
         return None;
     }
     let parts = opcode.split('.').collect::<Vec<_>>();
-    let cmp = parts
+    let cmp_token = parts
         .iter()
         .skip(1)
-        .find_map(|part| setp_comparison_op(part))?;
+        .find_map(|part| setp_comparison_token(part))?;
     let mut lhs = lower_scalar_expr_with_analysis(&args[0], analysis);
     let mut rhs = lower_scalar_expr_with_analysis(&args[1], analysis);
-    if mnem == "ISETP" && !parts.iter().any(|part| *part == "U32") && !matches!(cmp, "==" | "!=") {
+    if mnem == "ISETP"
+        && !parts.iter().any(|part| *part == "U32")
+        && ordered_setp_comparison_op(cmp_token).is_some_and(|cmp| !matches!(cmp, "==" | "!="))
+    {
         lhs = Expr::Cast {
             ty: "int32_t".to_string(),
             expr: Box::new(lhs),
@@ -881,10 +884,14 @@ fn lower_setp_expr(
             expr: Box::new(rhs),
         };
     }
-    let cmp_expr = Expr::Binary {
-        op: cmp.to_string(),
-        lhs: Box::new(lhs),
-        rhs: Box::new(rhs),
+    let cmp_expr = if matches!(mnem, "FSETP" | "DSETP" | "HSETP2") {
+        lower_float_setp_compare_expr(cmp_token, &args[0], &args[1], lhs, rhs, analysis)?
+    } else {
+        Expr::Binary {
+            op: ordered_setp_comparison_op(cmp_token)?.to_string(),
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        }
     };
     let Some(combine) = args.get(2) else {
         return Some(cmp_expr);
@@ -907,7 +914,27 @@ fn lower_setp_expr(
     })
 }
 
-fn setp_comparison_op(part: &str) -> Option<&'static str> {
+fn setp_comparison_token(part: &str) -> Option<&'static str> {
+    match part {
+        "LT" => Some("LT"),
+        "LTU" => Some("LTU"),
+        "LE" => Some("LE"),
+        "LEU" => Some("LEU"),
+        "GT" => Some("GT"),
+        "GTU" => Some("GTU"),
+        "GE" => Some("GE"),
+        "GEU" => Some("GEU"),
+        "EQ" => Some("EQ"),
+        "EQU" => Some("EQU"),
+        "NE" => Some("NE"),
+        "NEU" => Some("NEU"),
+        "NUM" => Some("NUM"),
+        "NAN" => Some("NAN"),
+        _ => None,
+    }
+}
+
+fn ordered_setp_comparison_op(part: &str) -> Option<&'static str> {
     match part {
         "LT" | "LTU" => Some("<"),
         "LE" | "LEU" => Some("<="),
@@ -916,6 +943,86 @@ fn setp_comparison_op(part: &str) -> Option<&'static str> {
         "EQ" | "EQU" => Some("=="),
         "NE" | "NEU" => Some("!="),
         _ => None,
+    }
+}
+
+fn lower_float_setp_compare_expr(
+    cmp_token: &str,
+    lhs_ir: &IRExpr,
+    rhs_ir: &IRExpr,
+    lhs: Expr,
+    rhs: Expr,
+    analysis: Option<&FunctionAnalysis>,
+) -> Option<Expr> {
+    if cmp_token == "NUM" {
+        let Some(nan_any) = float_setp_nan_any_expr(lhs_ir, rhs_ir, analysis) else {
+            return Some(Expr::Imm("true".to_string()));
+        };
+        return Some(Expr::Unary {
+            op: "!".to_string(),
+            arg: Box::new(nan_any),
+        });
+    }
+    if cmp_token == "NAN" {
+        return Some(
+            float_setp_nan_any_expr(lhs_ir, rhs_ir, analysis)
+                .unwrap_or_else(|| Expr::Imm("false".to_string())),
+        );
+    }
+    let ordered = Expr::Binary {
+        op: ordered_setp_comparison_op(cmp_token)?.to_string(),
+        lhs: Box::new(lhs.clone()),
+        rhs: Box::new(rhs.clone()),
+    };
+    if !is_unordered_float_cmp_token(cmp_token) {
+        return Some(ordered);
+    }
+    let Some(nan_any) = float_setp_nan_any_expr(lhs_ir, rhs_ir, analysis) else {
+        return Some(ordered);
+    };
+    Some(or_expr(ordered, nan_any))
+}
+
+fn is_unordered_float_cmp_token(cmp_token: &str) -> bool {
+    matches!(cmp_token, "LTU" | "LEU" | "GTU" | "GEU" | "EQU" | "NEU")
+}
+
+fn float_setp_nan_any_expr(
+    lhs_ir: &IRExpr,
+    rhs_ir: &IRExpr,
+    analysis: Option<&FunctionAnalysis>,
+) -> Option<Expr> {
+    let mut checks = Vec::new();
+    if ir_expr_may_be_nan(lhs_ir) {
+        checks.push(Expr::CallLike {
+            func: "isnan".to_string(),
+            args: vec![lower_scalar_expr_with_analysis(lhs_ir, analysis)],
+        });
+    }
+    if ir_expr_may_be_nan(rhs_ir) {
+        checks.push(Expr::CallLike {
+            func: "isnan".to_string(),
+            args: vec![lower_scalar_expr_with_analysis(rhs_ir, analysis)],
+        });
+    }
+    checks.into_iter().reduce(or_expr)
+}
+
+fn ir_expr_may_be_nan(expr: &IRExpr) -> bool {
+    match expr {
+        IRExpr::ImmI(_) => false,
+        IRExpr::ImmF(value) => value.is_nan(),
+        IRExpr::Op { op, .. } if matches!(op.as_str(), "+QNAN" | "-QNAN") => true,
+        IRExpr::Op { op, .. } if matches!(op.as_str(), "+INF" | "-INF") => false,
+        IRExpr::Reg(_) | IRExpr::Addr64 { .. } | IRExpr::Mem { .. } | IRExpr::Op { .. } => true,
+    }
+}
+
+fn or_expr(lhs: Expr, rhs: Expr) -> Expr {
+    Expr::Binary {
+        op: "||".to_string(),
+        lhs: Box::new(lhs),
+        rhs: Box::new(rhs),
     }
 }
 
@@ -2956,7 +3063,27 @@ mod tests {
                 IRExpr::Reg(crate::ir::RegId::new("PT", 0, 1)),
             ],
         );
-        assert_eq!(expr.render(), "r1_0 >= 0");
+        assert_eq!(expr.render(), "r1_0 >= 0 || isnan(r1_0)");
+
+        let num = lower_op_expr(
+            "FSETP.NUM.AND",
+            &[
+                IRExpr::Reg(crate::ir::RegId::new("R", 2, 1).with_ssa(0)),
+                IRExpr::Reg(crate::ir::RegId::new("R", 3, 1).with_ssa(0)),
+                IRExpr::Reg(crate::ir::RegId::new("PT", 0, 1)),
+            ],
+        );
+        assert_eq!(num.render(), "!(isnan(r2_0) || isnan(r3_0))");
+
+        let nan = lower_op_expr(
+            "FSETP.NAN.AND",
+            &[
+                IRExpr::Reg(crate::ir::RegId::new("R", 4, 1).with_ssa(0)),
+                IRExpr::Reg(crate::ir::RegId::new("R", 5, 1).with_ssa(0)),
+                IRExpr::Reg(crate::ir::RegId::new("PT", 0, 1)),
+            ],
+        );
+        assert_eq!(nan.render(), "isnan(r4_0) || isnan(r5_0)");
     }
 
     #[test]
@@ -2990,7 +3117,7 @@ mod tests {
                 },
             ],
         );
-        assert_eq!(expr.render(), "r1_0 >= 0");
+        assert_eq!(expr.render(), "r1_0 >= 0 || isnan(r1_0)");
     }
 
     #[test]
