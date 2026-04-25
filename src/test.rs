@@ -1946,7 +1946,8 @@ fn full_pass_topk_per_row_rewrites_split_window_pointer_pair() {
             && !out.contains("float* arg4_ptr")
             && out.contains("arg2_ptr[")
             && out.contains("arg4_ptr[")
-            && !out.contains("addr64("),
+            && !out.contains("addr64(")
+            && !out.contains("((uint32_t*)(r2_5))"),
         "expected topk_per_row to keep arg2_ptr/arg4_ptr typed in canonical output, got:
 {}",
         out
@@ -1958,6 +1959,20 @@ fn full_pass_topk_per_row_rewrites_split_window_pointer_pair() {
             && !out.contains("SHF.L.U64.HI(")
             && !out.contains("PLOP3.LUT("),
         "expected topk_per_row to lower carry-imad and plain lea helpers structurally, got:\n{}",
+        out
+    );
+}
+
+#[test]
+fn canonical_full_pass_topk_per_row_old_corpus_keeps_remainder_loads_rooted() {
+    let topk = split_decoded_functions(include_str!("../test_cu/corpus/ml_kernels.sass"))
+        .into_iter()
+        .find(|f| f.name == "topk_per_row")
+        .expect("topk_per_row fixture should exist");
+    let out = run_canonical_output_full_pass_from_instrs(topk.instrs, topk.sm, "topk_per_row");
+    assert!(
+        !out.contains("((uint32_t*)(r2_5))") && out.contains("arg0_ptr["),
+        "expected old-corpus topk_per_row remainder loads to stay rooted on arg0_ptr, got:\n{}",
         out
     );
 }
@@ -2046,6 +2061,30 @@ fn canonical_full_pass_state_machine_avoids_raw_true_predicate_helpers() {
     assert!(
         !out.contains("UIADD3.X("),
         "expected canonical state_machine to lower carry add pseudo-ops structurally, got:\n{}",
+        out
+    );
+}
+
+#[test]
+fn canonical_full_pass_multi_exit_loop_lowers_scalar_helper_ops() {
+    let kernel = split_decoded_functions(include_str!("../test_cu/corpus/control_flow_kernels.sass"))
+        .into_iter()
+        .find(|f| f.name == "multi_exit_loop")
+        .expect("multi_exit_loop fixture should exist");
+    let out =
+        run_canonical_output_full_pass_from_instrs(kernel.instrs, kernel.sm, "multi_exit_loop");
+    assert!(
+        !out.contains("I2F.RP(")
+            && !out.contains("F2I.FTZ.U32.TRUNC.NTZ(")
+            && !out.contains("IMAD.HI.U32("),
+        "expected canonical multi_exit_loop to lower scalar helper ops structurally, got:\n{}",
+        out
+    );
+    assert!(
+        out.contains("__int2float_ru(")
+            && out.contains("__float2uint_rz(")
+            && out.contains(">> 32"),
+        "expected canonical multi_exit_loop to render structural conversion/high-word math, got:\n{}",
         out
     );
 }

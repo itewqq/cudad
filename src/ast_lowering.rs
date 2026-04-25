@@ -714,6 +714,9 @@ fn lower_non_memory_stmt_with_analysis(
     if let Some(lowered) = lower_structural_control_stmt(stmt) {
         return lowered;
     }
+    if let Some(lowered) = lower_multi_def_imad_wide_stmt(stmt, analysis) {
+        return lowered;
+    }
     if let Some(lowered) = lower_multi_def_lea_stmt(stmt, analysis) {
         return lowered;
     }
@@ -860,6 +863,7 @@ fn lower_semantic_op_expr(
         .or_else(|| lower_plop3_expr(opcode, args))
         .or_else(|| lower_lea_hi_expr(opcode, args, analysis))
         .or_else(|| lower_lea_expr(opcode, args, analysis))
+        .or_else(|| lower_imad_hi_expr(opcode, args, analysis))
         .or_else(|| lower_imad_wide_expr(opcode, args, analysis))
         .or_else(|| lower_imad_x_expr(opcode, args, analysis))
         .or_else(|| lower_imad_expr(opcode, args, analysis))
@@ -868,6 +872,8 @@ fn lower_semantic_op_expr(
         .or_else(|| lower_shf_expr(opcode, args, analysis))
         .or_else(|| lower_shfl_expr(opcode, args, analysis))
         .or_else(|| lower_iabs_expr(opcode, args, analysis))
+        .or_else(|| lower_i2f_expr(opcode, args, analysis))
+        .or_else(|| lower_f2i_expr(opcode, args, analysis))
         .or_else(|| lower_frnd_expr(opcode, args, analysis))
         .or_else(|| lower_fadd_expr(opcode, args, analysis))
         .or_else(|| lower_fmul_expr(opcode, args, analysis))
@@ -1137,6 +1143,61 @@ fn lower_multi_def_lop3_stmt(
             },
         ]),
         predicate_def_indices: vec![data_def_idx, pred_def_idx],
+    })
+}
+
+fn lower_multi_def_imad_wide_stmt(
+    stmt: &IRStatement,
+    analysis: Option<&FunctionAnalysis>,
+) -> Option<LoweredStmt> {
+    let RValue::Op { opcode, args } = &stmt.value else {
+        return None;
+    };
+    let parts = opcode.split('.').collect::<Vec<_>>();
+    let mnem = parts.first().copied().unwrap_or(opcode);
+    if !matches!(mnem, "IMAD" | "UIMAD") || !parts.iter().any(|part| *part == "WIDE") {
+        return None;
+    }
+    let (lo_def_idx, lo_def) = stmt
+        .defs
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, expr)| expr.get_reg().map(|reg| (idx, reg)))
+        .find(|(_, reg)| matches!(reg.class.as_str(), "R" | "UR"))?;
+    let hi_def = stmt
+        .defs
+        .iter()
+        .filter_map(|expr| expr.get_reg())
+        .find(|reg| {
+            reg.class == lo_def.class && reg.idx == lo_def.idx.saturating_add(1)
+        })?;
+    let wide = lower_imad_wide_value_expr(opcode, args, analysis)?;
+    let hi_def_idx = stmt
+        .defs
+        .iter()
+        .enumerate()
+        .find_map(|(idx, expr)| {
+            let reg = expr.get_reg()?;
+            (reg == hi_def).then_some(idx)
+        })?;
+    Some(LoweredStmt {
+        stmt: Stmt::Sequence(vec![
+            Stmt::Assign {
+                dst: LValue::Var(lower_reg_name(lo_def)),
+                src: Expr::LaneExtract {
+                    value: Box::new(wide.clone()),
+                    lane: PointerLane::Lo32,
+                },
+            },
+            Stmt::Assign {
+                dst: LValue::Var(lower_reg_name(hi_def)),
+                src: Expr::LaneExtract {
+                    value: Box::new(wide),
+                    lane: PointerLane::Hi32,
+                },
+            },
+        ]),
+        predicate_def_indices: vec![lo_def_idx, hi_def_idx],
     })
 }
 
@@ -1510,14 +1571,68 @@ fn lower_imad_wide_expr(
     {
         return None;
     }
+    Some(Expr::LaneExtract {
+        value: Box::new(lower_imad_wide_value_expr(opcode, args, analysis)?),
+        lane: PointerLane::Lo32,
+    })
+}
+
+fn lower_imad_wide_value_expr(
+    opcode: &str,
+    args: &[IRExpr],
+    analysis: Option<&FunctionAnalysis>,
+) -> Option<Expr> {
+    if args.len() != 3 {
+        return None;
+    }
     Some(add_expr(
         Expr::Binary {
             op: "*".to_string(),
-            lhs: Box::new(lower_scalar_expr_with_analysis(&args[0], analysis)),
-            rhs: Box::new(lower_scalar_expr_with_analysis(&args[1], analysis)),
+            lhs: Box::new(lower_imad_wide_operand(opcode, &args[0], analysis)),
+            rhs: Box::new(lower_imad_wide_operand(opcode, &args[1], analysis)),
         },
-        lower_scalar_expr_with_analysis(&args[2], analysis),
+        lower_imad_wide_base_expr(&args[2], analysis),
     ))
+}
+
+fn lower_imad_wide_operand(
+    opcode: &str,
+    arg: &IRExpr,
+    analysis: Option<&FunctionAnalysis>,
+) -> Expr {
+    if opcode.starts_with("UIMAD") || opcode.split('.').any(|part| part == "U32") {
+        widen_u32_to_u64_expr(lower_scalar_expr_with_analysis(arg, analysis))
+    } else {
+        widen_sx32_to_i64_expr(lower_scalar_expr_with_analysis(arg, analysis))
+    }
+}
+
+fn lower_imad_wide_base_expr(arg: &IRExpr, analysis: Option<&FunctionAnalysis>) -> Expr {
+    if let Some(reg) = arg.get_reg() {
+        let hi = crate::ir::RegId::new(&reg.class, reg.idx.saturating_add(1), reg.sign)
+            .with_ssa(reg.ssa.unwrap_or(0));
+        return lower_wide_input_expr(
+            arg,
+            &IRExpr::Reg(hi),
+            analysis,
+        );
+    }
+    match lower_scalar_expr_with_analysis(arg, analysis) {
+        Expr::PtrLane {
+            base,
+            lane: PointerLane::Lo32,
+        } => Expr::Addr64 {
+            lo: Box::new(Expr::PtrLane {
+                base: base.clone(),
+                lane: PointerLane::Lo32,
+            }),
+            hi: Box::new(Expr::PtrLane {
+                base,
+                lane: PointerLane::Hi32,
+            }),
+        },
+        expr => widen_u32_to_u64_expr(expr),
+    }
 }
 
 fn lower_imad_x_expr(
@@ -1720,6 +1835,66 @@ fn lower_iabs_expr(
     })
 }
 
+fn lower_i2f_expr(
+    opcode: &str,
+    args: &[IRExpr],
+    analysis: Option<&FunctionAnalysis>,
+) -> Option<Expr> {
+    let parts = opcode.split('.').collect::<Vec<_>>();
+    let mnem = parts.first().copied().unwrap_or(opcode);
+    if !matches!(mnem, "I2F" | "UI2F") || args.len() != 1 {
+        return None;
+    }
+    let signed = mnem == "I2F";
+    let mut func = None;
+    for part in parts.iter().skip(1) {
+        match *part {
+            "RP" => func = Some(if signed { "__int2float_ru" } else { "__uint2float_ru" }),
+            "RM" => func = Some(if signed { "__int2float_rd" } else { "__uint2float_rd" }),
+            "RN" => func = Some(if signed { "__int2float_rn" } else { "__uint2float_rn" }),
+            "RZ" => func = Some(if signed { "__int2float_rz" } else { "__uint2float_rz" }),
+            _ => return None,
+        }
+    }
+    Some(if let Some(func) = func {
+        Expr::CallLike {
+            func: func.to_string(),
+            args: vec![lower_scalar_expr_with_analysis(&args[0], analysis)],
+        }
+    } else {
+        Expr::Cast {
+            ty: "float".to_string(),
+            expr: Box::new(lower_scalar_expr_with_analysis(&args[0], analysis)),
+        }
+    })
+}
+
+fn lower_f2i_expr(
+    opcode: &str,
+    args: &[IRExpr],
+    analysis: Option<&FunctionAnalysis>,
+) -> Option<Expr> {
+    let parts = opcode.split('.').collect::<Vec<_>>();
+    let mnem = parts.first().copied().unwrap_or(opcode);
+    if mnem != "F2I" || args.len() != 1 {
+        return None;
+    }
+    let unsigned = parts.iter().any(|part| *part == "U32");
+    let signed = parts.iter().any(|part| *part == "S32");
+    let trunc = parts.iter().any(|part| matches!(*part, "TRUNC" | "RZ"));
+    if !trunc || (!unsigned && !signed) {
+        return None;
+    }
+    let func = match unsigned {
+        true => "__float2uint_rz",
+        false => "__float2int_rz",
+    };
+    Some(Expr::CallLike {
+        func: func.to_string(),
+        args: vec![lower_scalar_expr_with_analysis(&args[0], analysis)],
+    })
+}
+
 fn lower_frnd_expr(
     opcode: &str,
     args: &[IRExpr],
@@ -1756,19 +1931,31 @@ fn lower_fadd_expr(
         return None;
     }
     let mut ftz = false;
+    let mut rounding_mode = None;
     for part in parts.iter().skip(1) {
         match *part {
             "FTZ" => ftz = true,
+            "RM" | "RP" | "RZ" | "RN" => rounding_mode = Some(*part),
             _ => return None,
         }
     }
-    if ftz {
+    if ftz || rounding_mode.is_some() {
+        if args.len() != 2 {
+            return None;
+        }
         return Some(Expr::CallLike {
-            func: "__fadd_ftz".to_string(),
-            args: args
-                .iter()
-                .map(|arg| lower_scalar_expr_with_analysis(arg, analysis))
-                .collect(),
+            // CUDA exposes rounding-mode intrinsics, not FTZ-specific spellings.
+            func: match rounding_mode.unwrap_or("RN") {
+                "RM" => "__fadd_rd".to_string(),
+                "RP" => "__fadd_ru".to_string(),
+                "RZ" => "__fadd_rz".to_string(),
+                "RN" => "__fadd_rn".to_string(),
+                _ => unreachable!(),
+            },
+            args: vec![
+                lower_scalar_expr_with_analysis(&args[0], analysis),
+                lower_scalar_expr_with_analysis(&args[1], analysis),
+            ],
         });
     }
     lower_add_expr(args, analysis)
@@ -1792,39 +1979,15 @@ fn lower_fmul_expr(
             _ => return None,
         }
     }
-    if let Some(mode) = rounding_mode {
-        if ftz {
-            return Some(Expr::CallLike {
-                func: match mode {
-                    "RM" => "__fmul_rd_ftz".to_string(),
-                    "RP" => "__fmul_ru_ftz".to_string(),
-                    "RZ" => "__fmul_rz_ftz".to_string(),
-                    "RN" => "__fmul_rn_ftz".to_string(),
-                    _ => unreachable!(),
-                },
-                args: vec![
-                    lower_scalar_expr_with_analysis(&args[0], analysis),
-                    lower_scalar_expr_with_analysis(&args[1], analysis),
-                ],
-            });
-        }
+    if ftz || rounding_mode.is_some() {
         return Some(Expr::CallLike {
-            func: match mode {
+            func: match rounding_mode.unwrap_or("RN") {
                 "RM" => "__fmul_rd".to_string(),
                 "RP" => "__fmul_ru".to_string(),
                 "RZ" => "__fmul_rz".to_string(),
                 "RN" => "__fmul_rn".to_string(),
                 _ => unreachable!(),
             },
-            args: vec![
-                lower_scalar_expr_with_analysis(&args[0], analysis),
-                lower_scalar_expr_with_analysis(&args[1], analysis),
-            ],
-        });
-    }
-    if ftz {
-        return Some(Expr::CallLike {
-            func: "__fmul_ftz".to_string(),
             args: vec![
                 lower_scalar_expr_with_analysis(&args[0], analysis),
                 lower_scalar_expr_with_analysis(&args[1], analysis),
@@ -1868,32 +2031,19 @@ fn lower_ffma_expr(
         }
     }
     let rounded = if let Some(mode) = rounding_mode {
-        if ftz {
-            Expr::CallLike {
-                func: match mode {
-                    "RM" => "__fmaf_rd_ftz".to_string(),
-                    "RP" => "__fmaf_ru_ftz".to_string(),
-                    "RZ" => "__fmaf_rz_ftz".to_string(),
-                    "RN" => "__fmaf_rn_ftz".to_string(),
-                    _ => unreachable!(),
-                },
-                args: lowered_args,
-            }
-        } else {
-            Expr::CallLike {
-                func: match mode {
-                    "RM" => "__fmaf_rd".to_string(),
-                    "RP" => "__fmaf_ru".to_string(),
-                    "RZ" => "__fmaf_rz".to_string(),
-                    "RN" => "__fmaf_rn".to_string(),
-                    _ => unreachable!(),
-                },
-                args: lowered_args,
-            }
+        Expr::CallLike {
+            func: match mode {
+                "RM" => "__fmaf_rd".to_string(),
+                "RP" => "__fmaf_ru".to_string(),
+                "RZ" => "__fmaf_rz".to_string(),
+                "RN" => "__fmaf_rn".to_string(),
+                _ => unreachable!(),
+            },
+            args: lowered_args,
         }
     } else if ftz {
         Expr::CallLike {
-            func: "__fmaf_ftz".to_string(),
+            func: "__fmaf_rn".to_string(),
             args: lowered_args,
         }
     } else {
@@ -2015,6 +2165,44 @@ fn lower_wide_input_expr(lo: &IRExpr, hi: &IRExpr, analysis: Option<&FunctionAna
         lo: Box::new(lower_scalar_expr_with_analysis(lo, analysis)),
         hi: Box::new(lower_scalar_expr_with_analysis(hi, analysis)),
     }
+}
+
+fn lower_imad_hi_expr(
+    opcode: &str,
+    args: &[IRExpr],
+    analysis: Option<&FunctionAnalysis>,
+) -> Option<Expr> {
+    let parts = opcode.split('.').collect::<Vec<_>>();
+    let mnem = parts.first().copied().unwrap_or(opcode);
+    if !matches!(mnem, "IMAD" | "UIMAD") || !parts.iter().any(|part| *part == "HI") || args.len() != 3
+    {
+        return None;
+    }
+    let wide_lhs = if parts.iter().any(|part| *part == "U32") {
+        widen_u32_to_u64_expr(lower_scalar_expr_with_analysis(&args[0], analysis))
+    } else {
+        widen_sx32_to_i64_expr(lower_scalar_expr_with_analysis(&args[0], analysis))
+    };
+    let wide_rhs = if parts.iter().any(|part| *part == "U32") {
+        widen_u32_to_u64_expr(lower_scalar_expr_with_analysis(&args[1], analysis))
+    } else {
+        widen_sx32_to_i64_expr(lower_scalar_expr_with_analysis(&args[1], analysis))
+    };
+    let hi = Expr::LaneExtract {
+        value: Box::new(Expr::Binary {
+            op: "*".to_string(),
+            lhs: Box::new(wide_lhs),
+            rhs: Box::new(wide_rhs),
+        }),
+        lane: PointerLane::Hi32,
+    };
+    if ir_expr_is_zero(&args[2]) {
+        return Some(hi);
+    }
+    Some(add_expr(
+        hi,
+        lower_scalar_expr_with_analysis(&args[2], analysis),
+    ))
 }
 
 fn add_expr(lhs: Expr, rhs: Expr) -> Expr {
@@ -3437,6 +3625,30 @@ mod tests {
             &[IRExpr::Reg(crate::ir::RegId::new("R", 4, 1).with_ssa(0))],
         );
         assert_eq!(mufu.render(), "exp2f(r4_0)");
+
+        let i2f = lower_op_expr(
+            "I2F.RP",
+            &[IRExpr::Reg(crate::ir::RegId::new("R", 5, 1).with_ssa(0))],
+        );
+        assert_eq!(i2f.render(), "__int2float_ru(r5_0)");
+
+        let f2i = lower_op_expr(
+            "F2I.FTZ.U32.TRUNC.NTZ",
+            &[IRExpr::Reg(crate::ir::RegId::new("R", 6, 1).with_ssa(0))],
+        );
+        assert_eq!(f2i.render(), "__float2uint_rz(r6_0)");
+
+        let imad_hi = lower_op_expr(
+            "IMAD.HI.U32",
+            &[
+                IRExpr::Reg(crate::ir::RegId::new("R", 7, 1).with_ssa(0)),
+                IRExpr::Reg(crate::ir::RegId::new("R", 8, 1).with_ssa(0)),
+                IRExpr::ImmI(0),
+            ],
+        );
+        let rendered = imad_hi.render();
+        assert!(!rendered.contains("IMAD.HI.U32("), "got: {rendered}");
+        assert!(rendered.contains(">> 32"), "got: {rendered}");
     }
 
     #[test]
@@ -3467,7 +3679,7 @@ mod tests {
                 IRExpr::ImmF(0.5),
             ],
         );
-        assert_eq!(fmul_ftz.render(), "__fmul_ftz(r1_0, 0.5)");
+        assert_eq!(fmul_ftz.render(), "__fmul_rn(r1_0, 0.5)");
 
         let fmul_rm = lower_op_expr(
             "FMUL.RM",
@@ -3485,7 +3697,7 @@ mod tests {
                 IRExpr::ImmI(1),
             ],
         );
-        assert_eq!(fadd_ftz.render(), "__fadd_ftz(r3_0, 1)");
+        assert_eq!(fadd_ftz.render(), "__fadd_rn(r3_0, 1)");
 
         let imad = lower_op_expr(
             "IMAD",
@@ -3505,7 +3717,13 @@ mod tests {
                 IRExpr::Reg(crate::ir::RegId::new("R", 10, 1).with_ssa(0)),
             ],
         );
-        assert_eq!(imad_wide.render(), "r9_0 * 4 + r10_0");
+        let rendered = imad_wide.render();
+        assert!(rendered.contains("(int64_t)((int32_t)(r9_0))"), "got: {rendered}");
+        assert!(rendered.contains("(int64_t)((int32_t)(4))"), "got: {rendered}");
+        assert!(
+            rendered.contains("((uintptr_t)(((uint64_t)(r11_0) << 32) | (uint32_t)(r10_0)))"),
+            "got: {rendered}"
+        );
 
         let imad_mov = lower_op_expr(
             "IMAD.MOV.U32",
@@ -3636,6 +3854,52 @@ mod tests {
         let rendered = src.render();
         assert!(rendered.starts_with("p0 ? "), "got: {rendered}");
         assert!(rendered.ends_with(" : p5_0"), "got: {rendered}");
+    }
+
+    #[test]
+    fn lowers_predicated_multidef_imad_wide_with_widened_value_and_false_path_values() {
+        let stmt = IRStatement {
+            defs: vec![
+                IRExpr::Reg(crate::ir::RegId::new("R", 6, 1).with_ssa(2)),
+                IRExpr::Reg(crate::ir::RegId::new("R", 7, 1).with_ssa(2)),
+            ],
+            value: RValue::Op {
+                opcode: "UIMAD.WIDE.U32".to_string(),
+                args: vec![
+                    IRExpr::Reg(crate::ir::RegId::new("R", 1, 1).with_ssa(0)),
+                    IRExpr::ImmI(16),
+                    IRExpr::Reg(crate::ir::RegId::new("R", 4, 1).with_ssa(0)),
+                ],
+            },
+            pred: Some(IRExpr::Reg(crate::ir::RegId::new("P", 0, 1))),
+            mem_addr_args: None,
+            pred_old_defs: vec![
+                IRExpr::Reg(crate::ir::RegId::new("R", 6, 1).with_ssa(1)),
+                IRExpr::Reg(crate::ir::RegId::new("R", 7, 1).with_ssa(1)),
+            ],
+        };
+        let lowered = lower_basic_stmt(0, 0, &stmt, &FunctionAnalysis::default());
+        let Stmt::Sequence(stmts) = lowered else {
+            panic!("expected sequence");
+        };
+        assert_eq!(stmts.len(), 2);
+        let Stmt::Assign { dst, src } = &stmts[0] else {
+            panic!("expected low-lane assignment");
+        };
+        assert_eq!(dst.render(), "r6_2");
+        let rendered = src.render();
+        assert!(rendered.starts_with("p0 ? "), "got: {rendered}");
+        assert!(rendered.contains("(uint64_t)((uint32_t)(r1_0))"), "got: {rendered}");
+        assert!(rendered.contains("(uint64_t)((uint32_t)(16))"), "got: {rendered}");
+        assert!(rendered.ends_with(" : r6_1"), "got: {rendered}");
+        let Stmt::Assign { dst, src } = &stmts[1] else {
+            panic!("expected high-lane assignment");
+        };
+        assert_eq!(dst.render(), "r7_2");
+        let rendered = src.render();
+        assert!(rendered.starts_with("p0 ? "), "got: {rendered}");
+        assert!(rendered.contains(">> 32"), "got: {rendered}");
+        assert!(rendered.ends_with(" : r7_1"), "got: {rendered}");
     }
 
     #[test]
@@ -3779,7 +4043,7 @@ mod tests {
                 IRExpr::ImmF(1.0),
             ],
         );
-        assert_eq!(ffma_ftz.render(), "__fmaf_ftz(r6_0, r7_0, 1)");
+        assert_eq!(ffma_ftz.render(), "__fmaf_rn(r6_0, r7_0, 1)");
 
         let frnd = lower_op_expr(
             "FRND.FLOOR",

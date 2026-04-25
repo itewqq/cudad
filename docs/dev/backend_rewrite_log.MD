@@ -241,6 +241,12 @@
   to `false`. This clears those helper leaks from `layer_norm_forward` and
   `softmax_forward`, and shrinks the remaining `topk_per_row` cleanup down to
   pointer-root recovery rather than opcode spelling.
+- Canonical scalar lowering now also covers the remaining `multi_exit_loop`
+  scalar-helper surface (`I2F.RP`, `F2I.FTZ.U32.TRUNC.NTZ`, `IMAD.HI.U32`),
+  and `FunctionAnalysis` now uses a low-lane-root fallback for inconsistent
+  `Addr64` pairs when the full wide-root proof is missing. That keeps the old
+  `topk_per_row` remainder path rooted on `arg0_ptr` instead of falling back
+  to anonymous `uint32_t*` casts.
 - Canonical targeted coverage now also pins this float-modifier slice:
   `dispatch_ops` no longer leaks raw `FRND.FLOOR(...)` / `FMUL.FTZ(...)`, and
   `softmax_forward` no longer leaks raw `FFMA.SAT(...)` / `FFMA.RM(...)` /
@@ -248,6 +254,13 @@
 - Canonical targeted coverage now also pins `topk_per_row` against this new
   helper slice: the canonical path must avoid raw `IMAD.X(...)` and plain
   `LEA(...)` leakage while keeping the typed `arg2_ptr` / `arg4_ptr` contract.
+- The first sub-agent review findings from the scalar-helper cleanup are now
+  addressed in the live branch: FTZ float ops lower through documented CUDA
+  rounding intrinsics instead of invented `*_ftz` helper names, and
+  `IMAD.WIDE` / `UIMAD.WIDE` now build an explicitly widened 64-bit value
+  before extracting lanes so signedness and overflow semantics are preserved.
+- Canonical AST tests now also pin predicated multi-def `IMAD.WIDE` lowering,
+  including false-path SSA preservation for both low/high written lanes.
 
 ## Next safe step
 
@@ -261,6 +274,10 @@
    /high-lane-address spellings, and the remaining
    vector/half/special-scalar ops (for example `HFMA2`, `PRMT`, rotate-heavy
    SHA idioms) that still force raw helper-shaped output.
+3. The most obvious remaining canonical helper leak is `BRX(...)` in
+   `state_machine`; decide whether to lower it directly to a structured switch
+   form or to teach structurization/canonical AST lowering a small indirect-
+   branch contract without reviving the old post-render repair machinery.
 3. Revisit the broader `sgemm_tiled` / shared-memory fixtures and migrate any
    additional smoke coverage that the new shared-scale and scalar-op lowering
    now makes trustworthy on the canonical driver.
