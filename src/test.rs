@@ -1641,6 +1641,11 @@ fn canonical_full_pass_warp_reduce_sum_keeps_shuffle_intrinsics() {
         "expected canonical warp_reduce_sum to avoid raw shuffle mnemonics, got:\n{}",
         out
     );
+    assert!(
+        !out.contains("SHF.R.U32.HI(") && !out.contains("USHF.R.U32.HI("),
+        "expected canonical warp_reduce_sum to avoid raw funnel-shift helpers, got:\n{}",
+        out
+    );
 }
 
 #[test]

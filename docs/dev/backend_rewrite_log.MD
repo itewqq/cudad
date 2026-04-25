@@ -3,7 +3,7 @@
 ## Status
 
 - Branch: `codex/memory-aware-backend-refactor`
-- Checkpoint commit: `f24e974`
+- Checkpoint commit: `d0a1150`
 - Current stage: phase 5 cutover of structured output entrypoints onto the canonical backend, with front-half address-contract fixes still landing as needed
 
 ## Landed invariants
@@ -159,6 +159,11 @@
 - Canonical scalar lowering now maps `SHFL.DOWN`/`SHFL.UP`/`SHFL.XOR` style ops
   to CUDA shuffle intrinsics, so warp reductions can keep `__shfl_*_sync`
   structure on the canonical path without depending on semantic-lift output.
+- Canonical scalar lowering now folds common `SHF*.R.*.HI` right-shift patterns
+  into native `>>` expressions, which makes warp/shared lane-group arithmetic
+  readable and prevents raw funnel-shift helpers from leaking into the
+  canonical path when the source is a known builtin like `threadIdx.x` or
+  `blockDim.x`.
 
 ## Next safe step
 
@@ -171,7 +176,8 @@
    different.
 3. Tackle the next structurally visible canonical holes: shared index/root
    recovery beyond direct `threadIdx` forms, unresolved control predicates, and
-   the last unmodeled scalar ops that still force raw helper-shaped output.
+   the remaining unmodeled scalar ops (notably `LOP3.LUT` predicate shaping)
+   that still force raw helper-shaped output.
 
 ## Open questions
 

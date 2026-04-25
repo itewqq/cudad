@@ -805,6 +805,7 @@ fn lower_semantic_op_expr(
 ) -> Option<Expr> {
     lower_setp_expr(opcode, args, analysis)
         .or_else(|| lower_wide_add_lo_expr(opcode, args, analysis))
+        .or_else(|| lower_shf_expr(opcode, args, analysis))
         .or_else(|| lower_shfl_expr(opcode, args, analysis))
         .or_else(|| lower_iabs_expr(opcode, args, analysis))
         .or_else(|| lower_ffma_expr(opcode, args, analysis))
@@ -907,6 +908,37 @@ fn lower_add_expr(args: &[IRExpr], analysis: Option<&FunctionAnalysis>) -> Optio
         lhs: Box::new(lhs),
         rhs: Box::new(rhs),
     }))
+}
+
+fn lower_shf_expr(
+    opcode: &str,
+    args: &[IRExpr],
+    analysis: Option<&FunctionAnalysis>,
+) -> Option<Expr> {
+    if args.len() != 3 {
+        return None;
+    }
+    let parts = opcode.split('.').collect::<Vec<_>>();
+    let is_right = parts.contains(&"R");
+    let is_hi = parts.contains(&"HI");
+    if !(is_right && is_hi) || !ir_expr_is_zero(&args[0]) {
+        return None;
+    }
+    let lhs = lower_scalar_expr_with_analysis(&args[2], analysis);
+    let rhs = lower_scalar_expr_with_analysis(&args[1], analysis);
+    let lhs = if parts.contains(&"S32") {
+        Expr::Cast {
+            ty: "int32_t".to_string(),
+            expr: Box::new(lhs),
+        }
+    } else {
+        lhs
+    };
+    Some(Expr::Binary {
+        op: ">>".to_string(),
+        lhs: Box::new(lhs),
+        rhs: Box::new(rhs),
+    })
 }
 
 fn lower_shfl_expr(
@@ -2020,6 +2052,32 @@ mod tests {
             ],
         );
         assert_eq!(shfl.render(), "__shfl_down_sync(0xffffffff, r3_0, 16)");
+    }
+
+    #[test]
+    fn lowers_shf_hi_right_patterns_to_shifts() {
+        let shf = lower_op_expr(
+            "SHF.R.S32.HI",
+            &[
+                IRExpr::Reg(crate::ir::RegId::new("RZ", 0, 1)),
+                IRExpr::ImmI(31),
+                IRExpr::Reg(crate::ir::RegId::new("R", 6, 1).with_ssa(0)),
+            ],
+        );
+        assert_eq!(shf.render(), "(int32_t)(r6_0) >> 31");
+
+        let ushf = lower_op_expr(
+            "USHF.R.U32.HI",
+            &[
+                IRExpr::Reg(crate::ir::RegId::new("URZ", 0, 1)),
+                IRExpr::ImmI(5),
+                IRExpr::Op {
+                    op: "SR_TID.X".to_string(),
+                    args: Vec::new(),
+                },
+            ],
+        );
+        assert_eq!(ushf.render(), "threadIdx.x >> 5");
     }
 
     #[test]
