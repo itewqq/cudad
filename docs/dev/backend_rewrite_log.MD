@@ -391,6 +391,10 @@
   backend, so the remaining corpus refresh work is narrower (`goto` budgets
   plus any final curated-output regeneration) instead of being blocked on the
   old lift harness or the old SHA timeout.
+- The obsolete `src/ast_passes/tests.rs` cleanup gauntlet is now cut back to
+  only the live `ast_simplify` contracts. The deleted cases were asserting the
+  old pre-canonical addr64 / helper-cleanup / FCHK-repair pipeline rather than
+  the canonical backend contract owned by `src/canonical_ast_passes.rs`.
 
 ## Next safe step
 
@@ -443,6 +447,7 @@
 - `src/structurizer/tests.rs`
 - `README.md`
 - `docs/dev/decompiler_design.MD`
+- `src/ast_passes/tests.rs`
 
 ## Interrupt resume note
 
