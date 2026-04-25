@@ -802,7 +802,7 @@ fn lower_non_memory_stmt_with_analysis(
 }
 
 fn lower_structural_control_stmt(stmt: &IRStatement) -> Option<LoweredStmt> {
-    let RValue::Op { opcode, .. } = &stmt.value else {
+    let RValue::Op { opcode, args } = &stmt.value else {
         return None;
     };
     let mnem = opcode.split('.').next().unwrap_or(opcode);
@@ -816,6 +816,11 @@ fn lower_structural_control_stmt(stmt: &IRStatement) -> Option<LoweredStmt> {
             func: "__syncwarp".to_string(),
             args: Vec::new(),
         }),
+        "BRX" => Stmt::Switch {
+            discriminant: args.first().map(lower_scalar_expr),
+            cases: Vec::new(),
+            default: None,
+        },
         "BRA" | "BSSY" | "BSYNC" | "SSY" | "SYNC" | "NOP" | "DEPBAR" | "MEMBAR" | "FENCE" => {
             Stmt::Empty
         }
@@ -3177,7 +3182,7 @@ mod tests {
     }
 
     #[test]
-    fn lowers_exit_and_barrier_ops_without_raw_helpers() {
+    fn lowers_exit_barrier_and_indirect_branch_ops_without_raw_helpers() {
         let exit_stmt = IRStatement {
             defs: Vec::new(),
             value: RValue::Op {
@@ -3203,6 +3208,22 @@ mod tests {
         };
         let barrier_lowered = lower_basic_stmt(0, 0, &barrier_stmt, &FunctionAnalysis::default());
         assert_eq!(barrier_lowered.render_with_indent(0), "__syncthreads();\n");
+
+        let brx_stmt = IRStatement {
+            defs: Vec::new(),
+            value: RValue::Op {
+                opcode: "BRX".to_string(),
+                args: vec![IRExpr::Reg(crate::ir::RegId::new("R", 8, 1).with_ssa(0))],
+            },
+            pred: Some(IRExpr::Reg(crate::ir::RegId::new("P", 1, 1))),
+            mem_addr_args: None,
+            pred_old_defs: Vec::new(),
+        };
+        let brx_lowered = lower_basic_stmt(0, 0, &brx_stmt, &FunctionAnalysis::default());
+        let rendered = brx_lowered.render_with_indent(0);
+        assert!(rendered.contains("if (p1)"), "got:\n{rendered}");
+        assert!(rendered.contains("switch (r8_0)"), "got:\n{rendered}");
+        assert!(!rendered.contains("BRX("), "got:\n{rendered}");
     }
 
     #[test]

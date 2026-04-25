@@ -261,6 +261,9 @@
   before extracting lanes so signedness and overflow semantics are preserved.
 - Canonical AST tests now also pin predicated multi-def `IMAD.WIDE` lowering,
   including false-path SSA preservation for both low/high written lanes.
+- The last obvious scalar/helper leak in the tracked corpus is now gone:
+  `state_machine` lowers indirect `BRX` control to an explicit switch-shaped
+  placeholder instead of emitting raw `BRX(...)` text in the canonical output.
 
 ## Next safe step
 
