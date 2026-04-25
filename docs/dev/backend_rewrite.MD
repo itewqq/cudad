@@ -65,6 +65,10 @@ constant array.
 - Optional predicate+data scalar outputs (for example `LOP3.LUT P0, R8, ...`)
   must preserve both results structurally; the canonical path must not turn the
   data def into an undefined use or silently drop the predicate fact.
+- `FunctionAnalysis` owns post-SSA scalar type facts as well as memory-space
+  facts, so canonical lowering can recover typed scalar semantics such as
+  `copysignf(...)` / `FSEL` / `IMAD` directly from SSA instead of leaning on
+  semantic-lift text helpers.
 - New backend modules must document their inputs, outputs, invariants, and
   forbidden responsibilities in rustdoc headers.
 

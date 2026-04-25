@@ -3,7 +3,7 @@
 ## Status
 
 - Branch: `codex/memory-aware-backend-refactor`
-- Checkpoint commit: `69b621f`
+- Checkpoint commit: `dec1367`
 - Current stage: phase 5 cutover of structured output entrypoints onto the canonical backend, with front-half address-contract fixes still landing as needed
 
 ## Landed invariants
@@ -176,6 +176,17 @@
   mask pattern as native bitwise `&`, and canonical statement lowering emits
   the companion predicate def as a structural `!= 0` assignment when the SASS
   instruction writes both a predicate and a data register.
+- `FunctionAnalysis` now also carries SSA-versioned scalar type facts, so the
+  canonical backend can recover typed scalar semantics without reviving
+  semantic-lift side tables or rendered-text heuristics.
+- Canonical scalar lowering now covers `FSEL`/`SEL`, `FMUL`, plain
+  `IMAD`/`UIMAD`, `IMAD.MOV`, `IMAD.IADD`, and `IMAD.SHL.U32` structurally,
+  which removes another band of raw helper-shaped arithmetic from kernels such
+  as `gelu_forward`.
+- Canonical `LOP3.LUT` lowering now also recognizes the float sign-injection
+  patterns used for `copysignf(...)`, and canonical coverage now pins that
+  `gelu_forward` keeps those math ops structural instead of leaking raw
+  `LOP3.LUT` / `FSEL` / `FMUL` / `IMAD` helper calls.
 
 ## Next safe step
 
@@ -184,9 +195,8 @@
    different.
 2. Tackle the next structurally visible canonical holes: shared index/root
    recovery beyond direct `threadIdx` forms, unresolved control predicates, and
-   the remaining unmodeled scalar ops (including broader `LOP3.LUT` predicate
-   shaping beyond the lane-mask case) that still force raw helper-shaped
-   output.
+   the remaining vector/half/special-scalar ops (for example `HFMA2`,
+   `PRMT`, rotate-heavy SHA idioms) that still force raw helper-shaped output.
 3. Revisit the broader `sgemm_tiled` / shared-memory fixtures and migrate any
    additional smoke coverage that the new shared-scale and scalar-op lowering
    now makes trustworthy on the canonical driver.

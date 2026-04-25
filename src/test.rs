@@ -1452,6 +1452,33 @@ fn full_pass_gelu_forward_recovers_copysign_and_typed_pointer_arithmetic() {
 }
 
 #[test]
+fn canonical_full_pass_gelu_forward_recovers_structural_math_ops() {
+    let gelu = split_decoded_functions(include_str!("../test_cu/corpus_sm100/ml_kernels.sass"))
+        .into_iter()
+        .find(|f| f.name == "gelu_forward")
+        .expect("gelu_forward fixture should exist");
+    let out = run_canonical_output_full_pass_from_instrs(gelu.instrs, gelu.sm, "gelu_forward");
+    assert!(
+        out.contains("blockDim.x * blockIdx.x + threadIdx.x"),
+        "expected canonical gelu_forward launch index to lower structurally, got:\n{}",
+        out
+    );
+    assert!(
+        out.contains("!p0_1 ? r8_0 : 1;") && out.contains("copysignf("),
+        "expected canonical gelu_forward to recover fsel/copysign math, got:\n{}",
+        out
+    );
+    assert!(
+        !out.contains("IMAD(")
+            && !out.contains("FMUL(")
+            && !out.contains("FSEL(")
+            && !out.contains("LOP3.LUT("),
+        "expected canonical gelu_forward math to avoid raw helper opcodes, got:\n{}",
+        out
+    );
+}
+
+#[test]
 fn full_pass_nbody_final_store_uses_collapsed_force_pointer() {
     let nbody = split_decoded_functions(include_str!(
         "../test_cu/corpus_sm100/simulation_kernels.sass"

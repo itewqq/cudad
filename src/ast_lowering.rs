@@ -33,6 +33,7 @@ use crate::ir::{IRExpr, IRStatement, RValue};
 use crate::memory_model::{CudaMemorySpace, MemAccessKind};
 use crate::structurizer::{LoopType, StructuredStatement};
 use crate::symbol_plan::plan_symbols;
+use crate::type_inference::InferredType;
 
 #[derive(Clone, Debug)]
 struct LoweredStmt {
@@ -807,11 +808,14 @@ fn lower_semantic_op_expr(
     analysis: Option<&FunctionAnalysis>,
 ) -> Option<Expr> {
     lower_setp_expr(opcode, args, analysis)
+        .or_else(|| lower_fsel_expr(opcode, args, analysis))
         .or_else(|| lower_lop3_expr(opcode, args, analysis))
+        .or_else(|| lower_imad_expr(opcode, args, analysis))
         .or_else(|| lower_wide_add_lo_expr(opcode, args, analysis))
         .or_else(|| lower_shf_expr(opcode, args, analysis))
         .or_else(|| lower_shfl_expr(opcode, args, analysis))
         .or_else(|| lower_iabs_expr(opcode, args, analysis))
+        .or_else(|| lower_fmul_expr(opcode, args, analysis))
         .or_else(|| lower_ffma_expr(opcode, args, analysis))
         .or_else(|| lower_fmnmx_expr(opcode, args, analysis))
         .or_else(|| lower_mufu_expr(opcode, args, analysis))
@@ -901,6 +905,22 @@ fn setp_comparison_op(part: &str) -> Option<&'static str> {
     }
 }
 
+fn lower_fsel_expr(
+    opcode: &str,
+    args: &[IRExpr],
+    analysis: Option<&FunctionAnalysis>,
+) -> Option<Expr> {
+    let mnem = opcode.split('.').next().unwrap_or(opcode);
+    if !matches!(mnem, "SEL" | "FSEL") || args.len() != 3 {
+        return None;
+    }
+    Some(Expr::Ternary {
+        cond: Box::new(lower_scalar_expr_with_analysis(&args[2], analysis)),
+        then_expr: Box::new(lower_scalar_expr_with_analysis(&args[0], analysis)),
+        else_expr: Box::new(lower_scalar_expr_with_analysis(&args[1], analysis)),
+    })
+}
+
 fn lower_add_expr(args: &[IRExpr], analysis: Option<&FunctionAnalysis>) -> Option<Expr> {
     let mut terms = args
         .iter()
@@ -973,6 +993,9 @@ fn lower_lop3_expr(
         IRExpr::ImmI(value) => (value & 0xff) as u8,
         _ => return None,
     };
+    if let Some(expr) = lower_lop3_float_sign_inject_expr(imm, args, analysis) {
+        return Some(expr);
+    }
     let a0z = ir_expr_is_zero(&args[0]);
     let a1z = ir_expr_is_zero(&args[1]);
     let a2z = ir_expr_is_zero(&args[2]);
@@ -1023,6 +1046,82 @@ fn lower_lop3_expr(
         );
     }
     None
+}
+
+fn lower_lop3_float_sign_inject_expr(
+    imm: u8,
+    args: &[IRExpr],
+    analysis: Option<&FunctionAnalysis>,
+) -> Option<Expr> {
+    match imm {
+        0xf8 if is_sign_mask_imm(&args[1])
+            && expr_is_floatish(&args[0], analysis)
+            && expr_is_floatish(&args[2], analysis) =>
+        {
+            Some(Expr::CallLike {
+                func: "copysignf".to_string(),
+                args: vec![
+                    lower_scalar_expr_with_analysis(&args[0], analysis),
+                    lower_scalar_expr_with_analysis(&args[2], analysis),
+                ],
+            })
+        }
+        0xf8 if is_sign_mask_imm(&args[2])
+            && expr_is_floatish(&args[0], analysis)
+            && expr_is_floatish(&args[1], analysis) =>
+        {
+            Some(Expr::CallLike {
+                func: "copysignf".to_string(),
+                args: vec![
+                    lower_scalar_expr_with_analysis(&args[0], analysis),
+                    lower_scalar_expr_with_analysis(&args[1], analysis),
+                ],
+            })
+        }
+        0xea if is_sign_mask_imm(&args[0])
+            && expr_is_floatish(&args[1], analysis)
+            && expr_is_floatish(&args[2], analysis) =>
+        {
+            Some(Expr::CallLike {
+                func: "copysignf".to_string(),
+                args: vec![
+                    lower_scalar_expr_with_analysis(&args[2], analysis),
+                    lower_scalar_expr_with_analysis(&args[1], analysis),
+                ],
+            })
+        }
+        0xea if is_sign_mask_imm(&args[1])
+            && expr_is_floatish(&args[0], analysis)
+            && expr_is_floatish(&args[2], analysis) =>
+        {
+            Some(Expr::CallLike {
+                func: "copysignf".to_string(),
+                args: vec![
+                    lower_scalar_expr_with_analysis(&args[2], analysis),
+                    lower_scalar_expr_with_analysis(&args[0], analysis),
+                ],
+            })
+        }
+        _ => None,
+    }
+}
+
+fn is_sign_mask_imm(expr: &IRExpr) -> bool {
+    matches!(expr, IRExpr::ImmI(value) if (*value as u32) == 0x8000_0000)
+}
+
+fn expr_is_floatish(expr: &IRExpr, analysis: Option<&FunctionAnalysis>) -> bool {
+    match expr {
+        IRExpr::ImmF(_) => true,
+        IRExpr::Reg(reg) => analysis
+            .and_then(|facts| facts.scalar_type_by_reg.get(reg).copied())
+            .is_some_and(is_floatish_scalar_type),
+        _ => false,
+    }
+}
+
+fn is_floatish_scalar_type(ty: InferredType) -> bool {
+    matches!(ty, InferredType::F16 | InferredType::F32 | InferredType::AnyFloat)
 }
 
 fn lop3_bit(imm: u8, a: u8, b: u8, c: u8) -> bool {
@@ -1113,6 +1212,62 @@ fn lower_lop3_binary_expr(x: Expr, y: Expr, nibble: u8) -> Option<Expr> {
     }
 }
 
+fn lower_imad_expr(
+    opcode: &str,
+    args: &[IRExpr],
+    analysis: Option<&FunctionAnalysis>,
+) -> Option<Expr> {
+    let parts = opcode.split('.').collect::<Vec<_>>();
+    let mnem = parts.first().copied().unwrap_or(opcode);
+    if !matches!(mnem, "IMAD" | "UIMAD") || args.len() != 3 {
+        return None;
+    }
+    if parts.iter().any(|part| matches!(*part, "WIDE" | "HI" | "X")) {
+        return None;
+    }
+    if parts.iter().any(|part| *part == "MOV") {
+        if ir_expr_is_zero(&args[0]) && ir_expr_is_zero(&args[1]) {
+            return Some(lower_scalar_expr_with_analysis(&args[2], analysis));
+        }
+        return None;
+    }
+    if parts.iter().any(|part| *part == "SHL") {
+        if let IRExpr::ImmI(value) = args[1] {
+            let factor = value as u64;
+            if factor > 0 && factor.is_power_of_two() {
+                return Some(Expr::Binary {
+                    op: "<<".to_string(),
+                    lhs: Box::new(lower_scalar_expr_with_analysis(&args[0], analysis)),
+                    rhs: Box::new(Expr::Imm(factor.trailing_zeros().to_string())),
+                });
+            }
+        }
+        return None;
+    }
+    if parts.iter().any(|part| *part == "IADD") {
+        if is_imm_i(&args[1], 1) {
+            return Some(add_expr(
+                lower_scalar_expr_with_analysis(&args[0], analysis),
+                lower_scalar_expr_with_analysis(&args[2], analysis),
+            ));
+        }
+        if is_imm_i(&args[0], 1) {
+            return Some(add_expr(
+                lower_scalar_expr_with_analysis(&args[1], analysis),
+                lower_scalar_expr_with_analysis(&args[2], analysis),
+            ));
+        }
+    }
+    Some(add_expr(
+        Expr::Binary {
+            op: "*".to_string(),
+            lhs: Box::new(lower_scalar_expr_with_analysis(&args[0], analysis)),
+            rhs: Box::new(lower_scalar_expr_with_analysis(&args[1], analysis)),
+        },
+        lower_scalar_expr_with_analysis(&args[2], analysis),
+    ))
+}
+
 fn lower_shf_expr(
     opcode: &str,
     args: &[IRExpr],
@@ -1193,6 +1348,21 @@ fn lower_iabs_expr(
     Some(Expr::CallLike {
         func: "abs".to_string(),
         args: vec![lower_scalar_expr_with_analysis(&args[0], analysis)],
+    })
+}
+
+fn lower_fmul_expr(
+    opcode: &str,
+    args: &[IRExpr],
+    analysis: Option<&FunctionAnalysis>,
+) -> Option<Expr> {
+    if opcode != "FMUL" || args.len() != 2 {
+        return None;
+    }
+    Some(Expr::Binary {
+        op: "*".to_string(),
+        lhs: Box::new(lower_scalar_expr_with_analysis(&args[0], analysis)),
+        rhs: Box::new(lower_scalar_expr_with_analysis(&args[1], analysis)),
     })
 }
 
@@ -1332,6 +1502,10 @@ fn add_expr(lhs: Expr, rhs: Expr) -> Expr {
         lhs: Box::new(lhs),
         rhs: Box::new(rhs),
     }
+}
+
+fn is_imm_i(expr: &IRExpr, value: i64) -> bool {
+    matches!(expr, IRExpr::ImmI(actual) if *actual == value)
 }
 
 fn lower_ir_op_expr_with_analysis(
@@ -2458,6 +2632,84 @@ mod tests {
             &[IRExpr::Reg(crate::ir::RegId::new("R", 4, 1).with_ssa(0))],
         );
         assert_eq!(mufu.render(), "exp2f(r4_0)");
+    }
+
+    #[test]
+    fn lowers_fsel_fmul_and_imad_family_semantically() {
+        let fsel = lower_op_expr(
+            "FSEL",
+            &[
+                IRExpr::Reg(crate::ir::RegId::new("R", 7, 1).with_ssa(0)),
+                IRExpr::ImmI(1),
+                IRExpr::Reg(crate::ir::RegId::new("P", 1, 1).with_ssa(0)),
+            ],
+        );
+        assert_eq!(fsel.render(), "p1_0 ? r7_0 : 1");
+
+        let fmul = lower_op_expr(
+            "FMUL",
+            &[
+                IRExpr::Reg(crate::ir::RegId::new("R", 1, 1).with_ssa(0)),
+                IRExpr::Reg(crate::ir::RegId::new("R", 2, 1).with_ssa(0)),
+            ],
+        );
+        assert_eq!(fmul.render(), "r1_0 * r2_0");
+
+        let imad = lower_op_expr(
+            "IMAD",
+            &[
+                IRExpr::Reg(crate::ir::RegId::new("R", 1, 1).with_ssa(0)),
+                IRExpr::Reg(crate::ir::RegId::new("R", 2, 1).with_ssa(0)),
+                IRExpr::Reg(crate::ir::RegId::new("R", 3, 1).with_ssa(0)),
+            ],
+        );
+        assert_eq!(imad.render(), "r1_0 * r2_0 + r3_0");
+
+        let imad_mov = lower_op_expr(
+            "IMAD.MOV.U32",
+            &[
+                IRExpr::Reg(crate::ir::RegId::new("RZ", 0, 1)),
+                IRExpr::Reg(crate::ir::RegId::new("RZ", 0, 1)),
+                IRExpr::Reg(crate::ir::RegId::new("R", 4, 1).with_ssa(0)),
+            ],
+        );
+        assert_eq!(imad_mov.render(), "r4_0");
+
+        let imad_iadd = lower_op_expr(
+            "IMAD.IADD",
+            &[
+                IRExpr::Reg(crate::ir::RegId::new("R", 5, 1).with_ssa(0)),
+                IRExpr::ImmI(1),
+                IRExpr::Reg(crate::ir::RegId::new("R", 6, 1).with_ssa(0)),
+            ],
+        );
+        assert_eq!(imad_iadd.render(), "r5_0 + r6_0");
+
+        let imad_shl = lower_op_expr(
+            "IMAD.SHL.U32",
+            &[
+                IRExpr::Reg(crate::ir::RegId::new("R", 8, 1).with_ssa(0)),
+                IRExpr::ImmI(16),
+                IRExpr::ImmI(0),
+            ],
+        );
+        assert_eq!(imad_shl.render(), "r8_0 << 4");
+    }
+
+    #[test]
+    fn lowers_float_sign_lop3_to_copysignf() {
+        let (analysis, _, _, stmt) = analyze_stmt(
+            "/*0000*/ MOV R4, c[0x0][0x160] ;\n\
+             /*0010*/ MOV R5, c[0x0][0x164] ;\n\
+             /*0020*/ LDG.E.CONSTANT R8, [R4.64] ;\n\
+             /*0030*/ FADD R9, R8, 0f00000000 ;\n\
+             /*0040*/ LOP3.LUT R10, R9, 0x80000000, R8, 0xf8, !PT ;\n\
+             /*0050*/ EXIT ;\n",
+            |stmt| stmt_opcode(stmt).starts_with("LOP3"),
+        );
+        let lowered = lower_non_memory_stmt_with_analysis(&stmt, Some(&analysis));
+        let rendered = lowered.stmt.render_with_indent(0);
+        assert!(rendered.contains("r10_0 = copysignf(r9_0, r8_0);"), "got:\n{rendered}");
     }
 
     #[test]

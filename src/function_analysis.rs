@@ -39,6 +39,7 @@ use crate::abi::{
 use crate::ir::{FunctionIR, IRExpr, IRStatement, RValue, RegId};
 use crate::memory_model::{CudaMemorySpace, MemAccessKind};
 use crate::parser::DecodedInstruction;
+use crate::type_inference::{infer_ssa_types, InferredType};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum AddressRoot {
@@ -69,6 +70,7 @@ pub struct FunctionAnalysis {
     pub abi_annotations: AbiAnnotations,
     pub abi_aliases: AbiArgAliases,
     pub shared_pointee_ty: Option<&'static str>,
+    pub scalar_type_by_reg: BTreeMap<RegId, InferredType>,
     pub builtin_by_reg: BTreeMap<RegId, String>,
     pub root_by_reg: BTreeMap<RegId, AddressRoot>,
     pub byte_offset_by_reg: BTreeMap<RegId, IRExpr>,
@@ -101,6 +103,7 @@ pub fn analyze_function_ir_with_profile(
         infer_arg_aliases(function_ir, &abi_annotations)
     };
     let shared_pointee_ty = infer_shared_word_pointee_type_for_function(function_ir);
+    let scalar_type_by_reg = infer_ssa_types(function_ir);
     let builtin_by_reg = recover_builtin_regs(function_ir, &abi_annotations);
 
     let (root_by_reg, byte_offset_by_reg) =
@@ -113,6 +116,7 @@ pub fn analyze_function_ir_with_profile(
         abi_annotations,
         abi_aliases,
         shared_pointee_ty,
+        scalar_type_by_reg,
         builtin_by_reg,
         root_by_reg,
         byte_offset_by_reg,
@@ -1029,6 +1033,28 @@ mod tests {
         "#;
         let analysis = analyze(sass);
         assert_eq!(analysis.shared_pointee_ty, Some("float"));
+    }
+
+    #[test]
+    fn carries_scalar_ssa_types_for_post_ssa_lowering() {
+        let sass = r#"
+            /*0000*/ MOV R4, c[0x0][0x160] ;
+            /*0010*/ MOV R5, c[0x0][0x164] ;
+            /*0020*/ LDG.E.CONSTANT R8, [R4.64] ;
+            /*0030*/ FMUL R9, R8, 0f3f800000 ;
+            /*0040*/ EXIT ;
+        "#;
+        let analysis = analyze(sass);
+        let load = crate::ir::RegId::new("R", 8, 1).with_ssa(0);
+        let mul = crate::ir::RegId::new("R", 9, 1).with_ssa(0);
+        assert_eq!(
+            analysis.scalar_type_by_reg.get(&load).copied(),
+            Some(InferredType::F32)
+        );
+        assert_eq!(
+            analysis.scalar_type_by_reg.get(&mul).copied(),
+            Some(InferredType::F32)
+        );
     }
 
     #[test]
