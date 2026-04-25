@@ -681,6 +681,9 @@ fn lower_non_memory_stmt_with_analysis(
     if let Some(lowered) = lower_structural_control_stmt(stmt) {
         return lowered;
     }
+    if let Some(lowered) = lower_multi_def_lea_stmt(stmt, analysis) {
+        return lowered;
+    }
     if let Some(lowered) = lower_multi_def_lop3_stmt(stmt, analysis) {
         return lowered;
     }
@@ -821,6 +824,8 @@ fn lower_semantic_op_expr(
     lower_setp_expr(opcode, args, analysis)
         .or_else(|| lower_fsel_expr(opcode, args, analysis))
         .or_else(|| lower_lop3_expr(opcode, args, analysis))
+        .or_else(|| lower_lea_expr(opcode, args, analysis))
+        .or_else(|| lower_imad_x_expr(opcode, args, analysis))
         .or_else(|| lower_imad_expr(opcode, args, analysis))
         .or_else(|| lower_iadd3_x_expr(opcode, args, analysis))
         .or_else(|| lower_wide_add_lo_expr(opcode, args, analysis))
@@ -1091,6 +1096,47 @@ fn lower_multi_def_lop3_stmt(
             Stmt::Assign {
                 dst: LValue::Var(lower_reg_name(pred_def)),
                 src: pred_expr,
+            },
+        ]),
+        predicate_def_idx: None,
+    })
+}
+
+fn lower_multi_def_lea_stmt(
+    stmt: &IRStatement,
+    analysis: Option<&FunctionAnalysis>,
+) -> Option<LoweredStmt> {
+    let RValue::Op { opcode, args } = &stmt.value else {
+        return None;
+    };
+    let mnem = opcode.split('.').next().unwrap_or(opcode);
+    if !matches!(mnem, "LEA" | "ULEA") || opcode.split('.').any(|part| part == "HI") {
+        return None;
+    }
+    let data_def = stmt
+        .defs
+        .iter()
+        .filter_map(|expr| expr.get_reg())
+        .find(|reg| matches!(reg.class.as_str(), "R" | "UR"))?;
+    let pred_def = stmt
+        .defs
+        .iter()
+        .filter_map(|expr| expr.get_reg())
+        .find(|reg| matches!(reg.class.as_str(), "P" | "UP"));
+    let data_expr = lower_lea_expr(opcode, args, analysis)?;
+    let Some(pred_def) = pred_def else {
+        return None;
+    };
+    let carry_expr = lower_lea_carry_expr(args, analysis)?;
+    Some(LoweredStmt {
+        stmt: Stmt::Sequence(vec![
+            Stmt::Assign {
+                dst: LValue::Var(lower_reg_name(data_def)),
+                src: data_expr,
+            },
+            Stmt::Assign {
+                dst: LValue::Var(lower_reg_name(pred_def)),
+                src: carry_expr,
             },
         ]),
         predicate_def_idx: None,
@@ -1393,6 +1439,46 @@ fn lower_imad_expr(
         },
         lower_scalar_expr_with_analysis(&args[2], analysis),
     ))
+}
+
+fn lower_imad_x_expr(
+    opcode: &str,
+    args: &[IRExpr],
+    analysis: Option<&FunctionAnalysis>,
+) -> Option<Expr> {
+    let parts = opcode.split('.').collect::<Vec<_>>();
+    let mnem = parts.first().copied().unwrap_or(opcode);
+    if !matches!(mnem, "IMAD" | "UIMAD") || !parts.iter().any(|part| *part == "X") || args.len() < 4
+    {
+        return None;
+    }
+    let carry = lower_carry_inc_expr(&args[3], analysis)?;
+    let mut expr = if ir_expr_is_zero(&args[0]) && ir_expr_is_zero(&args[1]) {
+        lower_scalar_expr_with_analysis(&args[2], analysis)
+    } else if is_imm_i(&args[1], 1) {
+        add_expr(
+            lower_scalar_expr_with_analysis(&args[0], analysis),
+            lower_scalar_expr_with_analysis(&args[2], analysis),
+        )
+    } else if is_imm_i(&args[0], 1) {
+        add_expr(
+            lower_scalar_expr_with_analysis(&args[1], analysis),
+            lower_scalar_expr_with_analysis(&args[2], analysis),
+        )
+    } else {
+        add_expr(
+            Expr::Binary {
+                op: "*".to_string(),
+                lhs: Box::new(lower_scalar_expr_with_analysis(&args[0], analysis)),
+                rhs: Box::new(lower_scalar_expr_with_analysis(&args[1], analysis)),
+            },
+            lower_scalar_expr_with_analysis(&args[2], analysis),
+        )
+    };
+    if !matches!(carry, Expr::Imm(ref text) if text == "0") {
+        expr = add_expr(expr, carry);
+    }
+    Some(expr)
 }
 
 fn lower_iadd3_x_expr(
@@ -1796,6 +1882,73 @@ fn add_expr(lhs: Expr, rhs: Expr) -> Expr {
         op: "+".to_string(),
         lhs: Box::new(lhs),
         rhs: Box::new(rhs),
+    }
+}
+
+fn lower_lea_expr(
+    opcode: &str,
+    args: &[IRExpr],
+    analysis: Option<&FunctionAnalysis>,
+) -> Option<Expr> {
+    let mnem = opcode.split('.').next().unwrap_or(opcode);
+    if !matches!(mnem, "LEA" | "ULEA") || opcode.split('.').any(|part| part == "HI") {
+        return None;
+    }
+    let [base, offset, shift] = args else {
+        return None;
+    };
+    let scaled = lower_shifted_u32_expr(base, shift, analysis)?;
+    Some(add_expr(
+        scaled,
+        lower_scalar_expr_with_analysis(offset, analysis),
+    ))
+}
+
+fn lower_lea_carry_expr(args: &[IRExpr], analysis: Option<&FunctionAnalysis>) -> Option<Expr> {
+    let [base, offset, shift] = args else {
+        return None;
+    };
+    let wide_sum = add_expr(
+        widen_u32_to_u64_expr(lower_shifted_u32_expr(base, shift, analysis)?),
+        widen_u32_to_u64_expr(lower_scalar_expr_with_analysis(offset, analysis)),
+    );
+    Some(Expr::Binary {
+        op: "!=".to_string(),
+        lhs: Box::new(Expr::LaneExtract {
+            value: Box::new(wide_sum),
+            lane: PointerLane::Hi32,
+        }),
+        rhs: Box::new(Expr::Imm("0".to_string())),
+    })
+}
+
+fn lower_shifted_u32_expr(
+    value: &IRExpr,
+    shift: &IRExpr,
+    analysis: Option<&FunctionAnalysis>,
+) -> Option<Expr> {
+    let shift = match shift {
+        IRExpr::ImmI(value) => *value,
+        _ => return None,
+    };
+    let base = lower_scalar_expr_with_analysis(value, analysis);
+    if shift == 0 {
+        return Some(base);
+    }
+    Some(Expr::Binary {
+        op: "<<".to_string(),
+        lhs: Box::new(base),
+        rhs: Box::new(Expr::Imm(shift.to_string())),
+    })
+}
+
+fn widen_u32_to_u64_expr(expr: Expr) -> Expr {
+    Expr::Cast {
+        ty: "uint64_t".to_string(),
+        expr: Box::new(Expr::Cast {
+            ty: "uint32_t".to_string(),
+            expr: Box::new(expr),
+        }),
     }
 }
 
@@ -3051,6 +3204,47 @@ mod tests {
             ],
         );
         assert_eq!(expr.render(), "ur7_0 + (up0_0 ? 1 : 0)");
+    }
+
+    #[test]
+    fn lowers_imad_x_and_multidef_lea_semantically() {
+        let imadx = lower_op_expr(
+            "IMAD.X",
+            &[
+                IRExpr::ImmI(0),
+                IRExpr::ImmI(0),
+                IRExpr::Reg(crate::ir::RegId::new("R", 15, 1).with_ssa(0)),
+                IRExpr::Reg(crate::ir::RegId::new("P", 3, 1).with_ssa(0)),
+            ],
+        );
+        assert_eq!(imadx.render(), "r15_0 + (p3_0 ? 1 : 0)");
+
+        let stmt = IRStatement {
+            defs: vec![
+                IRExpr::Reg(crate::ir::RegId::new("R", 2, 1).with_ssa(0)),
+                IRExpr::Reg(crate::ir::RegId::new("P", 0, 1).with_ssa(1)),
+            ],
+            value: RValue::Op {
+                opcode: "LEA".to_string(),
+                args: vec![
+                    IRExpr::Reg(crate::ir::RegId::new("R", 0, 1).with_ssa(0)),
+                    IRExpr::Reg(crate::ir::RegId::new("R", 4, 1).with_ssa(0)),
+                    IRExpr::ImmI(2),
+                ],
+            },
+            pred: None,
+            mem_addr_args: None,
+            pred_old_defs: Vec::new(),
+        };
+        let lowered = lower_non_memory_stmt(&stmt);
+        let rendered = lowered.stmt.render_with_indent(0);
+        assert!(
+            rendered.contains("r2_0 = (r0_0 << 2) + r4_0;"),
+            "got:\n{rendered}"
+        );
+        assert!(rendered.contains("p0_1 ="), "got:\n{rendered}");
+        assert!(rendered.contains(">> 32"), "got:\n{rendered}");
+        assert!(rendered.contains("!= 0;"), "got:\n{rendered}");
     }
 
     #[test]

@@ -215,10 +215,17 @@
   instead of treating `GEU`/`GTU`/`LEU`/`LTU`/`EQU`/`NEU` as ordered compares;
   the canonical path emits explicit `isnan(...)` disjuncts and also lowers
   `NUM` / `NAN` predicate tokens structurally.
+- Canonical scalar/address lowering now also covers `IMAD.X` carry-add forms
+  and non-`.HI` `LEA` address expressions structurally; multi-def `LEA`
+  statements now keep both the data result and the carry predicate on the
+  canonical path instead of leaking raw `LEA(...)` / `IMAD.X(...)` helpers.
 - Canonical targeted coverage now also pins this float-modifier slice:
   `dispatch_ops` no longer leaks raw `FRND.FLOOR(...)` / `FMUL.FTZ(...)`, and
   `softmax_forward` no longer leaks raw `FFMA.SAT(...)` / `FFMA.RM(...)` /
   `FADD.FTZ(...)` on the canonical path.
+- Canonical targeted coverage now also pins `topk_per_row` against this new
+  helper slice: the canonical path must avoid raw `IMAD.X(...)` and plain
+  `LEA(...)` leakage while keeping the typed `arg2_ptr` / `arg4_ptr` contract.
 
 ## Next safe step
 
@@ -228,9 +235,9 @@
 2. Tackle the next structurally visible canonical holes: loop-carried
    pointer-root/byte-offset recovery in `cumsum_linear`, the remaining
    predicate/control outliers beyond the now-handled compare/pseudo-op/carry-
-   add/float-modifier spellings, and the remaining vector/half/special-scalar
-   ops (for example `HFMA2`, `PRMT`, rotate-heavy SHA idioms) that still force
-   raw helper-shaped output.
+   add/float-modifier/plain-LEA/`IMAD.X` spellings, and the remaining
+   vector/half/special-scalar ops (for example `HFMA2`, `PRMT`, rotate-heavy
+   SHA idioms) that still force raw helper-shaped output.
 3. Revisit the broader `sgemm_tiled` / shared-memory fixtures and migrate any
    additional smoke coverage that the new shared-scale and scalar-op lowering
    now makes trustworthy on the canonical driver.

@@ -83,6 +83,9 @@ constant array.
   structurally where CUDA has a direct semantic spelling (`FRND.*`,
   `FADD.FTZ`, `FMUL.*`, `FFMA.SAT`, `FFMA.R*`) instead of leaking raw opcode
   helper calls for routine math code.
+- Canonical address/arithmetic lowering should also cover carry-aware helper
+  forms such as non-`.HI` `LEA` and `IMAD.X` structurally, preserving any
+  predicate carry defs without dropping back to raw opcode-shaped helper calls.
 - Canonical compare lowering must preserve unordered floating-point predicate
   semantics: `*U` compare tokens and `NUM`/`NAN` forms need explicit NaN-aware
   logic, not ordered C relational operators that silently change branch

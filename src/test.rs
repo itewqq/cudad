@@ -1940,6 +1940,11 @@ fn full_pass_topk_per_row_rewrites_split_window_pointer_pair() {
 {}",
         out
     );
+    assert!(
+        !out.contains("IMAD.X(") && !out.contains("LEA("),
+        "expected topk_per_row to lower carry-imad and plain lea helpers structurally, got:\n{}",
+        out
+    );
 }
 
 #[test]
