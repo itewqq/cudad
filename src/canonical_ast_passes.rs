@@ -63,7 +63,10 @@ fn canonicalize_function_once(function: StructuredFunction) -> StructuredFunctio
 pub fn prune_dead_pure_defs(function: StructuredFunction) -> StructuredFunction {
     let mut defs = HashMap::new();
     let body = fold_known_conditions_stmt(function.body, &mut defs);
-    let body = simplify_local_cleanup_regions(body);
+    let mut goto_targets = BTreeSet::new();
+    collect_goto_targets(&body, &mut goto_targets);
+    let body = simplify_local_cleanup_regions(body, &goto_targets, &BTreeSet::new());
+    let body = cleanup_local_control_flow(body);
     StructuredFunction {
         params: function.params,
         locals: function.locals,
@@ -71,8 +74,20 @@ pub fn prune_dead_pure_defs(function: StructuredFunction) -> StructuredFunction 
     }
 }
 
+pub fn canonicalize_post_bind_control_flow(function: StructuredFunction) -> StructuredFunction {
+    StructuredFunction {
+        params: function.params,
+        locals: function.locals,
+        body: cleanup_local_control_flow(function.body),
+    }
+}
+
 pub fn prune_dead_pure_stmt(stmt: Stmt) -> Stmt {
-    dce_stmt(stmt, BTreeSet::new()).0
+    prune_dead_pure_stmt_with_live_out(stmt, BTreeSet::new())
+}
+
+fn prune_dead_pure_stmt_with_live_out(stmt: Stmt, live_out: BTreeSet<String>) -> Stmt {
+    dce_stmt(stmt, live_out).0
 }
 
 fn dce_stmt(stmt: Stmt, live_out: BTreeSet<String>) -> (Stmt, BTreeSet<String>) {
@@ -344,68 +359,101 @@ fn fold_known_conditions_stmt(stmt: Stmt, defs: &mut HashMap<String, Expr>) -> S
     }
 }
 
-fn simplify_local_cleanup_regions(stmt: Stmt) -> Stmt {
+fn simplify_local_cleanup_regions(
+    stmt: Stmt,
+    goto_targets: &BTreeSet<String>,
+    live_out: &BTreeSet<String>,
+) -> Stmt {
     match stmt {
-        Stmt::Sequence(stmts) => simplify_local_cleanup_sequence(stmts, false),
-        Stmt::Block(stmts) => simplify_local_cleanup_sequence(stmts, true),
+        Stmt::Sequence(stmts) => {
+            simplify_local_cleanup_sequence(stmts, false, goto_targets, live_out)
+        }
+        Stmt::Block(stmts) => simplify_local_cleanup_sequence(stmts, true, goto_targets, live_out),
         Stmt::Label { name, body } => Stmt::Label {
             name,
-            body: Box::new(simplify_local_cleanup_regions(*body)),
+            body: Box::new(simplify_local_cleanup_regions(*body, goto_targets, live_out)),
         },
         Stmt::If {
             condition,
             then_branch,
             else_branch,
-        } => simplify_trivial_stmt(Stmt::If {
-            condition,
-            then_branch: Box::new(simplify_local_cleanup_regions(*then_branch)),
-            else_branch: else_branch
-                .map(|branch| Box::new(simplify_local_cleanup_regions(*branch))),
-        }),
+        } => simplify_trivial_stmt(
+            Stmt::If {
+                condition,
+                then_branch: Box::new(simplify_local_cleanup_regions(
+                    *then_branch,
+                    goto_targets,
+                    live_out,
+                )),
+                else_branch: else_branch.map(|branch| {
+                    Box::new(simplify_local_cleanup_regions(*branch, goto_targets, live_out))
+                }),
+            },
+            goto_targets,
+        ),
         Stmt::Loop {
             kind,
             condition,
             body,
         } => {
-            let loop_stmt = Stmt::Loop {
-                kind,
-                condition,
-                body: Box::new(simplify_local_cleanup_regions(*body)),
-            };
-            if contains_unstructured_control_flow(&loop_stmt) {
-                loop_stmt
-            } else {
-                simplify_trivial_stmt(prune_dead_pure_stmt(loop_stmt))
+            let mut body_live_out = live_out.clone();
+            if let Some(condition) = &condition {
+                collect_used_expr_vars(condition, &mut body_live_out);
             }
+            simplify_trivial_stmt(
+                Stmt::Loop {
+                    kind,
+                    condition,
+                    body: Box::new(simplify_local_cleanup_regions(
+                        *body,
+                        goto_targets,
+                        &body_live_out,
+                    )),
+                },
+                goto_targets,
+            )
         }
         Stmt::Switch {
             discriminant,
             cases,
             default,
-        } => {
-            let switch = Stmt::Switch {
+        } => simplify_trivial_stmt(
+            Stmt::Switch {
                 discriminant,
                 cases: cases
                     .into_iter()
-                    .map(|(label, body)| (label, simplify_local_cleanup_regions(body)))
+                    .map(|(label, body)| {
+                        (label, simplify_local_cleanup_regions(body, goto_targets, live_out))
+                    })
                     .collect(),
-                default: default.map(|body| Box::new(simplify_local_cleanup_regions(*body))),
-            };
-            if contains_unstructured_control_flow(&switch) {
-                switch
-            } else {
-                simplify_trivial_stmt(prune_dead_pure_stmt(switch))
-            }
-        }
+                default: default
+                    .map(|body| Box::new(simplify_local_cleanup_regions(*body, goto_targets, live_out))),
+            },
+            goto_targets,
+        ),
         other => other,
     }
 }
 
-fn simplify_local_cleanup_sequence(stmts: Vec<Stmt>, as_block: bool) -> Stmt {
+fn simplify_local_cleanup_sequence(
+    stmts: Vec<Stmt>,
+    as_block: bool,
+    goto_targets: &BTreeSet<String>,
+    live_out: &BTreeSet<String>,
+) -> Stmt {
+    let mut future_used = vec![BTreeSet::new(); stmts.len()];
+    let mut live_tail = live_out.clone();
+    for (idx, stmt) in stmts.iter().enumerate().rev() {
+        future_used[idx] = live_tail.clone();
+        collect_stmt_used_vars(stmt, &mut live_tail);
+    }
+
     let mut out = Vec::new();
     let mut chunk = Vec::new();
+    let mut chunk_live_out = live_out.clone();
 
-    let flush_chunk = |out: &mut Vec<Stmt>, chunk: &mut Vec<Stmt>| {
+    let flush_chunk =
+        |out: &mut Vec<Stmt>, chunk: &mut Vec<Stmt>, chunk_live_out: &mut BTreeSet<String>| {
         if chunk.is_empty() {
             return;
         }
@@ -414,51 +462,62 @@ fn simplify_local_cleanup_sequence(stmts: Vec<Stmt>, as_block: bool) -> Stmt {
         } else {
             Stmt::Sequence(std::mem::take(chunk))
         };
-        let simplified = simplify_trivial_stmt(prune_dead_pure_stmt(chunk_stmt));
+        let simplified = simplify_trivial_stmt(
+            prune_dead_pure_stmt_with_live_out(chunk_stmt, chunk_live_out.clone()),
+            goto_targets,
+        );
         match simplified {
             Stmt::Empty => {}
             Stmt::Sequence(inner) | Stmt::Block(inner) => out.extend(inner),
             other => out.push(other),
         }
+        *chunk_live_out = live_out.clone();
     };
 
-    for stmt in stmts.into_iter().map(simplify_local_cleanup_regions) {
+    for (idx, stmt) in stmts.into_iter().enumerate() {
+        let stmt = simplify_local_cleanup_regions(stmt, goto_targets, &future_used[idx]);
         if let Stmt::Label { name, body } = stmt {
-            flush_chunk(&mut out, &mut chunk);
+            flush_chunk(&mut out, &mut chunk, &mut chunk_live_out);
             let labeled = Stmt::Label {
                 name,
                 body: Box::new(*body),
             };
-            if !stmt_is_trivial_empty(&labeled) {
+            if !stmt_is_trivial_empty(&labeled, goto_targets) {
                 out.push(labeled);
             }
             continue;
         }
         if contains_unstructured_control_flow(&stmt) {
-            flush_chunk(&mut out, &mut chunk);
-            if !stmt_is_trivial_empty(&stmt) {
+            flush_chunk(&mut out, &mut chunk, &mut chunk_live_out);
+            if !stmt_is_trivial_empty(&stmt, goto_targets) {
                 out.push(stmt);
             }
         } else {
+            if chunk.is_empty() {
+                chunk_live_out = future_used[idx].clone();
+            }
             chunk.push(stmt);
         }
     }
-    flush_chunk(&mut out, &mut chunk);
+    flush_chunk(&mut out, &mut chunk, &mut chunk_live_out);
 
-    simplify_trivial_stmt(if as_block {
-        Stmt::Block(out)
-    } else {
-        Stmt::Sequence(out)
-    })
+    simplify_trivial_stmt(
+        if as_block {
+            Stmt::Block(out)
+        } else {
+            Stmt::Sequence(out)
+        },
+        goto_targets,
+    )
 }
 
-fn simplify_trivial_stmt(stmt: Stmt) -> Stmt {
+fn simplify_trivial_stmt(stmt: Stmt, goto_targets: &BTreeSet<String>) -> Stmt {
     match stmt {
         Stmt::Sequence(stmts) => {
             let kept = stmts
                 .into_iter()
-                .map(simplify_trivial_stmt)
-                .filter(|stmt| !stmt_is_trivial_empty(stmt))
+                .map(|stmt| simplify_trivial_stmt(stmt, goto_targets))
+                .filter(|stmt| !stmt_is_trivial_empty(stmt, goto_targets))
                 .collect::<Vec<_>>();
             match kept.len() {
                 0 => Stmt::Empty,
@@ -469,8 +528,8 @@ fn simplify_trivial_stmt(stmt: Stmt) -> Stmt {
         Stmt::Block(stmts) => {
             let kept = stmts
                 .into_iter()
-                .map(simplify_trivial_stmt)
-                .filter(|stmt| !stmt_is_trivial_empty(stmt))
+                .map(|stmt| simplify_trivial_stmt(stmt, goto_targets))
+                .filter(|stmt| !stmt_is_trivial_empty(stmt, goto_targets))
                 .collect::<Vec<_>>();
             match kept.len() {
                 0 => Stmt::Empty,
@@ -485,17 +544,20 @@ fn simplify_trivial_stmt(stmt: Stmt) -> Stmt {
         } => {
             if let Some(value) = expr_const_bool(&condition) {
                 return if value {
-                    simplify_trivial_stmt(*then_branch)
+                    simplify_trivial_stmt(*then_branch, goto_targets)
                 } else {
                     else_branch
-                        .map(|branch| simplify_trivial_stmt(*branch))
+                        .map(|branch| simplify_trivial_stmt(*branch, goto_targets))
                         .unwrap_or(Stmt::Empty)
                 };
             }
-            let then_branch = simplify_trivial_stmt(*then_branch);
-            let else_branch = else_branch.map(|branch| simplify_trivial_stmt(*branch));
-            if stmt_is_trivial_empty(&then_branch)
-                && else_branch.as_ref().is_none_or(stmt_is_trivial_empty)
+            let then_branch = simplify_trivial_stmt(*then_branch, goto_targets);
+            let else_branch =
+                else_branch.map(|branch| simplify_trivial_stmt(*branch, goto_targets));
+            if stmt_is_trivial_empty(&then_branch, goto_targets)
+                && else_branch
+                    .as_ref()
+                    .is_none_or(|branch| stmt_is_trivial_empty(branch, goto_targets))
             {
                 Stmt::Empty
             } else {
@@ -503,7 +565,7 @@ fn simplify_trivial_stmt(stmt: Stmt) -> Stmt {
                     condition,
                     then_branch: Box::new(then_branch),
                     else_branch: else_branch
-                        .filter(|branch| !stmt_is_trivial_empty(branch))
+                        .filter(|branch| !stmt_is_trivial_empty(branch, goto_targets))
                         .map(Box::new),
                 }
             }
@@ -515,7 +577,7 @@ fn simplify_trivial_stmt(stmt: Stmt) -> Stmt {
         } => Stmt::Loop {
             kind,
             condition,
-            body: Box::new(simplify_trivial_stmt(*body)),
+            body: Box::new(simplify_trivial_stmt(*body, goto_targets)),
         },
         Stmt::Switch {
             discriminant,
@@ -525,13 +587,13 @@ fn simplify_trivial_stmt(stmt: Stmt) -> Stmt {
             discriminant,
             cases: cases
                 .into_iter()
-                .map(|(label, body)| (label, simplify_trivial_stmt(body)))
+                .map(|(label, body)| (label, simplify_trivial_stmt(body, goto_targets)))
                 .collect(),
-            default: default.map(|body| Box::new(simplify_trivial_stmt(*body))),
+            default: default.map(|body| Box::new(simplify_trivial_stmt(*body, goto_targets))),
         },
         Stmt::Label { name, body } => {
-            let body = simplify_trivial_stmt(*body);
-            if stmt_is_trivial_empty(&body) {
+            let body = simplify_trivial_stmt(*body, goto_targets);
+            if stmt_is_trivial_empty(&body, goto_targets) && !goto_targets.contains(&name) {
                 Stmt::Empty
             } else {
                 Stmt::Label {
@@ -550,12 +612,344 @@ fn simplify_trivial_stmt(stmt: Stmt) -> Stmt {
     }
 }
 
-fn stmt_is_trivial_empty(stmt: &Stmt) -> bool {
+fn stmt_is_trivial_empty(stmt: &Stmt, goto_targets: &BTreeSet<String>) -> bool {
     match stmt {
         Stmt::Empty => true,
-        Stmt::Sequence(stmts) | Stmt::Block(stmts) => stmts.iter().all(stmt_is_trivial_empty),
+        Stmt::Sequence(stmts) | Stmt::Block(stmts) => stmts
+            .iter()
+            .all(|stmt| stmt_is_trivial_empty(stmt, goto_targets)),
+        Stmt::Label { name, body } => {
+            !goto_targets.contains(name) && stmt_is_trivial_empty(body, goto_targets)
+        }
         _ => false,
     }
+}
+
+fn collect_goto_targets(stmt: &Stmt, out: &mut BTreeSet<String>) {
+    match stmt {
+        Stmt::Sequence(stmts) | Stmt::Block(stmts) => {
+            for stmt in stmts {
+                collect_goto_targets(stmt, out);
+            }
+        }
+        Stmt::Label { body, .. } => collect_goto_targets(body, out),
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_goto_targets(then_branch, out);
+            if let Some(else_branch) = else_branch {
+                collect_goto_targets(else_branch, out);
+            }
+        }
+        Stmt::Loop { body, .. } => collect_goto_targets(body, out),
+        Stmt::Switch { cases, default, .. } => {
+            for (_, body) in cases {
+                collect_goto_targets(body, out);
+            }
+            if let Some(default) = default {
+                collect_goto_targets(default, out);
+            }
+        }
+        Stmt::Goto(label) => {
+            out.insert(label.clone());
+        }
+        Stmt::Break
+        | Stmt::Continue
+        | Stmt::Return(_)
+        | Stmt::Assign { .. }
+        | Stmt::ExprStmt(_)
+        | Stmt::Empty => {}
+    }
+}
+
+fn redirect_trivial_gotos(stmt: Stmt) -> Stmt {
+    match stmt {
+        Stmt::Sequence(stmts) => redirect_trivial_goto_sequence(stmts, false),
+        Stmt::Block(stmts) => redirect_trivial_goto_sequence(stmts, true),
+        Stmt::Label { name, body } => Stmt::Label {
+            name,
+            body: Box::new(redirect_trivial_gotos(*body)),
+        },
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => Stmt::If {
+            condition,
+            then_branch: Box::new(redirect_trivial_gotos(*then_branch)),
+            else_branch: else_branch.map(|branch| Box::new(redirect_trivial_gotos(*branch))),
+        },
+        Stmt::Loop {
+            kind,
+            condition,
+            body,
+        } => Stmt::Loop {
+            kind,
+            condition,
+            body: Box::new(redirect_trivial_gotos(*body)),
+        },
+        Stmt::Switch {
+            discriminant,
+            cases,
+            default,
+        } => Stmt::Switch {
+            discriminant,
+            cases: cases
+                .into_iter()
+                .map(|(label, body)| (label, redirect_trivial_gotos(body)))
+                .collect(),
+            default: default.map(|body| Box::new(redirect_trivial_gotos(*body))),
+        },
+        other => other,
+    }
+}
+
+fn redirect_trivial_goto_sequence(stmts: Vec<Stmt>, as_block: bool) -> Stmt {
+    let mut stmts = stmts
+        .into_iter()
+        .map(redirect_trivial_gotos)
+        .collect::<Vec<_>>();
+    let alias_map = collect_trivial_label_aliases(&stmts);
+    if !alias_map.is_empty() {
+        stmts = stmts
+            .into_iter()
+            .map(|stmt| rewrite_stmt_gotos(stmt, &alias_map))
+            .collect();
+    }
+
+    let mut out = Vec::new();
+    for idx in 0..stmts.len() {
+        let stmt = stmts[idx].clone();
+        if let Stmt::Goto(label) = &stmt {
+            if next_stmt_is_label(&stmts[idx + 1..], label) {
+                continue;
+            }
+        }
+        out.push(stmt);
+    }
+
+    if as_block {
+        Stmt::Block(out)
+    } else {
+        Stmt::Sequence(out)
+    }
+}
+
+fn trim_unreachable_linear_suffixes(stmt: Stmt) -> Stmt {
+    match stmt {
+        Stmt::Sequence(stmts) => trim_unreachable_sequence(stmts, false),
+        Stmt::Block(stmts) => trim_unreachable_sequence(stmts, true),
+        Stmt::Label { name, body } => Stmt::Label {
+            name,
+            body: Box::new(trim_unreachable_linear_suffixes(*body)),
+        },
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => Stmt::If {
+            condition,
+            then_branch: Box::new(trim_unreachable_linear_suffixes(*then_branch)),
+            else_branch: else_branch.map(|branch| Box::new(trim_unreachable_linear_suffixes(*branch))),
+        },
+        Stmt::Loop {
+            kind,
+            condition,
+            body,
+        } => Stmt::Loop {
+            kind,
+            condition,
+            body: Box::new(trim_unreachable_linear_suffixes(*body)),
+        },
+        Stmt::Switch {
+            discriminant,
+            cases,
+            default,
+        } => Stmt::Switch {
+            discriminant,
+            cases: cases
+                .into_iter()
+                .map(|(label, body)| (label, trim_unreachable_linear_suffixes(body)))
+                .collect(),
+            default: default.map(|body| Box::new(trim_unreachable_linear_suffixes(*body))),
+        },
+        other => other,
+    }
+}
+
+fn cleanup_local_control_flow(body: Stmt) -> Stmt {
+    redirect_trivial_gotos(trim_unreachable_linear_suffixes(body))
+}
+
+fn trim_unreachable_sequence(stmts: Vec<Stmt>, as_block: bool) -> Stmt {
+    let mut out = Vec::new();
+    let mut terminated = false;
+
+    for stmt in stmts
+        .into_iter()
+        .map(trim_unreachable_linear_suffixes)
+        .filter(|stmt| !stmt_is_linear_empty(stmt))
+    {
+        if terminated && !matches!(stmt, Stmt::Label { .. }) {
+            continue;
+        }
+        terminated = stmt_definitely_terminates(&stmt);
+        out.push(stmt);
+    }
+
+    if as_block {
+        Stmt::Block(out)
+    } else {
+        Stmt::Sequence(out)
+    }
+}
+
+fn stmt_definitely_terminates(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Return(_) | Stmt::Goto(_) | Stmt::Break | Stmt::Continue => true,
+        Stmt::Label { body, .. } => stmt_definitely_terminates(body),
+        Stmt::Sequence(stmts) | Stmt::Block(stmts) => stmts
+            .iter()
+            .rev()
+            .find(|stmt| !stmt_is_linear_empty(stmt))
+            .is_some_and(stmt_definitely_terminates),
+        Stmt::If {
+            then_branch,
+            else_branch: Some(else_branch),
+            ..
+        } => stmt_definitely_terminates(then_branch) && stmt_definitely_terminates(else_branch),
+        Stmt::Switch { cases, default, .. } => {
+            !cases.is_empty()
+                && cases
+                    .iter()
+                    .all(|(_, body)| stmt_definitely_terminates(body))
+                && default
+                    .as_deref()
+                    .is_some_and(stmt_definitely_terminates)
+        }
+        _ => false,
+    }
+}
+
+fn stmt_is_linear_empty(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Empty => true,
+        Stmt::Sequence(stmts) | Stmt::Block(stmts) => stmts.iter().all(stmt_is_linear_empty),
+        _ => false,
+    }
+}
+
+fn collect_trivial_label_aliases(stmts: &[Stmt]) -> HashMap<String, String> {
+    let mut aliases = HashMap::new();
+    for (idx, stmt) in stmts.iter().enumerate() {
+        let Stmt::Label { name, body } = stmt else {
+            continue;
+        };
+        let next_target = match body.as_ref() {
+            Stmt::Empty => next_stmt_label_or_goto(&stmts[idx + 1..]),
+            Stmt::Goto(target) => Some(target.clone()),
+            _ => None,
+        };
+        let Some(target) = next_target else {
+            continue;
+        };
+        if target != *name {
+            aliases.insert(name.clone(), target);
+        }
+    }
+
+    let keys = aliases.keys().cloned().collect::<Vec<_>>();
+    for key in keys {
+        if let Some(resolved) = resolve_label_alias(&key, &aliases) {
+            aliases.insert(key, resolved);
+        }
+    }
+    aliases
+}
+
+fn resolve_label_alias(label: &str, aliases: &HashMap<String, String>) -> Option<String> {
+    let mut current = aliases.get(label)?.clone();
+    let mut seen = HashSet::new();
+    seen.insert(label.to_string());
+    while let Some(next) = aliases.get(&current) {
+        if !seen.insert(current.clone()) {
+            return None;
+        }
+        current = next.clone();
+    }
+    Some(current)
+}
+
+fn rewrite_stmt_gotos(stmt: Stmt, aliases: &HashMap<String, String>) -> Stmt {
+    match stmt {
+        Stmt::Sequence(stmts) => Stmt::Sequence(
+            stmts.into_iter()
+                .map(|stmt| rewrite_stmt_gotos(stmt, aliases))
+                .collect(),
+        ),
+        Stmt::Block(stmts) => Stmt::Block(
+            stmts.into_iter()
+                .map(|stmt| rewrite_stmt_gotos(stmt, aliases))
+                .collect(),
+        ),
+        Stmt::Label { name, body } => Stmt::Label {
+            name,
+            body: Box::new(rewrite_stmt_gotos(*body, aliases)),
+        },
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => Stmt::If {
+            condition,
+            then_branch: Box::new(rewrite_stmt_gotos(*then_branch, aliases)),
+            else_branch: else_branch.map(|branch| Box::new(rewrite_stmt_gotos(*branch, aliases))),
+        },
+        Stmt::Loop {
+            kind,
+            condition,
+            body,
+        } => Stmt::Loop {
+            kind,
+            condition,
+            body: Box::new(rewrite_stmt_gotos(*body, aliases)),
+        },
+        Stmt::Switch {
+            discriminant,
+            cases,
+            default,
+        } => Stmt::Switch {
+            discriminant,
+            cases: cases
+                .into_iter()
+                .map(|(label, body)| (label, rewrite_stmt_gotos(body, aliases)))
+                .collect(),
+            default: default.map(|body| Box::new(rewrite_stmt_gotos(*body, aliases))),
+        },
+        Stmt::Goto(label) => Stmt::Goto(
+            resolve_label_alias(&label, aliases).unwrap_or(label),
+        ),
+        other => other,
+    }
+}
+
+fn next_stmt_is_label(stmts: &[Stmt], label: &str) -> bool {
+    stmts.iter().find(|stmt| !matches!(stmt, Stmt::Empty)).is_some_and(|stmt| {
+        matches!(stmt, Stmt::Label { name, .. } if name == label)
+    })
+}
+
+fn next_stmt_label_or_goto(stmts: &[Stmt]) -> Option<String> {
+    stmts
+        .iter()
+        .find(|stmt| !matches!(stmt, Stmt::Empty))
+        .and_then(|stmt| match stmt {
+            Stmt::Label { name, .. } => Some(name.clone()),
+            Stmt::Goto(label) => Some(label.clone()),
+            _ => None,
+        })
 }
 
 fn expr_const_bool(expr: &Expr) -> Option<bool> {
@@ -2104,5 +2498,120 @@ mod tests {
         let resolved = normalize_match_expr(&Expr::Reg("x".to_string()), &defs, 12);
 
         assert_eq!(canonical_match_expr(&resolved), "+(4,8,x)");
+    }
+
+    #[test]
+    fn canonicalize_drops_goto_that_falls_through_to_next_label() {
+        let function = StructuredFunction {
+            params: Vec::new(),
+            locals: Vec::new(),
+            body: Stmt::Sequence(vec![
+                Stmt::Goto("BB1".to_string()),
+                Stmt::Label {
+                    name: "BB1".to_string(),
+                    body: Box::new(Stmt::Return(None)),
+                },
+            ]),
+        };
+
+        let rendered = canonicalize_function(function).body.render_with_indent(0);
+
+        assert!(!rendered.contains("goto BB1;"), "got:\n{rendered}");
+        assert!(rendered.contains("BB1:"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn canonicalize_redirects_gotos_across_empty_label_aliases() {
+        let function = StructuredFunction {
+            params: Vec::new(),
+            locals: Vec::new(),
+            body: Stmt::Sequence(vec![
+                Stmt::Goto("BB1".to_string()),
+                Stmt::Label {
+                    name: "BB1".to_string(),
+                    body: Box::new(Stmt::Empty),
+                },
+                Stmt::Goto("BB2".to_string()),
+                Stmt::Label {
+                    name: "BB2".to_string(),
+                    body: Box::new(Stmt::Return(None)),
+                },
+            ]),
+        };
+
+        let rendered = canonicalize_function(function).body.render_with_indent(0);
+
+        assert!(!rendered.contains("goto BB1;"), "got:\n{rendered}");
+        assert!(!rendered.contains("BB1:"), "got:\n{rendered}");
+        assert!(rendered.contains("BB2:"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn canonicalize_drops_unreachable_suffix_after_terminal_before_bind_cleanup() {
+        let function = StructuredFunction {
+            params: Vec::new(),
+            locals: Vec::new(),
+            body: Stmt::Sequence(vec![
+                Stmt::Label {
+                    name: "BB1".to_string(),
+                    body: Box::new(Stmt::Sequence(vec![
+                        Stmt::Return(None),
+                        Stmt::If {
+                            condition: Expr::Reg("p0".to_string()),
+                            then_branch: Box::new(Stmt::Goto("BB2".to_string())),
+                            else_branch: None,
+                        },
+                    ])),
+                },
+                Stmt::Label {
+                    name: "BB2".to_string(),
+                    body: Box::new(Stmt::Return(None)),
+                },
+            ]),
+        };
+
+        let rendered = canonicalize_post_bind_control_flow(function).body.render_with_indent(0);
+
+        assert!(rendered.contains("BB1:"), "got:\n{rendered}");
+        assert!(rendered.contains("BB2:"), "got:\n{rendered}");
+        assert!(!rendered.contains("if (p0) goto BB2;"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn canonicalize_keeps_loop_values_live_when_used_after_region() {
+        let function = StructuredFunction {
+            params: Vec::new(),
+            locals: Vec::new(),
+            body: Stmt::Sequence(vec![
+                Stmt::If {
+                    condition: Expr::Reg("p0".to_string()),
+                    then_branch: Box::new(Stmt::Loop {
+                        kind: LoopKind::DoWhile,
+                        condition: Some(Expr::Reg("p1".to_string())),
+                        body: Box::new(Stmt::Sequence(vec![Stmt::Assign {
+                            dst: LValue::Var("acc".to_string()),
+                            src: Expr::CallLike {
+                                func: "fmaf".to_string(),
+                                args: vec![
+                                    Expr::Reg("lhs".to_string()),
+                                    Expr::Reg("rhs".to_string()),
+                                    Expr::Reg("acc".to_string()),
+                                ],
+                            },
+                        }])),
+                    }),
+                    else_branch: Some(Box::new(Stmt::Assign {
+                        dst: LValue::Var("acc".to_string()),
+                        src: Expr::Reg("fallback".to_string()),
+                    })),
+                },
+                Stmt::Return(Some(Expr::Reg("acc".to_string()))),
+            ]),
+        };
+
+        let rendered = canonicalize_function(function).body.render_with_indent(0);
+
+        assert!(rendered.contains("acc = fmaf(lhs, rhs, acc);"), "got:\n{rendered}");
+        assert!(rendered.contains("return acc;"), "got:\n{rendered}");
     }
 }

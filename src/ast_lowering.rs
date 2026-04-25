@@ -27,10 +27,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use crate::abi::ConstMemSemantic;
 use crate::ast::{Expr, LValue, PointerLane, Stmt};
 use crate::backend_names::canonical_reg_ident;
-use crate::canonical_ast_passes::canonicalize_function;
+use crate::canonical_ast_passes::{canonicalize_function, canonicalize_post_bind_control_flow};
 use crate::cfg::ControlFlowGraph;
 use crate::function_analysis::{AddressRoot, FunctionAnalysis, MemAccessInfo};
-use crate::ir::{FunctionIR, IRBlock, IRExpr, IRStatement, RValue};
+use crate::ir::{FunctionIR, IRBlock, IRCond, IRExpr, IRStatement, RValue};
 use crate::memory_model::{CudaMemorySpace, MemAccessKind};
 use crate::structurizer::{LoopType, StructuredStatement};
 use crate::symbol_plan::plan_symbols;
@@ -172,6 +172,12 @@ impl<'a> StructuredLowering<'a> {
         let seed = crate::ast::StructuredFunction {
             params: seed.params,
             locals: seed.locals,
+            body: self.trim_duplicate_label_prefixes(self.bind_missing_goto_labels(seed.body)),
+        };
+        let seed = canonicalize_post_bind_control_flow(seed);
+        let seed = crate::ast::StructuredFunction {
+            params: seed.params,
+            locals: seed.locals,
             body: self.bind_missing_goto_labels(seed.body),
         };
         let plan = plan_symbols(&seed, self.analysis);
@@ -248,7 +254,11 @@ impl<'a> StructuredLowering<'a> {
                         materialized_blocks,
                         next_target,
                     ));
-                    if Self::ends_with_unconditional_return(part) {
+                    if Self::ends_with_unconditional_return(part)
+                        && !parts[idx + 1..]
+                            .iter()
+                            .any(|tail| Self::contains_rendered_jump_target(tail, jump_targets))
+                    {
                         break;
                     }
                 }
@@ -384,6 +394,23 @@ impl<'a> StructuredLowering<'a> {
                 } else {
                     Stmt::Empty
                 };
+                let lowered_body = self.lower_structured_stmt_with_targets(
+                    &printable_body,
+                    jump_targets,
+                    materialized_blocks,
+                    None,
+                );
+                let lowered_body = match (loop_type, header_block_id) {
+                    (LoopType::DoWhile, Some(header_block_id))
+                        if Self::entry_block_id(&printable_body) == Some(*header_block_id) =>
+                    {
+                        Self::strip_leading_label(
+                            lowered_body,
+                            &format!("BB{}", header_block_id),
+                        )
+                    }
+                    _ => lowered_body,
+                };
                 let condition = condition_expr
                     .as_ref()
                     .map(|expr| lower_scalar_expr_with_analysis(expr, Some(self.analysis)));
@@ -395,12 +422,7 @@ impl<'a> StructuredLowering<'a> {
                     },
                     condition,
                     body: Box::new(Self::inject_loop_phi_backedge_updates(
-                        self.lower_structured_stmt_with_targets(
-                            &printable_body,
-                            jump_targets,
-                            materialized_blocks,
-                            None,
-                        ),
+                        lowered_body,
                         &loop_backedge,
                     )),
                 };
@@ -928,6 +950,120 @@ impl<'a> StructuredLowering<'a> {
         }
     }
 
+    fn trim_duplicate_label_prefixes(&self, stmt: Stmt) -> Stmt {
+        let mut seen = BTreeSet::new();
+        Self::trim_duplicate_label_prefixes_with_seen(stmt, &mut seen)
+    }
+
+    fn trim_duplicate_label_prefixes_with_seen(
+        stmt: Stmt,
+        seen_labels: &mut BTreeSet<String>,
+    ) -> Stmt {
+        match stmt {
+            Stmt::Sequence(stmts) => {
+                let mut out = Vec::new();
+                for stmt in stmts {
+                    let trimmed = Self::drop_duplicate_label_prefix(stmt, seen_labels, false);
+                    if Self::stmt_is_empty(&trimmed) {
+                        continue;
+                    }
+                    let mut emitted = BTreeSet::new();
+                    Self::collect_label_names(&trimmed, &mut emitted);
+                    seen_labels.extend(emitted);
+                    out.push(trimmed);
+                }
+                Self::stmt_sequence(out)
+            }
+            Stmt::Block(stmts) => {
+                let mut out = Vec::new();
+                for stmt in stmts {
+                    let trimmed = Self::drop_duplicate_label_prefix(stmt, seen_labels, false);
+                    if Self::stmt_is_empty(&trimmed) {
+                        continue;
+                    }
+                    let mut emitted = BTreeSet::new();
+                    Self::collect_label_names(&trimmed, &mut emitted);
+                    seen_labels.extend(emitted);
+                    out.push(trimmed);
+                }
+                Stmt::Block(out)
+            }
+            other => other,
+        }
+    }
+
+    fn drop_duplicate_label_prefix(
+        stmt: Stmt,
+        seen_labels: &BTreeSet<String>,
+        dropping_duplicate_body: bool,
+    ) -> Stmt {
+        match stmt {
+            Stmt::Sequence(stmts) => {
+                let mut out = Vec::new();
+                let mut trimming = true;
+                let mut suppress_non_label_prefix = dropping_duplicate_body;
+                for stmt in stmts {
+                    let child_is_duplicate_label =
+                        matches!(&stmt, Stmt::Label { name, .. } if seen_labels.contains(name));
+                    let stmt = if trimming {
+                        Self::drop_duplicate_label_prefix(
+                            stmt,
+                            seen_labels,
+                            suppress_non_label_prefix || child_is_duplicate_label,
+                        )
+                    } else {
+                        stmt
+                    };
+                    if trimming && Self::stmt_is_empty(&stmt) {
+                        suppress_non_label_prefix |= child_is_duplicate_label;
+                        continue;
+                    }
+                    trimming = false;
+                    out.push(stmt);
+                }
+                Self::stmt_sequence(out)
+            }
+            Stmt::Block(stmts) => {
+                let mut out = Vec::new();
+                let mut trimming = true;
+                let mut suppress_non_label_prefix = dropping_duplicate_body;
+                for stmt in stmts {
+                    let child_is_duplicate_label =
+                        matches!(&stmt, Stmt::Label { name, .. } if seen_labels.contains(name));
+                    let stmt = if trimming {
+                        Self::drop_duplicate_label_prefix(
+                            stmt,
+                            seen_labels,
+                            suppress_non_label_prefix || child_is_duplicate_label,
+                        )
+                    } else {
+                        stmt
+                    };
+                    if trimming && Self::stmt_is_empty(&stmt) {
+                        suppress_non_label_prefix |= child_is_duplicate_label;
+                        continue;
+                    }
+                    trimming = false;
+                    out.push(stmt);
+                }
+                Stmt::Block(out)
+            }
+            Stmt::Label { name, body } if seen_labels.contains(&name) => {
+                Self::drop_duplicate_label_prefix(*body, seen_labels, true)
+            }
+            Stmt::Label { name, body } => Stmt::Label {
+                name,
+                body: Box::new(Self::drop_duplicate_label_prefix(
+                    *body,
+                    seen_labels,
+                    false,
+                )),
+            },
+            other if dropping_duplicate_body => Stmt::Empty,
+            other => other,
+        }
+    }
+
     // Branch-entry phi materialization must happen inside the entry label when
     // the structured region is still a jump target; otherwise a surviving goto
     // would jump past the phi prelude and read stale SSA values.
@@ -959,6 +1095,31 @@ impl<'a> StructuredLowering<'a> {
                 }
             }
             other => Self::stmt_sequence(vec![prelude, other]),
+        }
+    }
+
+    fn strip_leading_label(stmt: Stmt, label: &str) -> Stmt {
+        match stmt {
+            Stmt::Label { name, body } if name == label => *body,
+            Stmt::Sequence(mut stmts) => {
+                if let Some(idx) = stmts.iter().position(|stmt| !Self::stmt_is_empty(stmt)) {
+                    let head = std::mem::replace(&mut stmts[idx], Stmt::Empty);
+                    stmts[idx] = Self::strip_leading_label(head, label);
+                    Self::stmt_sequence(stmts)
+                } else {
+                    Stmt::Empty
+                }
+            }
+            Stmt::Block(mut stmts) => {
+                if let Some(idx) = stmts.iter().position(|stmt| !Self::stmt_is_empty(stmt)) {
+                    let head = std::mem::replace(&mut stmts[idx], Stmt::Empty);
+                    stmts[idx] = Self::strip_leading_label(head, label);
+                    Stmt::Block(stmts)
+                } else {
+                    Stmt::Empty
+                }
+            }
+            other => other,
         }
     }
 
@@ -1249,17 +1410,30 @@ impl<'a> StructuredLowering<'a> {
         Self::collect_goto_label_names(&stmt, &mut goto_targets);
 
         let mut insert_before = BTreeMap::<String, Vec<String>>::new();
+        let mut synthesized_tail = Vec::new();
+        let mut synthesized_blocks = BTreeSet::new();
         let mut tail_labels = Vec::new();
 
         for label in goto_targets.into_iter().filter(|label| !labels.contains(label)) {
+            if let Some(block_id) = Self::label_block_id(&label) {
+                if !synthesized_blocks.contains(&block_id) {
+                    if let Some((region, covered)) =
+                        self.synthesize_missing_region(block_id, &labels, &synthesized_blocks)
+                    {
+                        synthesized_tail.extend(region);
+                        synthesized_blocks.extend(covered);
+                        continue;
+                    }
+                }
+            }
             if let Some(anchor) = self.resolve_existing_label_anchor(&label, &labels) {
                 insert_before.entry(anchor).or_default().push(label);
-            } else {
+            } else if self.missing_label_can_fallthrough_to_function_end(&label, &labels) {
                 tail_labels.push(label);
             }
         }
 
-        if insert_before.is_empty() && tail_labels.is_empty() {
+        if insert_before.is_empty() && tail_labels.is_empty() && synthesized_tail.is_empty() {
             return stmt;
         }
 
@@ -1271,13 +1445,14 @@ impl<'a> StructuredLowering<'a> {
         tail_labels.dedup();
 
         let stmt = Self::insert_missing_labels_before_anchors(stmt, &insert_before);
-        if tail_labels.is_empty() {
-            stmt
-        } else {
-            let mut out = vec![stmt];
-            out.extend(tail_labels.into_iter().map(Self::empty_label_stmt));
-            Self::stmt_sequence(out)
-        }
+        let mut out = vec![stmt];
+        out.extend(synthesized_tail);
+        out.extend(tail_labels.into_iter().map(Self::empty_label_stmt));
+        Self::stmt_sequence(out)
+    }
+
+    fn label_block_id(label: &str) -> Option<usize> {
+        label.strip_prefix("BB")?.parse::<usize>().ok()
     }
 
     fn resolve_existing_label_anchor(
@@ -1305,6 +1480,168 @@ impl<'a> StructuredLowering<'a> {
                 return None;
             }
             current = successors[0];
+        }
+    }
+
+    fn missing_label_can_fallthrough_to_function_end(
+        &self,
+        label: &str,
+        existing_labels: &BTreeSet<String>,
+    ) -> bool {
+        let Some(mut current) = label.strip_prefix("BB").and_then(|id| id.parse::<usize>().ok())
+        else {
+            return false;
+        };
+        let mut seen = HashSet::new();
+
+        loop {
+            let current_label = format!("BB{}", current);
+            if existing_labels.contains(&current_label) {
+                return false;
+            }
+            if !seen.insert(current) {
+                return false;
+            }
+
+            let mut successors = self.cfg_successor_block_ids(current);
+            successors.sort_unstable();
+            successors.dedup();
+            match successors.len() {
+                0 => return true,
+                1 => current = successors[0],
+                _ => return false,
+            }
+        }
+    }
+
+    fn synthesize_missing_region(
+        &self,
+        start_block_id: usize,
+        existing_labels: &BTreeSet<String>,
+        already_synthesized: &BTreeSet<usize>,
+    ) -> Option<(Vec<Stmt>, BTreeSet<usize>)> {
+        if existing_labels.contains(&format!("BB{start_block_id}"))
+            || already_synthesized.contains(&start_block_id)
+        {
+            return None;
+        }
+
+        let mut queue = VecDeque::from([start_block_id]);
+        let mut region = BTreeSet::new();
+
+        while let Some(block_id) = queue.pop_front() {
+            if region.contains(&block_id)
+                || already_synthesized.contains(&block_id)
+                || existing_labels.contains(&format!("BB{block_id}"))
+            {
+                continue;
+            }
+            region.insert(block_id);
+            for succ in self.cfg_successor_block_ids(block_id) {
+                if !region.contains(&succ)
+                    && !already_synthesized.contains(&succ)
+                    && !existing_labels.contains(&format!("BB{succ}"))
+                {
+                    queue.push_back(succ);
+                }
+            }
+        }
+
+        if region.is_empty() {
+            return None;
+        }
+
+        let stmts = region
+            .iter()
+            .copied()
+            .map(|block_id| self.synthesize_missing_block(block_id, &region, existing_labels))
+            .collect();
+        Some((stmts, region))
+    }
+
+    fn synthesize_missing_block(
+        &self,
+        block_id: usize,
+        region: &BTreeSet<usize>,
+        existing_labels: &BTreeSet<String>,
+    ) -> Stmt {
+        let body = self
+            .get_ir_block(block_id)
+            .map(|block| self.lower_stmt_list(block_id, &block.stmts, true, true))
+            .unwrap_or(Stmt::Empty);
+        let body = if Self::stmt_may_fallthrough(&body) {
+            Self::stmt_sequence(vec![
+                body,
+                self.synthesize_missing_block_exits(block_id, region, existing_labels),
+            ])
+        } else {
+            body
+        };
+        Stmt::Label {
+            name: format!("BB{block_id}"),
+            body: Box::new(body),
+        }
+    }
+
+    fn synthesize_missing_block_exits(
+        &self,
+        block_id: usize,
+        region: &BTreeSet<usize>,
+        existing_labels: &BTreeSet<String>,
+    ) -> Stmt {
+        let Some(block) = self.get_ir_block(block_id) else {
+            return Stmt::Empty;
+        };
+
+        let mut jumps = Vec::new();
+        for (cond, target_addr) in &block.irdst {
+            let Some(target_block_id) = self.block_id_for_start_addr(*target_addr as u64) else {
+                continue;
+            };
+            let target_label = format!("BB{target_block_id}");
+            if !region.contains(&target_block_id) && !existing_labels.contains(&target_label) {
+                continue;
+            }
+
+            let jump = Self::stmt_sequence(vec![
+                self.lower_phi_connector_chain_from_pred(target_block_id, block_id),
+                Stmt::Goto(target_label),
+            ]);
+            match self.lower_ir_cond_expr(cond) {
+                Some(condition) => jumps.push(Stmt::If {
+                    condition,
+                    then_branch: Box::new(jump),
+                    else_branch: None,
+                }),
+                None => jumps.push(jump),
+            }
+        }
+        Self::stmt_sequence(jumps)
+    }
+
+    fn block_id_for_start_addr(&self, start_addr: u64) -> Option<usize> {
+        self.function_ir
+            .blocks
+            .iter()
+            .find(|block| u64::from(block.start_addr) == start_addr)
+            .map(|block| block.id)
+    }
+
+    fn lower_ir_cond_expr(&self, cond: &Option<IRCond>) -> Option<Expr> {
+        match cond {
+            None | Some(IRCond::True) => None,
+            Some(IRCond::Pred { reg, sense }) => {
+                let reg_expr =
+                    lower_scalar_expr_with_analysis(&IRExpr::Reg(reg.clone()), Some(self.analysis));
+                Some(if *sense {
+                    reg_expr
+                } else {
+                    Expr::Unary {
+                        op: "!".to_string(),
+                        arg: Box::new(reg_expr),
+                    }
+                })
+            }
         }
     }
 
@@ -1607,6 +1944,45 @@ impl<'a> StructuredLowering<'a> {
             _ => false,
         }
     }
+
+    fn contains_rendered_jump_target(
+        stmt: &StructuredStatement,
+        jump_targets: &HashSet<usize>,
+    ) -> bool {
+        match stmt {
+            StructuredStatement::BasicBlock { block_id, .. } => jump_targets.contains(block_id),
+            StructuredStatement::Sequence(parts) => parts
+                .iter()
+                .any(|part| Self::contains_rendered_jump_target(part, jump_targets)),
+            StructuredStatement::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                Self::contains_rendered_jump_target(then_branch, jump_targets)
+                    || else_branch.as_deref().is_some_and(|branch| {
+                        Self::contains_rendered_jump_target(branch, jump_targets)
+                    })
+            }
+            StructuredStatement::Loop { body, .. } => {
+                Self::contains_rendered_jump_target(body, jump_targets)
+            }
+            StructuredStatement::Switch { cases, default, .. } => {
+                cases
+                    .iter()
+                    .any(|(_, body)| Self::contains_rendered_jump_target(body, jump_targets))
+                    || default.as_deref().is_some_and(|body| {
+                        Self::contains_rendered_jump_target(body, jump_targets)
+                    })
+            }
+            StructuredStatement::Break(_)
+            | StructuredStatement::Continue(_)
+            | StructuredStatement::Return(_)
+            | StructuredStatement::UnstructuredJump { .. }
+            | StructuredStatement::Empty => false,
+        }
+    }
+
 }
 
 pub fn lower_structured_function(
@@ -1702,6 +2078,7 @@ fn lower_base_and_index(
     else {
         return None;
     };
+    let resolved_root = resolved_access_root(&access.root, analysis);
     let base = match access.space {
         CudaMemorySpace::Shared => Expr::Builtin(match &access.root {
             AddressRoot::SharedObject(name) => name.clone(),
@@ -1711,7 +2088,7 @@ fn lower_base_and_index(
             AddressRoot::LocalObject(name) => name.clone(),
             _ => "local_mem".to_string(),
         }),
-        CudaMemorySpace::Global => match &access.root {
+        CudaMemorySpace::Global => match &resolved_root {
             AddressRoot::ParamWord(param_idx) => {
                 Expr::Reg(global_param_base_name(*param_idx, analysis))
             }
@@ -1748,6 +2125,17 @@ fn lower_base_and_index(
         ),
     };
     Some((normalize_index_base(base, access, analysis), index))
+}
+
+fn resolved_access_root(root: &AddressRoot, analysis: &FunctionAnalysis) -> AddressRoot {
+    match root {
+        AddressRoot::RegisterBase(reg) => analysis
+            .root_by_reg
+            .get(reg)
+            .cloned()
+            .unwrap_or_else(|| AddressRoot::RegisterBase(reg.clone())),
+        other => other.clone(),
+    }
 }
 
 fn lower_explicit_local_stmt(stmt: &IRStatement, access: &MemAccessInfo) -> Option<LoweredStmt> {
@@ -5169,6 +5557,233 @@ mod tests {
     }
 
     #[test]
+    fn keeps_later_jump_targets_even_after_earlier_return_blocks() {
+        let mut cfg = crate::cfg::ControlFlowGraph::new();
+        let bb0 = cfg.add_node(crate::cfg::BasicBlock {
+            id: 0,
+            start: 0x00,
+            instrs: Vec::new(),
+        });
+        let bb1 = cfg.add_node(crate::cfg::BasicBlock {
+            id: 1,
+            start: 0x10,
+            instrs: Vec::new(),
+        });
+        cfg.add_edge(bb0, bb1, crate::cfg::EdgeKind::UncondBranch);
+
+        let fir = crate::ir::FunctionIR {
+            blocks: vec![
+                crate::ir::IRBlock {
+                    id: 0,
+                    start_addr: 0x00,
+                    irdst: vec![(Some(crate::ir::IRCond::True), 0x10)],
+                    stmts: Vec::new(),
+                },
+                crate::ir::IRBlock {
+                    id: 1,
+                    start_addr: 0x10,
+                    irdst: vec![],
+                    stmts: vec![IRStatement {
+                        defs: vec![IRExpr::Reg(crate::ir::RegId::new("R", 2, 1).with_ssa(1))],
+                        value: RValue::ImmI(9),
+                        pred: None,
+                        mem_addr_args: None,
+                        pred_old_defs: Vec::new(),
+                    }],
+                },
+            ],
+        };
+        let structured = StructuredStatement::Sequence(vec![
+            StructuredStatement::UnstructuredJump {
+                from_block_id: 0,
+                to_block_id: 1,
+                condition: None,
+            },
+            StructuredStatement::Return(None),
+            StructuredStatement::BasicBlock {
+                block_id: 1,
+                stmts: fir.blocks[1].stmts.clone(),
+            },
+        ]);
+
+        let lowered =
+            lower_structured_function(&structured, &cfg, &fir, &FunctionAnalysis::default());
+        let rendered = lowered.body.render_with_indent(0);
+
+        assert!(rendered.contains("BB1:"), "got:\n{rendered}");
+        assert!(rendered.contains("r2_1 = 9;"), "got:\n{rendered}");
+        assert!(
+            !rendered.contains("goto BB0;") && !rendered.contains("goto BB2;"),
+            "got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn synthesizes_missing_cfg_regions_for_unresolved_jump_targets() {
+        let mut cfg = crate::cfg::ControlFlowGraph::new();
+        let bb0 = cfg.add_node(crate::cfg::BasicBlock {
+            id: 0,
+            start: 0x00,
+            instrs: Vec::new(),
+        });
+        let bb1 = cfg.add_node(crate::cfg::BasicBlock {
+            id: 1,
+            start: 0x10,
+            instrs: Vec::new(),
+        });
+        let bb2 = cfg.add_node(crate::cfg::BasicBlock {
+            id: 2,
+            start: 0x20,
+            instrs: Vec::new(),
+        });
+        cfg.add_edge(bb0, bb1, crate::cfg::EdgeKind::UncondBranch);
+        cfg.add_edge(bb1, bb2, crate::cfg::EdgeKind::UncondBranch);
+
+        let fir = crate::ir::FunctionIR {
+            blocks: vec![
+                crate::ir::IRBlock {
+                    id: 0,
+                    start_addr: 0x00,
+                    irdst: vec![(Some(crate::ir::IRCond::True), 0x10)],
+                    stmts: Vec::new(),
+                },
+                crate::ir::IRBlock {
+                    id: 1,
+                    start_addr: 0x10,
+                    irdst: vec![(Some(crate::ir::IRCond::True), 0x20)],
+                    stmts: vec![IRStatement {
+                        defs: vec![IRExpr::Reg(crate::ir::RegId::new("R", 3, 1).with_ssa(1))],
+                        value: RValue::ImmI(17),
+                        pred: None,
+                        mem_addr_args: None,
+                        pred_old_defs: Vec::new(),
+                    }],
+                },
+                crate::ir::IRBlock {
+                    id: 2,
+                    start_addr: 0x20,
+                    irdst: vec![],
+                    stmts: vec![IRStatement {
+                        defs: vec![IRExpr::Reg(crate::ir::RegId::new("R", 4, 1).with_ssa(1))],
+                        value: RValue::ImmI(23),
+                        pred: None,
+                        mem_addr_args: None,
+                        pred_old_defs: Vec::new(),
+                    }],
+                },
+            ],
+        };
+        let structured = StructuredStatement::Sequence(vec![
+            StructuredStatement::UnstructuredJump {
+                from_block_id: 0,
+                to_block_id: 1,
+                condition: None,
+            },
+            StructuredStatement::BasicBlock {
+                block_id: 2,
+                stmts: fir.blocks[2].stmts.clone(),
+            },
+        ]);
+
+        let lowered =
+            lower_structured_function(&structured, &cfg, &fir, &FunctionAnalysis::default());
+        let rendered = lowered.body.render_with_indent(0);
+
+        assert!(rendered.contains("BB1:"), "got:\n{rendered}");
+        assert!(rendered.contains("r3_1 = 17;"), "got:\n{rendered}");
+        assert!(rendered.contains("goto BB2;"), "got:\n{rendered}");
+        assert!(rendered.contains("BB2:"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn trims_duplicate_label_prefixes_before_new_labels() {
+        let stmt = Stmt::Sequence(vec![
+            Stmt::Label {
+                name: "BB1".to_string(),
+                body: Box::new(Stmt::Sequence(vec![
+                    Stmt::Assign {
+                        dst: LValue::Var("r0".to_string()),
+                        src: Expr::Imm("1".to_string()),
+                    },
+                    Stmt::Goto("BB2".to_string()),
+                ])),
+            },
+            Stmt::Label {
+                name: "BB1".to_string(),
+                body: Box::new(Stmt::Sequence(vec![
+                    Stmt::Assign {
+                        dst: LValue::Var("r0".to_string()),
+                        src: Expr::Imm("2".to_string()),
+                    },
+                    Stmt::Label {
+                        name: "BB3".to_string(),
+                        body: Box::new(Stmt::Assign {
+                            dst: LValue::Var("r1".to_string()),
+                            src: Expr::Imm("3".to_string()),
+                        }),
+                    },
+                ])),
+            },
+        ]);
+        let lowering = StructuredLowering {
+            cfg: &crate::cfg::ControlFlowGraph::new(),
+            function_ir: &crate::ir::FunctionIR { blocks: Vec::new() },
+            analysis: &FunctionAnalysis::default(),
+            block_id_to_idx: HashMap::new(),
+            block_id_to_node: HashMap::new(),
+        };
+        let trimmed = lowering.trim_duplicate_label_prefixes(stmt);
+        let rendered = trimmed.render_with_indent(0);
+
+        assert_eq!(rendered.matches("BB1:").count(), 1, "got:\n{rendered}");
+        assert_eq!(rendered.matches("BB3:").count(), 1, "got:\n{rendered}");
+        assert!(!rendered.contains("r0 = 2;"), "got:\n{rendered}");
+        assert!(rendered.contains("r1 = 3;"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn trims_fully_duplicate_late_label_regions() {
+        let stmt = Stmt::Sequence(vec![
+            Stmt::Label {
+                name: "BB8".to_string(),
+                body: Box::new(Stmt::Sequence(vec![
+                    Stmt::Goto("BB10".to_string()),
+                    Stmt::Label {
+                        name: "BB10".to_string(),
+                        body: Box::new(Stmt::Return(None)),
+                    },
+                ])),
+            },
+            Stmt::Label {
+                name: "BB8".to_string(),
+                body: Box::new(Stmt::Sequence(vec![
+                    Stmt::Assign {
+                        dst: LValue::Var("r2".to_string()),
+                        src: Expr::Imm("4".to_string()),
+                    },
+                    Stmt::Label {
+                        name: "BB10".to_string(),
+                        body: Box::new(Stmt::Return(None)),
+                    },
+                ])),
+            },
+        ]);
+        let lowering = StructuredLowering {
+            cfg: &crate::cfg::ControlFlowGraph::new(),
+            function_ir: &crate::ir::FunctionIR { blocks: Vec::new() },
+            analysis: &FunctionAnalysis::default(),
+            block_id_to_idx: HashMap::new(),
+            block_id_to_node: HashMap::new(),
+        };
+        let trimmed = lowering.trim_duplicate_label_prefixes(stmt);
+        let rendered = trimmed.render_with_indent(0);
+
+        assert_eq!(rendered.matches("BB8:").count(), 1, "got:\n{rendered}");
+        assert_eq!(rendered.matches("BB10:").count(), 1, "got:\n{rendered}");
+        assert!(!rendered.contains("r2 = 4;"), "got:\n{rendered}");
+    }
+
+    #[test]
     fn lowers_iadd3_to_addition_chain() {
         let stmt = IRStatement {
             defs: vec![IRExpr::Reg(crate::ir::RegId::new("R", 6, 1).with_ssa(0))],
@@ -5532,6 +6147,50 @@ mod tests {
             panic!("expected assignment");
         };
         assert_eq!(src.render(), "((uint32_t*)(r4_0))[0]");
+    }
+
+    #[test]
+    fn roots_register_base_globals_on_recovered_param_symbols() {
+        let rooted = crate::ir::RegId::new("R", 4, 1).with_ssa(0);
+        let stmt = IRStatement {
+            defs: vec![IRExpr::Reg(crate::ir::RegId::new("R", 0, 1).with_ssa(0))],
+            value: RValue::Op {
+                opcode: "LDG.E".to_string(),
+                args: vec![IRExpr::Mem {
+                    base: Box::new(IRExpr::Reg(rooted.clone())),
+                    offset: Some(Box::new(IRExpr::ImmI(8))),
+                    width: Some(32),
+                }],
+            },
+            pred: None,
+            mem_addr_args: Some(vec![IRExpr::Mem {
+                base: Box::new(IRExpr::Reg(rooted.clone())),
+                offset: Some(Box::new(IRExpr::ImmI(8))),
+                width: Some(32),
+            }]),
+            pred_old_defs: Vec::new(),
+        };
+        let mut analysis = FunctionAnalysis::default();
+        analysis
+            .root_by_reg
+            .insert(rooted.clone(), AddressRoot::ParamWord(0));
+        analysis.byte_offset_by_reg.insert(rooted.clone(), IRExpr::ImmI(0));
+        analysis.mem_accesses.push(MemAccessInfo {
+            block_id: 0,
+            stmt_idx: 0,
+            kind: MemAccessKind::Load,
+            space: CudaMemorySpace::Global,
+            bit_width: Some(32),
+            vector_width: None,
+            constant_byte_offset: Some(8),
+            has_dynamic_offset: true,
+            root: AddressRoot::RegisterBase(rooted),
+        });
+        let lowered = lower_memory_stmt(0, 0, &stmt, &analysis).expect("lowered");
+        let Stmt::Assign { src, .. } = lowered else {
+            panic!("expected assignment");
+        };
+        assert_eq!(src.render(), "((uint32_t*)(param_0))[2]");
     }
 
     #[test]
