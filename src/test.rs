@@ -1671,6 +1671,40 @@ fn full_pass_utf8_count_chars_rewrites_iadd64_pointer_arithmetic() {
     );
 }
 
+#[test]
+fn full_pass_power_series_drops_fchk_helpers_after_division_recovery() {
+    let kernel = split_decoded_functions(include_str!("../test_cu/corpus/loop_kernels.sass"))
+        .into_iter()
+        .find(|f| f.name == "power_series")
+        .expect("power_series fixture should exist");
+    let out = run_canonical_output_full_pass_from_instrs(kernel.instrs, kernel.sm, "power_series");
+    assert!(
+        !out.contains("FCHK(") && !out.contains("CALL.REL.NOINC()"),
+        "expected power_series to drop reciprocal helper leaks, got:\n{}",
+        out
+    );
+}
+
+#[test]
+fn full_pass_box_blur_constant_helper_branch_is_folded_before_goto_tail() {
+    let kernel = split_decoded_functions(include_str!(
+        "../test_cu/corpus/image_processing_kernels.sass"
+    ))
+    .into_iter()
+    .find(|f| f.name == "box_blur_variable_radius")
+    .expect("box_blur_variable_radius fixture should exist");
+    let out = run_canonical_output_full_pass_from_instrs(
+        kernel.instrs,
+        kernel.sm,
+        "box_blur_variable_radius",
+    );
+    assert!(
+        !out.contains("FCHK(") && !out.contains("CALL.REL.NOINC()"),
+        "expected box_blur_variable_radius to fold constant slowpath helpers, got:\n{}",
+        out
+    );
+}
+
 // ----------------------------------------------------------------------
 // Corpus invariant runner
 // ----------------------------------------------------------------------

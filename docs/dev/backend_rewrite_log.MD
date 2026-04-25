@@ -3,7 +3,7 @@
 ## Status
 
 - Branch: `codex/memory-aware-backend-refactor`
-- Checkpoint commit: `687da57`
+- Checkpoint commit: `6ec41ee`
 - Current stage: late phase 5 / phase 6 cleanup, with the canonical backend already live and the remaining work focused on helper-leak cleanup, validation, and final deletion sweep
 
 ## Landed invariants
@@ -118,6 +118,18 @@
 - Canonical global-index lowering now recursively expands rooted byte-offset
   expressions before rendering, which collapses nested rooted temps out of
   typed global loads/stores instead of leaking intermediate offset registers
+- Canonical AST cleanup now runs a bounded local sweep instead of a single
+  one-shot pass, which lets newly recovered reciprocal/division expressions
+  expose and then drop stale `FCHK` predicate temps without reintroducing the
+  old text-repair pipeline.
+- Canonical AST cleanup now folds constant predicate branches even when the
+  surrounding function still contains `goto`/label barriers, and it restricts
+  dead-code cleanup to structured chunks between those barriers instead of
+  skipping the whole function.
+- The targeted helper-leak regressions are now pinned directly:
+  `power_series` must drop loop-carried `FCHK` leftovers after reciprocal
+  recovery, and `box_blur_variable_radius` must fold its constant-false
+  helper branch before the remaining goto tail.
   into the rendered index.
 - Canonical scalar lowering now lowers low-lane results of `IADD.64` and
   `UIADD3.64` structurally, which removes another class of raw wide-add helper
@@ -341,17 +353,16 @@
 
 ## Next safe step
 
-1. Re-run the canonical/full-corpus acceptance checks after each deletion
-   slice so the branch proves the big-bang cutover still owns:
-   deterministic output, no leaked SSA suffixes, no raw helper mnemonics, and
-   the current goto/control budgets.
-2. Drive the remaining late-phase red tests down, especially the `ast_passes`
-   addr64-fold regressions and the corpus/goto-budget failures that still show
-   canonical pointer/control-flow cleanup gaps.
-3. Finish the next canonical cleanup slice around loop-carried pointer roots
-   (`dot_thread` / addr64-style packed reconstruction) and unsupported call
-   placeholders such as `CALL.REL.NOINC()`, then run the next review sub-agent
-   after another 2-4 atomic commits.
+1. Finish the remaining front-half/control-flow slice for internal slow-path
+   `CALL.REL.NOINC` sites that are still surfacing as unsupported call
+   placeholders behind goto tails.
+2. Re-run the targeted corpus acceptance checks after each deletion/control
+   slice so the branch proves the live backend still owns: deterministic
+   output, no leaked SSA suffixes, no raw helper mnemonics, and the current
+   goto/control budgets.
+3. Once another 2-4 atomic commits land, run the next review sub-agent and
+   wait for the result before starting the final deletion / corpus refresh
+   sweep.
 
 ## Open questions
 
@@ -381,6 +392,7 @@
 - `src/lib.rs`
 - `src/test.rs`
 - `src/canonical_ast_passes.rs`
+- `src/cfg.rs`
 - `src/structurizer/mod.rs`
 - `src/structurizer/tests.rs`
 

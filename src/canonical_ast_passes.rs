@@ -19,6 +19,7 @@
 //!   with unsafe liveness assumptions
 //!
 //! Algorithm:
+//! - bounded local recovery / condition-fold / dead-code sweeps
 //! - backward liveness over structured statements
 //! - loop-body fixpoint for structured loops
 //! - pure-expression pruning for dead assignments and dead expression
@@ -28,17 +29,28 @@
 //! - perform regex/text cleanup
 //! - rediscover memory facts from rendered output
 //! - run the old fixed-point backend repair pipeline
+//! - guess liveness across unstructured jump boundaries
 
 use std::collections::{BTreeSet, HashMap};
 
 use crate::ast::{Expr, LValue, Stmt, StructuredFunction};
 
 const MATCH_RESOLVE_DEPTH: usize = 12;
+const MAX_CANONICAL_SWEEPS: usize = 3;
 
 pub fn canonicalize_function(function: StructuredFunction) -> StructuredFunction {
-    if contains_unstructured_control_flow(&function.body) {
-        return prune_dead_pure_defs(function);
+    let mut current = function;
+    for _ in 0..MAX_CANONICAL_SWEEPS {
+        let next = canonicalize_function_once(current.clone());
+        if next == current {
+            return next;
+        }
+        current = next;
     }
+    current
+}
+
+fn canonicalize_function_once(function: StructuredFunction) -> StructuredFunction {
     let mut defs = HashMap::new();
     let body = recover_rcp_division_stmt_tree(function.body, &mut defs, &BTreeSet::new());
     prune_dead_pure_defs(StructuredFunction {
@@ -49,10 +61,9 @@ pub fn canonicalize_function(function: StructuredFunction) -> StructuredFunction
 }
 
 pub fn prune_dead_pure_defs(function: StructuredFunction) -> StructuredFunction {
-    if contains_unstructured_control_flow(&function.body) {
-        return function;
-    }
-    let body = simplify_trivial_stmt(prune_dead_pure_stmt(function.body));
+    let mut defs = HashMap::new();
+    let body = fold_known_conditions_stmt(function.body, &mut defs);
+    let body = simplify_local_cleanup_regions(body);
     StructuredFunction {
         params: function.params,
         locals: function.locals,
@@ -219,6 +230,217 @@ fn dce_sequence_like(
     (stmt, live)
 }
 
+fn fold_known_conditions_stmt(stmt: Stmt, defs: &mut HashMap<String, Expr>) -> Stmt {
+    match stmt {
+        Stmt::Sequence(stmts) => {
+            let mut local_defs = defs.clone();
+            let rewritten = Stmt::Sequence(
+                stmts
+                    .into_iter()
+                    .map(|stmt| fold_known_conditions_stmt(stmt, &mut local_defs))
+                    .collect(),
+            );
+            *defs = local_defs;
+            rewritten
+        }
+        Stmt::Block(stmts) => {
+            let mut local_defs = defs.clone();
+            let rewritten = Stmt::Block(
+                stmts
+                    .into_iter()
+                    .map(|stmt| fold_known_conditions_stmt(stmt, &mut local_defs))
+                    .collect(),
+            );
+            *defs = local_defs;
+            rewritten
+        }
+        Stmt::Label { name, body } => {
+            let mut label_defs = HashMap::new();
+            let body = fold_known_conditions_stmt(*body, &mut label_defs);
+            defs.clear();
+            Stmt::Label {
+                name,
+                body: Box::new(body),
+            }
+        }
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            let condition = resolve_named_expr(&condition, defs, MATCH_RESOLVE_DEPTH);
+            if let Some(value) = expr_const_bool(&condition) {
+                return if value {
+                    fold_known_conditions_stmt(*then_branch, defs)
+                } else if let Some(else_branch) = else_branch {
+                    fold_known_conditions_stmt(*else_branch, defs)
+                } else {
+                    Stmt::Empty
+                };
+            }
+
+            let mut then_defs = defs.clone();
+            let then_branch = Box::new(fold_known_conditions_stmt(*then_branch, &mut then_defs));
+            let else_branch = else_branch.map(|branch| {
+                let mut else_defs = defs.clone();
+                Box::new(fold_known_conditions_stmt(*branch, &mut else_defs))
+            });
+            defs.clear();
+            Stmt::If {
+                condition,
+                then_branch,
+                else_branch,
+            }
+        }
+        Stmt::Loop {
+            kind,
+            condition,
+            body,
+        } => {
+            let condition = condition
+                .map(|condition| resolve_named_expr(&condition, defs, MATCH_RESOLVE_DEPTH));
+            let mut body_defs = HashMap::new();
+            let body = Box::new(fold_known_conditions_stmt(*body, &mut body_defs));
+            defs.clear();
+            Stmt::Loop {
+                kind,
+                condition,
+                body,
+            }
+        }
+        Stmt::Switch {
+            discriminant,
+            cases,
+            default,
+        } => {
+            let discriminant =
+                discriminant.map(|expr| resolve_named_expr(&expr, defs, MATCH_RESOLVE_DEPTH));
+            let cases = cases
+                .into_iter()
+                .map(|(label, body)| {
+                    let mut case_defs = HashMap::new();
+                    (label, fold_known_conditions_stmt(body, &mut case_defs))
+                })
+                .collect();
+            let default = default.map(|body| {
+                let mut default_defs = HashMap::new();
+                Box::new(fold_known_conditions_stmt(*body, &mut default_defs))
+            });
+            defs.clear();
+            Stmt::Switch {
+                discriminant,
+                cases,
+                default,
+            }
+        }
+        Stmt::Goto(_) | Stmt::Break | Stmt::Continue | Stmt::Return(_) => {
+            defs.clear();
+            stmt
+        }
+        other => {
+            update_linear_defs(&other, defs);
+            other
+        }
+    }
+}
+
+fn simplify_local_cleanup_regions(stmt: Stmt) -> Stmt {
+    match stmt {
+        Stmt::Sequence(stmts) => simplify_local_cleanup_sequence(stmts, false),
+        Stmt::Block(stmts) => simplify_local_cleanup_sequence(stmts, true),
+        Stmt::Label { name, body } => Stmt::Label {
+            name,
+            body: Box::new(simplify_local_cleanup_regions(*body)),
+        },
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => simplify_trivial_stmt(Stmt::If {
+            condition,
+            then_branch: Box::new(simplify_local_cleanup_regions(*then_branch)),
+            else_branch: else_branch
+                .map(|branch| Box::new(simplify_local_cleanup_regions(*branch))),
+        }),
+        Stmt::Loop {
+            kind,
+            condition,
+            body,
+        } => {
+            let loop_stmt = Stmt::Loop {
+                kind,
+                condition,
+                body: Box::new(simplify_local_cleanup_regions(*body)),
+            };
+            if contains_unstructured_control_flow(&loop_stmt) {
+                loop_stmt
+            } else {
+                simplify_trivial_stmt(prune_dead_pure_stmt(loop_stmt))
+            }
+        }
+        Stmt::Switch {
+            discriminant,
+            cases,
+            default,
+        } => {
+            let switch = Stmt::Switch {
+                discriminant,
+                cases: cases
+                    .into_iter()
+                    .map(|(label, body)| (label, simplify_local_cleanup_regions(body)))
+                    .collect(),
+                default: default.map(|body| Box::new(simplify_local_cleanup_regions(*body))),
+            };
+            if contains_unstructured_control_flow(&switch) {
+                switch
+            } else {
+                simplify_trivial_stmt(prune_dead_pure_stmt(switch))
+            }
+        }
+        other => other,
+    }
+}
+
+fn simplify_local_cleanup_sequence(stmts: Vec<Stmt>, as_block: bool) -> Stmt {
+    let mut out = Vec::new();
+    let mut chunk = Vec::new();
+
+    let flush_chunk = |out: &mut Vec<Stmt>, chunk: &mut Vec<Stmt>| {
+        if chunk.is_empty() {
+            return;
+        }
+        let chunk_stmt = if as_block {
+            Stmt::Block(std::mem::take(chunk))
+        } else {
+            Stmt::Sequence(std::mem::take(chunk))
+        };
+        let simplified = simplify_trivial_stmt(prune_dead_pure_stmt(chunk_stmt));
+        match simplified {
+            Stmt::Empty => {}
+            Stmt::Sequence(inner) | Stmt::Block(inner) => out.extend(inner),
+            other => out.push(other),
+        }
+    };
+
+    for stmt in stmts.into_iter().map(simplify_local_cleanup_regions) {
+        if contains_unstructured_control_flow(&stmt) {
+            flush_chunk(&mut out, &mut chunk);
+            if !stmt_is_trivial_empty(&stmt) {
+                out.push(stmt);
+            }
+        } else {
+            chunk.push(stmt);
+        }
+    }
+    flush_chunk(&mut out, &mut chunk);
+
+    simplify_trivial_stmt(if as_block {
+        Stmt::Block(out)
+    } else {
+        Stmt::Sequence(out)
+    })
+}
+
 fn simplify_trivial_stmt(stmt: Stmt) -> Stmt {
     match stmt {
         Stmt::Sequence(stmts) => {
@@ -250,6 +472,15 @@ fn simplify_trivial_stmt(stmt: Stmt) -> Stmt {
             then_branch,
             else_branch,
         } => {
+            if let Some(value) = expr_const_bool(&condition) {
+                return if value {
+                    simplify_trivial_stmt(*then_branch)
+                } else {
+                    else_branch
+                        .map(|branch| simplify_trivial_stmt(*branch))
+                        .unwrap_or(Stmt::Empty)
+                };
+            }
             let then_branch = simplify_trivial_stmt(*then_branch);
             let else_branch = else_branch.map(|branch| simplify_trivial_stmt(*branch));
             if stmt_is_trivial_empty(&then_branch)
@@ -313,6 +544,41 @@ fn stmt_is_trivial_empty(stmt: &Stmt) -> bool {
         Stmt::Empty => true,
         Stmt::Sequence(stmts) | Stmt::Block(stmts) => stmts.iter().all(stmt_is_trivial_empty),
         _ => false,
+    }
+}
+
+fn expr_const_bool(expr: &Expr) -> Option<bool> {
+    match expr {
+        Expr::Imm(text) | Expr::Raw(text) => match text.trim() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => expr_const_i64(expr).map(|value| value != 0),
+        },
+        Expr::Unary { op, arg } if op == "!" => Some(!expr_const_bool(arg)?),
+        Expr::Binary { op, lhs, rhs } => match op.as_str() {
+            "&&" => Some(expr_const_bool(lhs)? && expr_const_bool(rhs)?),
+            "||" => Some(expr_const_bool(lhs)? || expr_const_bool(rhs)?),
+            "==" => Some(expr_const_i64(lhs)? == expr_const_i64(rhs)?),
+            "!=" => Some(expr_const_i64(lhs)? != expr_const_i64(rhs)?),
+            "<" => Some(expr_const_i64(lhs)? < expr_const_i64(rhs)?),
+            "<=" => Some(expr_const_i64(lhs)? <= expr_const_i64(rhs)?),
+            ">" => Some(expr_const_i64(lhs)? > expr_const_i64(rhs)?),
+            ">=" => Some(expr_const_i64(lhs)? >= expr_const_i64(rhs)?),
+            _ => None,
+        },
+        Expr::Cast { expr, .. } => {
+            expr_const_bool(expr).or_else(|| expr_const_i64(expr).map(|v| v != 0))
+        }
+        _ => expr_const_i64(expr).map(|value| value != 0),
+    }
+}
+
+fn expr_const_i64(expr: &Expr) -> Option<i64> {
+    match expr {
+        Expr::Imm(text) | Expr::Raw(text) => text.trim().parse::<i64>().ok(),
+        Expr::Unary { op, arg } if op == "-" => expr_const_i64(arg)?.checked_neg(),
+        Expr::Cast { expr, .. } => expr_const_i64(expr),
+        _ => None,
     }
 }
 
@@ -1710,5 +1976,55 @@ mod tests {
         };
         let rendered = prune_dead_pure_stmt(stmt).render_with_indent(0);
         assert!(!rendered.contains("FCHK("), "got:\n{}", rendered);
+    }
+
+    #[test]
+    fn canonicalize_cleans_structured_chunks_even_with_outer_goto_barrier() {
+        let function = StructuredFunction {
+            params: Vec::new(),
+            locals: Vec::new(),
+            body: Stmt::Sequence(vec![
+                Stmt::Assign {
+                    dst: LValue::Var("pred".to_string()),
+                    src: Expr::Binary {
+                        op: ">=".to_string(),
+                        lhs: Box::new(Expr::Cast {
+                            ty: "int32_t".to_string(),
+                            expr: Box::new(Expr::Imm("0".to_string())),
+                        }),
+                        rhs: Box::new(Expr::Cast {
+                            ty: "int32_t".to_string(),
+                            expr: Box::new(Expr::Imm("1".to_string())),
+                        }),
+                    },
+                },
+                Stmt::If {
+                    condition: Expr::Reg("pred".to_string()),
+                    then_branch: Box::new(Stmt::Block(vec![
+                        Stmt::Assign {
+                            dst: LValue::Var("chk".to_string()),
+                            src: Expr::CallLike {
+                                func: "FCHK".to_string(),
+                                args: vec![Expr::Imm("0".to_string()), Expr::Imm("1".to_string())],
+                            },
+                        },
+                        Stmt::ExprStmt(Expr::CallLike {
+                            func: "CALL.REL.NOINC".to_string(),
+                            args: Vec::new(),
+                        }),
+                    ])),
+                    else_branch: Some(Box::new(Stmt::Assign {
+                        dst: LValue::Var("out".to_string()),
+                        src: Expr::Imm("7".to_string()),
+                    })),
+                },
+                Stmt::Goto("BB3".to_string()),
+            ]),
+        };
+
+        let rendered = canonicalize_function(function).body.render_with_indent(0);
+        assert!(rendered.contains("goto BB3;"), "got:\n{rendered}");
+        assert!(!rendered.contains("FCHK("), "got:\n{rendered}");
+        assert!(!rendered.contains("CALL.REL.NOINC"), "got:\n{rendered}");
     }
 }
