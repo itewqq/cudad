@@ -3,8 +3,8 @@
 ## Status
 
 - Branch: `codex/memory-aware-backend-refactor`
-- Checkpoint commit: `31b1564`
-- Current stage: phase 5 cutover of structured output entrypoints onto the canonical backend, with front-half address-contract fixes still landing as needed
+- Checkpoint commit: `687da57`
+- Current stage: late phase 5 / phase 6 cleanup, with the canonical backend already live and the remaining work focused on helper-leak cleanup, validation, and final deletion sweep
 
 ## Landed invariants
 
@@ -90,6 +90,20 @@
   wide-add chains, so canonical lowering can keep more Blackwell pointer loops
   attached to typed param roots instead of falling back to anonymous register
   bases.
+- `FunctionAnalysis` now recovers loop-carried pointer-phi byte offsets from
+  companion scalar index phis, so rooted `IMAD.WIDE` address recurrences keep
+  their byte stride through optimized SSA instead of collapsing back to raw
+  packed pointer arithmetic.
+- Canonical AST lowering now recognizes rooted 64-bit pointer pairs and lowers
+  them as `WidePtr` expressions instead of anonymous `Addr64` packs, which
+  keeps rooted global parameter bases explicit through wide-address arithmetic
+  and fixes the main `dot_thread` pointer-param regression.
+- Canonical AST cleanup now owns FCHK-guarded reciprocal/division recovery for
+  `fmaf`-shaped Newton refinement trees, and it prunes dead helper predicates
+  inside rewritten structured blocks before symbol planning.
+- The canonical `dot_thread` recurrence contract now accepts the deliberate
+  `fmaf(...)` spelling as equivalent to `a * b + c`, so the test suite checks
+  for preserved FFMA structure rather than an obsolete render-only spelling.
 - Canonical global-index lowering now recursively expands rooted byte-offset
   expressions before rendering, which collapses nested rooted temps out of
   typed global loads/stores instead of leaking intermediate offset registers

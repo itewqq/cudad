@@ -1,5 +1,5 @@
-use crate::*;
 use crate::semantic_lift::{lift_function_ir, DefRef, SemanticLiftConfig};
+use crate::*;
 use pretty_assertions::assert_eq;
 use regex::Regex;
 
@@ -959,8 +959,10 @@ fn full_pass_dot_thread_recovers_pointer_params_and_typed_loads() {
 {}",
         out
     );
-    let ffma_recurrence = Regex::new(r"r\d+_\d+ = r\d+_\d+ \* r\d+_\d+ \+ r\d+_\d+;")
-        .expect("valid dot_thread recurrence regex");
+    let ffma_recurrence = Regex::new(
+        r"r\d+_\d+ = (?:r\d+_\d+ \* r\d+_\d+ \+ r\d+_\d+|(?:__)?fmaf(?:_[a-z]+)?\(r\d+_\d+, r\d+_\d+, r\d+_\d+\));",
+    )
+    .expect("valid dot_thread recurrence regex");
     assert!(
         ffma_recurrence.is_match(&out),
         "expected dot_thread accumulator FFMA recurrence to survive structurization, got:

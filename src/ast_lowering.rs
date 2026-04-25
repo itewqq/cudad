@@ -27,7 +27,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use crate::abi::ConstMemSemantic;
 use crate::ast::{Expr, LValue, PointerLane, Stmt};
 use crate::backend_names::canonical_reg_ident;
-use crate::canonical_ast_passes::prune_dead_pure_defs;
+use crate::canonical_ast_passes::canonicalize_function;
 use crate::cfg::ControlFlowGraph;
 use crate::function_analysis::{AddressRoot, FunctionAnalysis, MemAccessInfo};
 use crate::ir::{FunctionIR, IRBlock, IRExpr, IRStatement, RValue};
@@ -162,7 +162,7 @@ impl<'a> StructuredLowering<'a> {
 
     fn lower_function(&self, structured: &StructuredStatement) -> crate::ast::StructuredFunction {
         let body = self.lower_structured_stmt(structured);
-        let seed = prune_dead_pure_defs(crate::ast::StructuredFunction {
+        let seed = canonicalize_function(crate::ast::StructuredFunction {
             params: Vec::new(),
             locals: Vec::new(),
             body,
@@ -1550,6 +1550,19 @@ fn lower_root_relative_global_index_expr(
     let AddressRoot::ParamWord(param_idx) = access.root else {
         return None;
     };
+    let rooted_base_name = global_param_base_name(param_idx, analysis);
+    let lowered_addr = lower_scalar_expr_with_analysis(addr_base, Some(analysis));
+    if let Expr::WidePtr { base, offset: rooted } = lowered_addr {
+        if matches!(base.as_ref(), Expr::Reg(name) if name == &rooted_base_name) {
+            let byte_expr = match offset {
+                Some(offset) if !ir_expr_is_zero(offset) => {
+                    add_expr(*rooted, lower_scalar_expr_with_analysis(offset, Some(analysis)))
+                }
+                _ => *rooted,
+            };
+            return Some(scale_index_expr(byte_expr, bit_width));
+        }
+    }
     let absolute_addr = match addr_base {
         IRExpr::Addr64 { .. } => combine_byte_offset_expr(addr_base, offset, Some(analysis)),
         _ => return None,
@@ -1688,10 +1701,16 @@ fn lower_scalar_expr_with_analysis(expr: &IRExpr, analysis: Option<&FunctionAnal
             .unwrap_or_else(|| lower_reg_expr(reg)),
         IRExpr::ImmI(value) => Expr::Imm(value.to_string()),
         IRExpr::ImmF(value) => Expr::Imm(value.to_string()),
-        IRExpr::Addr64 { lo, hi } => Expr::Addr64 {
-            lo: Box::new(lower_scalar_expr_with_analysis(lo, analysis)),
-            hi: Box::new(lower_scalar_expr_with_analysis(hi, analysis)),
-        },
+        IRExpr::Addr64 { lo, hi } => analysis
+            .and_then(|facts| lower_rooted_wide_expr(lo, hi, facts))
+            .unwrap_or_else(|| {
+                let lo = lower_scalar_expr_with_analysis(lo, analysis);
+                let hi = lower_scalar_expr_with_analysis(hi, analysis);
+                lower_named_pointer_lane_wide_expr(lo.clone(), hi.clone()).unwrap_or(Expr::Addr64 {
+                    lo: Box::new(lo),
+                    hi: Box::new(hi),
+                })
+            }),
         IRExpr::Mem { .. } => Expr::Raw("/*mem*/".to_string()),
         IRExpr::Op { op, args } => lower_ir_op_expr_with_analysis(op, args, analysis),
     }
@@ -3179,6 +3198,9 @@ fn lower_wide_add_lo_expr(
 }
 
 fn lower_wide_input_expr(lo: &IRExpr, hi: &IRExpr, analysis: Option<&FunctionAnalysis>) -> Expr {
+    if let Some(rooted) = analysis.and_then(|facts| lower_rooted_wide_expr(lo, hi, facts)) {
+        return rooted;
+    }
     if ir_expr_is_zero(hi) {
         return Expr::Cast {
             ty: "uint64_t".to_string(),
@@ -3188,9 +3210,76 @@ fn lower_wide_input_expr(lo: &IRExpr, hi: &IRExpr, analysis: Option<&FunctionAna
             }),
         };
     }
-    Expr::Addr64 {
-        lo: Box::new(lower_scalar_expr_with_analysis(lo, analysis)),
-        hi: Box::new(lower_scalar_expr_with_analysis(hi, analysis)),
+    let lo = lower_scalar_expr_with_analysis(lo, analysis);
+    let hi = lower_scalar_expr_with_analysis(hi, analysis);
+    lower_named_pointer_lane_wide_expr(lo.clone(), hi.clone()).unwrap_or(Expr::Addr64 {
+        lo: Box::new(lo),
+        hi: Box::new(hi),
+    })
+}
+
+fn lower_rooted_wide_expr(
+    lo: &IRExpr,
+    hi: &IRExpr,
+    analysis: &FunctionAnalysis,
+) -> Option<Expr> {
+    let lo_reg = lo.get_reg()?;
+    let root = analysis.root_by_reg.get(lo_reg)?;
+    let base = rooted_wide_base_expr(root, analysis)?;
+    let hi_matches_root = match hi {
+        IRExpr::Reg(hi_reg) => analysis
+            .root_by_reg
+            .get(hi_reg)
+            .is_some_and(|hi_root| compatible_wide_roots(root, hi_root)),
+        other => ir_expr_is_zero(other),
+    };
+    if !hi_matches_root {
+        return None;
+    }
+    let byte_offset = analysis.byte_offset_by_reg.get(lo_reg)?;
+    let expanded = expand_rooted_offset_expr(byte_offset, root, analysis, &mut BTreeSet::new());
+    Some(Expr::WidePtr {
+        base: Box::new(base),
+        offset: Box::new(lower_scalar_expr_with_analysis(&expanded, Some(analysis))),
+    })
+}
+
+fn rooted_wide_base_expr(root: &AddressRoot, analysis: &FunctionAnalysis) -> Option<Expr> {
+    match root {
+        AddressRoot::ParamWord(param_idx) => {
+            Some(Expr::Reg(global_param_base_name(*param_idx, analysis)))
+        }
+        AddressRoot::SharedObject(name) => Some(Expr::Builtin(name.clone())),
+        AddressRoot::LocalObject(name) => Some(Expr::Reg(name.clone())),
+        AddressRoot::ConstSymbol(name) => Some(Expr::ConstMemSymbol(name.clone())),
+        AddressRoot::RegisterBase(_) | AddressRoot::Generic => None,
+    }
+}
+
+fn compatible_wide_roots(lo_root: &AddressRoot, hi_root: &AddressRoot) -> bool {
+    matches!(
+        (lo_root, hi_root),
+        (AddressRoot::ParamWord(lo_idx), AddressRoot::ParamWord(hi_idx))
+            if *hi_idx == lo_idx.saturating_add(1)
+    ) || lo_root == hi_root
+}
+
+fn lower_named_pointer_lane_wide_expr(lo: Expr, hi: Expr) -> Option<Expr> {
+    match (lo, hi) {
+        (
+            Expr::PtrLane {
+                base: lo_base,
+                lane: PointerLane::Lo32,
+            },
+            Expr::PtrLane {
+                base: hi_base,
+                lane: PointerLane::Hi32,
+            },
+        ) if lo_base == hi_base => Some(Expr::WidePtr {
+            base: Box::new(Expr::Reg(lo_base)),
+            offset: Box::new(Expr::Imm("0".to_string())),
+        }),
+        _ => None,
     }
 }
 
@@ -3241,10 +3330,24 @@ fn add_expr(lhs: Expr, rhs: Expr) -> Expr {
     if matches!(rhs, Expr::Imm(ref text) if text == "0") {
         return lhs;
     }
-    Expr::Binary {
-        op: "+".to_string(),
-        lhs: Box::new(lhs),
-        rhs: Box::new(rhs),
+    match (lhs, rhs) {
+        (Expr::WidePtr { base, offset }, rhs) if !matches!(rhs, Expr::WidePtr { .. }) => {
+            Expr::WidePtr {
+                base,
+                offset: Box::new(add_expr(*offset, rhs)),
+            }
+        }
+        (lhs, Expr::WidePtr { base, offset }) if !matches!(lhs, Expr::WidePtr { .. }) => {
+            Expr::WidePtr {
+                base,
+                offset: Box::new(add_expr(lhs, *offset)),
+            }
+        }
+        (lhs, rhs) => Expr::Binary {
+            op: "+".to_string(),
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        },
     }
 }
 

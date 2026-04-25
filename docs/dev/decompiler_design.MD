@@ -71,6 +71,9 @@ Key pieces:
   directly into the canonical AST
 - `plan_symbols` assigns params, locals, shared objects, and deterministic temp
   names without reading rendered text back in
+- `canonical_ast_passes` is limited to AST-native cleanup such as dead pure
+  helper pruning and structural recovery of FCHK-guarded reciprocal/division
+  idioms; it is not allowed to re-run text-based backend repair
 - `src/semantic_lift.rs` remains only as a test-only harness for targeted
   legacy lift coverage that has not yet been translated into canonical tests
 
