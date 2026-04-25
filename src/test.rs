@@ -2212,14 +2212,14 @@ fn lifted_rc4_no_raw_constmem_call_syntax() {
 // Corpus invariant runner
 // ----------------------------------------------------------------------
 //
-// Drives the real full-pass backend against every function in
+// Drives the canonical backend against every function in
 // `test_cu/corpus/*.sass` (multi-function `cuobjdump --dump-sass` dumps)
 // and asserts structural invariants rather than byte-equality goldens.
 // The corpus exists to catch regressions that escape the hand-authored
 // per-kernel fixtures — adding a new CUDA source file and regenerating
 // the `.sass` dump immediately expands coverage without writing goldens.
 
-/// Walk a list of `(filename, sass_text)` pairs through the full-pass
+/// Walk a list of `(filename, sass_text)` pairs through the canonical
 /// backend and return one `(file, function_name, output)` tuple per
 /// function. Shared by the SM 89 corpus and the SM 100/120 (Blackwell)
 /// corpora so each architecture's invariant tests can pass its own file
@@ -2234,7 +2234,7 @@ fn run_corpus_files(files: &[(&'static str, &'static str)]) -> Vec<(&'static str
             fname
         );
         for f in funcs {
-            let out = run_structured_output_full_pass_from_instrs(f.instrs.clone(), f.sm);
+            let out = run_canonical_output_full_pass_from_instrs(f.instrs.clone(), f.sm, &f.name);
             results.push((fname, f.name, out));
         }
     }

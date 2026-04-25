@@ -264,6 +264,10 @@
 - The last obvious scalar/helper leak in the tracked corpus is now gone:
   `state_machine` lowers indirect `BRX` control to an explicit switch-shaped
   placeholder instead of emitting raw `BRX(...)` text in the canonical output.
+- The corpus invariant runner and curated golden regeneration entrypoint are
+  now pointed at the canonical backend driver, which removes another old
+  full-pass call site from the branch and makes the remaining legacy-test
+  cleanup more mechanical.
 
 ## Next safe step
 
