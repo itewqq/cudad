@@ -79,6 +79,10 @@ constant array.
 - Canonical scalar lowering should treat common carry-chain arithmetic forms
   (`IADD3.X` / `UIADD3.X`) as real arithmetic on the surviving data result
   instead of leaving raw helper mnemonics in structured output.
+- Canonical scalar lowering should also model the common float modifier surface
+  structurally where CUDA has a direct semantic spelling (`FRND.*`,
+  `FADD.FTZ`, `FMUL.*`, `FFMA.SAT`, `FFMA.R*`) instead of leaking raw opcode
+  helper calls for routine math code.
 - New backend modules must document their inputs, outputs, invariants, and
   forbidden responsibilities in rustdoc headers.
 

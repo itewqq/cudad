@@ -205,17 +205,28 @@
   expressions structurally, which removes another raw helper-shaped arithmetic
   leak from canonical control-flow output (`state_machine` now renders
   `ur7_2 + (up0_2 ? 1 : 0)` instead of `UIADD3.X(...)`).
+- Canonical scalar lowering now also models the common float modifier surface
+  that still leaked through the canonical path: `FRND.FLOOR`/`FRND.TRUNC`
+  lower to `floorf(...)` / `truncf(...)`, `FADD.FTZ` and `FMUL.FTZ` collapse
+  to native arithmetic, and modeled `FFMA` variants (`.SAT`, `.RM`, `.RP`,
+  `.RZ`, `.RN`) lower to structural CUDA math intrinsics such as
+  `__saturatef(...)` / `__fmaf_rd(...)` instead of raw helper-shaped calls.
+- Canonical targeted coverage now also pins this float-modifier slice:
+  `dispatch_ops` no longer leaks raw `FRND.FLOOR(...)` / `FMUL.FTZ(...)`, and
+  `softmax_forward` no longer leaks raw `FFMA.SAT(...)` / `FFMA.RM(...)` /
+  `FADD.FTZ(...)` on the canonical path.
 
 ## Next safe step
 
 1. Keep shrinking the remaining old helper surface in `src/test.rs` only where
    canonical semantics are now genuinely stronger, not just cosmetically
    different.
-2. Tackle the next structurally visible canonical holes: shared index/root
-   recovery beyond direct `threadIdx` forms, the remaining predicate/control
-   outliers beyond the now-handled compare/pseudo-op/carry-add spellings, and
-   the remaining vector/half/special-scalar ops (for example `HFMA2`, `PRMT`,
-   rotate-heavy SHA idioms) that still force raw helper-shaped output.
+2. Tackle the next structurally visible canonical holes: loop-carried
+   pointer-root/byte-offset recovery in `cumsum_linear`, the remaining
+   predicate/control outliers beyond the now-handled compare/pseudo-op/carry-
+   add/float-modifier spellings, and the remaining vector/half/special-scalar
+   ops (for example `HFMA2`, `PRMT`, rotate-heavy SHA idioms) that still force
+   raw helper-shaped output.
 3. Revisit the broader `sgemm_tiled` / shared-memory fixtures and migrate any
    additional smoke coverage that the new shared-scale and scalar-op lowering
    now makes trustworthy on the canonical driver.

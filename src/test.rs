@@ -1171,18 +1171,20 @@ fn smoke_struct_output_full_pass_test_div_sass() {
         "../test_cu/test_div.sass"
     ));
     assert!(out.contains("void kernel(int32_t arg0, int32_t arg1, uint32_t* arg2_ptr)"));
-    assert!(out.contains("abs(arg1)"), "expected signed-dividend lowering, got:\n{}", out);
+    assert!(
+        out.contains("abs(arg1)"),
+        "expected signed-dividend lowering, got:\n{}",
+        out
+    );
     assert!(
         out.contains("rcp_approx("),
         "expected reciprocal approximation helper recovery, got:\n{}",
         out
     );
-    let final_store =
-        Regex::new(r"arg2_ptr\[0\] = r\d+_\d+;").expect("valid final store regex");
+    let final_store = Regex::new(r"arg2_ptr\[0\] = r\d+_\d+;").expect("valid final store regex");
     assert!(final_store.is_match(&out));
-    let negate_guard =
-        Regex::new(r"r\d+_\d+ = !p\d+_\d+ \? \(-r\d+_\d+\) : r\d+_\d+;")
-            .expect("valid negate guard regex");
+    let negate_guard = Regex::new(r"r\d+_\d+ = !p\d+_\d+ \? \(-r\d+_\d+\) : r\d+_\d+;")
+        .expect("valid negate guard regex");
     assert!(negate_guard.is_match(&out));
     assert!(!out.contains("ConstMem("));
     assert!(!out.contains("addr64("));
@@ -1307,9 +1309,7 @@ fn full_pass_dot_thread_recovers_pointer_params_and_typed_loads() {
         out
     );
     assert!(
-        out.contains("arg0_ptr[")
-            && out.contains("arg2_ptr[")
-            && out.contains("arg4_ptr["),
+        out.contains("arg0_ptr[") && out.contains("arg2_ptr[") && out.contains("arg4_ptr["),
         "expected dot_thread main memory accesses to stay on typed pointer arithmetic, got:
 {}",
         out
@@ -1334,8 +1334,7 @@ fn full_pass_dot_thread_recovers_pointer_params_and_typed_loads() {
 {}",
         out
     );
-    let ffma_recurrence =
-        Regex::new(r"r\d+_\d+ = r\d+_\d+ \* r\d+_\d+ \+ r\d+_\d+;")
+    let ffma_recurrence = Regex::new(r"r\d+_\d+ = r\d+_\d+ \* r\d+_\d+ \+ r\d+_\d+;")
         .expect("valid dot_thread recurrence regex");
     assert!(
         ffma_recurrence.is_match(&out),
@@ -1487,17 +1486,11 @@ fn full_pass_nbody_final_store_uses_collapsed_force_pointer() {
     .find(|f| f.name == "nbody_forces")
     .expect("nbody_forces fixture should exist");
     let out = run_canonical_output_full_pass_from_instrs(nbody.instrs, nbody.sm, "nbody_forces");
-    let store0 = Regex::new(
-        r"arg2_ptr\[[A-Za-z0-9_]+ \* 12 / 4\] = [A-Za-z0-9_]+;",
-    )
+    let store0 = Regex::new(r"arg2_ptr\[[A-Za-z0-9_]+ \* 12 / 4\] = [A-Za-z0-9_]+;")
         .expect("valid first store regex");
-    let store1 = Regex::new(
-        r"arg2_ptr\[\([A-Za-z0-9_]+ \* 12 \+ 4\) / 4\] = [A-Za-z0-9_]+;",
-    )
+    let store1 = Regex::new(r"arg2_ptr\[\([A-Za-z0-9_]+ \* 12 \+ 4\) / 4\] = [A-Za-z0-9_]+;")
         .expect("valid flattened second store regex");
-    let store2 = Regex::new(
-        r"arg2_ptr\[\([A-Za-z0-9_]+ \* 12 \+ 8\) / 4\] = [A-Za-z0-9_]+;",
-    )
+    let store2 = Regex::new(r"arg2_ptr\[\([A-Za-z0-9_]+ \* 12 \+ 8\) / 4\] = [A-Za-z0-9_]+;")
         .expect("valid flattened third store regex");
     assert!(
         store0.is_match(&out),
@@ -1646,7 +1639,8 @@ fn full_pass_stencil2d_top_halo_predicated_load_defaults_to_zero() {
         .into_iter()
         .find(|f| f.name == "stencil2d_5pt")
         .expect("stencil2d_5pt fixture should exist");
-    let out = run_canonical_output_full_pass_from_instrs(stencil.instrs, stencil.sm, "stencil2d_5pt");
+    let out =
+        run_canonical_output_full_pass_from_instrs(stencil.instrs, stencil.sm, "stencil2d_5pt");
     assert!(
         out.contains("r4_7 = !p2_1 ? (arg0_ptr[r8_0 + -1]) : 0;"),
         "expected predicated top-halo load to default to zero, got:\n{}",
@@ -1988,10 +1982,13 @@ fn canonical_full_pass_layer_norm_forward_lowers_raw_fsetp_compares() {
             .into_iter()
             .find(|f| f.name == "layer_norm_forward")
             .expect("layer_norm_forward fixture should exist");
-    let out =
-        run_canonical_output_full_pass_from_instrs(layer_norm.instrs, layer_norm.sm, "layer_norm_forward");
-    let geu_compare =
-        Regex::new(r"p\d+_\d+ = abs\(r\d+_\d+\) >= ").expect("valid canonical layernorm compare regex");
+    let out = run_canonical_output_full_pass_from_instrs(
+        layer_norm.instrs,
+        layer_norm.sm,
+        "layer_norm_forward",
+    );
+    let geu_compare = Regex::new(r"p\d+_\d+ = abs\(r\d+_\d+\) >= ")
+        .expect("valid canonical layernorm compare regex");
     assert!(
         geu_compare.is_match(&out),
         "expected canonical layer_norm_forward to lower GEU compare structurally, got:\n{}",
@@ -2011,8 +2008,11 @@ fn canonical_full_pass_state_machine_avoids_raw_true_predicate_helpers() {
             .into_iter()
             .find(|f| f.name == "state_machine")
             .expect("state_machine fixture should exist");
-    let out =
-        run_canonical_output_full_pass_from_instrs(state_machine.instrs, state_machine.sm, "state_machine");
+    let out = run_canonical_output_full_pass_from_instrs(
+        state_machine.instrs,
+        state_machine.sm,
+        "state_machine",
+    );
     assert!(
         !out.contains("!UPT()") && !out.contains("PT()"),
         "expected canonical state_machine to lower predicate pseudo-ops structurally, got:\n{}",
@@ -2032,10 +2032,21 @@ fn canonical_full_pass_dispatch_ops_avoids_raw_qnan_helpers() {
             .into_iter()
             .find(|f| f.name == "dispatch_ops")
             .expect("dispatch_ops fixture should exist");
-    let out = run_canonical_output_full_pass_from_instrs(dispatch.instrs, dispatch.sm, "dispatch_ops");
+    let out =
+        run_canonical_output_full_pass_from_instrs(dispatch.instrs, dispatch.sm, "dispatch_ops");
     assert!(
         !out.contains("+QNAN()") && out.contains("NAN"),
         "expected canonical dispatch_ops to lower QNAN pseudo-immediates structurally, got:\n{}",
+        out
+    );
+    assert!(
+        !out.contains("FRND.FLOOR(") && !out.contains("FMUL.FTZ("),
+        "expected canonical dispatch_ops to lower modeled float modifier ops structurally, got:\n{}",
+        out
+    );
+    assert!(
+        out.contains("floorf("),
+        "expected canonical dispatch_ops to recover floorf from FRND.FLOOR, got:\n{}",
         out
     );
 }
@@ -2065,6 +2076,16 @@ fn full_pass_old_softmax_forward_trims_post_loop_packed_pointer_tail() {
         !out.contains("CALL.REL.NOINC()"),
         "expected old-corpus softmax cleanup to drop compiler slow-path calls, got:
 {}",
+        out
+    );
+    assert!(
+        !out.contains("FFMA.SAT(") && !out.contains("FFMA.RM(") && !out.contains("FADD.FTZ("),
+        "expected old-corpus softmax to lower modeled float modifier ops structurally, got:\n{}",
+        out
+    );
+    assert!(
+        out.contains("__saturatef(") && out.contains("__fmaf_rd("),
+        "expected old-corpus softmax to render saturating/rounded FFMA forms structurally, got:\n{}",
         out
     );
 }

@@ -315,7 +315,11 @@ fn lower_base_and_index(
             analysis,
             access.bit_width.or(*width),
         ),
-        _ => lower_index_expr(offset.as_deref(), access.bit_width.or(*width), Some(analysis)),
+        _ => lower_index_expr(
+            offset.as_deref(),
+            access.bit_width.or(*width),
+            Some(analysis),
+        ),
     };
     Some((normalize_index_base(base, access, analysis), index))
 }
@@ -356,7 +360,11 @@ fn lower_local_byte_offset_expr(stmt: &IRStatement) -> Option<Expr> {
     let IRExpr::Mem { base, offset, .. } = mem_expr else {
         return None;
     };
-    Some(combine_byte_offset_expr(base.as_ref(), offset.as_deref(), None))
+    Some(combine_byte_offset_expr(
+        base.as_ref(),
+        offset.as_deref(),
+        None,
+    ))
 }
 
 fn local_space_helper_name(prefix: &str, access: &MemAccessInfo) -> String {
@@ -563,7 +571,10 @@ fn expr_is_indexable_base(expr: &Expr, access: &MemAccessInfo) -> bool {
     }
 }
 
-fn unresolved_access_scalar_ty(access: &MemAccessInfo, analysis: &FunctionAnalysis) -> &'static str {
+fn unresolved_access_scalar_ty(
+    access: &MemAccessInfo,
+    analysis: &FunctionAnalysis,
+) -> &'static str {
     match access.space {
         CudaMemorySpace::Shared => analysis.shared_pointee_ty.unwrap_or("uint32_t"),
         _ => scalar_ty_for_bit_width(access.bit_width),
@@ -816,6 +827,8 @@ fn lower_semantic_op_expr(
         .or_else(|| lower_shf_expr(opcode, args, analysis))
         .or_else(|| lower_shfl_expr(opcode, args, analysis))
         .or_else(|| lower_iabs_expr(opcode, args, analysis))
+        .or_else(|| lower_frnd_expr(opcode, args, analysis))
+        .or_else(|| lower_fadd_expr(opcode, args, analysis))
         .or_else(|| lower_fmul_expr(opcode, args, analysis))
         .or_else(|| lower_ffma_expr(opcode, args, analysis))
         .or_else(|| lower_fmnmx_expr(opcode, args, analysis))
@@ -1122,7 +1135,10 @@ fn expr_is_floatish(expr: &IRExpr, analysis: Option<&FunctionAnalysis>) -> bool 
 }
 
 fn is_floatish_scalar_type(ty: InferredType) -> bool {
-    matches!(ty, InferredType::F16 | InferredType::F32 | InferredType::AnyFloat)
+    matches!(
+        ty,
+        InferredType::F16 | InferredType::F32 | InferredType::AnyFloat
+    )
 }
 
 fn lop3_bit(imm: u8, a: u8, b: u8, c: u8) -> bool {
@@ -1223,7 +1239,10 @@ fn lower_imad_expr(
     if !matches!(mnem, "IMAD" | "UIMAD") || args.len() != 3 {
         return None;
     }
-    if parts.iter().any(|part| matches!(*part, "WIDE" | "HI" | "X")) {
+    if parts
+        .iter()
+        .any(|part| matches!(*part, "WIDE" | "HI" | "X"))
+    {
         return None;
     }
     if parts.iter().any(|part| *part == "MOV") {
@@ -1415,13 +1434,78 @@ fn lower_iabs_expr(
     })
 }
 
+fn lower_frnd_expr(
+    opcode: &str,
+    args: &[IRExpr],
+    analysis: Option<&FunctionAnalysis>,
+) -> Option<Expr> {
+    let parts = opcode.split('.').collect::<Vec<_>>();
+    if parts.first().copied() != Some("FRND") || args.len() != 1 {
+        return None;
+    }
+    let func = if parts.iter().any(|part| *part == "FLOOR") {
+        "floorf"
+    } else if parts.iter().any(|part| *part == "TRUNC") {
+        "truncf"
+    } else if parts.iter().any(|part| *part == "CEIL") {
+        "ceilf"
+    } else if parts.iter().any(|part| matches!(*part, "NEAR" | "RN")) {
+        "rintf"
+    } else {
+        return None;
+    };
+    Some(Expr::CallLike {
+        func: func.to_string(),
+        args: vec![lower_scalar_expr_with_analysis(&args[0], analysis)],
+    })
+}
+
+fn lower_fadd_expr(
+    opcode: &str,
+    args: &[IRExpr],
+    analysis: Option<&FunctionAnalysis>,
+) -> Option<Expr> {
+    let parts = opcode.split('.').collect::<Vec<_>>();
+    if parts.first().copied() != Some("FADD") || args.len() < 2 {
+        return None;
+    }
+    if !parts.iter().skip(1).all(|part| *part == "FTZ") {
+        return None;
+    }
+    lower_add_expr(args, analysis)
+}
+
 fn lower_fmul_expr(
     opcode: &str,
     args: &[IRExpr],
     analysis: Option<&FunctionAnalysis>,
 ) -> Option<Expr> {
-    if opcode != "FMUL" || args.len() != 2 {
+    let parts = opcode.split('.').collect::<Vec<_>>();
+    if parts.first().copied() != Some("FMUL") || args.len() != 2 {
         return None;
+    }
+    let mut rounding_mode = None;
+    for part in parts.iter().skip(1) {
+        match *part {
+            "FTZ" => {}
+            "RM" | "RP" | "RZ" | "RN" => rounding_mode = Some(*part),
+            _ => return None,
+        }
+    }
+    if let Some(mode) = rounding_mode {
+        return Some(Expr::CallLike {
+            func: match mode {
+                "RM" => "__fmul_rd".to_string(),
+                "RP" => "__fmul_ru".to_string(),
+                "RZ" => "__fmul_rz".to_string(),
+                "RN" => "__fmul_rn".to_string(),
+                _ => unreachable!(),
+            },
+            args: vec![
+                lower_scalar_expr_with_analysis(&args[0], analysis),
+                lower_scalar_expr_with_analysis(&args[1], analysis),
+            ],
+        });
     }
     Some(Expr::Binary {
         op: "*".to_string(),
@@ -1430,11 +1514,16 @@ fn lower_fmul_expr(
     })
 }
 
-fn lower_ffma_expr(opcode: &str, args: &[IRExpr], analysis: Option<&FunctionAnalysis>) -> Option<Expr> {
-    if opcode != "FFMA" || args.len() != 3 {
+fn lower_ffma_expr(
+    opcode: &str,
+    args: &[IRExpr],
+    analysis: Option<&FunctionAnalysis>,
+) -> Option<Expr> {
+    let parts = opcode.split('.').collect::<Vec<_>>();
+    if parts.first().copied() != Some("FFMA") || args.len() != 3 {
         return None;
     }
-    Some(Expr::Binary {
+    let base = Expr::Binary {
         op: "+".to_string(),
         lhs: Box::new(Expr::Binary {
             op: "*".to_string(),
@@ -1442,7 +1531,42 @@ fn lower_ffma_expr(opcode: &str, args: &[IRExpr], analysis: Option<&FunctionAnal
             rhs: Box::new(lower_scalar_expr_with_analysis(&args[1], analysis)),
         }),
         rhs: Box::new(lower_scalar_expr_with_analysis(&args[2], analysis)),
-    })
+    };
+    let mut rounding_mode = None;
+    let mut saturate = false;
+    for part in parts.iter().skip(1) {
+        match *part {
+            "FTZ" => {}
+            "SAT" => saturate = true,
+            "RM" | "RP" | "RZ" | "RN" => rounding_mode = Some(*part),
+            _ => return None,
+        }
+    }
+    let rounded = if let Some(mode) = rounding_mode {
+        Expr::CallLike {
+            func: match mode {
+                "RM" => "__fmaf_rd".to_string(),
+                "RP" => "__fmaf_ru".to_string(),
+                "RZ" => "__fmaf_rz".to_string(),
+                "RN" => "__fmaf_rn".to_string(),
+                _ => unreachable!(),
+            },
+            args: vec![
+                lower_scalar_expr_with_analysis(&args[0], analysis),
+                lower_scalar_expr_with_analysis(&args[1], analysis),
+                lower_scalar_expr_with_analysis(&args[2], analysis),
+            ],
+        }
+    } else {
+        base
+    };
+    if saturate {
+        return Some(Expr::CallLike {
+            func: "__saturatef".to_string(),
+            args: vec![rounded],
+        });
+    }
+    Some(rounded)
 }
 
 fn lower_fmnmx_expr(
@@ -2061,9 +2185,10 @@ mod tests {
             pred_old_defs: Vec::new(),
         };
         let mut analysis = FunctionAnalysis::default();
-        analysis
-            .root_by_reg
-            .insert(rooted.clone(), AddressRoot::SharedObject("shmem".to_string()));
+        analysis.root_by_reg.insert(
+            rooted.clone(),
+            AddressRoot::SharedObject("shmem".to_string()),
+        );
         analysis.byte_offset_by_reg.insert(
             rooted,
             IRExpr::Op {
@@ -2327,7 +2452,10 @@ mod tests {
             panic!("expected assignment");
         };
         assert_eq!(dst.render(), "r7_1");
-        assert_eq!(src.render(), "p2 ? (atomicAdd(&((uint32_t*)(r4))[0], r13)) : r7_0");
+        assert_eq!(
+            src.render(),
+            "p2 ? (atomicAdd(&((uint32_t*)(r4))[0], r13)) : r7_0"
+        );
     }
 
     #[test]
@@ -2605,8 +2733,14 @@ mod tests {
         };
         let lowered = lower_non_memory_stmt(&stmt);
         let rendered = lowered.stmt.render_with_indent(0);
-        assert!(rendered.contains("r8_0 = threadIdx.x & 31;"), "got:\n{rendered}");
-        assert!(rendered.contains("p0_1 = (threadIdx.x & 31) != 0;"), "got:\n{rendered}");
+        assert!(
+            rendered.contains("r8_0 = threadIdx.x & 31;"),
+            "got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("p0_1 = (threadIdx.x & 31) != 0;"),
+            "got:\n{rendered}"
+        );
     }
 
     #[test]
@@ -2725,6 +2859,33 @@ mod tests {
             ],
         );
         assert_eq!(fmul.render(), "r1_0 * r2_0");
+
+        let fmul_ftz = lower_op_expr(
+            "FMUL.FTZ",
+            &[
+                IRExpr::Reg(crate::ir::RegId::new("R", 1, 1).with_ssa(0)),
+                IRExpr::ImmF(0.5),
+            ],
+        );
+        assert_eq!(fmul_ftz.render(), "r1_0 * 0.5");
+
+        let fmul_rm = lower_op_expr(
+            "FMUL.RM",
+            &[
+                IRExpr::Reg(crate::ir::RegId::new("R", 1, 1).with_ssa(0)),
+                IRExpr::Reg(crate::ir::RegId::new("R", 2, 1).with_ssa(0)),
+            ],
+        );
+        assert_eq!(fmul_rm.render(), "__fmul_rd(r1_0, r2_0)");
+
+        let fadd_ftz = lower_op_expr(
+            "FADD.FTZ",
+            &[
+                IRExpr::Reg(crate::ir::RegId::new("R", 3, 1).with_ssa(0)),
+                IRExpr::ImmI(1),
+            ],
+        );
+        assert_eq!(fadd_ftz.render(), "r3_0 + 1");
 
         let imad = lower_op_expr(
             "IMAD",
@@ -2845,7 +3006,10 @@ mod tests {
         );
         let lowered = lower_non_memory_stmt_with_analysis(&stmt, Some(&analysis));
         let rendered = lowered.stmt.render_with_indent(0);
-        assert!(rendered.contains("r10_0 = copysignf(r9_0, r8_0);"), "got:\n{rendered}");
+        assert!(
+            rendered.contains("r10_0 = copysignf(r9_0, r8_0);"),
+            "got:\n{rendered}"
+        );
     }
 
     #[test]
@@ -2874,7 +3038,7 @@ mod tests {
     }
 
     #[test]
-    fn keeps_modifier_bearing_ffma_and_fmnmx_explicit_until_modeled() {
+    fn lowers_modeled_float_modifier_ops_and_keeps_unknown_fmnmx_explicit() {
         let ffma = lower_op_expr(
             "FFMA.RM",
             &[
@@ -2883,7 +3047,23 @@ mod tests {
                 IRExpr::Reg(crate::ir::RegId::new("R", 3, 1).with_ssa(0)),
             ],
         );
-        assert_eq!(ffma.render(), "FFMA.RM(r1_0, r2_0, r3_0)");
+        assert_eq!(ffma.render(), "__fmaf_rd(r1_0, r2_0, r3_0)");
+
+        let ffma_sat = lower_op_expr(
+            "FFMA.SAT",
+            &[
+                IRExpr::Reg(crate::ir::RegId::new("R", 4, 1).with_ssa(0)),
+                IRExpr::ImmF(0.5),
+                IRExpr::ImmF(0.5),
+            ],
+        );
+        assert_eq!(ffma_sat.render(), "__saturatef(r4_0 * 0.5 + 0.5)");
+
+        let frnd = lower_op_expr(
+            "FRND.FLOOR",
+            &[IRExpr::Reg(crate::ir::RegId::new("R", 5, 1).with_ssa(0))],
+        );
+        assert_eq!(frnd.render(), "floorf(r5_0)");
 
         let fmnmx = lower_op_expr(
             "FMNMX.NAN",
