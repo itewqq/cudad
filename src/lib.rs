@@ -21,7 +21,8 @@ pub mod memory_model;
 pub mod op_semantics;
 pub mod parser;
 pub mod ptr_verification;
-pub mod semantic_lift;
+#[cfg(test)]
+mod semantic_lift;
 pub mod semantic_propagation;
 pub mod structurizer;
 pub mod symbol_plan;
@@ -54,7 +55,6 @@ pub use parser::{
     TerminatorKind,
 };
 pub use ptr_verification::*;
-pub use semantic_lift::*;
 pub use semantic_propagation::*;
 pub use structurizer::*;
 pub use symbol_plan::*;

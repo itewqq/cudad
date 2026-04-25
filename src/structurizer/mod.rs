@@ -9,7 +9,6 @@ use crate::ast::{
 use crate::ast_passes::ast_simplify;
 use crate::cfg::ControlFlowGraph;
 use crate::ir::{DisplayCtx, FunctionIR, IRBlock, IRCond, IRExpr, IRStatement, RValue, RegId};
-use crate::semantic_lift::{DefRef, SemanticLiftResult};
 
 use petgraph::algo::dominators::{simple_fast, Dominators};
 use petgraph::graph::NodeIndex;
@@ -164,56 +163,6 @@ impl<'a> Structurizer<'a> {
         }
         candidates.sort_by_key(|&n| cfg[n].id);
         candidates.first().copied()
-    }
-
-    fn lifted_def_emit_order(stmt: &IRStatement) -> Vec<usize> {
-        let RValue::Op { opcode, .. } = &stmt.value else {
-            return (0..stmt.defs.len()).collect();
-        };
-        if stmt.defs.is_empty() {
-            if opcode.starts_with("ST") {
-                if opcode.split('.').skip(1).any(|t| t == "128") {
-                    return vec![0, 1, 2, 3];
-                }
-                if opcode.split('.').skip(1).any(|t| t == "64") {
-                    return vec![0, 1];
-                }
-            }
-            return vec![0];
-        }
-        let filter_sink_defs = |indices: &mut Vec<usize>| {
-            if stmt.defs.iter().any(|def| !Self::is_zero_or_true_reg(def)) {
-                indices.retain(|idx| {
-                    stmt.defs
-                        .get(*idx)
-                        .is_some_and(|def| !Self::is_zero_or_true_reg(def))
-                });
-            }
-        };
-        let mnem = opcode.split('.').next().unwrap_or(opcode);
-        let is_iadd3_non_x =
-            matches!(mnem, "IADD3" | "UIADD3") && !opcode.split('.').any(|t| t == "X");
-        if is_iadd3_non_x && stmt.defs.len() > 1 {
-            // Predicate carry defs conceptually happen before the low-result write,
-            // but implicit .64 hi-lane defs are still data results and should stay
-            // after the low half so mutable-name views keep the tuple update ordered.
-            let mut preds = Vec::new();
-            let mut data_after_first = Vec::new();
-            for idx in 1..stmt.defs.len() {
-                match stmt.defs.get(idx).and_then(IRExpr::get_reg) {
-                    Some(reg) if matches!(reg.class.as_str(), "P" | "UP") => preds.push(idx),
-                    _ => data_after_first.push(idx),
-                }
-            }
-            let mut out = preds;
-            out.push(0);
-            out.extend(data_after_first);
-            filter_sink_defs(&mut out);
-            return out;
-        }
-        let mut out = (0..stmt.defs.len()).collect::<Vec<_>>();
-        filter_sink_defs(&mut out);
-        out
     }
 
     fn is_branch_only_opcode(opcode: &str) -> bool {
@@ -737,36 +686,6 @@ impl<'a> Structurizer<'a> {
         }
     }
 
-    fn lower_lifted_stmt_ast(lifted_stmt: &crate::semantic_lift::LiftedStmt) -> AstStmt {
-        if lifted_stmt.dest.is_sink_literal() {
-            return Self::ast_guarded(
-                lifted_stmt.pred.clone(),
-                AstStmt::ExprStmt(lifted_stmt.rhs.clone()),
-            );
-        }
-        match (&lifted_stmt.pred, &lifted_stmt.pred_old_val) {
-            (Some(pred), Some(old)) => AstStmt::Assign {
-                dst: lifted_stmt.dest.clone(),
-                src: AstExpr::Ternary {
-                    cond: Box::new(pred.clone()),
-                    then_expr: Box::new(lifted_stmt.rhs.clone()),
-                    else_expr: Box::new(old.clone()),
-                },
-            },
-            (Some(pred), None) => Self::ast_guarded(
-                Some(pred.clone()),
-                AstStmt::Assign {
-                    dst: lifted_stmt.dest.clone(),
-                    src: lifted_stmt.rhs.clone(),
-                },
-            ),
-            (None, _) => AstStmt::Assign {
-                dst: lifted_stmt.dest.clone(),
-                src: lifted_stmt.rhs.clone(),
-            },
-        }
-    }
-
     fn resolve_stmt_lookup_idx(
         fir_block: Option<&IRBlock>,
         fir_search_from: &mut usize,
@@ -796,31 +715,12 @@ impl<'a> Structurizer<'a> {
         stmt_idx: usize,
         ir_s: &IRStatement,
         ctx: &dyn DisplayCtx,
-        lifted: Option<&SemanticLiftResult>,
     ) -> Vec<AstStmt> {
-        if let Some(res) = lifted {
-            let mut lowered = Vec::new();
-            for def_idx in Self::lifted_def_emit_order(ir_s) {
-                let def_ref = DefRef {
-                    block_id,
-                    stmt_idx,
-                    def_idx,
-                };
-                let Some(lifted_stmt) = res.by_def.get(&def_ref) else {
-                    continue;
-                };
-                lowered.push(Self::lower_lifted_stmt_ast(lifted_stmt));
-            }
-            if !lowered.is_empty() {
-                return lowered;
-            }
-        }
-
         let side_effect_only =
             ir_s.defs.is_empty() || ir_s.defs.iter().all(Self::is_zero_or_true_reg);
         let value_expr = Self::ast_value_from_rvalue(ctx, &ir_s.value);
         let pred_expr = ir_s.pred.as_ref().map(|pred| {
-            self.resolve_stmt_predicate_expr_ast(block_id, stmt_idx, pred, ctx, lifted)
+            self.resolve_stmt_predicate_expr_ast(block_id, stmt_idx, pred, ctx)
         });
 
         if side_effect_only {
@@ -857,7 +757,6 @@ impl<'a> Structurizer<'a> {
         block_id: usize,
         stmts: &[IRStatement],
         ctx: &dyn DisplayCtx,
-        lifted: Option<&SemanticLiftResult>,
         emit_returns: bool,
     ) -> AstStmt {
         let fir_block = self.get_ir_block(block_id);
@@ -909,7 +808,6 @@ impl<'a> Structurizer<'a> {
                                 lookup_stmt_idx,
                                 pred,
                                 ctx,
-                                lifted,
                             )
                         }),
                         AstStmt::ExprStmt(AstExpr::CallLike {
@@ -930,7 +828,6 @@ impl<'a> Structurizer<'a> {
                                 lookup_stmt_idx,
                                 pred,
                                 ctx,
-                                lifted,
                             )
                         }),
                         AstStmt::Return(None),
@@ -956,7 +853,6 @@ impl<'a> Structurizer<'a> {
                 lookup_stmt_idx,
                 ir_s,
                 ctx,
-                lifted,
             ));
         }
 
@@ -1674,84 +1570,15 @@ impl<'a> Structurizer<'a> {
         &self,
         block_id: usize,
         ctx: &dyn DisplayCtx,
-        lifted: Option<&SemanticLiftResult>,
     ) -> AstStmt {
         let Some(block) = self.get_ir_block(block_id) else {
             return AstStmt::Empty;
         };
-        match self.lower_stmt_list_ast(block_id, &block.stmts, ctx, lifted, false) {
+        match self.lower_stmt_list_ast(block_id, &block.stmts, ctx, false) {
             AstStmt::Empty => AstStmt::Empty,
             AstStmt::Sequence(stmts) => AstStmt::Block(stmts),
             stmt => AstStmt::Block(vec![stmt]),
         }
-    }
-
-    fn resolve_predicate_condition_expr_ast(
-        &self,
-        block_id: usize,
-        max_stmt_idx: Option<usize>,
-        pred: &RegId,
-        lifted: Option<&SemanticLiftResult>,
-    ) -> Option<AstExpr> {
-        let lifted = lifted?;
-        let block = self.get_ir_block(block_id)?;
-        let end = max_stmt_idx
-            .map(|idx| idx.saturating_add(1).min(block.stmts.len()))
-            .unwrap_or(block.stmts.len());
-        for (stmt_idx, stmt) in block.stmts[..end].iter().enumerate().rev() {
-            for (def_idx, def) in stmt.defs.iter().enumerate() {
-                let IRExpr::Reg(dst) = def else {
-                    continue;
-                };
-                if dst.class != pred.class || dst.idx != pred.idx {
-                    continue;
-                }
-                if let Some(want_ssa) = pred.ssa {
-                    if dst.ssa != Some(want_ssa) {
-                        continue;
-                    }
-                }
-                let def_ref = DefRef {
-                    block_id: block.id,
-                    stmt_idx,
-                    def_idx,
-                };
-                if let Some(ls) = lifted.by_def.get(&def_ref) {
-                    return Some(ls.rhs.clone());
-                }
-            }
-        }
-
-        let want_ssa = pred.ssa?;
-        let mut resolved = None;
-        for other_block in &self.function_ir.blocks {
-            for (stmt_idx, stmt) in other_block.stmts.iter().enumerate() {
-                for (def_idx, def) in stmt.defs.iter().enumerate() {
-                    let IRExpr::Reg(dst) = def else {
-                        continue;
-                    };
-                    if dst.class != pred.class || dst.idx != pred.idx || dst.ssa != Some(want_ssa) {
-                        continue;
-                    }
-                    let def_ref = DefRef {
-                        block_id: other_block.id,
-                        stmt_idx,
-                        def_idx,
-                    };
-                    let Some(ls) = lifted.by_def.get(&def_ref) else {
-                        continue;
-                    };
-                    if let Some(existing) = &resolved {
-                        if existing != &ls.rhs {
-                            return None;
-                        }
-                    } else {
-                        resolved = Some(ls.rhs.clone());
-                    }
-                }
-            }
-        }
-        resolved
     }
 
     fn resolve_stmt_predicate_expr_ast(
@@ -1760,18 +1587,15 @@ impl<'a> Structurizer<'a> {
         stmt_idx: usize,
         pred_expr: &IRExpr,
         ctx: &dyn DisplayCtx,
-        lifted: Option<&SemanticLiftResult>,
     ) -> AstExpr {
         match pred_expr {
             IRExpr::Op { op, args } if op == "!" && args.len() == 1 => AstExpr::Unary {
                 op: "!".to_string(),
                 arg: Box::new(
-                    self.resolve_stmt_predicate_expr_ast(block_id, stmt_idx, &args[0], ctx, lifted),
+                    self.resolve_stmt_predicate_expr_ast(block_id, stmt_idx, &args[0], ctx),
                 ),
             },
-            IRExpr::Reg(pred) => self
-                .resolve_predicate_condition_expr_ast(block_id, Some(stmt_idx), pred, lifted)
-                .unwrap_or_else(|| Self::ast_expr_from_display(ctx, pred_expr)),
+            IRExpr::Reg(_) => Self::ast_expr_from_display(ctx, pred_expr),
             _ => Self::ast_expr_from_display(ctx, pred_expr),
         }
     }
@@ -1781,7 +1605,6 @@ impl<'a> Structurizer<'a> {
         condition_block_id: usize,
         condition_expr: &IRExpr,
         ctx: &dyn DisplayCtx,
-        lifted: Option<&SemanticLiftResult>,
     ) -> AstExpr {
         match condition_expr {
             IRExpr::Op { op, args } if op == "!" && args.len() == 1 => AstExpr::Unary {
@@ -1790,12 +1613,9 @@ impl<'a> Structurizer<'a> {
                     condition_block_id,
                     &args[0],
                     ctx,
-                    lifted,
                 )),
             },
-            IRExpr::Reg(pred) => self
-                .resolve_predicate_condition_expr_ast(condition_block_id, None, pred, lifted)
-                .unwrap_or_else(|| Self::ast_expr_from_display(ctx, condition_expr)),
+            IRExpr::Reg(_) => Self::ast_expr_from_display(ctx, condition_expr),
             _ => Self::ast_expr_from_display(ctx, condition_expr),
         }
     }
@@ -1804,11 +1624,10 @@ impl<'a> Structurizer<'a> {
         &self,
         stmt: &StructuredStatement,
         ctx: &dyn DisplayCtx,
-        lifted: Option<&SemanticLiftResult>,
     ) -> AstStmt {
         let mut jump_targets = HashSet::new();
         Self::collect_jump_targets(stmt, &mut jump_targets);
-        self.lower_structured_stmt_ast_with_targets(stmt, ctx, lifted, &jump_targets, None)
+        self.lower_structured_stmt_ast_with_targets(stmt, ctx, &jump_targets, None)
     }
 
     fn entry_block_id(stmt: &StructuredStatement) -> Option<usize> {
@@ -1847,13 +1666,12 @@ impl<'a> Structurizer<'a> {
         &self,
         stmt: &StructuredStatement,
         ctx: &dyn DisplayCtx,
-        lifted: Option<&SemanticLiftResult>,
         jump_targets: &HashSet<usize>,
         fallthrough_target_block: Option<usize>,
     ) -> AstStmt {
         match stmt {
             StructuredStatement::BasicBlock { block_id, stmts } => {
-                let body = self.lower_stmt_list_ast(*block_id, stmts, ctx, lifted, true);
+                let body = self.lower_stmt_list_ast(*block_id, stmts, ctx, true);
                 let body = if let Some(target_block_id) = fallthrough_target_block {
                     Self::ast_sequence(vec![
                         body,
@@ -1888,7 +1706,6 @@ impl<'a> Structurizer<'a> {
                     out.push(self.lower_structured_stmt_ast_with_targets(
                         child,
                         ctx,
-                        lifted,
                         jump_targets,
                         next_target,
                     ));
@@ -1904,12 +1721,11 @@ impl<'a> Structurizer<'a> {
                 then_branch,
                 else_branch,
             } => {
-                let prelude = self.lower_condition_prelude_ast(*condition_block_id, ctx, lifted);
+                let prelude = self.lower_condition_prelude_ast(*condition_block_id, ctx);
                 let else_ref = else_branch.as_deref();
                 let then_ast = self.lower_structured_stmt_ast_with_targets(
                     then_branch,
                     ctx,
-                    lifted,
                     jump_targets,
                     fallthrough_target_block,
                 );
@@ -1918,7 +1734,6 @@ impl<'a> Structurizer<'a> {
                         self.lower_structured_stmt_ast_with_targets(
                             stmt,
                             ctx,
-                            lifted,
                             jump_targets,
                             fallthrough_target_block,
                         )
@@ -1943,7 +1758,6 @@ impl<'a> Structurizer<'a> {
                             *condition_block_id,
                             &negate_condition(condition_expr.clone()),
                             ctx,
-                            lifted,
                         ),
                         then_branch: Box::new(else_ast.unwrap()),
                         else_branch: None,
@@ -1954,7 +1768,6 @@ impl<'a> Structurizer<'a> {
                             *condition_block_id,
                             condition_expr,
                             ctx,
-                            lifted,
                         ),
                         then_branch: Box::new(then_ast),
                         else_branch: else_ast.map(Box::new),
@@ -2020,7 +1833,7 @@ impl<'a> Structurizer<'a> {
                     Self::ast_sequence(vec![phi_backedge_updates, body_entry_backedge_updates]);
                 let condition_prelude = if *loop_type != LoopType::DoWhile {
                     header_block_id
-                        .map(|hid| self.lower_condition_prelude_ast(hid, ctx, lifted))
+                        .map(|hid| self.lower_condition_prelude_ast(hid, ctx))
                         .unwrap_or(AstStmt::Empty)
                 } else {
                     AstStmt::Empty
@@ -2033,7 +1846,7 @@ impl<'a> Structurizer<'a> {
                     },
                     condition: condition_expr.as_ref().map(|expr| {
                         if let Some(hid) = header_block_id {
-                            self.lower_condition_expr_ast(*hid, expr, ctx, lifted)
+                            self.lower_condition_expr_ast(*hid, expr, ctx)
                         } else {
                             Self::ast_expr_from_display(ctx, expr)
                         }
@@ -2042,7 +1855,6 @@ impl<'a> Structurizer<'a> {
                         self.lower_structured_stmt_ast_with_targets(
                             &printable_body,
                             ctx,
-                            lifted,
                             jump_targets,
                             None,
                         ),
@@ -2111,7 +1923,7 @@ impl<'a> Structurizer<'a> {
                 cases,
                 default,
             } => {
-                let prelude = self.lower_condition_prelude_ast(*header_block_id, ctx, lifted);
+                let prelude = self.lower_condition_prelude_ast(*header_block_id, ctx);
                 let switch_stmt = AstStmt::Switch {
                     discriminant: discriminant
                         .as_ref()
@@ -2124,7 +1936,6 @@ impl<'a> Structurizer<'a> {
                                 self.lower_structured_stmt_ast_with_targets(
                                     body,
                                     ctx,
-                                    lifted,
                                     jump_targets,
                                     fallthrough_target_block,
                                 ),
@@ -2135,7 +1946,6 @@ impl<'a> Structurizer<'a> {
                         Box::new(self.lower_structured_stmt_ast_with_targets(
                             body,
                             ctx,
-                            lifted,
                             jump_targets,
                             fallthrough_target_block,
                         ))
@@ -2162,7 +1972,7 @@ impl<'a> Structurizer<'a> {
         ctx: &dyn DisplayCtx,
         indent_level: usize,
     ) -> String {
-        ast_simplify(self.lower_structured_stmt_ast(stmt, ctx, None))
+        ast_simplify(self.lower_structured_stmt_ast(stmt, ctx))
             .render_with_indent(indent_level)
     }
 }

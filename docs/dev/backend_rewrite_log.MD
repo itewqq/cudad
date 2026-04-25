@@ -294,19 +294,29 @@
   `pretty_print_with_lift_cleanup*` and the seeded-wide-addr/token-alias helper
   machinery are gone, and the structurizer tests no longer pin those obsolete
   post-struct rendering contracts.
+- The last semantic-lift production coupling is now fenced off the live
+  backend path: `structurizer` no longer reaches into semantic-lift side
+  tables for predicate/statement pretty-printing, and `src/lib.rs` only
+  builds `semantic_lift` for tests instead of shipping it as part of the
+  production library surface.
+- Test-only coverage now imports semantic-lift helpers explicitly from the
+  private module instead of relying on a crate-root re-export, which keeps the
+  legacy lift harness available for narrow unit tests without reintroducing it
+  as backend API.
 
 ## Next safe step
 
-1. Delete the remaining semantic-lift-only production glue that still exists
-   inside `structurizer`/`semantic_lift`/`lib.rs`, or fence it to test-only
-   scope if it has not been translated into canonical analysis/lowering yet.
-2. Re-run the canonical/full-corpus acceptance checks after each deletion
+1. Re-run the canonical/full-corpus acceptance checks after each deletion
    slice so the branch proves the big-bang cutover still owns:
    deterministic output, no leaked SSA suffixes, no raw helper mnemonics, and
    the current goto/control budgets.
-3. Once another 3-ish atomic commits land, spawn the next review sub-agent
-   against the deletion slice and fold any findings back before touching the
-   remaining CLI/library cleanup.
+2. Refresh the user-facing docs (`README.md`, `docs/dev/decompiler_design.MD`)
+   so they stop naming deleted modules (`name_recovery`, `typed_output`) and
+   instead describe the canonical memory-aware SSA -> analysis -> AST -> symbol
+   plan -> renderer pipeline.
+3. This slice reaches the next review cadence, so spawn the next review
+   sub-agent against the semantic-lift cutover commit, wait for the result,
+   and fold any findings back before final acceptance cleanup.
 
 ## Open questions
 
@@ -343,5 +353,5 @@
 
 Resume from the remaining semantic-lift deletion slice: the text-repair/name-
 recovery modules are gone, so the next safe work is collapsing or deleting the
-last lift-only hooks that still sit inside `structurizer`/`semantic_lift`
-while keeping the canonical corpus/tests green after each atomic commit.
+last lift-only hooks that still sit inside `semantic_lift`/docs while keeping
+the canonical corpus/tests green after each atomic commit.

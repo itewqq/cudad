@@ -1,4 +1,5 @@
 use crate::*;
+use crate::semantic_lift::{lift_function_ir, DefRef, SemanticLiftConfig};
 use pretty_assertions::assert_eq;
 use regex::Regex;
 
