@@ -3,7 +3,7 @@
 ## Status
 
 - Branch: `codex/memory-aware-backend-refactor`
-- Checkpoint commit: `3abd8ca`
+- Checkpoint commit: `db0e02e`
 - Current stage: phase 5 cutover of structured output entrypoints onto the canonical backend, with front-half address-contract fixes still landing as needed
 
 ## Landed invariants
@@ -167,7 +167,7 @@
 - Canonical targeted coverage now also pins `warp_reduce_sum` shuffle lowering,
   and the broader float-pointer/signature smoke for `warp_reduce_sum` now runs
   on the canonical helper instead of the legacy structured-output path.
-- Remaining legacy helper usage in `src/test.rs`: `19`.
+- Remaining legacy helper usage in `src/test.rs`: `18`.
 
 ## Next safe step
 

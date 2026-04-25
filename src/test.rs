@@ -1673,15 +1673,15 @@ fn full_pass_stencil2d_top_halo_predicated_load_defaults_to_zero() {
         .into_iter()
         .find(|f| f.name == "stencil2d_5pt")
         .expect("stencil2d_5pt fixture should exist");
-    let out = run_structured_output_full_pass_from_instrs(stencil.instrs, stencil.sm);
+    let out = run_canonical_output_full_pass_from_instrs(stencil.instrs, stencil.sm, "stencil2d_5pt");
     assert!(
-        !out.contains(": v18;"),
-        "expected predicated top-halo load to stop reusing its stale SSA live-in, got:\n{}",
+        out.contains("r4_7 = !p2_1 ? (arg0_ptr[r8_0 + -1]) : 0;"),
+        "expected predicated top-halo load to default to zero, got:\n{}",
         out
     );
     assert!(
-        out.contains("v21 = !b5 ? (*(arg0_ptr + v15)) : 0;"),
-        "expected predicated top-halo load to default to zero, got:\n{}",
+        out.contains("r0_3 = !p1_5 ? (arg0_ptr[r8_0 + 16]) : 0;"),
+        "expected predicated right-halo load to default to zero, got:\n{}",
         out
     );
 }
