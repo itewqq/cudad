@@ -672,13 +672,13 @@ fn lower_non_memory_stmt_with_analysis(
     match &stmt.value {
         RValue::Op { opcode, args } => {
             let rhs = lower_op_expr_with_analysis(opcode, args, analysis);
-            if let Some(def) = stmt.defs.first().and_then(|expr| expr.get_reg()) {
+            if let Some((def_idx, def)) = select_non_memory_result_def(stmt) {
                 LoweredStmt {
                     stmt: Stmt::Assign {
                         dst: LValue::Var(lower_reg_name(def)),
                         src: rhs,
                     },
-                    predicate_def_idx: Some(0),
+                    predicate_def_idx: Some(def_idx),
                 }
             } else {
                 LoweredStmt {
@@ -695,13 +695,13 @@ fn lower_non_memory_stmt_with_analysis(
                     .map(|arg| lower_scalar_expr_with_analysis(arg, analysis))
                     .collect(),
             };
-            if let Some(def) = stmt.defs.first().and_then(|expr| expr.get_reg()) {
+            if let Some((def_idx, def)) = select_non_memory_result_def(stmt) {
                 LoweredStmt {
                     stmt: Stmt::Assign {
                         dst: LValue::Var(lower_reg_name(def)),
                         src: rhs,
                     },
-                    predicate_def_idx: Some(0),
+                    predicate_def_idx: Some(def_idx),
                 }
             } else {
                 LoweredStmt {
@@ -712,13 +712,13 @@ fn lower_non_memory_stmt_with_analysis(
         }
         RValue::ImmI(value) => {
             let src = Expr::Imm(value.to_string());
-            if let Some(def) = stmt.defs.first().and_then(|expr| expr.get_reg()) {
+            if let Some((def_idx, def)) = select_non_memory_result_def(stmt) {
                 LoweredStmt {
                     stmt: Stmt::Assign {
                         dst: LValue::Var(lower_reg_name(def)),
                         src,
                     },
-                    predicate_def_idx: Some(0),
+                    predicate_def_idx: Some(def_idx),
                 }
             } else {
                 LoweredStmt {
@@ -729,13 +729,13 @@ fn lower_non_memory_stmt_with_analysis(
         }
         RValue::ImmF(value) => {
             let src = Expr::Imm(value.to_string());
-            if let Some(def) = stmt.defs.first().and_then(|expr| expr.get_reg()) {
+            if let Some((def_idx, def)) = select_non_memory_result_def(stmt) {
                 LoweredStmt {
                     stmt: Stmt::Assign {
                         dst: LValue::Var(lower_reg_name(def)),
                         src,
                     },
-                    predicate_def_idx: Some(0),
+                    predicate_def_idx: Some(def_idx),
                 }
             } else {
                 LoweredStmt {
@@ -805,6 +805,7 @@ fn lower_semantic_op_expr(
 ) -> Option<Expr> {
     lower_setp_expr(opcode, args, analysis)
         .or_else(|| lower_wide_add_lo_expr(opcode, args, analysis))
+        .or_else(|| lower_shfl_expr(opcode, args, analysis))
         .or_else(|| lower_iabs_expr(opcode, args, analysis))
         .or_else(|| lower_ffma_expr(opcode, args, analysis))
         .or_else(|| lower_fmnmx_expr(opcode, args, analysis))
@@ -906,6 +907,44 @@ fn lower_add_expr(args: &[IRExpr], analysis: Option<&FunctionAnalysis>) -> Optio
         lhs: Box::new(lhs),
         rhs: Box::new(rhs),
     }))
+}
+
+fn lower_shfl_expr(
+    opcode: &str,
+    args: &[IRExpr],
+    analysis: Option<&FunctionAnalysis>,
+) -> Option<Expr> {
+    if args.len() != 3 {
+        return None;
+    }
+    let src = lower_scalar_expr_with_analysis(&args[0], analysis);
+    let lane = lower_scalar_expr_with_analysis(&args[1], analysis);
+    let clamp = lower_scalar_expr_with_analysis(&args[2], analysis);
+    if opcode.starts_with("SHFL.DOWN") {
+        return Some(Expr::CallLike {
+            func: "__shfl_down_sync".to_string(),
+            args: vec![Expr::Imm("0xffffffff".to_string()), src, lane],
+        });
+    }
+    if opcode.starts_with("SHFL.UP") {
+        return Some(Expr::CallLike {
+            func: "__shfl_up_sync".to_string(),
+            args: vec![Expr::Imm("0xffffffff".to_string()), src, lane],
+        });
+    }
+    if opcode.starts_with("SHFL.BFLY") || opcode.starts_with("SHFL.XOR") {
+        return Some(Expr::CallLike {
+            func: "__shfl_xor_sync".to_string(),
+            args: vec![Expr::Imm("0xffffffff".to_string()), src, lane],
+        });
+    }
+    if opcode.starts_with("SHFL") || opcode.starts_with("USHFL") {
+        return Some(Expr::CallLike {
+            func: "__shfl_sync".to_string(),
+            args: vec![Expr::Imm("0xffffffff".to_string()), src, lane, clamp],
+        });
+    }
+    None
 }
 
 fn lower_iabs_expr(
@@ -1309,18 +1348,22 @@ fn can_expand_rooted_reg(
 }
 
 fn select_memory_result_def(stmt: &IRStatement) -> Option<(usize, &crate::ir::RegId)> {
+    select_non_memory_result_def(stmt)
+}
+
+fn select_non_memory_result_def(stmt: &IRStatement) -> Option<(usize, &crate::ir::RegId)> {
     stmt.defs
         .iter()
         .enumerate()
         .filter_map(|(idx, def)| {
             let reg = def.get_reg()?;
-            (!is_sink_or_predicate_reg(reg)).then_some((idx, reg))
+            (!is_sink_reg(reg)).then_some((idx, reg))
         })
         .next()
 }
 
-fn is_sink_or_predicate_reg(reg: &crate::ir::RegId) -> bool {
-    matches!(reg.class.as_str(), "PT" | "UPT" | "P" | "UP" | "RZ" | "URZ")
+fn is_sink_reg(reg: &crate::ir::RegId) -> bool {
+    matches!(reg.class.as_str(), "PT" | "UPT" | "RZ" | "URZ")
 }
 
 fn apply_stmt_predicate(stmt: &IRStatement, lowered: LoweredStmt) -> Stmt {
@@ -1964,6 +2007,46 @@ mod tests {
             ],
         );
         assert_eq!(setp.render(), "(int32_t)(r2_0) >= (int32_t)(1)");
+    }
+
+    #[test]
+    fn lowers_shfl_down_to_cuda_intrinsic() {
+        let shfl = lower_op_expr(
+            "SHFL.DOWN",
+            &[
+                IRExpr::Reg(crate::ir::RegId::new("R", 3, 1).with_ssa(0)),
+                IRExpr::ImmI(16),
+                IRExpr::ImmI(31),
+            ],
+        );
+        assert_eq!(shfl.render(), "__shfl_down_sync(0xffffffff, r3_0, 16)");
+    }
+
+    #[test]
+    fn non_memory_lowering_prefers_data_def_over_sink_predicate() {
+        let stmt = IRStatement {
+            defs: vec![
+                IRExpr::Reg(crate::ir::RegId::new("PT", 0, 1)),
+                IRExpr::Reg(crate::ir::RegId::new("R", 0, 1).with_ssa(0)),
+            ],
+            value: RValue::Op {
+                opcode: "SHFL.DOWN".to_string(),
+                args: vec![
+                    IRExpr::Reg(crate::ir::RegId::new("R", 3, 1).with_ssa(0)),
+                    IRExpr::ImmI(16),
+                    IRExpr::ImmI(31),
+                ],
+            },
+            pred: None,
+            mem_addr_args: None,
+            pred_old_defs: Vec::new(),
+        };
+        let lowered = lower_non_memory_stmt(&stmt);
+        let Stmt::Assign { dst, src } = lowered.stmt else {
+            panic!("expected assignment");
+        };
+        assert_eq!(dst.render(), "r0_0");
+        assert_eq!(src.render(), "__shfl_down_sync(0xffffffff, r3_0, 16)");
     }
 
     #[test]

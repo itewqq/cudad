@@ -59,6 +59,9 @@ constant array.
 - No post-render text parsing for semantics.
 - No regex-driven semantic reconstruction.
 - Unknown SASS stays representable and conservative.
+- Multi-def scalar ops must keep their non-sink data results; optional
+  predicate/sink defs (for example on `SHFL`) must not cause the canonical path
+  to drop the real value-producing def.
 - New backend modules must document their inputs, outputs, invariants, and
   forbidden responsibilities in rustdoc headers.
 

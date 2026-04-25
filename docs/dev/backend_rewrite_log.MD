@@ -3,7 +3,7 @@
 ## Status
 
 - Branch: `codex/memory-aware-backend-refactor`
-- Checkpoint commit: `f464db3`
+- Checkpoint commit: `f24e974`
 - Current stage: phase 5 cutover of structured output entrypoints onto the canonical backend, with front-half address-contract fixes still landing as needed
 
 ## Landed invariants
@@ -152,19 +152,26 @@
   addresses from the new decode/IR contract, which makes fixtures like
   `reduce_block` and `stencil1d` render `shmem[threadIdx.x + k]` forms on the
   canonical path instead of leaking `(rN_0 + byte_offset) / 4`.
+- Canonical non-memory lowering now selects the first non-sink result def
+  instead of blindly taking operand 0, which keeps real data defs alive for
+  multi-def ops like `SHFL.DOWN PT, R0, ...` instead of silently assigning the
+  sink predicate and dropping the shuffle result.
+- Canonical scalar lowering now maps `SHFL.DOWN`/`SHFL.UP`/`SHFL.XOR` style ops
+  to CUDA shuffle intrinsics, so warp reductions can keep `__shfl_*_sync`
+  structure on the canonical path without depending on semantic-lift output.
 
 ## Next safe step
 
-1. Re-run the canonical full-pass fixtures that were blocked on erased shared
-   address scales (`reduce_block`, `stencil1d`, and then `warp_reduce_sum`) and
-   migrate any newly-solid assertions off the legacy structured-output helper.
+1. Re-run the canonical full-pass fixtures whose remaining gaps are now mostly
+   structural rather than scalar-expression loss (`warp_reduce_sum`, then the
+   still-partial `sgemm_tiled` / shared-memory kernels) and migrate only the
+   assertions that the canonical backend now proves directly.
 2. Keep shrinking the remaining old helper surface in `src/test.rs` only where
    canonical semantics are now genuinely stronger, not just cosmetically
    different.
-3. Replace the remaining placeholder non-memory AST lowering gaps and broader
-   canonical correctness holes (notably `warp_reduce_sum` control predicates and
-   the still-partial full `sgemm_tiled` lowering) without reviving the old
-   semantic-lift backend.
+3. Tackle the next structurally visible canonical holes: shared index/root
+   recovery beyond direct `threadIdx` forms, unresolved control predicates, and
+   the last unmodeled scalar ops that still force raw helper-shaped output.
 
 ## Open questions
 

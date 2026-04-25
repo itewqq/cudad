@@ -1625,6 +1625,25 @@ fn canonical_full_pass_sgemm_tiled_avoids_lea_helper_artifacts() {
 }
 
 #[test]
+fn canonical_full_pass_warp_reduce_sum_keeps_shuffle_intrinsics() {
+    let warp = split_decoded_functions(include_str!("../test_cu/corpus/compute_kernels.sass"))
+        .into_iter()
+        .find(|f| f.name == "warp_reduce_sum")
+        .expect("warp_reduce_sum fixture should exist");
+    let out = run_canonical_output_full_pass_from_instrs(warp.instrs, warp.sm, "warp_reduce_sum");
+    assert!(
+        out.contains("__shfl_down_sync"),
+        "expected canonical warp_reduce_sum to keep CUDA shuffle intrinsics, got:\n{}",
+        out
+    );
+    assert!(
+        !out.contains("SHFL.DOWN("),
+        "expected canonical warp_reduce_sum to avoid raw shuffle mnemonics, got:\n{}",
+        out
+    );
+}
+
+#[test]
 fn full_pass_warp_reduce_sum_infers_float_input_pointer() {
     let warp = split_decoded_functions(include_str!("../test_cu/corpus/compute_kernels.sass"))
         .into_iter()
