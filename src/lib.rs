@@ -21,8 +21,6 @@ pub mod memory_model;
 pub mod op_semantics;
 pub mod parser;
 pub mod ptr_verification;
-#[cfg(test)]
-mod semantic_lift;
 pub mod semantic_propagation;
 pub mod structurizer;
 pub mod symbol_plan;

@@ -199,8 +199,9 @@ The active backend is architecture-first and canonical-only. The main path is:
 8. symbol/declaration planning in `src/symbol_plan.rs`
 9. direct rendering from the canonical AST
 
-`src/semantic_lift.rs` is retained only for narrow test-only regression
-coverage; it is not part of the production backend or public library API.
+The legacy `src/semantic_lift.rs` sources are no longer part of the normal CLI
+or default test build; any remaining lift-specific value is documentary until
+the final file deletion sweep lands.
 
 The default binary already drives that full pass. There is no separate "legacy pretty-printer mode" exposed as the normal CLI path.
 
@@ -283,7 +284,7 @@ Useful public entry points include:
 - `src/ast_lowering.rs` — canonical AST lowering from structured SSA + analysis
 - `src/symbol_plan.rs` — deterministic declaration and temp planning
 - `src/backend_pipeline.rs` — canonical full-pass driver
-- `src/semantic_lift.rs` — test-only legacy lift harness kept for focused unit tests
+- `src/semantic_lift.rs` — legacy lift sources left in-tree for reference while the final file deletion sweep is pending
 - `test_cu/` — fixtures, corpora, and golden outputs
 - `docs/dev/decompiler_design.MD` — current backend design notes
 

@@ -382,16 +382,24 @@
   the live CLI across SM 89 / SM 100 / SM 120, and the structured-helper-leak
   corpus invariants plus SM 89 determinism all pass again after that cleanup
   guard landed.
+- The legacy semantic-lift harness is now disconnected from the default test
+  build: the remaining `src/test.rs` checks that only asserted lift-specific
+  pretty-print details are deleted, and `src/lib.rs` no longer compiles
+  `semantic_lift` even behind `#[cfg(test)]`.
+- The broader acceptance refresh is moving again on the branch tip after that
+  cleanup: SM 100 and SM 120 corpus determinism both pass on the canonical
+  backend, so the remaining corpus refresh work is narrower (`goto` budgets
+  plus any final curated-output regeneration) instead of being blocked on the
+  old lift harness or the old SHA timeout.
 
 ## Next safe step
 
-1. Continue the final phase 6 deletion sweep: remove any remaining legacy-only
+1. Re-run the remaining broader acceptance slices that still matter after the
+   `sha256_single_block` perf fix (mainly the corpus `goto` budgets and any
+   corpus-wide invariants that have not yet been refreshed on this branch tip).
+2. Continue the final phase 6 deletion sweep: remove any remaining legacy-only
    backend helpers/tests that no longer back the canonical pipeline, then
    regenerate the curated acceptance outputs from the canonical driver only.
-2. Re-run the remaining broader acceptance slices that still matter after the
-   `sha256_single_block` perf fix (goto budgets, SM 100/120 determinism, and
-   any corpus-wide invariants that have not yet been refreshed on this branch
-   tip).
 3. Once another 2-4 atomic commits land, run the next review sub-agent and
    wait for the result before starting the final corpus refresh / PR cleanup
    pass.
@@ -433,6 +441,7 @@
 - `src/structurizer/mod.rs`
 - `src/structurizer/collapse.rs`
 - `src/structurizer/tests.rs`
+- `README.md`
 - `docs/dev/decompiler_design.MD`
 
 ## Interrupt resume note

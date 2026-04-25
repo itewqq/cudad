@@ -1,4 +1,3 @@
-use crate::semantic_lift::{lift_function_ir, DefRef, SemanticLiftConfig};
 use crate::*;
 use pretty_assertions::assert_eq;
 use regex::Regex;
@@ -306,7 +305,7 @@ fn ssa_iadd3_pred_output_is_defined_and_reused_by_lea_hi_x() {
 }
 
 #[test]
-fn ssa_iadd64_defines_high_lane_and_lifts_carry_into_hi_half() {
+fn ssa_iadd64_defines_high_lane_and_preserves_hi_inputs() {
     let sample = r#"
         /*0000*/ LDC.64 R4, c[0x0][0x380] ;
         /*0010*/ SHF.R.S32.HI R7, RZ, 0x1f, R6 ;
@@ -332,39 +331,10 @@ fn ssa_iadd64_defines_high_lane_and_lifts_carry_into_hi_half() {
     );
     assert!(matches!(args[2], IRExpr::Reg(ref r) if r.class == "R" && r.idx == 7));
     assert!(matches!(args[3], IRExpr::Reg(ref r) if r.class == "R" && r.idx == 5));
-
-    let lifted = lift_function_ir(&fir, &SemanticLiftConfig::default());
-    let stmt_idx = block0
-        .stmts
-        .iter()
-        .position(|candidate| std::ptr::eq(candidate, stmt))
-        .expect("IADD.64 statement should have an index");
-    let hi = lifted
-        .by_def
-        .get(&DefRef {
-            block_id: block0.id,
-            stmt_idx,
-            def_idx: 1,
-        })
-        .expect("expected lifted hi-half for IADD.64")
-        .rhs
-        .render();
-    assert!(
-        hi.contains("(int64_t)((int32_t)(R6.0))"),
-        "expected hi-half to preserve the widened scalar addend, got: {hi}"
-    );
-    assert!(
-        hi.contains("((uintptr_t)(((uint64_t)(R5.0) << 32) | (uint32_t)(R4.0)))"),
-        "expected hi-half to preserve the explicit wide base pair, got: {hi}"
-    );
-    assert!(
-        !hi.contains("carry_u32_add3("),
-        "expected hi-half to collapse the carry helper into a wide sum, got: {hi}"
-    );
 }
 
 #[test]
-fn ssa_uiadd3_64_defines_high_lane_and_lifts_carry_into_hi_half() {
+fn ssa_uiadd3_64_defines_high_lane_and_preserves_hi_inputs() {
     let sample = r#"
         /*0000*/ UIADD3.64 UR4, UPT, UPT, UR18, 0x10, URZ ;
         /*0010*/ EXIT ;
@@ -402,40 +372,6 @@ fn ssa_uiadd3_64_defines_high_lane_and_lifts_carry_into_hi_half() {
     assert!(matches!(args[3], IRExpr::Reg(ref r) if r.class == "UR" && r.idx == 19));
     assert!(matches!(args[4], IRExpr::ImmI(0)));
     assert!(matches!(args[5], IRExpr::Reg(ref r) if r.class == "URZ"));
-
-    let lifted = lift_function_ir(&fir, &SemanticLiftConfig::default());
-    let stmt_idx = block0
-        .stmts
-        .iter()
-        .position(|candidate| std::ptr::eq(candidate, stmt))
-        .expect("UIADD3.64 statement should have an index");
-    let hi_def_idx = stmt
-        .defs
-        .iter()
-        .position(|def| matches!(def, IRExpr::Reg(reg) if reg.class == "UR" && reg.idx == 5))
-        .expect("expected hi-half def index");
-    let hi = lifted
-        .by_def
-        .get(&DefRef {
-            block_id: block0.id,
-            stmt_idx,
-            def_idx: hi_def_idx,
-        })
-        .expect("expected lifted hi-half for UIADD3.64")
-        .rhs
-        .render();
-    assert!(
-        hi.contains("((uintptr_t)(((uint64_t)(UR19.0) << 32) | (uint32_t)(UR18.0)))"),
-        "expected hi-half to preserve the explicit wide base pair, got: {hi}"
-    );
-    assert!(
-        hi.contains("(uint64_t)((uint32_t)(16))"),
-        "expected hi-half to preserve the widened immediate addend, got: {hi}"
-    );
-    assert!(
-        !hi.contains("carry_u32_add3("),
-        "expected hi-half to collapse the carry helper into a wide sum, got: {hi}"
-    );
 }
 
 #[test]
@@ -555,39 +491,6 @@ fn ssa_imad_wide_models_implicit_hi_def() {
         "implicit high half missing from IMAD.WIDE defs: {:?}",
         stmt.defs
     );
-}
-
-#[test]
-fn semantic_lift_carry_def_uses_pre_increment_low_operand() {
-    let sample = r#"
-        /*0000*/ IADD3 R1, P0, R1, 0x1, RZ ;
-        /*0010*/ IADD3.X R2, R2, RZ, RZ, P0, !PT ;
-        /*0020*/ EXIT ;
-    "#;
-    let cfg = build_cfg(decode_sass(sample));
-    let fir = build_ssa(&cfg);
-    let lifted = lift_function_ir(&fir, &SemanticLiftConfig::default());
-
-    let low = lifted
-        .by_def
-        .get(&DefRef {
-            block_id: 0,
-            stmt_idx: 0,
-            def_idx: 0,
-        })
-        .expect("expected low add def");
-    let carry = lifted
-        .by_def
-        .get(&DefRef {
-            block_id: 0,
-            stmt_idx: 0,
-            def_idx: 1,
-        })
-        .expect("expected carry def");
-
-    assert_eq!(low.rhs.render(), "R1.0 + 1");
-    assert_eq!(carry.rhs.render(), "carry_u32_add3(R1.0, 1, 0)");
-    assert!(!carry.rhs.render().contains("R1.1"));
 }
 
 #[test]

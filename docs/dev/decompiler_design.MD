@@ -82,8 +82,9 @@ Key pieces:
   only runs when a direct `FCHK` proof is live in scope, and its local name
   resolution must stop at self/mutual cycles instead of exploding loop-carried
   expressions into giant trees
-- `src/semantic_lift.rs` remains only as a test-only harness for targeted
-  legacy lift coverage that has not yet been translated into canonical tests
+- the legacy `src/semantic_lift.rs` sources are no longer part of the live CLI
+  or default test build; any remaining reference value they provide is now
+  documentary only until the files can be deleted outright
 - the structurizer is allowed to duplicate short acyclic terminal helper tails
   when that is the cleanest way to avoid goto fallback, but it refuses to
   duplicate loop/goto-bearing composites
