@@ -167,7 +167,7 @@
 - Canonical targeted coverage now also pins `warp_reduce_sum` shuffle lowering,
   and the broader float-pointer/signature smoke for `warp_reduce_sum` now runs
   on the canonical helper instead of the legacy structured-output path.
-- Remaining legacy helper usage in `src/test.rs`: `18`.
+- Remaining legacy helper usage in `src/test.rs`: `16`.
 - `LOP3.LUT` instructions with both predicate and data outputs now keep both
   defs on the canonical path, which fixes `warp_reduce_sum` lane-mask recovery
   (`threadIdx.x & 31`) and removes the old undefined `r8_0` artifact from the
@@ -187,6 +187,9 @@
   patterns used for `copysignf(...)`, and canonical coverage now pins that
   `gelu_forward` keeps those math ops structural instead of leaking raw
   `LOP3.LUT` / `FSEL` / `FMUL` / `IMAD` helper calls.
+- The duplicated old-backend `sgemm_tiled` full-pass tests are now deleted; the
+  canonical `sgemm_tiled` coverage owns the typed predicated-load and
+  LEA-helper-elimination contracts directly.
 
 ## Next safe step
 
