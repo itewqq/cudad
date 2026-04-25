@@ -238,9 +238,7 @@ fn simplify_trivial_stmt(stmt: Stmt) -> Stmt {
             let then_branch = simplify_trivial_stmt(*then_branch);
             let else_branch = else_branch.map(|branch| simplify_trivial_stmt(*branch));
             if stmt_is_trivial_empty(&then_branch)
-                && else_branch
-                    .as_ref()
-                    .is_none_or(stmt_is_trivial_empty)
+                && else_branch.as_ref().is_none_or(stmt_is_trivial_empty)
             {
                 Stmt::Empty
             } else {
@@ -376,6 +374,8 @@ fn calllike_may_have_side_effects(func: &str) -> bool {
             | "atomicOr"
             | "atomicXor"
             | "atomicOp"
+            | "__syncthreads"
+            | "__syncwarp"
     ) || func.starts_with("local_store_")
 }
 
@@ -518,7 +518,10 @@ mod tests {
             },
             Stmt::Return(None),
         ]);
-        assert_eq!(prune_dead_pure_stmt(stmt), Stmt::Sequence(vec![Stmt::Return(None)]));
+        assert_eq!(
+            prune_dead_pure_stmt(stmt),
+            Stmt::Sequence(vec![Stmt::Return(None)])
+        );
     }
 
     #[test]
@@ -530,7 +533,25 @@ mod tests {
             }),
             Stmt::Return(None),
         ]);
-        assert_eq!(prune_dead_pure_stmt(stmt), Stmt::Sequence(vec![Stmt::Return(None)]));
+        assert_eq!(
+            prune_dead_pure_stmt(stmt),
+            Stmt::Sequence(vec![Stmt::Return(None)])
+        );
+    }
+
+    #[test]
+    fn keeps_barrier_expr_statements_live() {
+        let stmt = Stmt::Sequence(vec![
+            Stmt::ExprStmt(Expr::CallLike {
+                func: "__syncthreads".to_string(),
+                args: Vec::new(),
+            }),
+            Stmt::Return(None),
+        ]);
+        assert_eq!(
+            prune_dead_pure_stmt(stmt.clone()),
+            stmt,
+        );
     }
 
     #[test]
@@ -569,9 +590,6 @@ mod tests {
                 Stmt::Return(None),
             ]),
         };
-        assert_eq!(
-            prune_dead_pure_defs(function).body,
-            Stmt::Return(None),
-        );
+        assert_eq!(prune_dead_pure_defs(function).body, Stmt::Return(None),);
     }
 }

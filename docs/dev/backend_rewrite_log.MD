@@ -268,6 +268,10 @@
   now pointed at the canonical backend driver, which removes another old
   full-pass call site from the branch and makes the remaining legacy-test
   cleanup more mechanical.
+- Canonical AST DCE now treats synchronization intrinsics as effectful
+  statements, so `__syncthreads()` / `__syncwarp()` survive the late pure-call
+  pruning pass instead of disappearing from rendered kernels such as
+  `histogram256`.
 
 ## Next safe step
 
