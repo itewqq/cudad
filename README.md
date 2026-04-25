@@ -69,10 +69,10 @@ __global__ void kernel(uint32_t arg0, uint32_t arg2, uintptr_t arg4_ptr, uint32_
 }
 ```
 
-That is representative of the current backend:
+That is representative of an older snapshot of the backend:
 - signatures are inferred heuristically from ABI usage and CUDA builtins such as `blockIdx.x`, `threadIdx.x`, and `blockDim.x` are recovered
 - control flow is no longer raw `BRA` / `EXIT`; it becomes structured `if` / `do ... while` code when the CFG is recoverable
-- semantic lift recovers helpers such as `lea_hi_x`, typed loads/stores, and arithmetic/comparison structure instead of dumping raw mnemonics
+- the canonical backend now recovers typed memory accesses, builtins, and arithmetic/comparison structure through `FunctionAnalysis` plus AST lowering instead of post-render text repair
 - locals are typed, but names are still generic (`vN`, `bN`, `uN`) unless stronger recovery exists
 - pointer reconstruction is improved but still incomplete, so `addr64(lo, hi)` style artifacts can remain in real kernels
 
@@ -193,12 +193,14 @@ The active backend is architecture-first and canonical-only. The main path is:
 2. `build_cfg` in `src/cfg.rs`
 3. `build_ssa` in `src/ir.rs`
 4. IR optimization passes in `src/ir_dce.rs`, `src/ir_constprop.rs`, `src/ir_algebra.rs`, `src/ir_cse.rs`, and `src/ir_copyprop.rs`
-5. control-flow structurization in `src/structurizer.rs`
-6. semantic lift in `src/semantic_lift.rs`
-7. ABI annotation + argument aliasing in `src/abi.rs`
-8. structural name recovery in `src/name_recovery.rs`
-9. AST cleanup in `src/ast_passes.rs`
-10. typed final rendering in `src/typed_output.rs`
+5. `FunctionAnalysis` in `src/function_analysis.rs`
+6. control-flow structurization in `src/structurizer/`
+7. structured AST lowering in `src/ast_lowering.rs`
+8. symbol/declaration planning in `src/symbol_plan.rs`
+9. direct rendering from the canonical AST
+
+`src/semantic_lift.rs` is retained only for narrow test-only regression
+coverage; it is not part of the production backend or public library API.
 
 The default binary already drives that full pass. There is no separate "legacy pretty-printer mode" exposed as the normal CLI path.
 
@@ -220,13 +222,14 @@ cargo run -- -i kernel.sass --cfg-dot > /tmp/kernel.cfg.dot
 
 If the CFG is wrong, structurization will also be wrong.
 
-### Debug lifting / naming issues
+### Debug analysis / lowering issues
 
 ```bash
 cargo run -- -i kernel.sass --ssa-dot -o /tmp/kernel.ssa.dot
 ```
 
-Use this when the output still contains low-level value plumbing and you need to see what SSA the lifter actually received.
+Use this when the output still contains low-level value plumbing and you need
+to see the SSA that feeds `FunctionAnalysis` and canonical AST lowering.
 
 ### Refresh the canonical snapshots
 
@@ -266,7 +269,8 @@ Useful public entry points include:
 - `decode_instruction_line`, `decode_sass`, `split_decoded_functions`
 - `build_cfg`
 - `build_ssa`
-- `lift_function_ir`
+- `build_decompile_artifacts`, `build_named_decompile_artifacts`
+- `analyze_function_ir`, `analyze_function_ir_with_profile`
 - ABI helpers in `src/abi.rs`
 
 ## Repository layout
@@ -274,11 +278,12 @@ Useful public entry points include:
 - `src/parser.rs` — decoded SASS front-end
 - `src/cfg.rs` — basic-block and CFG construction
 - `src/ir.rs` — SSA IR builder
-- `src/semantic_lift.rs` — opcode-to-expression lift rules
-- `src/structurizer.rs` — control-flow recovery
-- `src/abi.rs` — ABI slot decoding and argument alias inference
-- `src/name_recovery.rs` — structural symbol assignment
-- `src/typed_output.rs` — typed final render
+- `src/function_analysis.rs` — post-SSA ABI, type, and memory-space facts
+- `src/structurizer/` — control-flow recovery
+- `src/ast_lowering.rs` — canonical AST lowering from structured SSA + analysis
+- `src/symbol_plan.rs` — deterministic declaration and temp planning
+- `src/backend_pipeline.rs` — canonical full-pass driver
+- `src/semantic_lift.rs` — test-only legacy lift harness kept for focused unit tests
 - `test_cu/` — fixtures, corpora, and golden outputs
 - `docs/dev/decompiler_design.MD` — current backend design notes
 

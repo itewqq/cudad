@@ -1,6 +1,24 @@
-//! Conservative semantic lifting for SSA IR expression rendering.
-//! This pass is non-mutating: it does not alter CFG/SSA/structure, only
-//! computes optional expression rewrites for display.
+//! Test-only semantic lifting harness for focused SSA regression coverage.
+//!
+//! Purpose:
+//! - keep narrow opcode-to-expression tests alive while the canonical backend
+//!   finishes moving every surviving semantic contract into
+//!   `FunctionAnalysis`, `ast_lowering`, and renderer tests
+//!
+//! Inputs:
+//! - optimized `FunctionIR`
+//! - optional ABI annotations and argument aliases
+//!
+//! Outputs:
+//! - optional lifted expressions/statements used by unit tests
+//!
+//! Invariants:
+//! - non-mutating: this module never edits CFG, SSA, or structured control
+//! - conservative: unsupported ops stay explicit instead of guessed
+//!
+//! This module must not:
+//! - participate in the production backend pipeline
+//! - be treated as part of the public library API
 
 use std::collections::{BTreeMap, BTreeSet};
 

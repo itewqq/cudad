@@ -16,12 +16,12 @@ The active decompiler flow is:
    - `ir_algebra`
    - `ir_cse`
    - `ir_copyprop`
-5. `Structurizer::structure_function` in `src/structurizer.rs`
-6. `lift_function_ir` in `src/semantic_lift.rs`
-7. ABI annotation / alias inference in `src/abi.rs`
-8. structural name recovery in `src/name_recovery.rs`
-9. AST cleanup passes in `src/ast_passes.rs`
-10. typed final render in `src/typed_output.rs`
+5. `analyze_function_ir` / `FunctionAnalysis` in `src/function_analysis.rs`
+6. `Structurizer::structure_function` in `src/structurizer/`
+7. `lower_structured_function` in `src/ast_lowering.rs`
+8. symbol/declaration planning in `src/symbol_plan.rs`
+9. canonical AST cleanup in `src/canonical_ast_passes.rs`
+10. direct render from `StructuredFunction`
 
 The CLI in `src/bin/main.rs` already drives that full pass by default. The only public debug side exits are `--cfg-dot` and `--ssa-dot`.
 
@@ -54,37 +54,50 @@ The control-flow layer depends on a few invariants:
 3. CFG node payloads carry decoded instructions all the way into SSA construction
 4. pseudo-register sentinels such as `RZ`, `PT`, `URZ`, and `UPT` are never treated as normal SSA definition targets
 
-`build_ssa` then creates the mid-end IR used by optimization, lifting, naming, and typing passes.
+`build_ssa` then creates the mid-end IR used by optimization, analysis,
+structurization, and canonical lowering.
 
-## Semantic lift and naming
+## Function analysis, lowering, and symbol planning
 
-The lifting layer is still rule-based, but it is now part of the default backend rather than a side pipeline.
+The canonical backend no longer depends on semantic-lift side tables or
+post-render name recovery. Instead it threads explicit analysis facts through
+the structured lowering pipeline.
 
 Key pieces:
 
-- `lift_function_ir` rewrites SSA statements into higher-level expressions
-- rules live under `src/semantic_lift/rules/`
-- current rule coverage includes arithmetic, comparisons, loads/stores, special registers, atomics, bitwise helpers, and common math intrinsics
-- `plan_structured_name_recovery_with_lift` assigns stable temp-style names before final rendering
+- `FunctionAnalysis` classifies ABI facts, pointer roots, builtin accesses,
+  memory spaces, and scalar/pointee types on optimized SSA
+- `lower_structured_function` lowers `StructuredStatement + FunctionAnalysis`
+  directly into the canonical AST
+- `plan_symbols` assigns params, locals, shared objects, and deterministic temp
+  names without reading rendered text back in
+- `src/semantic_lift.rs` remains only as a test-only harness for targeted
+  legacy lift coverage that has not yet been translated into canonical tests
 
-The name recovery pass is intentionally conservative:
+Symbol planning is intentionally conservative:
 
-- only congruent SSA values are merged
-- reused hardware registers can still split into multiple recovered symbols
-- when semantic recovery is weak, the output falls back to deterministic generic names such as `vN`, `bN`, and `uN`
+- params/builtins get semantic names when analysis proves them
+- reused hardware registers can still split into multiple canonical temporaries
+- when stronger recovery is unavailable, the output falls back to deterministic
+  temp-style names instead of heuristic pretty names
 
-## ABI and typed rendering
+## ABI, memory spaces, and rendering
 
-`src/abi.rs` resolves constant-memory accesses into CUDA-facing meaning where possible.
+`src/abi.rs` and `src/function_analysis.rs` resolve constant-memory accesses and
+address roots into CUDA-facing meaning where possible.
 
 That layer is responsible for:
 
 - detecting an ABI profile (`auto`, `legacy140`, `modern160`)
 - mapping known builtins such as `blockDim.x`, `gridDim.y`, `threadIdx.x`, and `blockIdx.x`
 - inferring argument aliases from parameter-window accesses
+- classifying `Param`, `Const`, `Global`, `Local`, `Shared`, and `Generic`
+  memory operations before lowering
 - feeding typed declarations and signature hints into the final render
 
-The typed output pass in `src/typed_output.rs` is the last step that turns structured output into the emitted pseudo-C function.
+Rendering now happens directly from the canonical AST plus symbol plan; there
+is no `typed_output.rs`, regex declaration synthesis, or post-render pointer
+repair stage in the live backend.
 
 ## Current regression model
 

@@ -303,6 +303,11 @@
   private module instead of relying on a crate-root re-export, which keeps the
   legacy lift harness available for narrow unit tests without reintroducing it
   as backend API.
+- The review follow-up for this slice is also addressed: `README.md`,
+  `docs/dev/decompiler_design.MD`, and the `src/semantic_lift.rs` header now
+  describe semantic lift as a test-only legacy harness and document the live
+  canonical pipeline as SSA optimization -> `FunctionAnalysis` ->
+  structurization -> AST lowering -> symbol planning -> render.
 
 ## Next safe step
 
@@ -310,13 +315,11 @@
    slice so the branch proves the big-bang cutover still owns:
    deterministic output, no leaked SSA suffixes, no raw helper mnemonics, and
    the current goto/control budgets.
-2. Refresh the user-facing docs (`README.md`, `docs/dev/decompiler_design.MD`)
-   so they stop naming deleted modules (`name_recovery`, `typed_output`) and
-   instead describe the canonical memory-aware SSA -> analysis -> AST -> symbol
-   plan -> renderer pipeline.
-3. This slice reaches the next review cadence, so spawn the next review
-   sub-agent against the semantic-lift cutover commit, wait for the result,
-   and fold any findings back before final acceptance cleanup.
+2. Drive the remaining late-phase red tests down, especially the `ast_passes`
+   addr64-fold regressions and the corpus/goto-budget failures that still show
+   canonical pointer/control-flow cleanup gaps.
+3. After another 2-4 atomic commits in that cleanup slice, run the next review
+   sub-agent and wait for the result before the final cutover summary.
 
 ## Open questions
 
