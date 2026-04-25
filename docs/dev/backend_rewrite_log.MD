@@ -286,13 +286,20 @@
   `render_typed_structured_output`, `collect_shared_memory_decls`, or the old
   full-pass test driver; the remaining legacy deletion work is now in the
   production modules rather than the test harness.
+- The legacy text-repair modules are now off the live library surface:
+  `src/lib.rs` no longer exports `name_recovery` or `typed_output`, and the
+  corresponding source files are deleted instead of left behind as dormant
+  compatibility code.
+- The old structurizer-side cleanup/token-map bridge is also deleted:
+  `pretty_print_with_lift_cleanup*` and the seeded-wide-addr/token-alias helper
+  machinery are gone, and the structurizer tests no longer pin those obsolete
+  post-struct rendering contracts.
 
 ## Next safe step
 
-1. Delete the remaining production-only legacy modules and exports that still
-   exist solely for the old post-struct backend path (`typed_output`,
-   lifted name-recovery glue, semantic-lift-only rendering hooks, and any
-   duplicated public re-exports that survive only for that path).
+1. Delete the remaining semantic-lift-only production glue that still exists
+   inside `structurizer`/`semantic_lift`/`lib.rs`, or fence it to test-only
+   scope if it has not been translated into canonical analysis/lowering yet.
 2. Re-run the canonical/full-corpus acceptance checks after each deletion
    slice so the branch proves the big-bang cutover still owns:
    deterministic output, no leaked SSA suffixes, no raw helper mnemonics, and
@@ -329,10 +336,12 @@
 - `src/lib.rs`
 - `src/test.rs`
 - `src/canonical_ast_passes.rs`
+- `src/structurizer/mod.rs`
+- `src/structurizer/tests.rs`
 
 ## Interrupt resume note
 
-Resume from the production-module deletion slice, not the tests: `src/test.rs`
-is now off the old backend path, so the next safe work is deleting the
-remaining legacy rendering/name-recovery modules while keeping the canonical
-corpus/tests green after each atomic commit.
+Resume from the remaining semantic-lift deletion slice: the text-repair/name-
+recovery modules are gone, so the next safe work is collapsing or deleting the
+last lift-only hooks that still sit inside `structurizer`/`semantic_lift`
+while keeping the canonical corpus/tests green after each atomic commit.

@@ -3,18 +3,12 @@
 //! converted into structured control flow, it falls back to explicit goto.
 
 use crate::ast::{
-    Expr as AstExpr, IntrinsicOp, LValue as AstLValue, LoopKind as AstLoopKind, PointerLane,
-    Stmt as AstStmt,
+    Expr as AstExpr, IntrinsicOp, LValue as AstLValue, LoopKind as AstLoopKind, Stmt as AstStmt,
 };
 #[cfg(test)]
 use crate::ast_passes::ast_simplify;
-use crate::ast_passes::{
-    ast_apply_token_map, ast_cleanup_with_seeded_wide_addrs, SeededWideAddrInfo,
-    SeededWideAddrMaps,
-};
 use crate::cfg::ControlFlowGraph;
 use crate::ir::{DisplayCtx, FunctionIR, IRBlock, IRCond, IRExpr, IRStatement, RValue, RegId};
-use crate::name_recovery::apply_token_map_to_rendered;
 use crate::semantic_lift::{DefRef, SemanticLiftResult};
 
 use petgraph::algo::dominators::{simple_fast, Dominators};
@@ -149,789 +143,6 @@ impl fmt::Display for StructuredStatement {
 }
 
 // --- Structurizer Implementation ---
-fn seeded_wide_ptr_info(base: &str) -> SeededWideAddrInfo {
-    SeededWideAddrInfo {
-        base: AstExpr::Raw(base.to_string()),
-        seed_lo: AstExpr::PtrLane {
-            base: base.to_string(),
-            lane: PointerLane::Lo32,
-        },
-    }
-}
-
-fn parse_constmem_word_symbol(text: &str) -> Option<(u32, u32)> {
-    let body = text.strip_prefix("c[0x")?;
-    let (bank_hex, rest) = body.split_once("][0x")?;
-    let offset_hex = rest.strip_suffix(']')?;
-    let bank = u32::from_str_radix(bank_hex, 16).ok()?;
-    let offset = u32::from_str_radix(offset_hex, 16).ok()?;
-    Some((bank, offset))
-}
-
-fn adjacent_constmem_word_symbol(text: &str) -> Option<String> {
-    let (bank, offset) = parse_constmem_word_symbol(text)?;
-    Some(format!("c[0x{:x}][0x{:x}]", bank, offset + 4))
-}
-
-fn seeded_constmem_pair_info(lo_name: &str, lo_sym: &str, hi_sym: &str) -> SeededWideAddrInfo {
-    let render_sym = |text: &str| {
-        if text.starts_with("c[0x") {
-            AstExpr::Raw(text.to_string())
-        } else {
-            AstExpr::ConstMemSymbol(text.to_string())
-        }
-    };
-    SeededWideAddrInfo {
-        base: AstExpr::Addr64 {
-            lo: Box::new(render_sym(lo_sym)),
-            hi: Box::new(render_sym(hi_sym)),
-        },
-        seed_lo: AstExpr::Reg(lo_name.to_string()),
-    }
-}
-
-fn ast_lvalue_var_name(lvalue: &AstLValue) -> Option<String> {
-    match lvalue {
-        AstLValue::Var(name) => Some(name.clone()),
-        AstLValue::PtrLane { base, lane } => Some(format!("{}.{}", base, lane.render_suffix())),
-        _ => None,
-    }
-}
-
-fn expr_ptr_lane_base(expr: &AstExpr, lane: PointerLane) -> Option<String> {
-    match expr {
-        AstExpr::PtrLane {
-            base,
-            lane: actual_lane,
-        } if *actual_lane == lane => Some(base.clone()),
-        AstExpr::ConstMemSymbol(name) | AstExpr::Reg(name) => PointerLane::parse_named(name)
-            .and_then(|(base, actual_lane)| (actual_lane == lane).then_some(base)),
-        _ => None,
-    }
-}
-
-fn infer_lo_seed_info(
-    expr: &AstExpr,
-    lo_by_name: &HashMap<String, SeededWideAddrInfo>,
-) -> Option<SeededWideAddrInfo> {
-    if let Some(base) = expr_ptr_lane_base(expr, PointerLane::Lo32) {
-        return Some(seeded_wide_ptr_info(&base));
-    }
-    match expr {
-        AstExpr::Reg(name) => lo_by_name.get(name).cloned(),
-        AstExpr::Binary { op, lhs, rhs } if op == "+" => {
-            infer_lo_seed_info(lhs, lo_by_name).or_else(|| infer_lo_seed_info(rhs, lo_by_name))
-        }
-        AstExpr::Ternary {
-            then_expr,
-            else_expr,
-            ..
-        } => {
-            let then_info = infer_lo_seed_info(then_expr, lo_by_name)?;
-            let else_info = infer_lo_seed_info(else_expr, lo_by_name)?;
-            (then_info == else_info).then_some(then_info)
-        }
-        _ => None,
-    }
-}
-
-fn infer_hi_seed_info(
-    expr: &AstExpr,
-    lo_by_name: &HashMap<String, SeededWideAddrInfo>,
-    hi_by_name: &HashMap<String, SeededWideAddrInfo>,
-) -> Option<SeededWideAddrInfo> {
-    if let Some(base) = expr_ptr_lane_base(expr, PointerLane::Hi32) {
-        return Some(seeded_wide_ptr_info(&base));
-    }
-    match expr {
-        AstExpr::Reg(name) => hi_by_name.get(name).cloned(),
-        AstExpr::Intrinsic { op, args }
-            if matches!(op, IntrinsicOp::LeaHiX | IntrinsicOp::LeaHiXSx32) && args.len() >= 2 =>
-        {
-            infer_hi_seed_info(&args[1], lo_by_name, hi_by_name)
-        }
-        AstExpr::CallLike { func, args }
-            if matches!(func.as_str(), "lea_hi_x" | "lea_hi_x_sx32") && args.len() >= 2 =>
-        {
-            infer_hi_seed_info(&args[1], lo_by_name, hi_by_name)
-        }
-        AstExpr::Binary { op, lhs, rhs } if op == "+" => {
-            infer_hi_seed_info(lhs, lo_by_name, hi_by_name)
-                .or_else(|| infer_hi_seed_info(rhs, lo_by_name, hi_by_name))
-                .or_else(|| infer_lo_seed_info(lhs, lo_by_name))
-                .or_else(|| infer_lo_seed_info(rhs, lo_by_name))
-        }
-        AstExpr::Ternary {
-            then_expr,
-            else_expr,
-            ..
-        } => {
-            let then_info = infer_hi_seed_info(then_expr, lo_by_name, hi_by_name)?;
-            let else_info = infer_hi_seed_info(else_expr, lo_by_name, hi_by_name)?;
-            (then_info == else_info).then_some(then_info)
-        }
-        _ => None,
-    }
-}
-
-fn unify_phi_seed_info(
-    args: &[IRExpr],
-    known: &HashMap<String, SeededWideAddrInfo>,
-) -> Option<SeededWideAddrInfo> {
-    let mut resolved = None;
-    let mut saw_known = false;
-    for arg in args {
-        let Some(reg) = arg.get_reg() else {
-            continue;
-        };
-        let Some(info) = known.get(&reg.display()) else {
-            continue;
-        };
-        saw_known = true;
-        match &resolved {
-            None => resolved = Some(info.clone()),
-            Some(existing) if existing == info => {}
-            Some(_) => return None,
-        }
-    }
-    if saw_known {
-        resolved
-    } else {
-        None
-    }
-}
-
-fn pointer_seed_preserving_opcode(opcode: &str) -> bool {
-    opcode.starts_with("IADD")
-        || opcode.starts_with("UIADD")
-        || opcode.starts_with("LEA")
-        || opcode == "MOV"
-        || opcode.starts_with("MOV.")
-        || opcode.starts_with("IMAD.MOV")
-        || opcode.starts_with("IMAD.X")
-}
-
-fn infer_seed_info_from_ir_args(
-    args: &[IRExpr],
-    known: &HashMap<String, SeededWideAddrInfo>,
-) -> Option<SeededWideAddrInfo> {
-    let mut resolved = None;
-    for arg in args {
-        let Some(reg) = arg.get_reg() else {
-            continue;
-        };
-        let Some(info) = known.get(&reg.display()) else {
-            continue;
-        };
-        match &resolved {
-            None => resolved = Some(info.clone()),
-            Some(existing) if existing == info => {}
-            Some(_) => return None,
-        }
-    }
-    resolved
-}
-
-pub fn build_seeded_wide_addr_maps(
-    function_ir: &FunctionIR,
-    lifted: Option<&SemanticLiftResult>,
-) -> SeededWideAddrMaps {
-    let Some(lifted) = lifted else {
-        return SeededWideAddrMaps::default();
-    };
-
-    let mut rhs_by_name = HashMap::<String, AstExpr>::new();
-    for lifted_stmt in lifted.by_def.values() {
-        let Some(name) = ast_lvalue_var_name(&lifted_stmt.dest) else {
-            continue;
-        };
-        rhs_by_name
-            .entry(name)
-            .or_insert_with(|| lifted_stmt.rhs.clone());
-    }
-
-    let mut seeded = SeededWideAddrMaps::default();
-    let constmem_word_defs = rhs_by_name
-        .iter()
-        .filter_map(|(name, rhs)| match rhs {
-            AstExpr::ConstMemSymbol(sym) | AstExpr::Raw(sym)
-                if parse_constmem_word_symbol(sym).is_some() =>
-            {
-                Some((sym.clone(), name.clone()))
-            }
-            _ => None,
-        })
-        .collect::<HashMap<_, _>>();
-    for (name, rhs) in &rhs_by_name {
-        let lo_sym = match rhs {
-            AstExpr::ConstMemSymbol(sym) | AstExpr::Raw(sym)
-                if parse_constmem_word_symbol(sym).is_some() =>
-            {
-                sym
-            }
-            _ => continue,
-        };
-        let Some(hi_sym) = adjacent_constmem_word_symbol(lo_sym) else {
-            continue;
-        };
-        let Some(hi_name) = constmem_word_defs.get(&hi_sym) else {
-            continue;
-        };
-        let info = seeded_constmem_pair_info(name, lo_sym, &hi_sym);
-        seeded.lo_by_name.entry(name.clone()).or_insert_with(|| info.clone());
-        seeded.hi_by_name
-            .entry(hi_name.clone())
-            .or_insert_with(|| info.clone());
-    }
-    for _ in 0..64 {
-        let mut changed = false;
-        for (name, rhs) in &rhs_by_name {
-            if !seeded.lo_by_name.contains_key(name) {
-                if let Some(info) = infer_lo_seed_info(rhs, &seeded.lo_by_name) {
-                    seeded.lo_by_name.insert(name.clone(), info);
-                    changed = true;
-                }
-            }
-            if !seeded.hi_by_name.contains_key(name) {
-                if let Some(info) = infer_hi_seed_info(rhs, &seeded.lo_by_name, &seeded.hi_by_name)
-                {
-                    seeded.hi_by_name.insert(name.clone(), info);
-                    changed = true;
-                }
-            }
-        }
-        for block in &function_ir.blocks {
-            for stmt in &block.stmts {
-                if let RValue::Op { opcode, args } = &stmt.value {
-                    if stmt.defs.len() == 1 && pointer_seed_preserving_opcode(opcode) {
-                        if let Some(reg) = stmt.defs[0].get_reg() {
-                            let name = reg.display();
-                            if !seeded.lo_by_name.contains_key(&name) {
-                                if let Some(info) =
-                                    infer_seed_info_from_ir_args(args, &seeded.lo_by_name)
-                                {
-                                    seeded.lo_by_name.insert(name.clone(), info);
-                                    changed = true;
-                                }
-                            }
-                            if !seeded.hi_by_name.contains_key(&name) {
-                                if let Some(info) =
-                                    infer_seed_info_from_ir_args(args, &seeded.hi_by_name)
-                                {
-                                    seeded.hi_by_name.insert(name.clone(), info);
-                                    changed = true;
-                                }
-                            }
-                        }
-                    }
-                }
-                let RValue::Phi(args) = &stmt.value else {
-                    continue;
-                };
-                for def in &stmt.defs {
-                    let Some(reg) = def.get_reg() else {
-                        continue;
-                    };
-                    let name = reg.display();
-                    if !seeded.lo_by_name.contains_key(&name) {
-                        if let Some(info) = unify_phi_seed_info(args, &seeded.lo_by_name) {
-                            seeded.lo_by_name.insert(name.clone(), info);
-                            changed = true;
-                        }
-                    }
-                    if !seeded.hi_by_name.contains_key(&name) {
-                        if let Some(info) = unify_phi_seed_info(args, &seeded.hi_by_name) {
-                            seeded.hi_by_name.insert(name.clone(), info);
-                            changed = true;
-                        }
-                    }
-                }
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-
-    seeded
-}
-
-fn collect_ast_stmt_uses(stmt: &AstStmt, out: &mut HashSet<String>) {
-    match stmt {
-        AstStmt::Block(stmts) | AstStmt::Sequence(stmts) => {
-            for stmt in stmts {
-                collect_ast_stmt_uses(stmt, out);
-            }
-        }
-        AstStmt::Label { body, .. } => collect_ast_stmt_uses(body, out),
-        AstStmt::If {
-            condition,
-            then_branch,
-            else_branch,
-        } => {
-            collect_ast_expr_uses(condition, out);
-            collect_ast_stmt_uses(then_branch, out);
-            if let Some(else_branch) = else_branch.as_deref() {
-                collect_ast_stmt_uses(else_branch, out);
-            }
-        }
-        AstStmt::Loop {
-            condition, body, ..
-        } => {
-            if let Some(condition) = condition {
-                collect_ast_expr_uses(condition, out);
-            }
-            collect_ast_stmt_uses(body, out);
-        }
-        AstStmt::Switch {
-            discriminant,
-            cases,
-            default,
-        } => {
-            if let Some(discriminant) = discriminant {
-                collect_ast_expr_uses(discriminant, out);
-            }
-            for (_, body) in cases {
-                collect_ast_stmt_uses(body, out);
-            }
-            if let Some(default) = default.as_deref() {
-                collect_ast_stmt_uses(default, out);
-            }
-        }
-        AstStmt::Return(expr) => {
-            if let Some(expr) = expr {
-                collect_ast_expr_uses(expr, out);
-            }
-        }
-        AstStmt::Assign { dst, src } => {
-            collect_ast_lvalue_uses(dst, out);
-            collect_ast_expr_uses(src, out);
-        }
-        AstStmt::ExprStmt(expr) => collect_ast_expr_uses(expr, out),
-        AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Empty => {}
-    }
-}
-
-fn collect_ast_lvalue_uses(lvalue: &AstLValue, out: &mut HashSet<String>) {
-    match lvalue {
-        AstLValue::Var(_) | AstLValue::Raw(_) => {}
-        AstLValue::PtrLane { base, lane } => {
-            out.insert(format!("{}.{}", base, lane.render_suffix()));
-        }
-        AstLValue::Deref { addr, .. } => collect_ast_expr_uses(addr, out),
-        AstLValue::Indexed { base, index } => {
-            collect_ast_expr_uses(base, out);
-            collect_ast_expr_uses(index, out);
-        }
-    }
-}
-
-fn collect_ast_expr_uses(expr: &AstExpr, out: &mut HashSet<String>) {
-    match expr {
-        AstExpr::Raw(_) | AstExpr::Imm(_) | AstExpr::Builtin(_) => {}
-        AstExpr::Reg(name) | AstExpr::ConstMemSymbol(name) => {
-            out.insert(name.clone());
-        }
-        AstExpr::PtrLane { base, lane } => {
-            out.insert(format!("{}.{}", base, lane.render_suffix()));
-        }
-        AstExpr::LaneExtract { value, .. } => collect_ast_expr_uses(value, out),
-        AstExpr::Unary { arg, .. } => collect_ast_expr_uses(arg, out),
-        AstExpr::Binary { lhs, rhs, .. } => {
-            collect_ast_expr_uses(lhs, out);
-            collect_ast_expr_uses(rhs, out);
-        }
-        AstExpr::Ternary {
-            cond,
-            then_expr,
-            else_expr,
-        } => {
-            collect_ast_expr_uses(cond, out);
-            collect_ast_expr_uses(then_expr, out);
-            collect_ast_expr_uses(else_expr, out);
-        }
-        AstExpr::CallLike { args, .. } | AstExpr::Intrinsic { args, .. } => {
-            for arg in args {
-                collect_ast_expr_uses(arg, out);
-            }
-        }
-        AstExpr::Load { addr, .. } => collect_ast_expr_uses(addr, out),
-        AstExpr::WidePtr { base, offset } => {
-            collect_ast_expr_uses(base, out);
-            collect_ast_expr_uses(offset, out);
-        }
-        AstExpr::Addr64 { lo, hi } => {
-            collect_ast_expr_uses(lo, out);
-            collect_ast_expr_uses(hi, out);
-        }
-        AstExpr::Cast { expr, .. } => collect_ast_expr_uses(expr, out),
-        AstExpr::Index { base, index } => {
-            collect_ast_expr_uses(base, out);
-            collect_ast_expr_uses(index, out);
-        }
-    }
-}
-
-fn fresh_split_name(base: &str, used: &mut HashSet<String>) -> String {
-    let stem = format!("{}_next", base);
-    if used.insert(stem.clone()) {
-        return stem;
-    }
-    let mut idx = 1usize;
-    loop {
-        let candidate = format!("{}_{}", stem, idx);
-        if used.insert(candidate.clone()) {
-            return candidate;
-        }
-        idx += 1;
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-enum AliasTypeClass {
-    Bool,
-    Int,
-    Float,
-    Half,
-    Pointer,
-}
-
-fn split_type_conflicting_aliases(
-    stmt: &AstStmt,
-    token_map: &mut HashMap<String, String>,
-    used_output_names: &mut HashSet<String>,
-) {
-    let mut classes = HashMap::<String, HashSet<AliasTypeClass>>::new();
-    collect_token_type_classes(stmt, &mut classes);
-
-    let mut grouped = HashMap::<String, Vec<(String, AliasTypeClass)>>::new();
-    for (token, token_classes) in classes {
-        let Some(mapped) = token_map.get(&token).cloned() else {
-            continue;
-        };
-        let mut sorted = token_classes.into_iter().collect::<Vec<_>>();
-        sorted.sort();
-        sorted.dedup();
-        if sorted.len() != 1 {
-            continue;
-        }
-        grouped
-            .entry(mapped)
-            .or_default()
-            .push((token, sorted[0]));
-    }
-
-    for (shared_name, originals) in grouped {
-        let mut by_class = HashMap::<AliasTypeClass, Vec<String>>::new();
-        for (token, class) in originals {
-            by_class.entry(class).or_default().push(token);
-        }
-        if by_class.len() < 2 {
-            continue;
-        }
-
-        let keep_class = by_class
-            .iter()
-            .max_by_key(|(_, tokens)| tokens.len())
-            .map(|(class, _)| *class)
-            .unwrap();
-        for (class, mut tokens) in by_class {
-            if class == keep_class {
-                continue;
-            }
-            tokens.sort();
-            tokens.dedup();
-            for token in tokens {
-                if token_map.get(&token) != Some(&shared_name) {
-                    continue;
-                }
-                let fresh = fresh_split_name(&shared_name, used_output_names);
-                token_map.insert(token, fresh);
-            }
-        }
-        used_output_names.insert(shared_name);
-    }
-}
-
-fn collect_token_type_classes(
-    stmt: &AstStmt,
-    out: &mut HashMap<String, HashSet<AliasTypeClass>>,
-) {
-    match stmt {
-        AstStmt::Label { body, .. } => collect_token_type_classes(body, out),
-        AstStmt::Block(stmts) | AstStmt::Sequence(stmts) => {
-            for stmt in stmts {
-                collect_token_type_classes(stmt, out);
-            }
-        }
-        AstStmt::If {
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            collect_token_type_classes(then_branch, out);
-            if let Some(else_branch) = else_branch.as_deref() {
-                collect_token_type_classes(else_branch, out);
-            }
-        }
-        AstStmt::Loop { body, .. } => collect_token_type_classes(body, out),
-        AstStmt::Switch { cases, default, .. } => {
-            for (_, body) in cases {
-                collect_token_type_classes(body, out);
-            }
-            if let Some(default) = default.as_deref() {
-                collect_token_type_classes(default, out);
-            }
-        }
-        AstStmt::Assign { dst, src } => {
-            let Some(name) = ast_lvalue_var_name(dst) else {
-                return;
-            };
-            let Some(class) = ast_expr_type_class(src) else {
-                return;
-            };
-            out.entry(name.to_string()).or_default().insert(class);
-        }
-        AstStmt::Break
-        | AstStmt::Continue
-        | AstStmt::Return(_)
-        | AstStmt::ExprStmt(_)
-        | AstStmt::Goto(_)
-        | AstStmt::Empty => {}
-    }
-}
-
-fn ast_expr_type_class(expr: &AstExpr) -> Option<AliasTypeClass> {
-    match expr {
-        AstExpr::Imm(text) | AstExpr::Raw(text) => raw_expr_type_class(text),
-        AstExpr::Reg(_) | AstExpr::ConstMemSymbol(_) | AstExpr::Builtin(_) => None,
-        AstExpr::PtrLane { .. } | AstExpr::LaneExtract { .. } => Some(AliasTypeClass::Int),
-        AstExpr::Unary { arg, .. } => ast_expr_type_class(arg),
-        AstExpr::Binary { op, lhs, rhs } => {
-            let lhs_class = ast_expr_type_class(lhs);
-            let rhs_class = ast_expr_type_class(rhs);
-            if matches!(op.as_str(), "+" | "-") {
-                if lhs_class == Some(AliasTypeClass::Pointer) && rhs_class == Some(AliasTypeClass::Int)
-                {
-                    return Some(AliasTypeClass::Pointer);
-                }
-                if rhs_class == Some(AliasTypeClass::Pointer) && lhs_class == Some(AliasTypeClass::Int)
-                {
-                    return Some(AliasTypeClass::Pointer);
-                }
-            }
-            match (lhs_class, rhs_class) {
-                (Some(lhs), Some(rhs)) if lhs == rhs => Some(lhs),
-                (Some(AliasTypeClass::Float), _) | (_, Some(AliasTypeClass::Float)) => {
-                    Some(AliasTypeClass::Float)
-                }
-                (Some(AliasTypeClass::Half), _) | (_, Some(AliasTypeClass::Half)) => {
-                    Some(AliasTypeClass::Half)
-                }
-                (Some(AliasTypeClass::Int), Some(AliasTypeClass::Int)) => {
-                    Some(AliasTypeClass::Int)
-                }
-                _ => None,
-            }
-        }
-        AstExpr::Ternary {
-            then_expr,
-            else_expr,
-            ..
-        } => {
-            let then_class = ast_expr_type_class(then_expr);
-            let else_class = ast_expr_type_class(else_expr);
-            match (then_class, else_class) {
-                (Some(lhs), Some(rhs)) if lhs == rhs => Some(lhs),
-                (Some(lhs), None) => Some(lhs),
-                (None, Some(rhs)) => Some(rhs),
-                _ => None,
-            }
-        }
-        AstExpr::CallLike { func, args } => {
-            if func.ends_with('f') {
-                return Some(AliasTypeClass::Float);
-            }
-            if matches!(func.as_str(), "bitmux" | "majority" | "mul_hi_u32") {
-                return Some(AliasTypeClass::Int);
-            }
-            args.iter().find_map(ast_expr_type_class)
-        }
-        AstExpr::Intrinsic { op, args } => match op {
-            IntrinsicOp::CarryU32Add3
-            | IntrinsicOp::LeaHiX
-            | IntrinsicOp::LeaHiXSx32
-            | IntrinsicOp::PairHi => Some(AliasTypeClass::Int),
-            IntrinsicOp::Min | IntrinsicOp::Max | IntrinsicOp::Clamp => {
-                args.iter().find_map(ast_expr_type_class)
-            }
-        },
-        AstExpr::Load { ty, addr } => ty
-            .as_deref()
-            .and_then(type_name_class)
-            .or_else(|| load_addr_type_class(addr)),
-        AstExpr::WidePtr { .. } | AstExpr::Addr64 { .. } => Some(AliasTypeClass::Pointer),
-        AstExpr::Cast { ty, expr } => type_name_class(ty).or_else(|| ast_expr_type_class(expr)),
-        AstExpr::Index { base, .. } => ast_expr_type_class(base),
-    }
-}
-
-fn raw_expr_type_class(text: &str) -> Option<AliasTypeClass> {
-    let text = text.trim();
-    if matches!(text, "true" | "false") {
-        return Some(AliasTypeClass::Bool);
-    }
-    if text.contains('.') || text.contains("e-") || text.contains("e+") || text.contains("E-") || text.contains("E+") {
-        if text.chars().any(|ch| ch.is_ascii_digit()) {
-            return Some(AliasTypeClass::Float);
-        }
-    }
-    text.parse::<i128>().ok().map(|_| AliasTypeClass::Int)
-}
-
-fn type_name_class(ty: &str) -> Option<AliasTypeClass> {
-    let ty = ty.trim();
-    if ty.ends_with('*') || matches!(ty, "uintptr_t" | "intptr_t") {
-        return Some(AliasTypeClass::Pointer);
-    }
-    match ty {
-        "float" => Some(AliasTypeClass::Float),
-        "__half" => Some(AliasTypeClass::Half),
-        "bool" => Some(AliasTypeClass::Bool),
-        "uint8_t" | "int8_t" | "uint16_t" | "int16_t" | "uint32_t" | "int32_t" | "uint64_t"
-        | "int64_t" => Some(AliasTypeClass::Int),
-        _ => None,
-    }
-}
-
-fn load_addr_type_class(addr: &AstExpr) -> Option<AliasTypeClass> {
-    match addr {
-        AstExpr::Cast { ty, .. } => ty
-            .trim()
-            .strip_suffix('*')
-            .and_then(type_name_class)
-            .or_else(|| type_name_class(ty)),
-        AstExpr::Binary { lhs, rhs, .. } => load_addr_type_class(lhs).or_else(|| load_addr_type_class(rhs)),
-        AstExpr::WidePtr { base, .. } => load_addr_type_class(base),
-        _ => None,
-    }
-}
-
-fn split_unsafe_token_aliases(stmt: &AstStmt, token_map: &mut HashMap<String, String>) {
-    let mut used_output_names = token_map.values().cloned().collect::<HashSet<_>>();
-    split_type_conflicting_aliases(stmt, token_map, &mut used_output_names);
-    split_unsafe_token_aliases_stmt(stmt, token_map, &mut used_output_names);
-}
-
-fn split_stmt_local_alias_collisions(
-    stmt: &AstStmt,
-    token_map: &mut HashMap<String, String>,
-    used_output_names: &mut HashSet<String>,
-) {
-    let mut symbols = HashSet::new();
-    collect_ast_stmt_uses(stmt, &mut symbols);
-    if let AstStmt::Assign { dst, .. } = stmt {
-        if let Some(name) = ast_lvalue_var_name(dst) {
-            symbols.insert(name.to_string());
-        }
-    }
-
-    let mut by_output = HashMap::<String, Vec<String>>::new();
-    for symbol in symbols {
-        if let Some(mapped) = token_map.get(&symbol).cloned() {
-            by_output.entry(mapped).or_default().push(symbol);
-        }
-    }
-
-    for (shared_name, mut originals) in by_output {
-        originals.sort();
-        originals.dedup();
-        if originals.len() < 2 {
-            continue;
-        }
-        let keep = originals.remove(0);
-        for original in originals {
-            if token_map.get(&original) != Some(&shared_name) {
-                continue;
-            }
-            let fresh = fresh_split_name(&shared_name, used_output_names);
-            token_map.insert(original, fresh);
-        }
-        used_output_names.insert(shared_name);
-        let _ = keep;
-    }
-}
-
-fn split_unsafe_token_aliases_stmt(
-    stmt: &AstStmt,
-    token_map: &mut HashMap<String, String>,
-    used_output_names: &mut HashSet<String>,
-) {
-    split_stmt_local_alias_collisions(stmt, token_map, used_output_names);
-    match stmt {
-        AstStmt::Block(stmts) | AstStmt::Sequence(stmts) => {
-            let mut future_uses = vec![HashSet::<String>::new(); stmts.len() + 1];
-            for idx in (0..stmts.len()).rev() {
-                future_uses[idx] = future_uses[idx + 1].clone();
-                collect_ast_stmt_uses(&stmts[idx], &mut future_uses[idx]);
-            }
-            for (idx, child) in stmts.iter().enumerate() {
-                if let AstStmt::Assign { dst, src } = child {
-                    if let Some(dst_name) = ast_lvalue_var_name(dst) {
-                        if let Some(shared_name) = token_map.get(&dst_name).cloned() {
-                            let mut rhs_uses = HashSet::new();
-                            collect_ast_lvalue_uses(dst, &mut rhs_uses);
-                            collect_ast_expr_uses(src, &mut rhs_uses);
-                            let future = &future_uses[idx + 1];
-                            let overlaps = rhs_uses.into_iter().any(|used| {
-                                used != dst_name
-                                    && future.contains(&used)
-                                    && token_map.get(&used) == Some(&shared_name)
-                            });
-                            if overlaps {
-                                let fresh = fresh_split_name(&shared_name, used_output_names);
-                                token_map.insert(dst_name, fresh);
-                            }
-                        }
-                    }
-                }
-                split_unsafe_token_aliases_stmt(child, token_map, used_output_names);
-            }
-        }
-        AstStmt::Label { body, .. } => {
-            split_unsafe_token_aliases_stmt(body, token_map, used_output_names);
-        }
-        AstStmt::If {
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            split_unsafe_token_aliases_stmt(then_branch, token_map, used_output_names);
-            if let Some(else_branch) = else_branch.as_deref() {
-                split_unsafe_token_aliases_stmt(else_branch, token_map, used_output_names);
-            }
-        }
-        AstStmt::Loop { body, .. } => {
-            split_unsafe_token_aliases_stmt(body, token_map, used_output_names);
-        }
-        AstStmt::Switch { cases, default, .. } => {
-            for (_, body) in cases {
-                split_unsafe_token_aliases_stmt(body, token_map, used_output_names);
-            }
-            if let Some(default) = default.as_deref() {
-                split_unsafe_token_aliases_stmt(default, token_map, used_output_names);
-            }
-        }
-        AstStmt::Break
-        | AstStmt::Continue
-        | AstStmt::Return(_)
-        | AstStmt::Assign { .. }
-        | AstStmt::ExprStmt(_)
-        | AstStmt::Goto(_)
-        | AstStmt::Empty => {}
-    }
-}
-
 pub struct Structurizer<'a> {
     cfg: &'a ControlFlowGraph, // DiGraph<CfgBasicBlock, EdgeKind>
     function_ir: &'a FunctionIR,
@@ -941,6 +152,7 @@ pub struct Structurizer<'a> {
     block_id_to_idx: HashMap<usize, usize>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl<'a> Structurizer<'a> {
     fn choose_entry_node(cfg: &ControlFlowGraph) -> Option<NodeIndex> {
         let mut candidates = cfg
@@ -970,11 +182,7 @@ impl<'a> Structurizer<'a> {
             return vec![0];
         }
         let filter_sink_defs = |indices: &mut Vec<usize>| {
-            if stmt
-                .defs
-                .iter()
-                .any(|def| !Self::is_zero_or_true_reg(def))
-            {
+            if stmt.defs.iter().any(|def| !Self::is_zero_or_true_reg(def)) {
                 indices.retain(|idx| {
                     stmt.defs
                         .get(*idx)
@@ -1414,24 +622,8 @@ impl<'a> Structurizer<'a> {
                         arg: Box::new(arg.clone()),
                     },
                     (
-                        "+"
-                        | "-"
-                        | "*"
-                        | "/"
-                        | "%"
-                        | "&"
-                        | "|"
-                        | "^"
-                        | "<<"
-                        | ">>"
-                        | "&&"
-                        | "||"
-                        | "=="
-                        | "!="
-                        | "<"
-                        | "<="
-                        | ">"
-                        | ">=",
+                        "+" | "-" | "*" | "/" | "%" | "&" | "|" | "^" | "<<" | ">>" | "&&" | "||"
+                        | "==" | "!=" | "<" | "<=" | ">" | ">=",
                         [lhs, rhs],
                     ) => AstExpr::Binary {
                         op: op.clone(),
@@ -2088,8 +1280,11 @@ impl<'a> Structurizer<'a> {
             }
 
             if self.is_direct_cfg_successor(current_from, target_block_id) {
-                let direct =
-                    self.lower_block_phi_assignments_from_pred_ast(target_block_id, current_from, ctx);
+                let direct = self.lower_block_phi_assignments_from_pred_ast(
+                    target_block_id,
+                    current_from,
+                    ctx,
+                );
                 if !Self::ast_is_empty(&direct) {
                     out.push(direct);
                 }
@@ -2142,7 +1337,11 @@ impl<'a> Structurizer<'a> {
         let Some(block) = self.get_ir_block(block_id) else {
             return false;
         };
-        !block.stmts.is_empty() && block.stmts.iter().all(|stmt| matches!(stmt.value, RValue::Phi(_)))
+        !block.stmts.is_empty()
+            && block
+                .stmts
+                .iter()
+                .all(|stmt| matches!(stmt.value, RValue::Phi(_)))
     }
 
     fn cfg_path_exists(&self, start_block_id: usize, goal_block_id: usize) -> bool {
@@ -2381,7 +1580,9 @@ impl<'a> Structurizer<'a> {
             ),
             AstStmt::Label { name, body } => AstStmt::Label {
                 name,
-                body: Box::new(Self::inject_loop_phi_updates_before_continue(*body, updates)),
+                body: Box::new(Self::inject_loop_phi_updates_before_continue(
+                    *body, updates,
+                )),
             },
             AstStmt::If {
                 condition,
@@ -2613,9 +1814,7 @@ impl<'a> Structurizer<'a> {
     fn entry_block_id(stmt: &StructuredStatement) -> Option<usize> {
         match stmt {
             StructuredStatement::BasicBlock { block_id, .. } => Some(*block_id),
-            StructuredStatement::Sequence(stmts) => {
-                stmts.iter().find_map(Self::entry_block_id)
-            }
+            StructuredStatement::Sequence(stmts) => stmts.iter().find_map(Self::entry_block_id),
             StructuredStatement::If {
                 condition_block_id, ..
             } => Some(*condition_block_id),
@@ -2735,10 +1934,7 @@ impl<'a> Structurizer<'a> {
                     })
                     .filter(|stmt| !Self::ast_is_empty(stmt));
                 let then_empty = Self::ast_is_empty(&then_ast);
-                let else_empty = else_ast
-                    .as_ref()
-                    .map(Self::ast_is_empty)
-                    .unwrap_or(true);
+                let else_empty = else_ast.as_ref().map(Self::ast_is_empty).unwrap_or(true);
                 let core = if then_empty && else_empty {
                     AstStmt::Empty
                 } else if then_empty && !else_empty {
@@ -2785,7 +1981,9 @@ impl<'a> Structurizer<'a> {
                     (LoopType::DoWhile, Some(header_block_id)) => {
                         let body_entry_block_id = Self::entry_block_id(&printable_body);
                         match body_entry_block_id {
-                            Some(body_entry_block_id) if body_entry_block_id != *header_block_id => {
+                            Some(body_entry_block_id)
+                                if body_entry_block_id != *header_block_id =>
+                            {
                                 Some(body_entry_block_id)
                             }
                             _ => Some(*header_block_id),
@@ -2804,7 +2002,9 @@ impl<'a> Structurizer<'a> {
                     (LoopType::DoWhile, Some(header_block_id)) => {
                         let body_entry_block_id = Self::entry_block_id(&printable_body);
                         match body_entry_block_id {
-                            Some(body_entry_block_id) if body_entry_block_id != *header_block_id => {
+                            Some(body_entry_block_id)
+                                if body_entry_block_id != *header_block_id =>
+                            {
                                 self.lower_phi_connector_chain_from_pred_ast(
                                     body_entry_block_id,
                                     *header_block_id,
@@ -2850,17 +2050,23 @@ impl<'a> Structurizer<'a> {
                     )),
                 };
                 let loop_exit_phi = match (fallthrough_target_block, header_block_id, loop_type) {
-                    (Some(target_block_id), Some(header_block_id), LoopType::While | LoopType::DoWhile) => {
-                        self.lower_phi_connector_chain_from_pred_ast(
-                            target_block_id,
-                            *header_block_id,
-                            ctx,
-                        )
-                    }
+                    (
+                        Some(target_block_id),
+                        Some(header_block_id),
+                        LoopType::While | LoopType::DoWhile,
+                    ) => self.lower_phi_connector_chain_from_pred_ast(
+                        target_block_id,
+                        *header_block_id,
+                        ctx,
+                    ),
                     _ => AstStmt::Empty,
                 };
-                let lowered =
-                    Self::ast_sequence(vec![phi_prelude, condition_prelude, loop_stmt, loop_exit_phi]);
+                let lowered = Self::ast_sequence(vec![
+                    phi_prelude,
+                    condition_prelude,
+                    loop_stmt,
+                    loop_exit_phi,
+                ]);
                 if let Some(header_block_id) = header_block_id {
                     if jump_targets.contains(header_block_id) {
                         AstStmt::Label {
@@ -2886,11 +2092,8 @@ impl<'a> Structurizer<'a> {
                 to_block_id,
                 condition,
             } => {
-                let phi_prelude = self.lower_phi_connector_chain_from_pred_ast(
-                    *to_block_id,
-                    *from_block_id,
-                    ctx,
-                );
+                let phi_prelude =
+                    self.lower_phi_connector_chain_from_pred_ast(*to_block_id, *from_block_id, ctx);
                 let jump = Self::ast_sequence(vec![
                     phi_prelude,
                     AstStmt::Goto(format!("BB{}", to_block_id)),
@@ -2959,68 +2162,8 @@ impl<'a> Structurizer<'a> {
         ctx: &dyn DisplayCtx,
         indent_level: usize,
     ) -> String {
-        self.pretty_print_with_lift(stmt, ctx, indent_level, None)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn pretty_print_with_lift(
-        &self,
-        stmt: &StructuredStatement,
-        ctx: &dyn DisplayCtx,
-        indent_level: usize,
-        lifted: Option<&SemanticLiftResult>,
-    ) -> String {
-        ast_simplify(self.lower_structured_stmt_ast(stmt, ctx, lifted))
+        ast_simplify(self.lower_structured_stmt_ast(stmt, ctx, None))
             .render_with_indent(indent_level)
-    }
-
-    pub fn pretty_print_with_lift_cleanup(
-        &self,
-        stmt: &StructuredStatement,
-        ctx: &dyn DisplayCtx,
-        indent_level: usize,
-        lifted: Option<&SemanticLiftResult>,
-    ) -> String {
-        let seeded_wide_addrs = build_seeded_wide_addr_maps(self.function_ir, lifted);
-        ast_cleanup_with_seeded_wide_addrs(
-            self.lower_structured_stmt_ast(stmt, ctx, lifted),
-            &seeded_wide_addrs,
-        )
-        .render_with_indent(indent_level)
-    }
-
-    pub fn pretty_print_with_lift_cleanup_and_names(
-        &self,
-        stmt: &StructuredStatement,
-        ctx: &dyn DisplayCtx,
-        indent_level: usize,
-        lifted: Option<&SemanticLiftResult>,
-        token_map: &HashMap<String, String>,
-        _enable_post_name_addr64_fold: bool,
-    ) -> String {
-        // Run the structural cleanup while the AST is still in SSA form.
-        // Re-running addr64/DCE cleanup after token coalescing is unsafe:
-        // name recovery intentionally maps many SSA defs onto the same source
-        // variable, which destroys the single-def invariant those passes rely on
-        // and can trigger recursive alias blowups on real corpus kernels.
-        let seeded_wide_addrs = build_seeded_wide_addr_maps(self.function_ir, lifted);
-        let cleaned = ast_cleanup_with_seeded_wide_addrs(
-            self.lower_structured_stmt_ast(stmt, ctx, lifted),
-            &seeded_wide_addrs,
-        );
-        let mut token_map = token_map.clone();
-        split_unsafe_token_aliases(&cleaned, &mut token_map);
-        // Name recovery intentionally coalesces multiple SSA values onto the same
-        // recovered source variable. Re-running pointer-pair/addr64 folding after
-        // that coalescing can silently change pointer offsets, so keep the final
-        // named stage as a pure token remap.
-        let named = ast_apply_token_map(cleaned, &token_map);
-        // Keep the final named pass structural-only. Post-name DCE-style cleanup
-        // can erase defs once multiple SSA values intentionally coalesce onto
-        // one recovered name, but the final render still needs token remapping
-        // for raw helper fragments that survive as text.
-        let rendered = named.render_with_indent(indent_level);
-        apply_token_map_to_rendered(&rendered, &token_map)
     }
 }
 
