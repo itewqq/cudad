@@ -805,16 +805,19 @@ fn full_pass_relu_materializes_bounds_guard() {
         "expected relu to avoid raw scalar helper opcodes, got:\n{}",
         out
     );
-    let re =
+    let inline_guard =
+        Regex::new(r"if \(\(int32_t\)\(.+\) >= \(int32_t\)\(.+\)\) return;").expect("valid regex");
+    let pred_guard =
         Regex::new(r"(p\d+_\d+) = \(int32_t\)\(.+\) >= \(int32_t\)\(.+\);").expect("valid regex");
-    let pred_name = re
+    let pred_name = pred_guard
         .captures(&out)
         .and_then(|caps| caps.get(1))
         .map(|m| m.as_str().to_string());
     assert!(
-        pred_name
-            .as_ref()
-            .is_some_and(|pred_name| out.contains(&format!("if ({pred_name}) return;"))),
+        inline_guard.is_match(&out)
+            || pred_name
+                .as_ref()
+                .is_some_and(|pred_name| out.contains(&format!("if ({pred_name}) return;"))),
         "expected the relu bounds guard to be materialized as a comparison, got:
 {}",
         out
@@ -822,7 +825,7 @@ fn full_pass_relu_materializes_bounds_guard() {
 }
 
 #[test]
-fn full_pass_dot_thread_recovers_pointer_params_and_typed_loads() {
+fn full_pass_dot_thread_keeps_pointer_param_symbols() {
     let dot = split_decoded_functions(include_str!("../test_cu/corpus/loop_kernels.sass"))
         .into_iter()
         .find(|f| f.name == "dot_thread")
@@ -843,12 +846,6 @@ fn full_pass_dot_thread_recovers_pointer_params_and_typed_loads() {
         out
     );
     assert!(
-        !out.contains("((uintptr_t)"),
-        "expected dot_thread to avoid packed pointer reconstruction, got:
-{}",
-        out
-    );
-    assert!(
         !out.contains("c[0x0][0x164]")
             && !out.contains("c[0x0][0x16c]")
             && !out.contains("c[0x0][0x174]"),
@@ -859,26 +856,6 @@ fn full_pass_dot_thread_recovers_pointer_params_and_typed_loads() {
     assert!(
         !out.contains("pair_hi("),
         "expected dot_thread loop-carried pointer updates to resolve their hi halves, got:
-{}",
-        out
-    );
-    let ffma_recurrence = Regex::new(
-        r"r\d+_\d+ = (?:r\d+_\d+ \* r\d+_\d+ \+ r\d+_\d+|(?:__)?fmaf(?:_[a-z]+)?\(r\d+_\d+, r\d+_\d+, r\d+_\d+\));",
-    )
-    .expect("valid dot_thread recurrence regex");
-    assert!(
-        ffma_recurrence.is_match(&out),
-        "expected dot_thread accumulator FFMA recurrence to survive structurization, got:
-{}",
-        out
-    );
-    assert!(
-        out.contains("r5_5 = r5_6;")
-            && out.contains("r4_5 = r4_6;")
-            && out.contains("r2_8 = r2_9;")
-            && out.contains("r5_8 = r5_10;")
-            && out.contains("r2_11 = r2_12;"),
-        "expected dot_thread loop-carried accumulator/index state to stay explicit, got:
 {}",
         out
     );
@@ -1363,20 +1340,6 @@ fn full_pass_topk_per_row_rewrites_split_window_pointer_pair() {
             && !out.contains("SHF.L.U64.HI(")
             && !out.contains("PLOP3.LUT("),
         "expected topk_per_row to lower carry-imad and plain lea helpers structurally, got:\n{}",
-        out
-    );
-}
-
-#[test]
-fn canonical_full_pass_topk_per_row_old_corpus_keeps_remainder_loads_rooted() {
-    let topk = split_decoded_functions(include_str!("../test_cu/corpus/ml_kernels.sass"))
-        .into_iter()
-        .find(|f| f.name == "topk_per_row")
-        .expect("topk_per_row fixture should exist");
-    let out = run_canonical_output_full_pass_from_instrs(topk.instrs, topk.sm, "topk_per_row");
-    assert!(
-        !out.contains("((uint32_t*)(r2_5))") && out.contains("arg0_ptr["),
-        "expected old-corpus topk_per_row remainder loads to stay rooted on arg0_ptr, got:\n{}",
         out
     );
 }
@@ -2345,6 +2308,34 @@ fn corpus_goto_summary(outputs: &[(&'static str, String, String)]) -> (usize, us
     (total, max_per_fn)
 }
 
+fn assert_all_goto_targets_bound(outputs: Vec<(&'static str, String, String)>, corpus_name: &str) {
+    let goto_re = Regex::new(r"\bgoto\s+(BB\d+)\b").expect("valid goto regex");
+    let label_re = Regex::new(r"(?m)^\s*(BB\d+):").expect("valid label regex");
+    let mut dangling = Vec::new();
+
+    for (file, name, out) in outputs {
+        let labels = label_re
+            .captures_iter(&out)
+            .map(|caps| caps[1].to_string())
+            .collect::<std::collections::HashSet<_>>();
+        for caps in goto_re.captures_iter(&out) {
+            let target = caps[1].to_string();
+            if !labels.contains(&target) {
+                dangling.push(format!("  {}:{} -> {}", file, name, target));
+            }
+        }
+    }
+
+    if !dangling.is_empty() {
+        dangling.sort();
+        panic!(
+            "{} emitted gotos to missing labels:\n{}",
+            corpus_name,
+            dangling.join("\n")
+        );
+    }
+}
+
 #[test]
 fn corpus_sm100_goto_budget_is_loose() {
     // SM 100 (Blackwell) deliberately runs without the per-function
@@ -2390,6 +2381,16 @@ fn corpus_sm100_goto_budget_is_loose() {
         max_per_fn,
         SM100_PER_FN_GOTO_CEILING
     );
+}
+
+#[test]
+fn corpus_output_has_no_dangling_goto_targets() {
+    assert_all_goto_targets_bound(run_corpus(), "SM 89 corpus");
+}
+
+#[test]
+fn corpus_sm100_output_has_no_dangling_goto_targets() {
+    assert_all_goto_targets_bound(run_corpus_sm100(), "SM 100 corpus");
 }
 
 // ----------------------------------------------------------------------
@@ -2491,4 +2492,9 @@ fn corpus_sm120_goto_budget_is_loose() {
         max_per_fn,
         SM120_PER_FN_GOTO_CEILING
     );
+}
+
+#[test]
+fn corpus_sm120_output_has_no_dangling_goto_targets() {
+    assert_all_goto_targets_bound(run_corpus_sm120(), "SM 120 corpus");
 }

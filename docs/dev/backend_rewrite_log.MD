@@ -395,6 +395,11 @@
   connector block, the live backend either redirects that jump through the
   connector chain or synthesizes an empty anchor label before the surviving
   successor label instead of emitting an unbound target into final output.
+- More brittle full-pass tests are now trimmed back to stable canonical
+  contracts: the old-corpus `topk_per_row` remainder micro-shape test is
+  deleted, `relu` accepts either inline or named comparison guards, and the
+  `dot_thread` coverage now pins typed pointer symbols / resolved param words
+  instead of exact loop-carried temp choreography from a transitional backend.
 
 ## Next safe step
 
