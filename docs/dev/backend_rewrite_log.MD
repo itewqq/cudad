@@ -4,7 +4,7 @@
 
 - Branch: `codex/memory-aware-backend-refactor`
 - Checkpoint commit: `f464db3`
-- Current stage: phase 5 cutover of structured output entrypoints onto the canonical backend
+- Current stage: phase 5 cutover of structured output entrypoints onto the canonical backend, with front-half address-contract fixes still landing as needed
 
 ## Landed invariants
 
@@ -141,25 +141,30 @@
   - structured control flow
   - an early structured AST
   - rendered output from that AST
+- The tolerant decode / SSA front half now has an explicit contract to keep
+  shared/global address scale modifiers (`.X4`, `.X8`, `.X16`) structured
+  instead of erasing them before analysis/lowering sees the memory operand.
+- `FunctionAnalysis` now also recovers special-register builtin values (for
+  example `threadIdx.x`) through simple SSA copy chains, so canonical AST
+  lowering can substitute builtin roots directly instead of keeping raw
+  register temps alive in obvious address expressions.
+- Canonical shared-memory index lowering can now consume scaled thread-index
+  addresses from the new decode/IR contract, which makes fixtures like
+  `reduce_block` and `stencil1d` render `shmem[threadIdx.x + k]` forms on the
+  canonical path instead of leaking `(rN_0 + byte_offset) / 4`.
 
 ## Next safe step
 
-1. Switch the remaining curated full-pass tests and helper entrypoints from the
-   old structured-output path onto the canonical driver, starting with the
-   fixtures that now pass thanks to semantic scalar lowering of `ConstMem`,
-   `IABS`, and `MUFU.RCP`, recursive rooted offset expansion, typed casts for
-   unresolved register-backed memory bases, `UIADD3.64` root propagation, the
-   raw `IADD.64` helper-lowering cleanup, and typed shared-backing
-   declarations.
-2. Delete duplicated CLI/test helper logic that still builds semantic-lift,
-   token-map, or post-render cleanup artifacts after the canonical path is
-   proven on those fixtures, starting with the stable canonical smoke path
-   (`if.sass`, `test_div.sass`) and the ready corpus fixtures (`dot_thread`,
-   `nbody_forces`).
-3. Replace the remaining placeholder non-memory AST lowering gaps and remaining
-   canonical full-pass correctness holes (notably broader `sgemm_tiled` / warp
-   reduction control predicates and unresolved generic pointer loops) with
-   semantic lowering that no longer depends on the old semantic-lift backend.
+1. Re-run the canonical full-pass fixtures that were blocked on erased shared
+   address scales (`reduce_block`, `stencil1d`, and then `warp_reduce_sum`) and
+   migrate any newly-solid assertions off the legacy structured-output helper.
+2. Keep shrinking the remaining old helper surface in `src/test.rs` only where
+   canonical semantics are now genuinely stronger, not just cosmetically
+   different.
+3. Replace the remaining placeholder non-memory AST lowering gaps and broader
+   canonical correctness holes (notably `warp_reduce_sum` control predicates and
+   the still-partial full `sgemm_tiled` lowering) without reviving the old
+   semantic-lift backend.
 
 ## Open questions
 

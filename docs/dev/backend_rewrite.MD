@@ -28,6 +28,9 @@ function dumps are not allowed to collapse every rendered function back to
 ## Front-half contract
 
 - The parser must stay tolerant and lossless.
+- Memory-bearing operand modifiers such as address width/scale (`.64`, `.X4`,
+  `.X8`, `.X16`) must survive decode and IR lowering as structured data, not
+  only as raw strings.
 - CFG stays control-flow-only.
 - SSA stays the canonical mid-level control/dataflow representation.
 - Memory-space information must become explicit before AST lowering.

@@ -69,6 +69,7 @@ pub struct FunctionAnalysis {
     pub abi_annotations: AbiAnnotations,
     pub abi_aliases: AbiArgAliases,
     pub shared_pointee_ty: Option<&'static str>,
+    pub builtin_by_reg: BTreeMap<RegId, String>,
     pub root_by_reg: BTreeMap<RegId, AddressRoot>,
     pub byte_offset_by_reg: BTreeMap<RegId, IRExpr>,
     pub mem_accesses: Vec<MemAccessInfo>,
@@ -100,6 +101,7 @@ pub fn analyze_function_ir_with_profile(
         infer_arg_aliases(function_ir, &abi_annotations)
     };
     let shared_pointee_ty = infer_shared_word_pointee_type_for_function(function_ir);
+    let builtin_by_reg = recover_builtin_regs(function_ir, &abi_annotations);
 
     let (root_by_reg, byte_offset_by_reg) =
         propagate_address_facts(function_ir, &abi_annotations, &abi_aliases);
@@ -111,9 +113,131 @@ pub fn analyze_function_ir_with_profile(
         abi_annotations,
         abi_aliases,
         shared_pointee_ty,
+        builtin_by_reg,
         root_by_reg,
         byte_offset_by_reg,
         mem_accesses,
+    }
+}
+
+fn recover_builtin_regs(
+    function_ir: &FunctionIR,
+    abi_annotations: &AbiAnnotations,
+) -> BTreeMap<RegId, String> {
+    let mut builtins = BTreeMap::<RegId, String>::new();
+    let mut changed = true;
+
+    while changed {
+        changed = false;
+        for block in &function_ir.blocks {
+            for (stmt_idx, stmt) in block.stmts.iter().enumerate() {
+                let stmt_ref = StatementRef {
+                    block_id: block.id,
+                    stmt_idx,
+                };
+                let propagated = builtin_seed_from_stmt(stmt, &builtins).or_else(|| {
+                    stmt_builtin_load_name(stmt, &stmt_ref, abi_annotations)
+                });
+                let Some(name) = propagated else {
+                    continue;
+                };
+                for def in &stmt.defs {
+                    let Some(reg) = def.get_reg() else {
+                        continue;
+                    };
+                    if !matches!(reg.class.as_str(), "R" | "UR") {
+                        continue;
+                    }
+                    match builtins.get(reg) {
+                        Some(existing) if existing == &name => {}
+                        _ => {
+                            builtins.insert(reg.clone(), name.clone());
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    builtins
+}
+
+fn builtin_seed_from_stmt(
+    stmt: &IRStatement,
+    builtins: &BTreeMap<RegId, String>,
+) -> Option<String> {
+    match &stmt.value {
+        RValue::Phi(args) => merge_builtins(args.iter().filter_map(|expr| expr_builtin_name(expr, builtins))),
+        RValue::Op { opcode, args } if is_root_copy_like(opcode) => args
+            .iter()
+            .find_map(|expr| expr_builtin_name(expr, builtins)),
+        RValue::Op { opcode, args }
+            if matches!(opcode.split('.').next().unwrap_or(opcode), "S2R" | "CS2R" | "S2UR") =>
+        {
+            args.first().and_then(|expr| expr_builtin_name(expr, builtins))
+        }
+        _ => None,
+    }
+}
+
+fn builtin_name_from_annotations(
+    def_idx: usize,
+    annotations: &[crate::abi::ConstMemAnnotation],
+) -> Option<String> {
+    annotations.iter().find_map(|ann| match &ann.semantic {
+        ConstMemSemantic::Builtin(name) if def_idx == 0 => Some((*name).to_string()),
+        _ => None,
+    })
+}
+
+fn stmt_builtin_load_name(
+    stmt: &IRStatement,
+    stmt_ref: &StatementRef,
+    abi_annotations: &AbiAnnotations,
+) -> Option<String> {
+    let RValue::Op { opcode, .. } = &stmt.value else {
+        return None;
+    };
+    let mnem = opcode.split('.').next().unwrap_or(opcode);
+    if !(matches!(mnem, "LDC" | "ULDC" | "LDCU") || is_root_copy_like(opcode)) {
+        return None;
+    }
+    abi_annotations
+        .constmem_by_stmt
+        .get(stmt_ref)
+        .and_then(|annotations| builtin_name_from_annotations(0, annotations))
+}
+
+fn merge_builtins(builtins: impl Iterator<Item = String>) -> Option<String> {
+    let mut iter = builtins;
+    let first = iter.next()?;
+    iter.all(|name| name == first).then_some(first)
+}
+
+fn expr_builtin_name(expr: &IRExpr, builtins: &BTreeMap<RegId, String>) -> Option<String> {
+    match expr {
+        IRExpr::Reg(reg) => builtins.get(reg).cloned(),
+        IRExpr::Op { op, args } if args.is_empty() => special_register_builtin_name(op)
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+fn special_register_builtin_name(op: &str) -> Option<&'static str> {
+    match op {
+        "SR_CTAID.X" => Some("blockIdx.x"),
+        "SR_CTAID.Y" => Some("blockIdx.y"),
+        "SR_CTAID.Z" => Some("blockIdx.z"),
+        "SR_TID.X" => Some("threadIdx.x"),
+        "SR_TID.Y" => Some("threadIdx.y"),
+        "SR_TID.Z" => Some("threadIdx.z"),
+        "SR_NTID.X" => Some("blockDim.x"),
+        "SR_NTID.Y" => Some("blockDim.y"),
+        "SR_NTID.Z" => Some("blockDim.z"),
+        "SR_GRIDID" => Some("gridId"),
+        "SR_LANEID" => Some("laneId"),
+        _ => None,
     }
 }
 
@@ -905,6 +1029,26 @@ mod tests {
         "#;
         let analysis = analyze(sass);
         assert_eq!(analysis.shared_pointee_ty, Some("float"));
+    }
+
+    #[test]
+    fn recovers_special_register_builtins_through_copy_chains() {
+        let sass = r#"
+            /*0000*/ S2R R7, SR_TID.X ;
+            /*0010*/ MOV R8, R7 ;
+            /*0020*/ EXIT ;
+        "#;
+        let analysis = analyze(sass);
+        let tid = crate::ir::RegId::new("R", 7, 1).with_ssa(0);
+        let tid_copy = crate::ir::RegId::new("R", 8, 1).with_ssa(0);
+        assert_eq!(
+            analysis.builtin_by_reg.get(&tid).map(String::as_str),
+            Some("threadIdx.x")
+        );
+        assert_eq!(
+            analysis.builtin_by_reg.get(&tid_copy).map(String::as_str),
+            Some("threadIdx.x")
+        );
     }
 
     #[test]

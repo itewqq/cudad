@@ -631,7 +631,10 @@ fn lower_scalar_expr(expr: &IRExpr) -> Expr {
 
 fn lower_scalar_expr_with_analysis(expr: &IRExpr, analysis: Option<&FunctionAnalysis>) -> Expr {
     match expr {
-        IRExpr::Reg(reg) => lower_reg_expr(reg),
+        IRExpr::Reg(reg) => analysis
+            .and_then(|facts| facts.builtin_by_reg.get(reg))
+            .map(|name| Expr::Builtin(name.clone()))
+            .unwrap_or_else(|| lower_reg_expr(reg)),
         IRExpr::ImmI(value) => Expr::Imm(value.to_string()),
         IRExpr::ImmF(value) => Expr::Imm(value.to_string()),
         IRExpr::Addr64 { lo, hi } => Expr::Addr64 {
@@ -1582,6 +1585,22 @@ mod tests {
             panic!("expected assign");
         };
         assert_eq!(dst.render(), "shmem[(r2_0 + 8) / 4]");
+    }
+
+    #[test]
+    fn lowers_scaled_shared_thread_indices_to_element_offsets() {
+        let sass = r#"
+            /*0000*/ S2R R7, SR_TID.X ;
+            /*0010*/ STS [R7.X4+0x10], R4 ;
+            /*0020*/ EXIT ;
+        "#;
+        let (analysis, block_id, stmt_idx, stmt) =
+            analyze_stmt(sass, |stmt| stmt_opcode(stmt).starts_with("STS"));
+        let lowered = lower_memory_stmt(block_id, stmt_idx, &stmt, &analysis).expect("lowered");
+        let Stmt::Assign { dst, .. } = lowered else {
+            panic!("expected assign");
+        };
+        assert_eq!(dst.render(), "shmem[threadIdx.x + 4]");
     }
 
     #[test]

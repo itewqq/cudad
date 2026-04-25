@@ -1,4 +1,25 @@
-//! Canonical SASS decoding front-end.
+//! Tolerant CUDA SASS decoding front-end.
+//!
+//! Purpose:
+//! - parse irregular SASS text into a lossless decoded instruction stream
+//! - preserve operand structure needed by CFG, SSA, and memory-aware analysis
+//! - keep unknown syntax representable instead of rejecting the whole line
+//!
+//! Inputs:
+//! - raw `nvdisasm`-style text
+//!
+//! Outputs:
+//! - `DecodedInstruction` / `DecodedOperand` values with raw fallback fields
+//!
+//! Invariants:
+//! - parsing must stay syntax-tolerant
+//! - address operands must preserve width/scale modifiers such as `.64` and
+//!   `.X4` instead of collapsing them away
+//! - unknown operands remain representable as `Raw`
+//!
+//! This module must not:
+//! - infer high-level semantics from rendered text
+//! - require a fully formal SASS grammar
 
 use nom::{
     bytes::complete::{tag, take_while},
@@ -67,6 +88,7 @@ pub enum DecodedOperand {
         base: Box<DecodedOperand>,
         offset: Option<i64>,
         width: Option<u32>,
+        scale: Option<u32>,
         raw: String,
     },
     Raw(String),
@@ -437,6 +459,17 @@ fn split_address_base_offset(inner: &str) -> (&str, Option<i64>) {
     (inner.trim(), None)
 }
 
+fn split_address_base_scale(base: &str) -> (&str, Option<u32>) {
+    let trimmed = base.trim();
+    let Some((head, suffix)) = trimmed.rsplit_once(".X") else {
+        return (trimmed, None);
+    };
+    let Ok(scale) = suffix.parse::<u32>() else {
+        return (trimmed, None);
+    };
+    (head.trim(), (scale > 1).then_some(scale))
+}
+
 fn decode_address_operand(tok: &str) -> Option<DecodedOperand> {
     let t = tok.trim();
     if !(t.starts_with('[') && t.ends_with(']')) {
@@ -444,11 +477,13 @@ fn decode_address_operand(tok: &str) -> Option<DecodedOperand> {
     }
     let inner = &t[1..t.len() - 1];
     let (base_str, offset) = split_address_base_offset(inner);
-    let base = decode_operand(base_str);
+    let (base_core, scale) = split_address_base_scale(base_str);
+    let base = decode_operand(base_core);
     Some(DecodedOperand::Address {
         width: decoded_width(&base),
         base: Box::new(base),
         offset,
+        scale,
         raw: t.to_string(),
     })
 }
@@ -875,6 +910,34 @@ mod tests {
             DecodedOperand::Address {
                 offset: Some(-0x20),
                 width: Some(64),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn classify_bracketed_operand_preserves_scaled_thread_index() {
+        let decoded = decode_operand("[R7.X4+0x200]");
+        assert!(matches!(
+            decoded,
+            DecodedOperand::Address {
+                offset: Some(0x200),
+                width: None,
+                scale: Some(4),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn classify_bracketed_operand_preserves_scaled_base_without_offset() {
+        let decoded = decode_operand("[R11.X8]");
+        assert!(matches!(
+            decoded,
+            DecodedOperand::Address {
+                offset: None,
+                width: None,
+                scale: Some(8),
                 ..
             }
         ));

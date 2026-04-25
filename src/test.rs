@@ -1703,14 +1703,14 @@ fn full_pass_reduce_block_scales_shared_word_indices_by_element_size() {
         .into_iter()
         .find(|f| f.name == "reduce_block")
         .expect("reduce_block fixture should exist");
-    let out = run_structured_output_full_pass_from_instrs(reduce.instrs, reduce.sm);
+    let out = run_canonical_output_full_pass_from_instrs(reduce.instrs, reduce.sm, "reduce_block");
     assert!(
         out.contains("shmem[threadIdx.x + 128]"),
         "expected reduce_block to use float-element shared offsets, got:\n{}",
         out
     );
     assert!(
-        !out.contains("shmem[threadIdx.x + 512]"),
+        !out.contains("shmem[(r7_0 + 512) / 4]"),
         "reduce_block should not leak raw byte offsets into shared indices, got:\n{}",
         out
     );
@@ -1723,10 +1723,10 @@ fn full_pass_stencil1d_scales_shared_word_indices_by_element_size() {
             .into_iter()
             .find(|f| f.name == "stencil1d")
             .expect("stencil1d fixture should exist");
-    let out = run_structured_output_full_pass_from_instrs(stencil.instrs, stencil.sm);
+    let out = run_canonical_output_full_pass_from_instrs(stencil.instrs, stencil.sm, "stencil1d");
     assert!(
-        out.contains("shmem[threadIdx.x + 4]"),
-        "expected stencil1d center element to use float indices, got:\n{}",
+        out.contains("shmem[threadIdx.x]"),
+        "expected stencil1d base shared index to use threadIdx.x directly, got:\n{}",
         out
     );
     assert!(
@@ -1735,7 +1735,7 @@ fn full_pass_stencil1d_scales_shared_word_indices_by_element_size() {
         out
     );
     assert!(
-        !out.contains("shmem[threadIdx.x + 528]"),
+        !out.contains("shmem[(r19_0 + 528) / 4]"),
         "stencil1d should not leak raw byte offsets into shared indices, got:\n{}",
         out
     );

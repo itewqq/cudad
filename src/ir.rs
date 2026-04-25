@@ -1,6 +1,25 @@
-//! ir.rs  –  SSA construction + DOT export
-//! fully implements Cytron 91 algorithm (minimal Φ + rename)
-//! no string cached inside nodes; all printing via DisplayCtx
+//! SSA construction and decoded-operand lowering for the canonical backend.
+//!
+//! Purpose:
+//! - lower tolerant decoded operands into a stable SSA-friendly IR
+//! - build SSA with Cytron-style phi placement and renaming
+//! - preserve address structure needed by `FunctionAnalysis`
+//!
+//! Inputs:
+//! - `ControlFlowGraph`
+//! - decoded instructions / operands from the tolerant parser
+//!
+//! Outputs:
+//! - `FunctionIR` and `IRExpr` values suitable for optimization and analysis
+//!
+//! Invariants:
+//! - address operands must preserve wide-pair and scaled-index structure
+//! - SSA statements keep explicit memory-address operands in `mem_addr_args`
+//! - this module owns IR construction, not pseudo-C rendering
+//!
+//! This module must not:
+//! - recover semantics by inspecting rendered output
+//! - silently discard address modifiers that later stages need
 
 use crate::cfg::{ControlFlowGraph, EdgeKind};
 use crate::op_semantics::{derive_op_semantics, OpSemantics};
@@ -447,6 +466,7 @@ fn lower_operand(op: &DecodedOperand) -> IRExpr {
             base,
             offset,
             width,
+            scale,
             ..
         } => {
             let mut base_expr = lower_operand(base.as_ref());
@@ -457,6 +477,12 @@ fn lower_operand(op: &DecodedOperand) -> IRExpr {
                         hi: Box::new(hi_expr),
                     };
                 }
+            }
+            if let Some(scale) = scale.filter(|scale| *scale > 1) {
+                base_expr = IRExpr::Op {
+                    op: "*".into(),
+                    args: vec![base_expr, IRExpr::ImmI(i64::from(scale))],
+                };
             }
             let off_expr = offset.as_ref().map(|v| Box::new(IRExpr::ImmI(*v)));
             IRExpr::Mem {
@@ -511,10 +537,17 @@ fn lower_addr_operand_with_implicit_width(op: &DecodedOperand) -> Option<IRExpr>
             base,
             offset,
             width: None,
+            scale,
             ..
         } => {
-            let lo = lower_operand(base.as_ref());
+            let mut lo = lower_operand(base.as_ref());
             let hi = infer_64bit_pair_hi_expr(base.as_ref())?;
+            if let Some(scale) = scale.filter(|scale| *scale > 1) {
+                lo = IRExpr::Op {
+                    op: "*".into(),
+                    args: vec![lo, IRExpr::ImmI(i64::from(scale))],
+                };
+            }
             Some(IRExpr::Mem {
                 base: Box::new(IRExpr::Addr64 {
                     lo: Box::new(lo),
