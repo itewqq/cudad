@@ -313,7 +313,11 @@ impl AbiArgAliases {
                     out.push(format!("uint64_t arg{}_u64", alias.param_idx));
                 }
                 ArgAliasKind::Word32 => {
-                    out.push(format!("{} arg{}", alias_scalar_c_type(alias), alias.param_idx));
+                    out.push(format!(
+                        "{} arg{}",
+                        alias_scalar_c_type(alias),
+                        alias.param_idx
+                    ));
                 }
             }
         }
@@ -1135,7 +1139,10 @@ pub fn infer_arg_aliases(function_ir: &FunctionIR, annotations: &AbiAnnotations)
         if out.by_param.contains_key(&word_idx) || merged_as_hi.contains(&word_idx) {
             continue; // already handled as part of a Ptr64 pair
         }
-        let scalar_evidence = scalar_evidence_by_word.get(&word_idx).copied().unwrap_or_default();
+        let scalar_evidence = scalar_evidence_by_word
+            .get(&word_idx)
+            .copied()
+            .unwrap_or_default();
         let scalar_kind = select_word_scalar_kind(&scalar_evidence);
         let is_signed = matches!(scalar_kind, ArgScalarKind::I32) || usage.signed_hits > 0;
         out.by_param.insert(
@@ -1319,10 +1326,7 @@ fn scalar_kind_from_inferred_type(ty: Option<InferredType>) -> Option<ArgScalarK
         InferredType::U8 | InferredType::U16 | InferredType::U32 | InferredType::AnyInt => {
             Some(ArgScalarKind::U32)
         }
-        InferredType::Bottom
-        | InferredType::U64
-        | InferredType::Ptr64
-        | InferredType::Top => None,
+        InferredType::Bottom | InferredType::U64 | InferredType::Ptr64 | InferredType::Top => None,
     }
 }
 
@@ -1376,10 +1380,7 @@ fn resolve_param_pair_base_from_mem_expr(mem_expr: &IRExpr, flow: &ParamWordFlow
     resolve_param_pair_base_from_addr_base_expr(base, flow)
 }
 
-fn resolve_param_pair_base_from_addr_base_expr(
-    base: &IRExpr,
-    flow: &ParamWordFlow,
-) -> Option<u32> {
+fn resolve_param_pair_base_from_addr_base_expr(base: &IRExpr, flow: &ParamWordFlow) -> Option<u32> {
     match base {
         IRExpr::Addr64 { lo, hi } => resolve_param_pair_base_from_lo_hi_exprs(
             lo,
@@ -1698,17 +1699,15 @@ fn expr_pointee_type(
     match expr {
         IRExpr::ImmF(_) => (expected_width == 4).then_some("float"),
         IRExpr::ImmI(_) => None,
-        _ => expr
-            .get_reg()
-            .and_then(|reg| {
-                reg_pointee_type(
-                    reg,
-                    ssa_types,
-                    reg_fallback_tys,
-                    copy_phi_edges,
-                    expected_width,
-                )
-            }),
+        _ => expr.get_reg().and_then(|reg| {
+            reg_pointee_type(
+                reg,
+                ssa_types,
+                reg_fallback_tys,
+                copy_phi_edges,
+                expected_width,
+            )
+        }),
     }
 }
 
@@ -1852,9 +1851,10 @@ fn infer_pointer_pointee_ty_from_evidence(types: &BTreeSet<&'static str>) -> Opt
         }
     }
     let width = pointee_type_width_bytes(*types.iter().next()?)?;
-    if types.iter().all(|ty| {
-        pointee_type_width_bytes(ty) == Some(width) && is_integer_pointee_type(ty)
-    }) {
+    if types
+        .iter()
+        .all(|ty| pointee_type_width_bytes(ty) == Some(width) && is_integer_pointee_type(ty))
+    {
         return preferred_integer_pointee_type(types, width);
     }
     None
@@ -2636,7 +2636,10 @@ fn resolve_param_word_from_reg(
             && is_pred_reg_expr(&args[4])
         {
             (&args[1], &args[4])
-        } else if args.len() == 4 && matches!(args[2], IRExpr::ImmI(_)) && is_pred_reg_expr(&args[3]) {
+        } else if args.len() == 4
+            && matches!(args[2], IRExpr::ImmI(_))
+            && is_pred_reg_expr(&args[3])
+        {
             (&args[1], &args[3])
         } else {
             return None;
@@ -3265,8 +3268,9 @@ mod tests {
 
     #[test]
     fn infers_real_power_series_scalar_param_types() {
-        let funcs =
-            crate::parser::split_decoded_functions(include_str!("../test_cu/corpus/loop_kernels.sass"));
+        let funcs = crate::parser::split_decoded_functions(include_str!(
+            "../test_cu/corpus/loop_kernels.sass"
+        ));
         let func = funcs
             .into_iter()
             .find(|func| func.name == "power_series")
@@ -3285,7 +3289,9 @@ mod tests {
             aliases.by_param.get(&1).and_then(|alias| alias.scalar_kind),
             Some(ArgScalarKind::I32)
         );
-        assert!(aliases.render_typed_param_list().contains(&"float arg0".to_string()));
+        assert!(aliases
+            .render_typed_param_list()
+            .contains(&"float arg0".to_string()));
         assert!(aliases
             .render_typed_param_list()
             .contains(&"int32_t arg1".to_string()));
@@ -3307,11 +3313,17 @@ mod tests {
         let aliases = infer_arg_aliases(&fir, &anns);
 
         assert_eq!(
-            aliases.by_param.get(&11).and_then(|alias| alias.scalar_kind),
+            aliases
+                .by_param
+                .get(&11)
+                .and_then(|alias| alias.scalar_kind),
             Some(ArgScalarKind::F32)
         );
         assert_eq!(
-            aliases.by_param.get(&12).and_then(|alias| alias.scalar_kind),
+            aliases
+                .by_param
+                .get(&12)
+                .and_then(|alias| alias.scalar_kind),
             Some(ArgScalarKind::F32)
         );
         let params = aliases.render_typed_param_list();
