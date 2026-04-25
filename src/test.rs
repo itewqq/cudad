@@ -1654,9 +1654,9 @@ fn full_pass_warp_reduce_sum_infers_float_input_pointer() {
         .into_iter()
         .find(|f| f.name == "warp_reduce_sum")
         .expect("warp_reduce_sum fixture should exist");
-    let out = run_structured_output_full_pass_from_instrs(warp.instrs, warp.sm);
+    let out = run_canonical_output_full_pass_from_instrs(warp.instrs, warp.sm, "warp_reduce_sum");
     assert!(
-        out.contains("__global__ void kernel(float* arg0_ptr, float* arg2_ptr, int32_t arg4)"),
+        out.contains("void warp_reduce_sum(float* arg0_ptr, float* arg2_ptr, int32_t arg4)"),
         "expected warp_reduce_sum to infer float input/output pointers, got:\n{}",
         out
     );

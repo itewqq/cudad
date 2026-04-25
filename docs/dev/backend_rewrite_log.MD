@@ -3,7 +3,7 @@
 ## Status
 
 - Branch: `codex/memory-aware-backend-refactor`
-- Checkpoint commit: `d0a1150`
+- Checkpoint commit: `3abd8ca`
 - Current stage: phase 5 cutover of structured output entrypoints onto the canonical backend, with front-half address-contract fixes still landing as needed
 
 ## Landed invariants
@@ -164,6 +164,10 @@
   readable and prevents raw funnel-shift helpers from leaking into the
   canonical path when the source is a known builtin like `threadIdx.x` or
   `blockDim.x`.
+- Canonical targeted coverage now also pins `warp_reduce_sum` shuffle lowering,
+  and the broader float-pointer/signature smoke for `warp_reduce_sum` now runs
+  on the canonical helper instead of the legacy structured-output path.
+- Remaining legacy helper usage in `src/test.rs`: `19`.
 
 ## Next safe step
 
