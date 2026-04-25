@@ -31,7 +31,7 @@
 //! - run the old fixed-point backend repair pipeline
 //! - guess liveness across unstructured jump boundaries
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::ast::{Expr, LValue, Stmt, StructuredFunction};
 
@@ -268,7 +268,7 @@ fn fold_known_conditions_stmt(stmt: Stmt, defs: &mut HashMap<String, Expr>) -> S
             then_branch,
             else_branch,
         } => {
-            let condition = resolve_named_expr(&condition, defs, MATCH_RESOLVE_DEPTH);
+            let condition = normalize_match_expr(&condition, defs, MATCH_RESOLVE_DEPTH);
             if let Some(value) = expr_const_bool(&condition) {
                 return if value {
                     fold_known_conditions_stmt(*then_branch, defs)
@@ -298,7 +298,7 @@ fn fold_known_conditions_stmt(stmt: Stmt, defs: &mut HashMap<String, Expr>) -> S
             body,
         } => {
             let condition = condition
-                .map(|condition| resolve_named_expr(&condition, defs, MATCH_RESOLVE_DEPTH));
+                .map(|condition| normalize_match_expr(&condition, defs, MATCH_RESOLVE_DEPTH));
             let mut body_defs = HashMap::new();
             let body = Box::new(fold_known_conditions_stmt(*body, &mut body_defs));
             defs.clear();
@@ -314,7 +314,7 @@ fn fold_known_conditions_stmt(stmt: Stmt, defs: &mut HashMap<String, Expr>) -> S
             default,
         } => {
             let discriminant =
-                discriminant.map(|expr| resolve_named_expr(&expr, defs, MATCH_RESOLVE_DEPTH));
+                discriminant.map(|expr| normalize_match_expr(&expr, defs, MATCH_RESOLVE_DEPTH));
             let cases = cases
                 .into_iter()
                 .map(|(label, body)| {
@@ -1051,6 +1051,11 @@ fn recover_fchk_division_assign(stmt: &Stmt, defs: &HashMap<String, Expr>) -> Op
     let Stmt::Assign { dst, src } = stmt else {
         return None;
     };
+    // Most kernels do not carry any reciprocal slow-path proof at all; skip the
+    // expensive matcher unless a direct `FCHK` seed is still live in scope.
+    if !defs_contain_direct_fchk(defs) {
+        return None;
+    }
     let (num, den) = match_rcp_division_expr(src, defs)?;
     if !defs.values().any(|expr| {
         let Some((fchk_num, fchk_den)) = match_fchk_expr(expr) else {
@@ -1141,6 +1146,10 @@ fn match_fchk_expr(expr: &Expr) -> Option<(Expr, Expr)> {
         }
         _ => None,
     }
+}
+
+fn defs_contain_direct_fchk(defs: &HashMap<String, Expr>) -> bool {
+    defs.values().any(|expr| match_fchk_expr(expr).is_some())
 }
 
 fn match_division_expr(expr: &Expr, defs: &HashMap<String, Expr>) -> Option<(Expr, Expr)> {
@@ -1303,73 +1312,88 @@ fn match_binary_expr(expr: &Expr, op: &str, defs: &HashMap<String, Expr>) -> Opt
 }
 
 fn normalize_match_expr(expr: &Expr, defs: &HashMap<String, Expr>, depth: usize) -> Expr {
-    rewrite_match_expr(resolve_named_expr(expr, defs, depth))
+    let mut active = HashSet::new();
+    rewrite_match_expr(resolve_named_expr(expr, defs, depth, &mut active))
 }
 
-fn resolve_named_expr(expr: &Expr, defs: &HashMap<String, Expr>, depth: usize) -> Expr {
+fn resolve_named_expr(
+    expr: &Expr,
+    defs: &HashMap<String, Expr>,
+    depth: usize,
+    active: &mut HashSet<String>,
+) -> Expr {
     if depth == 0 {
         return expr.clone();
     }
     if let Some(name) = match_var_name(expr) {
+        // Structured phi lowering can leave loop-carried defs that point back to
+        // the current variable. Keep that variable as a leaf instead of
+        // repeatedly inlining it into an exponentially larger tree.
+        if active.contains(&name) {
+            return expr.clone();
+        }
         if let Some(mapped) = defs.get(&name) {
-            return resolve_named_expr(mapped, defs, depth - 1);
+            active.insert(name.clone());
+            let resolved = resolve_named_expr(mapped, defs, depth - 1, active);
+            active.remove(&name);
+            return resolved;
         }
     }
     match expr {
         Expr::Unary { op, arg } => Expr::Unary {
             op: op.clone(),
-            arg: Box::new(resolve_named_expr(arg, defs, depth)),
+            arg: Box::new(resolve_named_expr(arg, defs, depth, active)),
         },
         Expr::Binary { op, lhs, rhs } => Expr::Binary {
             op: op.clone(),
-            lhs: Box::new(resolve_named_expr(lhs, defs, depth)),
-            rhs: Box::new(resolve_named_expr(rhs, defs, depth)),
+            lhs: Box::new(resolve_named_expr(lhs, defs, depth, active)),
+            rhs: Box::new(resolve_named_expr(rhs, defs, depth, active)),
         },
         Expr::Ternary {
             cond,
             then_expr,
             else_expr,
         } => Expr::Ternary {
-            cond: Box::new(resolve_named_expr(cond, defs, depth)),
-            then_expr: Box::new(resolve_named_expr(then_expr, defs, depth)),
-            else_expr: Box::new(resolve_named_expr(else_expr, defs, depth)),
+            cond: Box::new(resolve_named_expr(cond, defs, depth, active)),
+            then_expr: Box::new(resolve_named_expr(then_expr, defs, depth, active)),
+            else_expr: Box::new(resolve_named_expr(else_expr, defs, depth, active)),
         },
         Expr::CallLike { func, args } => Expr::CallLike {
             func: func.clone(),
             args: args
                 .iter()
-                .map(|arg| resolve_named_expr(arg, defs, depth))
+                .map(|arg| resolve_named_expr(arg, defs, depth, active))
                 .collect(),
         },
         Expr::Intrinsic { op, args } => Expr::Intrinsic {
             op: op.clone(),
             args: args
                 .iter()
-                .map(|arg| resolve_named_expr(arg, defs, depth))
+                .map(|arg| resolve_named_expr(arg, defs, depth, active))
                 .collect(),
         },
         Expr::Load { ty, addr } => Expr::Load {
             ty: ty.clone(),
-            addr: Box::new(resolve_named_expr(addr, defs, depth)),
+            addr: Box::new(resolve_named_expr(addr, defs, depth, active)),
         },
         Expr::WidePtr { base, offset } => Expr::WidePtr {
-            base: Box::new(resolve_named_expr(base, defs, depth)),
-            offset: Box::new(resolve_named_expr(offset, defs, depth)),
+            base: Box::new(resolve_named_expr(base, defs, depth, active)),
+            offset: Box::new(resolve_named_expr(offset, defs, depth, active)),
         },
         Expr::Addr64 { lo, hi } => Expr::Addr64 {
-            lo: Box::new(resolve_named_expr(lo, defs, depth)),
-            hi: Box::new(resolve_named_expr(hi, defs, depth)),
+            lo: Box::new(resolve_named_expr(lo, defs, depth, active)),
+            hi: Box::new(resolve_named_expr(hi, defs, depth, active)),
         },
         Expr::Cast { ty, expr } => Expr::Cast {
             ty: ty.clone(),
-            expr: Box::new(resolve_named_expr(expr, defs, depth)),
+            expr: Box::new(resolve_named_expr(expr, defs, depth, active)),
         },
         Expr::Index { base, index } => Expr::Index {
-            base: Box::new(resolve_named_expr(base, defs, depth)),
-            index: Box::new(resolve_named_expr(index, defs, depth)),
+            base: Box::new(resolve_named_expr(base, defs, depth, active)),
+            index: Box::new(resolve_named_expr(index, defs, depth, active)),
         },
         Expr::LaneExtract { value, lane } => Expr::LaneExtract {
-            value: Box::new(resolve_named_expr(value, defs, depth)),
+            value: Box::new(resolve_named_expr(value, defs, depth, active)),
             lane: *lane,
         },
         other => other.clone(),
@@ -1650,6 +1674,7 @@ fn collect_stmt_used_vars(stmt: &Stmt, live: &mut BTreeSet<String>) {
 mod tests {
     use super::*;
     use crate::ast::LoopKind;
+    use std::collections::HashMap;
 
     #[test]
     fn removes_dead_pure_helper_assignments() {
@@ -2037,5 +2062,47 @@ mod tests {
         assert!(rendered.contains("goto BB3;"), "got:\n{rendered}");
         assert!(!rendered.contains("FCHK("), "got:\n{rendered}");
         assert!(!rendered.contains("CALL.REL.NOINC"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn normalize_match_expr_stops_self_referential_defs_at_the_cycle() {
+        let mut defs = HashMap::new();
+        defs.insert(
+            "idx".to_string(),
+            Expr::Binary {
+                op: "+".to_string(),
+                lhs: Box::new(Expr::Reg("idx".to_string())),
+                rhs: Box::new(Expr::Imm("4".to_string())),
+            },
+        );
+
+        let resolved = normalize_match_expr(&Expr::Reg("idx".to_string()), &defs, 12);
+
+        assert_eq!(canonical_match_expr(&resolved), "+(4,idx)");
+    }
+
+    #[test]
+    fn normalize_match_expr_stops_mutual_cycles_without_blowing_up() {
+        let mut defs = HashMap::new();
+        defs.insert(
+            "x".to_string(),
+            Expr::Binary {
+                op: "+".to_string(),
+                lhs: Box::new(Expr::Reg("y".to_string())),
+                rhs: Box::new(Expr::Imm("4".to_string())),
+            },
+        );
+        defs.insert(
+            "y".to_string(),
+            Expr::Binary {
+                op: "+".to_string(),
+                lhs: Box::new(Expr::Reg("x".to_string())),
+                rhs: Box::new(Expr::Imm("8".to_string())),
+            },
+        );
+
+        let resolved = normalize_match_expr(&Expr::Reg("x".to_string()), &defs, 12);
+
+        assert_eq!(canonical_match_expr(&resolved), "+(4,8,x)");
     }
 }

@@ -98,6 +98,10 @@ constant array.
   semantics: `*U` compare tokens and `NUM`/`NAN` forms need explicit NaN-aware
   logic, not ordered C relational operators that silently change branch
   behavior on NaN inputs.
+- Canonical AST cleanup must stay proof-driven and bounded: reciprocal/division
+  recovery only runs when a direct `FCHK` witness is still live in the local
+  statement region, and local name resolution must stop at self/mutual cycles
+  in loop-carried defs instead of recursively inflating the expression tree.
 - New backend modules must document their inputs, outputs, invariants, and
   forbidden responsibilities in rustdoc headers.
 

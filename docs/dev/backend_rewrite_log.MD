@@ -4,7 +4,7 @@
 
 - Branch: `codex/memory-aware-backend-refactor`
 - Checkpoint commit: `3c01801`
-- Current stage: late phase 5 / early phase 6 control-flow cleanup, with the canonical backend already live and the remaining work focused on broader validation plus the last legacy deletion sweep
+- Current stage: phase 6 acceptance/perf cleanup, with the canonical backend already live and the remaining work focused on broader validation plus the last legacy deletion sweep
 
 ## Landed invariants
 
@@ -373,15 +373,25 @@
   pure helper placeholders; the live contract is to eliminate them by control-
   flow recovery and reciprocal/division simplification rather than by pinning
   them as effectful AST calls.
+- Canonical AST cleanup now gates reciprocal/division recovery on a direct
+  in-scope `FCHK` witness and resolves local name aliases with cycle guards, so
+  large non-reciprocal kernels like `sha256_single_block` no longer spend the
+  cleanup pass recursively inflating loop-carried expressions that have no
+  reciprocal proof to recover.
+- The previously timing-out `sha256_single_block` corpus slice now completes on
+  the live CLI across SM 89 / SM 100 / SM 120, and the structured-helper-leak
+  corpus invariants plus SM 89 determinism all pass again after that cleanup
+  guard landed.
 
 ## Next safe step
 
-1. Re-run the broader helper-leak acceptance slice now that the sub-agent
-   follow-up fixes are in and the targeted `box_blur_variable_radius` /
-   `power_series` regressions plus the new CFG/AST unit coverage are green.
-2. Continue the final phase 6 deletion sweep: remove any remaining legacy-only
+1. Continue the final phase 6 deletion sweep: remove any remaining legacy-only
    backend helpers/tests that no longer back the canonical pipeline, then
    regenerate the curated acceptance outputs from the canonical driver only.
+2. Re-run the remaining broader acceptance slices that still matter after the
+   `sha256_single_block` perf fix (goto budgets, SM 100/120 determinism, and
+   any corpus-wide invariants that have not yet been refreshed on this branch
+   tip).
 3. Once another 2-4 atomic commits land, run the next review sub-agent and
    wait for the result before starting the final corpus refresh / PR cleanup
    pass.
@@ -396,9 +406,10 @@
   more structurizer-side heuristic is still needed for a few larger shared
   helper tails.
 - Whether the remaining packed-pointer heavy kernels (`sobel_edge_detect`,
-  broader affine `layer_norm_forward` slices, rotate-heavy SHA idioms) need
-  another canonical lowering pass before their old smoke tests can be replaced
-  one-for-one instead of simply deleted.
+  broader affine `layer_norm_forward` slices, and any still-temp-heavy SHA
+  idioms beyond the fixed `sha256_single_block` timeout) need another canonical
+  lowering pass before their old smoke tests can be replaced one-for-one
+  instead of simply deleted.
 - How aggressively the public `lib.rs` surface should shrink in the same
   cutover versus a final follow-up cleanup commit after all internal callers
   are gone.
@@ -422,11 +433,12 @@
 - `src/structurizer/mod.rs`
 - `src/structurizer/collapse.rs`
 - `src/structurizer/tests.rs`
+- `docs/dev/decompiler_design.MD`
 
 ## Interrupt resume note
 
-Resume from the post-`box_blur` control-flow slice: predicated helper calls now
-enter the CFG/structurizer as real branches again, so the next safe work is
-broader corpus validation followed by the last semantic-lift deletion cleanup
-while keeping the canonical helper-leak regressions green after each atomic
-commit.
+Resume from the post-`sha256_single_block` perf fix: canonical cleanup is now
+bounded on non-reciprocal kernels again, so the next safe work is the last
+legacy semantic-lift deletion sweep plus the remaining corpus acceptance
+refresh while keeping the canonical helper-leak regressions green after each
+atomic commit.
