@@ -58,11 +58,84 @@ fn decoded_target_addr(instr: &DecodedInstruction) -> Option<u32> {
     })
 }
 
-/// Conservatively recognize compiler-emitted slowpath helpers that stay
-/// in-line with the caller: they only branch forward within the helper
-/// slice and eventually fall out to the caller's continuation instead of
-/// returning.
-fn helper_region_exits_without_return(
+fn call_has_explicit_lexical_return(instrs: &[DecodedInstruction], call_idx: usize) -> bool {
+    let Some(next_addr) = instrs.get(call_idx + 1).map(|instr| instr.addr) else {
+        return false;
+    };
+    let Some(prev) = call_idx.checked_sub(1).and_then(|idx| instrs.get(idx)) else {
+        return false;
+    };
+    if prev.pred.is_some() {
+        return false;
+    }
+    let is_return_setup =
+        opcode_mnemonic(&prev.opcode) == "MOV" || prev.opcode.starts_with("IMAD.MOV");
+    is_return_setup
+        && prev
+            .operands
+            .iter()
+            .any(|operand| decoded_operand_addr(operand) == Some(next_addr))
+}
+
+fn decoded_operand_addr(operand: &crate::parser::DecodedOperand) -> Option<u32> {
+    match operand {
+        crate::parser::DecodedOperand::ImmediateI(value) if *value >= 0 => Some(*value as u32),
+        crate::parser::DecodedOperand::Raw(text) => {
+            let trimmed = text.trim();
+            if let Some(rest) = trimmed.strip_prefix("0x") {
+                u32::from_str_radix(rest, 16).ok()
+            } else {
+                trimmed.parse::<u32>().ok()
+            }
+        }
+        _ => None,
+    }
+}
+
+fn helper_inline_opcode_allowed(opcode: &str) -> bool {
+    matches!(
+        opcode_mnemonic(opcode),
+        "BSYNC"
+            | "BSSY"
+            | "CS2R"
+            | "F2F"
+            | "F2I"
+            | "FADD"
+            | "FCHK"
+            | "FFMA"
+            | "FMUL"
+            | "FSEL"
+            | "I2F"
+            | "I2FP"
+            | "IADD3"
+            | "IMAD"
+            | "IMNMX"
+            | "ISETP"
+            | "LDC"
+            | "LDG"
+            | "LDL"
+            | "LDS"
+            | "LEA"
+            | "LOP3"
+            | "MOV"
+            | "MUFU"
+            | "NOP"
+            | "PLOP3"
+            | "PRMT"
+            | "S2R"
+            | "S2UR"
+            | "SEL"
+            | "SHF"
+            | "STG"
+            | "STL"
+            | "STS"
+            | "UIADD3"
+            | "UISETP"
+            | "ULDC"
+    )
+}
+
+fn helper_subcall_returns(
     start_addr: u32,
     instrs: &[DecodedInstruction],
     addr2idx: &BTreeMap<u32, usize>,
@@ -88,11 +161,7 @@ fn helper_region_exits_without_return(
         };
         let mnem = opcode_mnemonic(&instr.opcode);
         match mnem {
-            "RET" | "BRX" => {
-                cache.insert(start_addr, false);
-                return false;
-            }
-            "EXIT" => {
+            "RET" => {
                 if instr.pred.is_some() {
                     let Some(next_idx) = idx.checked_add(1).filter(|next| *next < instrs.len())
                     else {
@@ -101,6 +170,10 @@ fn helper_region_exits_without_return(
                     };
                     work.push_back(next_idx);
                 }
+            }
+            "EXIT" | "BRX" | "PRET" => {
+                cache.insert(start_addr, false);
+                return false;
             }
             "BRA" | "JMP" | "JMPP" => {
                 let Some(target_addr) = decoded_target_addr(instr) else {
@@ -125,7 +198,26 @@ fn helper_region_exits_without_return(
                     work.push_back(next_idx);
                 }
             }
-            "CALL" | "CAL" | "JCAL" | "PRET" => {
+            "CALL" | "CAL" | "JCAL" => {
+                let Some(target_addr) = decoded_target_addr(instr) else {
+                    cache.insert(start_addr, false);
+                    return false;
+                };
+                if target_addr <= instr.addr
+                    || !addr2idx.contains_key(&target_addr)
+                    || !call_has_explicit_lexical_return(instrs, idx)
+                    || !helper_subcall_returns(target_addr, instrs, addr2idx, cache)
+                {
+                    cache.insert(start_addr, false);
+                    return false;
+                }
+                let Some(next_idx) = idx.checked_add(1).filter(|next| *next < instrs.len()) else {
+                    cache.insert(start_addr, false);
+                    return false;
+                };
+                work.push_back(next_idx);
+            }
+            _ if helper_inline_opcode_allowed(&instr.opcode) => {
                 let Some(next_idx) = idx.checked_add(1).filter(|next| *next < instrs.len()) else {
                     cache.insert(start_addr, false);
                     return false;
@@ -133,11 +225,8 @@ fn helper_region_exits_without_return(
                 work.push_back(next_idx);
             }
             _ => {
-                let Some(next_idx) = idx.checked_add(1).filter(|next| *next < instrs.len()) else {
-                    cache.insert(start_addr, false);
-                    return false;
-                };
-                work.push_back(next_idx);
+                cache.insert(start_addr, false);
+                return false;
             }
         }
     }
@@ -146,16 +235,119 @@ fn helper_region_exits_without_return(
     true
 }
 
-/// Rewrite predicated non-returning calls into CFG conditional branches
-/// before block partitioning so structurization sees the helper slowpath
-/// as ordinary control flow instead of an opaque call opcode.
+/// Conservatively recognize compiler-emitted slowpath helpers that stay
+/// in-line with the caller: they only branch forward within the helper
+/// slice, any nested internal calls have an explicit lexical return target,
+/// and the helper ultimately exits the kernel instead of returning.
+fn helper_region_exits_without_return(
+    start_addr: u32,
+    instrs: &[DecodedInstruction],
+    addr2idx: &BTreeMap<u32, usize>,
+    helper_cache: &mut HashMap<u32, bool>,
+    subcall_cache: &mut HashMap<u32, bool>,
+) -> bool {
+    if let Some(cached) = helper_cache.get(&start_addr) {
+        return *cached;
+    }
+    let Some(&start_idx) = addr2idx.get(&start_addr) else {
+        helper_cache.insert(start_addr, false);
+        return false;
+    };
+
+    let mut seen = BTreeSet::new();
+    let mut work = VecDeque::from([start_idx]);
+    while let Some(idx) = work.pop_front() {
+        if !seen.insert(idx) {
+            continue;
+        }
+        let Some(instr) = instrs.get(idx) else {
+            helper_cache.insert(start_addr, false);
+            return false;
+        };
+        let mnem = opcode_mnemonic(&instr.opcode);
+        match mnem {
+            "RET" | "BRX" | "PRET" => {
+                helper_cache.insert(start_addr, false);
+                return false;
+            }
+            "EXIT" => {
+                if instr.pred.is_some() {
+                    let Some(next_idx) = idx.checked_add(1).filter(|next| *next < instrs.len())
+                    else {
+                        helper_cache.insert(start_addr, false);
+                        return false;
+                    };
+                    work.push_back(next_idx);
+                }
+            }
+            "BRA" | "JMP" | "JMPP" => {
+                let Some(target_addr) = decoded_target_addr(instr) else {
+                    helper_cache.insert(start_addr, false);
+                    return false;
+                };
+                if target_addr < start_addr {
+                    helper_cache.insert(start_addr, false);
+                    return false;
+                }
+                let Some(&target_idx) = addr2idx.get(&target_addr) else {
+                    helper_cache.insert(start_addr, false);
+                    return false;
+                };
+                work.push_back(target_idx);
+                if instr.pred.is_some() {
+                    let Some(next_idx) = idx.checked_add(1).filter(|next| *next < instrs.len())
+                    else {
+                        helper_cache.insert(start_addr, false);
+                        return false;
+                    };
+                    work.push_back(next_idx);
+                }
+            }
+            "CALL" | "CAL" | "JCAL" => {
+                let Some(target_addr) = decoded_target_addr(instr) else {
+                    helper_cache.insert(start_addr, false);
+                    return false;
+                };
+                if target_addr <= instr.addr
+                    || !addr2idx.contains_key(&target_addr)
+                    || !call_has_explicit_lexical_return(instrs, idx)
+                    || !helper_subcall_returns(target_addr, instrs, addr2idx, subcall_cache)
+                {
+                    helper_cache.insert(start_addr, false);
+                    return false;
+                }
+                let Some(next_idx) = idx.checked_add(1).filter(|next| *next < instrs.len()) else {
+                    helper_cache.insert(start_addr, false);
+                    return false;
+                };
+                work.push_back(next_idx);
+            }
+            _ if helper_inline_opcode_allowed(&instr.opcode) => {
+                let Some(next_idx) = idx.checked_add(1).filter(|next| *next < instrs.len()) else {
+                    helper_cache.insert(start_addr, false);
+                    return false;
+                };
+                work.push_back(next_idx);
+            }
+            _ => {
+                helper_cache.insert(start_addr, false);
+                return false;
+            }
+        }
+    }
+
+    helper_cache.insert(start_addr, true);
+    true
+}
+
 fn rewrite_predicated_nonreturning_calls(instrs: &mut [DecodedInstruction]) {
     let addr2idx = instrs
         .iter()
         .enumerate()
         .map(|(idx, instr)| (instr.addr, idx))
         .collect::<BTreeMap<_, _>>();
-    let mut cache = HashMap::new();
+    let mut helper_cache = HashMap::new();
+    let mut subcall_cache = HashMap::new();
 
     for idx in 0..instrs.len() {
         let next_addr = instrs.get(idx + 1).map(|next| next.addr);
@@ -169,7 +361,16 @@ fn rewrite_predicated_nonreturning_calls(instrs: &mut [DecodedInstruction]) {
         if target <= instr.addr {
             continue;
         }
-        if !helper_region_exits_without_return(target, instrs, &addr2idx, &mut cache) {
+        // Only rewrite helpers whose inlined target stays inside this function,
+        // uses known inline-safe opcodes, and falls back to the caller's next
+        // instruction instead of returning through the normal call path.
+        if !helper_region_exits_without_return(
+            target,
+            instrs,
+            &addr2idx,
+            &mut helper_cache,
+            &mut subcall_cache,
+        ) {
             continue;
         }
         instrs[idx].terminator = TerminatorKind::CondBranch {
@@ -422,6 +623,24 @@ mod tests {
         edges
     }
 
+    fn helper_exits_without_return(sass: &str, start_addr: u32) -> bool {
+        let instrs = decode_sass(sass);
+        let addr2idx = instrs
+            .iter()
+            .enumerate()
+            .map(|(idx, instr)| (instr.addr, idx))
+            .collect::<BTreeMap<_, _>>();
+        let mut helper_cache = HashMap::new();
+        let mut subcall_cache = HashMap::new();
+        helper_region_exits_without_return(
+            start_addr,
+            &instrs,
+            &addr2idx,
+            &mut helper_cache,
+            &mut subcall_cache,
+        )
+    }
+
     #[test]
     fn cfg_uses_conditional_terminators() {
         let sass = r#"
@@ -469,6 +688,47 @@ mod tests {
         "#;
         let cfg = build_cfg(decode_sass(sass));
         assert_eq!(cfg.node_count(), 3);
+        assert_eq!(
+            outgoing(&cfg, 0x0),
+            vec![(0x10, EdgeKind::FallThrough), (0x20, EdgeKind::CondBranch)]
+        );
+    }
+
+    #[test]
+    fn helper_scan_rejects_unknown_opcodes() {
+        let sass = r#"
+            /*0000*/ @P0 CALL.REL.NOINC 0x0020 ;
+            /*0010*/ BRA 0x0010 ;
+            /*0020*/ FOO R0, R0 ;
+            /*0030*/ EXIT ;
+        "#;
+        assert!(!helper_exits_without_return(sass, 0x20));
+    }
+
+    #[test]
+    fn helper_scan_requires_explicit_lexical_return_for_nested_calls() {
+        let sass = r#"
+            /*0000*/ @P0 CALL.REL.NOINC 0x0020 ;
+            /*0010*/ BRA 0x0010 ;
+            /*0020*/ CALL.REL.NOINC 0x0040 ;
+            /*0030*/ EXIT ;
+            /*0040*/ RET ;
+        "#;
+        assert!(!helper_exits_without_return(sass, 0x20));
+    }
+
+    #[test]
+    fn helper_scan_accepts_nested_calls_with_explicit_lexical_return() {
+        let sass = r#"
+            /*0000*/ @P0 CALL.REL.NOINC 0x0020 ;
+            /*0010*/ BRA 0x0010 ;
+            /*0020*/ MOV R4, 0x0040 ;
+            /*0030*/ CALL.REL.NOINC 0x0050 ;
+            /*0040*/ EXIT ;
+            /*0050*/ RET ;
+        "#;
+        assert!(helper_exits_without_return(sass, 0x20));
+        let cfg = build_cfg(decode_sass(sass));
         assert_eq!(
             outgoing(&cfg, 0x0),
             vec![(0x10, EdgeKind::FallThrough), (0x20, EdgeKind::CondBranch)]

@@ -364,6 +364,11 @@
 - Structurizer unit coverage now pins that shared terminal helper chains use
   node splitting instead of goto fallback once the helper tail is small,
   acyclic, and return-terminated.
+- Review follow-up fixes are now landed for the helper-slowpath slice:
+  branch-entry phi preludes are injected inside entry labels so surviving gotos
+  cannot skip them, and the CFG helper rewrite now rejects unknown opcode
+  classes while requiring explicit lexical nested-return setup before treating
+  an internal `CALL.REL.NOINC` chain as inline control flow.
 - Canonical local cleanup continues to treat raw `CALL.REL.NOINC` sites as
   pure helper placeholders; the live contract is to eliminate them by control-
   flow recovery and reciprocal/division simplification rather than by pinning
@@ -371,9 +376,9 @@
 
 ## Next safe step
 
-1. Re-run the broader helper-leak acceptance slice now that the
-   `box_blur_variable_radius` front-half/control-flow fix is live again and
-   `power_series` remains green after the cleanup re-tightening.
+1. Re-run the broader helper-leak acceptance slice now that the sub-agent
+   follow-up fixes are in and the targeted `box_blur_variable_radius` /
+   `power_series` regressions plus the new CFG/AST unit coverage are green.
 2. Continue the final phase 6 deletion sweep: remove any remaining legacy-only
    backend helpers/tests that no longer back the canonical pipeline, then
    regenerate the curated acceptance outputs from the canonical driver only.

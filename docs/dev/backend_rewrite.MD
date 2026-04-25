@@ -33,9 +33,10 @@ function dumps are not allowed to collapse every rendered function back to
   only as raw strings.
 - CFG stays control-flow-only.
 - CFG may rewrite predicated non-returning helper calls into conditional
-  branch edges when a conservative forward walk proves the helper never
-  returns to the caller; that rewrite is still control-flow modeling, not
-  semantic lifting.
+  branch edges when a conservative forward walk over inline-safe opcodes,
+  forward-only branches, and explicit lexical nested-return setup shows the
+  helper exits the kernel instead of returning to the caller; that rewrite is
+  still control-flow modeling, not semantic lifting.
 - SSA stays the canonical mid-level control/dataflow representation.
 - Memory-space information must become explicit before AST lowering.
 

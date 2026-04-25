@@ -249,7 +249,7 @@ impl<'a> StructuredLowering<'a> {
                     })
                     .filter(|stmt| !Self::stmt_is_empty(stmt));
                 let then_stmt = if let Some(then_phi) = then_phi {
-                    Self::stmt_sequence(vec![then_phi, then_stmt])
+                    Self::prepend_entry_prelude(then_stmt, then_phi)
                 } else {
                     then_stmt
                 };
@@ -270,7 +270,7 @@ impl<'a> StructuredLowering<'a> {
                             })
                             .filter(|stmt| !Self::stmt_is_empty(stmt));
                         if let Some(else_phi) = else_phi {
-                            Self::stmt_sequence(vec![else_phi, lowered])
+                            Self::prepend_entry_prelude(lowered, else_phi)
                         } else {
                             lowered
                         }
@@ -887,6 +887,40 @@ impl<'a> StructuredLowering<'a> {
             Stmt::Empty => true,
             Stmt::Block(stmts) | Stmt::Sequence(stmts) => stmts.iter().all(Self::stmt_is_empty),
             _ => false,
+        }
+    }
+
+    // Branch-entry phi materialization must happen inside the entry label when
+    // the structured region is still a jump target; otherwise a surviving goto
+    // would jump past the phi prelude and read stale SSA values.
+    fn prepend_entry_prelude(stmt: Stmt, prelude: Stmt) -> Stmt {
+        if Self::stmt_is_empty(&prelude) {
+            return stmt;
+        }
+        match stmt {
+            Stmt::Label { name, body } => Stmt::Label {
+                name,
+                body: Box::new(Self::prepend_entry_prelude(*body, prelude)),
+            },
+            Stmt::Sequence(mut stmts) => {
+                if let Some(idx) = stmts.iter().position(|stmt| !Self::stmt_is_empty(stmt)) {
+                    let head = std::mem::replace(&mut stmts[idx], Stmt::Empty);
+                    stmts[idx] = Self::prepend_entry_prelude(head, prelude);
+                    Self::stmt_sequence(stmts)
+                } else {
+                    prelude
+                }
+            }
+            Stmt::Block(mut stmts) => {
+                if let Some(idx) = stmts.iter().position(|stmt| !Self::stmt_is_empty(stmt)) {
+                    let head = std::mem::replace(&mut stmts[idx], Stmt::Empty);
+                    stmts[idx] = Self::prepend_entry_prelude(head, prelude);
+                    Stmt::Block(stmts)
+                } else {
+                    prelude
+                }
+            }
+            other => Self::stmt_sequence(vec![prelude, other]),
         }
     }
 
@@ -4575,6 +4609,148 @@ mod tests {
         assert!(rendered.contains("r5_1 = r4_2;"), "got:\n{rendered}");
         assert!(rendered.contains("r6_1 = r5_1;"), "got:\n{rendered}");
         assert!(!rendered.contains("phi("), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn lowers_if_entry_phi_inside_jump_target_label() {
+        let mut cfg = crate::cfg::ControlFlowGraph::new();
+        let bb0 = cfg.add_node(crate::cfg::BasicBlock {
+            id: 0,
+            start: 0x00,
+            instrs: Vec::new(),
+        });
+        let bb1 = cfg.add_node(crate::cfg::BasicBlock {
+            id: 1,
+            start: 0x10,
+            instrs: Vec::new(),
+        });
+        let bb2 = cfg.add_node(crate::cfg::BasicBlock {
+            id: 2,
+            start: 0x20,
+            instrs: Vec::new(),
+        });
+        let bb4 = cfg.add_node(crate::cfg::BasicBlock {
+            id: 4,
+            start: 0x40,
+            instrs: Vec::new(),
+        });
+        cfg.add_edge(bb0, bb1, crate::cfg::EdgeKind::CondBranch);
+        cfg.add_edge(bb0, bb2, crate::cfg::EdgeKind::FallThrough);
+        cfg.add_edge(bb4, bb1, crate::cfg::EdgeKind::UncondBranch);
+
+        let pred = crate::ir::RegId::new("P", 0, 1);
+        let phi_dst = crate::ir::RegId::new("R", 5, 1).with_ssa(1);
+        let use_dst = crate::ir::RegId::new("R", 6, 1).with_ssa(1);
+        let fir = crate::ir::FunctionIR {
+            blocks: vec![
+                crate::ir::IRBlock {
+                    id: 0,
+                    start_addr: 0x00,
+                    irdst: vec![
+                        (
+                            Some(crate::ir::IRCond::Pred {
+                                reg: pred.clone(),
+                                sense: true,
+                            }),
+                            0x10,
+                        ),
+                        (
+                            Some(crate::ir::IRCond::Pred {
+                                reg: pred.clone(),
+                                sense: false,
+                            }),
+                            0x20,
+                        ),
+                    ],
+                    stmts: vec![IRStatement {
+                        defs: vec![IRExpr::Reg(pred.clone())],
+                        value: RValue::ImmI(1),
+                        pred: None,
+                        mem_addr_args: None,
+                        pred_old_defs: Vec::new(),
+                    }],
+                },
+                crate::ir::IRBlock {
+                    id: 1,
+                    start_addr: 0x10,
+                    irdst: vec![],
+                    stmts: vec![
+                        IRStatement {
+                            defs: vec![IRExpr::Reg(phi_dst.clone())],
+                            value: RValue::Phi(vec![IRExpr::ImmI(11), IRExpr::ImmI(99)]),
+                            pred: None,
+                            mem_addr_args: None,
+                            pred_old_defs: Vec::new(),
+                        },
+                        IRStatement {
+                            defs: vec![IRExpr::Reg(use_dst)],
+                            value: RValue::Op {
+                                opcode: "MOV".to_string(),
+                                args: vec![IRExpr::Reg(phi_dst)],
+                            },
+                            pred: None,
+                            mem_addr_args: None,
+                            pred_old_defs: Vec::new(),
+                        },
+                    ],
+                },
+                crate::ir::IRBlock {
+                    id: 2,
+                    start_addr: 0x20,
+                    irdst: vec![],
+                    stmts: vec![IRStatement {
+                        defs: vec![IRExpr::Reg(crate::ir::RegId::new("R", 7, 1).with_ssa(1))],
+                        value: RValue::ImmI(22),
+                        pred: None,
+                        mem_addr_args: None,
+                        pred_old_defs: Vec::new(),
+                    }],
+                },
+                crate::ir::IRBlock {
+                    id: 4,
+                    start_addr: 0x40,
+                    irdst: vec![(Some(crate::ir::IRCond::True), 0x10)],
+                    stmts: vec![IRStatement {
+                        defs: vec![IRExpr::Reg(crate::ir::RegId::new("R", 8, 1).with_ssa(1))],
+                        value: RValue::ImmI(33),
+                        pred: None,
+                        mem_addr_args: None,
+                        pred_old_defs: Vec::new(),
+                    }],
+                },
+            ],
+        };
+        let structured = StructuredStatement::Sequence(vec![
+            StructuredStatement::If {
+                condition_block_id: 0,
+                condition_expr: IRExpr::Reg(pred),
+                then_branch: Box::new(StructuredStatement::BasicBlock {
+                    block_id: 1,
+                    stmts: fir.blocks[1].stmts.clone(),
+                }),
+                else_branch: Some(Box::new(StructuredStatement::BasicBlock {
+                    block_id: 2,
+                    stmts: fir.blocks[2].stmts.clone(),
+                })),
+            },
+            StructuredStatement::BasicBlock {
+                block_id: 4,
+                stmts: fir.blocks[3].stmts.clone(),
+            },
+            StructuredStatement::UnstructuredJump {
+                from_block_id: 4,
+                to_block_id: 1,
+                condition: None,
+            },
+        ]);
+
+        let lowered = lower_structured_stmt(&structured, &cfg, &fir, &FunctionAnalysis::default());
+        let rendered = lowered.render_with_indent(0);
+        let label_pos = rendered.find("BB1:").expect("branch entry label");
+        let phi_pos = rendered.find("r5_1 = 11;").expect("phi prelude");
+        assert!(label_pos < phi_pos, "got:\n{rendered}");
+        assert!(rendered.contains("goto BB1;"), "got:\n{rendered}");
+        assert!(rendered.contains("r6_1 = r5_1;"), "got:\n{rendered}");
     }
 
     #[test]

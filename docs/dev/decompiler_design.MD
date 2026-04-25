@@ -54,8 +54,9 @@ The control-flow layer depends on a few invariants:
 3. CFG node payloads carry decoded instructions all the way into SSA construction
 4. pseudo-register sentinels such as `RZ`, `PT`, `URZ`, and `UPT` are never treated as normal SSA definition targets
 5. predicated non-returning helper calls can be rewritten into conditional CFG
-   edges when a forward-only reachability walk proves the helper falls back
-   into the caller instead of returning
+   edges when a forward-only reachability walk over inline-safe opcodes,
+   forward branches, and explicit lexical nested-return setup shows the helper
+   exits the kernel instead of returning to the caller
 
 `build_ssa` then creates the mid-end IR used by optimization, analysis,
 structurization, and canonical lowering.
