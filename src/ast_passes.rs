@@ -1,6 +1,10 @@
 //! Structural cleanup passes over the typed AST.
 //! These operate before final rendering so backend cleanup stops depending
 //! exclusively on post-render text rewriting.
+//!
+//! This module is internal to the crate. The live canonical path only relies on
+//! the local structural simplifier; the broader legacy cleanup entry points are
+//! being deleted instead of kept as public backend API.
 
 use crate::ast::{Expr, IntrinsicOp, LValue, PointerLane, Stmt};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -177,7 +181,9 @@ fn contains_unstructured_control_flow(stmt: &Stmt) -> bool {
         }
         Stmt::Loop { body, .. } => contains_unstructured_control_flow(body),
         Stmt::Switch { cases, default, .. } => {
-            cases.iter().any(|(_, body)| contains_unstructured_control_flow(body))
+            cases
+                .iter()
+                .any(|(_, body)| contains_unstructured_control_flow(body))
                 || default
                     .as_deref()
                     .map(contains_unstructured_control_flow)
@@ -595,7 +601,11 @@ fn guard_select_specialize_stmt(stmt: Stmt, defs: &Addr64Defs, active_guards: &[
             ));
             Stmt::Label {
                 name,
-                body: Box::new(guard_select_specialize_stmt(*body, &label_defs, active_guards)),
+                body: Box::new(guard_select_specialize_stmt(
+                    *body,
+                    &label_defs,
+                    active_guards,
+                )),
             }
         }
         Stmt::Block(stmts) => Stmt::Block(
@@ -940,11 +950,7 @@ fn split_wide_lane_fold_expr(expr: Expr, defs: &Addr64Defs, active_guards: &[Exp
     fold_split_wide_lane_expr(&expr, defs, active_guards).unwrap_or(expr)
 }
 
-fn split_wide_lane_fold_addr_expr(
-    expr: Expr,
-    defs: &Addr64Defs,
-    active_guards: &[Expr],
-) -> Expr {
+fn split_wide_lane_fold_addr_expr(expr: Expr, defs: &Addr64Defs, active_guards: &[Expr]) -> Expr {
     match expr {
         Expr::Unary { op, arg } => Expr::Unary {
             op,
@@ -1908,7 +1914,9 @@ fn typed_wide_addr_fold_lvalue(lvalue: LValue, defs: &HashMap<String, Expr>) -> 
         LValue::Deref { ty, addr } => {
             let original_addr = (*addr).clone();
             if ty.is_none() {
-                if let Some(addr) = recover_plain_symbolic_pointer_index_from_wide_addr(&original_addr) {
+                if let Some(addr) =
+                    recover_plain_symbolic_pointer_index_from_wide_addr(&original_addr)
+                {
                     return LValue::Deref {
                         ty,
                         addr: Box::new(addr),
@@ -1917,12 +1925,13 @@ fn typed_wide_addr_fold_lvalue(lvalue: LValue, defs: &HashMap<String, Expr>) -> 
             }
             let addr = typed_wide_addr_fold_expr(*addr, defs);
             let rewritten = ty.as_deref().and_then(|ty_name| {
-                recover_explicit_symbolic_pointer_index(&original_addr, ty_name, defs)
-                    .or_else(|| {
+                recover_explicit_symbolic_pointer_index(&original_addr, ty_name, defs).or_else(
+                    || {
                         should_apply_symbolic_index_recovery(&original_addr, ty_name)
                             .then(|| recover_symbolic_pointer_index_from_wide_addr(&addr, ty_name))
                             .flatten()
-                    })
+                    },
+                )
             });
             let untyped_index = ty
                 .is_none()
@@ -1994,7 +2003,9 @@ fn typed_wide_addr_fold_expr(expr: Expr, defs: &HashMap<String, Expr>) -> Expr {
         Expr::Load { ty, addr } => {
             let original_addr = (*addr).clone();
             if ty.is_none() {
-                if let Some(addr) = recover_plain_symbolic_pointer_index_from_wide_addr(&original_addr) {
+                if let Some(addr) =
+                    recover_plain_symbolic_pointer_index_from_wide_addr(&original_addr)
+                {
                     return Expr::Load {
                         ty,
                         addr: Box::new(addr),
@@ -2012,12 +2023,13 @@ fn typed_wide_addr_fold_expr(expr: Expr, defs: &HashMap<String, Expr>) -> Expr {
                 }
             };
             let rewritten = ty.as_deref().and_then(|ty_name| {
-                recover_explicit_symbolic_pointer_index(&original_addr, ty_name, defs)
-                    .or_else(|| {
+                recover_explicit_symbolic_pointer_index(&original_addr, ty_name, defs).or_else(
+                    || {
                         should_apply_symbolic_index_recovery(&original_addr, ty_name)
                             .then(|| recover_symbolic_pointer_index_from_wide_addr(&addr, ty_name))
                             .flatten()
-                    })
+                    },
+                )
             });
             let untyped_index = ty
                 .is_none()
@@ -2055,8 +2067,9 @@ fn typed_wide_addr_fold_expr(expr: Expr, defs: &HashMap<String, Expr>) -> Expr {
                     if ty.trim_end().ends_with('*')
                         || matches!(ty.as_str(), "uintptr_t" | "intptr_t") =>
                 {
-                    if let Some((base, offset)) = match_typed_packed_wide_ptr_expr(expr.as_ref(), defs)
-                        .or_else(|| match_base_relative_wide_ptr_expr(expr.as_ref()))
+                    if let Some((base, offset)) =
+                        match_typed_packed_wide_ptr_expr(expr.as_ref(), defs)
+                            .or_else(|| match_base_relative_wide_ptr_expr(expr.as_ref()))
                     {
                         let collapsed = simplify_typed_wide_ptr_expr(base, offset, defs);
                         if ty.trim_end().ends_with('*') {
@@ -2117,30 +2130,40 @@ fn recover_explicit_symbolic_pointer_index(
     })
 }
 
-fn resolve_direct_explicit_lo_lane_value(expr: &Expr, defs: &HashMap<String, Expr>) -> Option<Expr> {
+fn resolve_direct_explicit_lo_lane_value(
+    expr: &Expr,
+    defs: &HashMap<String, Expr>,
+) -> Option<Expr> {
     let expr = strip_loop_phi_expr(expr);
     if let Some(value) = syntactic_explicit_lo_lane_value(expr) {
         return Some(value);
     }
     match expr {
-        Expr::Reg(name) => defs.get(name).and_then(|value| syntactic_explicit_lo_lane_value(value)),
-        Expr::Raw(text) if is_symbolic_name(text) => {
-            defs.get(text).and_then(|value| syntactic_explicit_lo_lane_value(value))
-        }
+        Expr::Reg(name) => defs
+            .get(name)
+            .and_then(|value| syntactic_explicit_lo_lane_value(value)),
+        Expr::Raw(text) if is_symbolic_name(text) => defs
+            .get(text)
+            .and_then(|value| syntactic_explicit_lo_lane_value(value)),
         _ => None,
     }
 }
 
-fn resolve_direct_explicit_hi_lane_value(expr: &Expr, defs: &HashMap<String, Expr>) -> Option<Expr> {
+fn resolve_direct_explicit_hi_lane_value(
+    expr: &Expr,
+    defs: &HashMap<String, Expr>,
+) -> Option<Expr> {
     let expr = strip_loop_phi_expr(expr);
     if let Some(value) = syntactic_explicit_hi_lane_value(expr) {
         return Some(value);
     }
     match expr {
-        Expr::Reg(name) => defs.get(name).and_then(|value| syntactic_explicit_hi_lane_value(value)),
-        Expr::Raw(text) if is_symbolic_name(text) => {
-            defs.get(text).and_then(|value| syntactic_explicit_hi_lane_value(value))
-        }
+        Expr::Reg(name) => defs
+            .get(name)
+            .and_then(|value| syntactic_explicit_hi_lane_value(value)),
+        Expr::Raw(text) if is_symbolic_name(text) => defs
+            .get(text)
+            .and_then(|value| syntactic_explicit_hi_lane_value(value)),
         _ => None,
     }
 }
@@ -2329,12 +2352,14 @@ fn expr_mentions_symbolic_pointer_base_expr(expr: &Expr, base: &Expr) -> bool {
                 || expr_mentions_symbolic_pointer_base_expr(then_expr, base)
                 || expr_mentions_symbolic_pointer_base_expr(else_expr, base)
         }
-        Expr::CallLike { args, .. } | Expr::Intrinsic { args, .. } => {
-            args.iter()
-                .any(|arg| expr_mentions_symbolic_pointer_base_expr(arg, base))
-        }
+        Expr::CallLike { args, .. } | Expr::Intrinsic { args, .. } => args
+            .iter()
+            .any(|arg| expr_mentions_symbolic_pointer_base_expr(arg, base)),
         Expr::Load { addr, .. } => expr_mentions_symbolic_pointer_base_expr(addr, base),
-        Expr::WidePtr { base: inner_base, offset } => {
+        Expr::WidePtr {
+            base: inner_base,
+            offset,
+        } => {
             expr_mentions_symbolic_pointer_base_expr(inner_base, base)
                 || expr_mentions_symbolic_pointer_base_expr(offset, base)
         }
@@ -2342,7 +2367,10 @@ fn expr_mentions_symbolic_pointer_base_expr(expr: &Expr, base: &Expr) -> bool {
             expr_mentions_symbolic_pointer_base_expr(lo, base)
                 || expr_mentions_symbolic_pointer_base_expr(hi, base)
         }
-        Expr::Index { base: inner_base, index } => {
+        Expr::Index {
+            base: inner_base,
+            index,
+        } => {
             expr_mentions_symbolic_pointer_base_expr(inner_base, base)
                 || expr_mentions_symbolic_pointer_base_expr(index, base)
         }
@@ -2400,7 +2428,9 @@ fn expr_has_pointer_cast(expr: &Expr) -> bool {
             args.iter().any(expr_has_pointer_cast)
         }
         Expr::Load { addr, .. } => expr_has_pointer_cast(addr),
-        Expr::WidePtr { base, offset } => expr_has_pointer_cast(base) || expr_has_pointer_cast(offset),
+        Expr::WidePtr { base, offset } => {
+            expr_has_pointer_cast(base) || expr_has_pointer_cast(offset)
+        }
         Expr::Addr64 { lo, hi } => expr_has_pointer_cast(lo) || expr_has_pointer_cast(hi),
         Expr::Index { base, index } => expr_has_pointer_cast(base) || expr_has_pointer_cast(index),
         Expr::LaneExtract { value, .. } => expr_has_pointer_cast(value),
@@ -2507,7 +2537,8 @@ fn fold_resolved_typed_scaled_hi_expr(expr: &Expr, defs: &HashMap<String, Expr>)
     }
 
     for carry_idx in 0..terms.len() {
-        let Some((carry_lo_source, step)) = match_typed_carry_increment(terms[carry_idx], defs) else {
+        let Some((carry_lo_source, step)) = match_typed_carry_increment(terms[carry_idx], defs)
+        else {
             continue;
         };
         if carry_lo_source.lane != PointerLane::Lo32 {
@@ -2533,7 +2564,8 @@ fn fold_resolved_typed_scaled_hi_expr(expr: &Expr, defs: &HashMap<String, Expr>)
             }
             let hi_offset = typed_wide_value_offset(&hi_source.value, &hi_base)
                 .unwrap_or_else(|| Expr::Imm("0".to_string()));
-            if normalize_offset_expr(hi_offset.clone()) != normalize_offset_expr(lo_offset.clone()) {
+            if normalize_offset_expr(hi_offset.clone()) != normalize_offset_expr(lo_offset.clone())
+            {
                 continue;
             }
 
@@ -2623,10 +2655,13 @@ fn match_lo_backed_wide_value_parts(
     defs: &HashMap<String, Expr>,
 ) -> Option<(Expr, Expr)> {
     if let Some((lo, _hi)) = match_u64_pack_expr(expr) {
-        return match_lo_backed_wide_value_parts(&Expr::Addr64 {
-            lo: Box::new(lo),
-            hi: Box::new(Expr::Imm("0".to_string())),
-        }, defs);
+        return match_lo_backed_wide_value_parts(
+            &Expr::Addr64 {
+                lo: Box::new(lo),
+                hi: Box::new(Expr::Imm("0".to_string())),
+            },
+            defs,
+        );
     }
 
     let expr = strip_wide_casts(expr);
@@ -2637,8 +2672,8 @@ fn match_lo_backed_wide_value_parts(
                 return None;
             }
             let base = typed_wide_value_base(&lo_source.value);
-            let offset =
-                typed_wide_value_offset(&lo_source.value, &base).unwrap_or_else(|| Expr::Imm("0".to_string()));
+            let offset = typed_wide_value_offset(&lo_source.value, &base)
+                .unwrap_or_else(|| Expr::Imm("0".to_string()));
             Some((base, offset))
         }
         Expr::Binary { op, lhs, rhs } if op == "+" || op == "-" => {
@@ -3651,7 +3686,8 @@ fn match_loop_carried_next_lo_value(
         ));
     }
 
-    if let Some(current_lo_source) = resolve_typed_lane_source(&Expr::Reg(current_lo.to_string()), defs)
+    if let Some(current_lo_source) =
+        resolve_typed_lane_source(&Expr::Reg(current_lo.to_string()), defs)
     {
         if current_lo_source.lane == PointerLane::Lo32 {
             let base = typed_wide_value_base(&current_lo_source.value);
@@ -6654,10 +6690,7 @@ fn pointer_base_candidate(expr: &Expr) -> Option<Expr> {
         }
     }
     match strip_wide_casts(expr) {
-        Expr::Raw(text)
-        | Expr::Reg(text)
-        | Expr::ConstMemSymbol(text)
-        | Expr::Builtin(text)
+        Expr::Raw(text) | Expr::Reg(text) | Expr::ConstMemSymbol(text) | Expr::Builtin(text)
             if strip_ptr_suffix(text, ".lo32", "_lo32").is_some()
                 || strip_ptr_suffix(text, ".hi32", "_hi32").is_some()
                 || text.ends_with("_ptr") =>
@@ -7285,9 +7318,13 @@ fn fold_constant_binary(op: &str, lhs: &Expr, rhs: &Expr) -> Option<Expr> {
     let rhs_const = const_scalar(rhs)?;
     match (op, lhs_const, rhs_const) {
         ("&&", ConstScalar::Bool(lhs), ConstScalar::Bool(rhs)) => Some(bool_expr(lhs && rhs)),
-        ("&&", ConstScalar::Int(lhs), ConstScalar::Int(rhs)) => Some(bool_expr(lhs != 0 && rhs != 0)),
+        ("&&", ConstScalar::Int(lhs), ConstScalar::Int(rhs)) => {
+            Some(bool_expr(lhs != 0 && rhs != 0))
+        }
         ("||", ConstScalar::Bool(lhs), ConstScalar::Bool(rhs)) => Some(bool_expr(lhs || rhs)),
-        ("||", ConstScalar::Int(lhs), ConstScalar::Int(rhs)) => Some(bool_expr(lhs != 0 || rhs != 0)),
+        ("||", ConstScalar::Int(lhs), ConstScalar::Int(rhs)) => {
+            Some(bool_expr(lhs != 0 || rhs != 0))
+        }
         ("==", lhs, rhs) => Some(bool_expr(lhs == rhs)),
         ("!=", lhs, rhs) => Some(bool_expr(lhs != rhs)),
         (">", ConstScalar::Int(lhs), ConstScalar::Int(rhs)) => Some(bool_expr(lhs > rhs)),
@@ -7386,11 +7423,15 @@ fn raw_const_scalar(text: &str) -> Option<ConstScalar> {
     let lhs = raw_const_scalar(lhs)?;
     let rhs = raw_const_scalar(rhs)?;
     match (op, lhs, rhs) {
-        ("&&", ConstScalar::Bool(lhs), ConstScalar::Bool(rhs)) => Some(ConstScalar::Bool(lhs && rhs)),
+        ("&&", ConstScalar::Bool(lhs), ConstScalar::Bool(rhs)) => {
+            Some(ConstScalar::Bool(lhs && rhs))
+        }
         ("&&", ConstScalar::Int(lhs), ConstScalar::Int(rhs)) => {
             Some(ConstScalar::Bool(lhs != 0 && rhs != 0))
         }
-        ("||", ConstScalar::Bool(lhs), ConstScalar::Bool(rhs)) => Some(ConstScalar::Bool(lhs || rhs)),
+        ("||", ConstScalar::Bool(lhs), ConstScalar::Bool(rhs)) => {
+            Some(ConstScalar::Bool(lhs || rhs))
+        }
         ("||", ConstScalar::Int(lhs), ConstScalar::Int(rhs)) => {
             Some(ConstScalar::Bool(lhs != 0 || rhs != 0))
         }
@@ -7537,7 +7578,8 @@ fn raw_binary_op_is_unary_position(text: &str, idx: usize) -> bool {
     matches!(
         prefix.chars().next_back(),
         Some(
-            '(' | '[' | '{'
+            '(' | '['
+                | '{'
                 | ','
                 | '?'
                 | ':'
@@ -7688,21 +7730,29 @@ fn parse_raw_match_expr(text: &str) -> Option<Expr> {
         if let Some((lhs, op, rhs)) = split_raw_top_level_binary_ops(text, ops) {
             return Some(Expr::Binary {
                 op: op.to_string(),
-                lhs: Box::new(parse_raw_match_expr(lhs).unwrap_or_else(|| Expr::Raw(lhs.to_string()))),
-                rhs: Box::new(parse_raw_match_expr(rhs).unwrap_or_else(|| Expr::Raw(rhs.to_string()))),
+                lhs: Box::new(
+                    parse_raw_match_expr(lhs).unwrap_or_else(|| Expr::Raw(lhs.to_string())),
+                ),
+                rhs: Box::new(
+                    parse_raw_match_expr(rhs).unwrap_or_else(|| Expr::Raw(rhs.to_string())),
+                ),
             });
         }
     }
     if let Some(inner) = raw_unary_operand(text, "!") {
         return Some(Expr::Unary {
             op: "!".to_string(),
-            arg: Box::new(parse_raw_match_expr(inner).unwrap_or_else(|| Expr::Raw(inner.to_string()))),
+            arg: Box::new(
+                parse_raw_match_expr(inner).unwrap_or_else(|| Expr::Raw(inner.to_string())),
+            ),
         });
     }
     if let Some(inner) = raw_unary_operand(text, "-") {
         return Some(Expr::Unary {
             op: "-".to_string(),
-            arg: Box::new(parse_raw_match_expr(inner).unwrap_or_else(|| Expr::Raw(inner.to_string()))),
+            arg: Box::new(
+                parse_raw_match_expr(inner).unwrap_or_else(|| Expr::Raw(inner.to_string())),
+            ),
         });
     }
     if let Some((ty, rest)) = parse_raw_leading_cast(text) {
@@ -7918,11 +7968,7 @@ fn recover_rcp_division_slowpaths(stmts: Vec<Stmt>) -> Vec<Stmt> {
             &future_used[idx],
         ));
     }
-    let cleaned = prune_dead_runtime_helper_temps_stmt(
-        Stmt::Sequence(out),
-        BTreeSet::new(),
-    )
-    .0;
+    let cleaned = prune_dead_runtime_helper_temps_stmt(Stmt::Sequence(out), BTreeSet::new()).0;
     let cleaned = dedup_consecutive_pure_assigns(cleaned);
     match cleaned {
         Stmt::Sequence(stmts) => stmts,
@@ -7934,13 +7980,15 @@ fn recover_rcp_division_slowpaths(stmts: Vec<Stmt>) -> Vec<Stmt> {
 fn dedup_consecutive_pure_assigns(stmt: Stmt) -> Stmt {
     match stmt {
         Stmt::Sequence(stmts) => rebuild_stmt_list(
-            stmts.into_iter()
+            stmts
+                .into_iter()
                 .map(dedup_consecutive_pure_assigns)
                 .collect(),
             true,
         ),
         Stmt::Block(stmts) => rebuild_stmt_list(
-            stmts.into_iter()
+            stmts
+                .into_iter()
                 .map(dedup_consecutive_pure_assigns)
                 .collect(),
             false,
@@ -7956,7 +8004,8 @@ fn dedup_consecutive_pure_assigns(stmt: Stmt) -> Stmt {
         } => Stmt::If {
             condition,
             then_branch: Box::new(dedup_consecutive_pure_assigns(*then_branch)),
-            else_branch: else_branch.map(|branch| Box::new(dedup_consecutive_pure_assigns(*branch))),
+            else_branch: else_branch
+                .map(|branch| Box::new(dedup_consecutive_pure_assigns(*branch))),
         },
         Stmt::Loop {
             kind,
@@ -8234,9 +8283,11 @@ fn recover_fchk_division_stmt(
     }
     let (pred_name, fast_branch, slow_branch) = match condition {
         Expr::Reg(name) => (name.clone(), else_branch.as_ref(), then_branch.as_ref()),
-        Expr::Unary { op, arg } if op == "!" => {
-            (match_var_name(arg)?, then_branch.as_ref(), else_branch.as_ref())
-        }
+        Expr::Unary { op, arg } if op == "!" => (
+            match_var_name(arg)?,
+            then_branch.as_ref(),
+            else_branch.as_ref(),
+        ),
         _ => return None,
     };
     let Some(fast_assigns) = match_assign_list(fast_branch) else {
@@ -8252,9 +8303,7 @@ fn recover_fchk_division_stmt(
         return None;
     };
     let Some(pred_expr) = defs.get(&pred_name) else {
-        if let Some(recovered) =
-            recover_division_merge_without_pred_def(&fast_assigns, defs)
-        {
+        if let Some(recovered) = recover_division_merge_without_pred_def(&fast_assigns, defs) {
             if debug {
                 eprintln!("recover accepted direct-division merge without predicate def");
             }
@@ -8453,13 +8502,12 @@ fn prune_dead_runtime_helper_temps_stmt(
         }
         let mut condition_vars = BTreeSet::new();
         collect_condition_vars(&current, &mut condition_vars);
-        let (next, live_before) =
-            runtime_helper_dce_stmt(
-                current.clone(),
-                &helper_vars,
-                &condition_vars,
-                live_out.clone(),
-            );
+        let (next, live_before) = runtime_helper_dce_stmt(
+            current.clone(),
+            &helper_vars,
+            &condition_vars,
+            live_out.clone(),
+        );
         if next == current {
             return (next, live_before);
         }
@@ -8604,10 +8652,7 @@ fn collect_runtime_helper_vars_into(
     }
 }
 
-fn branches_look_like_parallel_assigns(
-    then_branch: &Stmt,
-    else_branch: Option<&Stmt>,
-) -> bool {
+fn branches_look_like_parallel_assigns(then_branch: &Stmt, else_branch: Option<&Stmt>) -> bool {
     let Some(else_branch) = else_branch else {
         return false;
     };
@@ -8677,11 +8722,15 @@ fn expr_is_runtime_helper_seed(expr: &Expr) -> bool {
                 || expr_is_runtime_helper_seed(then_expr)
                 || expr_is_runtime_helper_seed(else_expr)
         }
-        Expr::Load { addr, .. } | Expr::Cast { expr: addr, .. } => expr_is_runtime_helper_seed(addr),
+        Expr::Load { addr, .. } | Expr::Cast { expr: addr, .. } => {
+            expr_is_runtime_helper_seed(addr)
+        }
         Expr::WidePtr { base, offset } => {
             expr_is_runtime_helper_seed(base) || expr_is_runtime_helper_seed(offset)
         }
-        Expr::Addr64 { lo, hi } => expr_is_runtime_helper_seed(lo) || expr_is_runtime_helper_seed(hi),
+        Expr::Addr64 { lo, hi } => {
+            expr_is_runtime_helper_seed(lo) || expr_is_runtime_helper_seed(hi)
+        }
         Expr::Index { base, index } => {
             expr_is_runtime_helper_seed(base) || expr_is_runtime_helper_seed(index)
         }
@@ -8729,8 +8778,12 @@ fn runtime_helper_dce_stmt(
             then_branch,
             else_branch,
         } => {
-            let (then_branch, then_live) =
-                runtime_helper_dce_stmt(*then_branch, helper_vars, condition_vars, live_out.clone());
+            let (then_branch, then_live) = runtime_helper_dce_stmt(
+                *then_branch,
+                helper_vars,
+                condition_vars,
+                live_out.clone(),
+            );
             let (else_branch, else_live) = if let Some(else_branch) = else_branch {
                 let (stmt, live) =
                     runtime_helper_dce_stmt(*else_branch, helper_vars, condition_vars, live_out);
@@ -8773,12 +8826,8 @@ fn runtime_helper_dce_stmt(
                 body_live_out = next_live_out;
             }
 
-            let (body, body_live_before) = runtime_helper_dce_stmt(
-                original_body,
-                helper_vars,
-                condition_vars,
-                body_live_out,
-            );
+            let (body, body_live_before) =
+                runtime_helper_dce_stmt(original_body, helper_vars, condition_vars, body_live_out);
             let mut live_before = live_out;
             live_before.extend(cond_live);
             live_before.extend(body_live_before);
@@ -8811,12 +8860,8 @@ fn runtime_helper_dce_stmt(
                 })
                 .collect();
             let default = default.map(|body| {
-                let (body, default_live) = runtime_helper_dce_stmt(
-                    *body,
-                    helper_vars,
-                    condition_vars,
-                    live_out.clone(),
-                );
+                let (body, default_live) =
+                    runtime_helper_dce_stmt(*body, helper_vars, condition_vars, live_out.clone());
                 live_before.extend(default_live);
                 Box::new(body)
             });
@@ -8865,8 +8910,7 @@ fn runtime_helper_dce_sequence(
     let mut kept = Vec::new();
 
     for stmt in stmts.into_iter().rev() {
-        let (stmt, live_before) =
-            runtime_helper_dce_stmt(stmt, helper_vars, condition_vars, live);
+        let (stmt, live_before) = runtime_helper_dce_stmt(stmt, helper_vars, condition_vars, live);
         live = live_before;
         if !matches!(stmt, Stmt::Empty) {
             kept.push(stmt);
@@ -8962,7 +9006,8 @@ fn match_fchk_expr(expr: &Expr) -> Option<(Expr, Expr)> {
 fn match_rcp_division_expr(expr: &Expr, defs: &HashMap<String, Expr>) -> Option<(Expr, Expr)> {
     let expr = normalize_match_expr(expr, defs, 12);
     let (lhs, rhs) = match_binary_expr(&expr, "+", defs)?;
-    match_rcp_division_parts(&lhs, &rhs, defs).or_else(|| match_rcp_division_parts(&rhs, &lhs, defs))
+    match_rcp_division_parts(&lhs, &rhs, defs)
+        .or_else(|| match_rcp_division_parts(&rhs, &lhs, defs))
 }
 
 fn match_division_expr(expr: &Expr, defs: &HashMap<String, Expr>) -> Option<(Expr, Expr)> {
@@ -9021,9 +9066,7 @@ fn match_rcp_division_parts(
                 }
                 continue;
             };
-            if same_match_expr(&corr_scaled, &scaled_resolved)
-                && same_match_expr(&corr_num, num)
-            {
+            if same_match_expr(&corr_scaled, &scaled_resolved) && same_match_expr(&corr_num, num) {
                 let chosen_den = if same_rendered_expr(&corr_den, &den) {
                     den
                 } else {
@@ -9194,7 +9237,11 @@ fn match_mul_factor_pairs(expr: &Expr, defs: &HashMap<String, Expr>) -> Option<V
 fn match_binary_expr(expr: &Expr, op: &str, defs: &HashMap<String, Expr>) -> Option<(Expr, Expr)> {
     let expr = normalize_match_expr(expr, defs, 12);
     match expr {
-        Expr::Binary { op: actual, lhs, rhs } if actual == op => Some((
+        Expr::Binary {
+            op: actual,
+            lhs,
+            rhs,
+        } if actual == op => Some((
             normalize_match_expr(&lhs, defs, 12),
             normalize_match_expr(&rhs, defs, 12),
         )),
@@ -9328,24 +9375,45 @@ fn canonical_match_expr(expr: &Expr) -> String {
             canonical_match_expr(addr)
         ),
         Expr::WidePtr { base, offset } => {
-            format!("wide({}, {})", canonical_match_expr(base), canonical_match_expr(offset))
+            format!(
+                "wide({}, {})",
+                canonical_match_expr(base),
+                canonical_match_expr(offset)
+            )
         }
         Expr::Addr64 { lo, hi } => {
-            format!("addr64({}, {})", canonical_match_expr(lo), canonical_match_expr(hi))
+            format!(
+                "addr64({}, {})",
+                canonical_match_expr(lo),
+                canonical_match_expr(hi)
+            )
         }
         Expr::Cast { ty, expr } => format!("cast:{}:{}", ty, canonical_match_expr(expr)),
         Expr::Index { base, index } => {
-            format!("idx({}, {})", canonical_match_expr(base), canonical_match_expr(index))
+            format!(
+                "idx({}, {})",
+                canonical_match_expr(base),
+                canonical_match_expr(index)
+            )
         }
         Expr::LaneExtract { value, lane } => {
-            format!("lane:{}:{}", lane.render_suffix(), canonical_match_expr(value))
+            format!(
+                "lane:{}:{}",
+                lane.render_suffix(),
+                canonical_match_expr(value)
+            )
         }
         _ => normalize_match_render(&expr.render()),
     }
 }
 
 fn collect_assoc_match_terms<'a>(expr: &'a Expr, op: &str, out: &mut Vec<&'a Expr>) {
-    if let Expr::Binary { op: actual, lhs, rhs } = expr {
+    if let Expr::Binary {
+        op: actual,
+        lhs,
+        rhs,
+    } = expr
+    {
         if actual == op {
             collect_assoc_match_terms(lhs, op, out);
             collect_assoc_match_terms(rhs, op, out);
@@ -9761,13 +9829,15 @@ fn prune_globally_unused_pure_assigns(stmt: Stmt) -> Stmt {
 fn prune_globally_unused_pure_assigns_once(stmt: Stmt, used: &BTreeSet<String>) -> Stmt {
     match stmt {
         Stmt::Sequence(stmts) => rebuild_stmt_preserving_shape(
-            stmts.into_iter()
+            stmts
+                .into_iter()
                 .map(|stmt| prune_globally_unused_pure_assigns_once(stmt, used))
                 .collect(),
             true,
         ),
         Stmt::Block(stmts) => rebuild_stmt_preserving_shape(
-            stmts.into_iter()
+            stmts
+                .into_iter()
                 .map(|stmt| prune_globally_unused_pure_assigns_once(stmt, used))
                 .collect(),
             false,
@@ -9804,17 +9874,15 @@ fn prune_globally_unused_pure_assigns_once(stmt: Stmt, used: &BTreeSet<String>) 
                 .into_iter()
                 .map(|(label, body)| (label, prune_globally_unused_pure_assigns_once(body, used)))
                 .collect(),
-            default: default.map(|body| {
-                Box::new(prune_globally_unused_pure_assigns_once(*body, used))
-            }),
+            default: default
+                .map(|body| Box::new(prune_globally_unused_pure_assigns_once(*body, used))),
         },
         Stmt::Assign { dst, src } => {
-            let drop_assign = lvalue_symbol_name(&dst)
-                .is_some_and(|name| {
-                    can_prune_globally_unused_name(&name)
-                        && !used.contains(&name)
-                        && expr_is_pure_for_dce(&src)
-                });
+            let drop_assign = lvalue_symbol_name(&dst).is_some_and(|name| {
+                can_prune_globally_unused_name(&name)
+                    && !used.contains(&name)
+                    && expr_is_pure_for_dce(&src)
+            });
             if drop_assign {
                 Stmt::Empty
             } else {

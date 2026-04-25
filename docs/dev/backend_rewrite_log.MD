@@ -331,20 +331,15 @@
   `pretty_print_with_lift_cleanup*` and the seeded-wide-addr/token-alias helper
   machinery are gone, and the structurizer tests no longer pin those obsolete
   post-struct rendering contracts.
-- The last semantic-lift production coupling is now fenced off the live
-  backend path: `structurizer` no longer reaches into semantic-lift side
-  tables for predicate/statement pretty-printing, and `src/lib.rs` only
-  builds `semantic_lift` for tests instead of shipping it as part of the
-  production library surface.
-- Test-only coverage now imports semantic-lift helpers explicitly from the
-  private module instead of relying on a crate-root re-export, which keeps the
-  legacy lift harness available for narrow unit tests without reintroducing it
-  as backend API.
-- The review follow-up for this slice is also addressed: `README.md`,
-  `docs/dev/decompiler_design.MD`, and the `src/semantic_lift.rs` header now
-  describe semantic lift as a test-only legacy harness and document the live
-  canonical pipeline as SSA optimization -> `FunctionAnalysis` ->
-  structurization -> AST lowering -> symbol planning -> render.
+- The last semantic-lift production coupling is gone from the tree entirely:
+  `structurizer` no longer reaches into lift side tables, `src/lib.rs` no
+  longer exports the old lift surface, and the dormant `src/semantic_lift.rs`
+  sources plus their rule tables are deleted instead of hanging around as
+  pseudo-reference code.
+- The review follow-up for this slice is also addressed: `README.md` and
+  `docs/dev/decompiler_design.MD` now describe the live canonical pipeline as
+  SSA optimization -> `FunctionAnalysis` -> structurization -> AST lowering ->
+  symbol planning -> render without any remaining semantic-lift side path.
 - Canonical structured lowering now owns structural phi materialization instead
   of leaking raw `phi(...)` helpers from SSA blocks: condition-block preludes,
   edge phi connectors, loop-entry seeds, loop backedge updates, and jump-target
@@ -382,10 +377,10 @@
   the live CLI across SM 89 / SM 100 / SM 120, and the structured-helper-leak
   corpus invariants plus SM 89 determinism all pass again after that cleanup
   guard landed.
-- The legacy semantic-lift harness is now disconnected from the default test
-  build: the remaining `src/test.rs` checks that only asserted lift-specific
-  pretty-print details are deleted, and `src/lib.rs` no longer compiles
-  `semantic_lift` even behind `#[cfg(test)]`.
+- The legacy semantic-lift harness is now deleted rather than merely
+  disconnected: the remaining `src/test.rs` checks that only asserted
+  lift-specific pretty-print details are gone, and there is no dormant
+  `semantic_lift` module left to silently fall out of coverage.
 - The broader acceptance refresh is moving again on the branch tip after that
   cleanup: SM 100 and SM 120 corpus determinism both pass on the canonical
   backend, so the remaining corpus refresh work is narrower (`goto` budgets
@@ -410,9 +405,6 @@
 
 ## Open questions
 
-- Which remaining pieces of `semantic_lift` are still carrying real decode/IR
-  knowledge that must be translated into canonical analysis/lowering before the
-  module can be deleted outright.
 - Whether the new acyclic helper-duplication bound (`<= 6` blocks, no
   loops/gotos) is enough for the remaining corpus slowpaths, or whether one
   more structurizer-side heuristic is still needed for a few larger shared

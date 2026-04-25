@@ -3,7 +3,7 @@
 pub mod abi;
 pub mod ast;
 pub mod ast_lowering;
-pub mod ast_passes;
+mod ast_passes;
 pub mod backend_names;
 pub mod backend_pipeline;
 pub mod canonical_ast_passes;
@@ -32,7 +32,6 @@ mod test;
 pub use abi::*;
 pub use ast::*;
 pub use ast_lowering::*;
-pub use ast_passes::*;
 pub use backend_names::*;
 pub use backend_pipeline::*;
 pub use canonical_ast_passes::*;
