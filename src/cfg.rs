@@ -3,7 +3,7 @@
 use crate::parser::{DecodedInstruction, TerminatorKind};
 use petgraph::graph::{Graph, NodeIndex};
 use petgraph::visit::EdgeRef;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 #[derive(Debug, Clone)]
 pub struct BasicBlock {
@@ -43,8 +43,145 @@ fn maybe_add_edge(
     }
 }
 
+fn decoded_target_addr(instr: &DecodedInstruction) -> Option<u32> {
+    instr.operands.first().and_then(|op| match op {
+        crate::parser::DecodedOperand::ImmediateI(value) if *value >= 0 => Some(*value as u32),
+        crate::parser::DecodedOperand::Raw(text) => {
+            let trimmed = text.trim();
+            if let Some(rest) = trimmed.strip_prefix("0x") {
+                u32::from_str_radix(rest, 16).ok()
+            } else {
+                trimmed.parse::<u32>().ok()
+            }
+        }
+        _ => None,
+    })
+}
+
+/// Conservatively recognize compiler-emitted slowpath helpers that stay
+/// in-line with the caller: they only branch forward within the helper
+/// slice and eventually fall out to the caller's continuation instead of
+/// returning.
+fn helper_region_exits_without_return(
+    start_addr: u32,
+    instrs: &[DecodedInstruction],
+    addr2idx: &BTreeMap<u32, usize>,
+    cache: &mut HashMap<u32, bool>,
+) -> bool {
+    if let Some(cached) = cache.get(&start_addr) {
+        return *cached;
+    }
+    let Some(&start_idx) = addr2idx.get(&start_addr) else {
+        cache.insert(start_addr, false);
+        return false;
+    };
+
+    let mut seen = BTreeSet::new();
+    let mut work = VecDeque::from([start_idx]);
+    while let Some(idx) = work.pop_front() {
+        if !seen.insert(idx) {
+            continue;
+        }
+        let Some(instr) = instrs.get(idx) else {
+            cache.insert(start_addr, false);
+            return false;
+        };
+        let mnem = opcode_mnemonic(&instr.opcode);
+        match mnem {
+            "RET" | "BRX" => {
+                cache.insert(start_addr, false);
+                return false;
+            }
+            "EXIT" => {
+                if instr.pred.is_some() {
+                    let Some(next_idx) = idx.checked_add(1).filter(|next| *next < instrs.len())
+                    else {
+                        cache.insert(start_addr, false);
+                        return false;
+                    };
+                    work.push_back(next_idx);
+                }
+            }
+            "BRA" | "JMP" | "JMPP" => {
+                let Some(target_addr) = decoded_target_addr(instr) else {
+                    cache.insert(start_addr, false);
+                    return false;
+                };
+                if target_addr < start_addr {
+                    cache.insert(start_addr, false);
+                    return false;
+                }
+                let Some(&target_idx) = addr2idx.get(&target_addr) else {
+                    cache.insert(start_addr, false);
+                    return false;
+                };
+                work.push_back(target_idx);
+                if instr.pred.is_some() {
+                    let Some(next_idx) = idx.checked_add(1).filter(|next| *next < instrs.len())
+                    else {
+                        cache.insert(start_addr, false);
+                        return false;
+                    };
+                    work.push_back(next_idx);
+                }
+            }
+            "CALL" | "CAL" | "JCAL" | "PRET" => {
+                let Some(next_idx) = idx.checked_add(1).filter(|next| *next < instrs.len()) else {
+                    cache.insert(start_addr, false);
+                    return false;
+                };
+                work.push_back(next_idx);
+            }
+            _ => {
+                let Some(next_idx) = idx.checked_add(1).filter(|next| *next < instrs.len()) else {
+                    cache.insert(start_addr, false);
+                    return false;
+                };
+                work.push_back(next_idx);
+            }
+        }
+    }
+
+    cache.insert(start_addr, true);
+    true
+}
+
+/// Rewrite predicated non-returning calls into CFG conditional branches
+/// before block partitioning so structurization sees the helper slowpath
+/// as ordinary control flow instead of an opaque call opcode.
+fn rewrite_predicated_nonreturning_calls(instrs: &mut [DecodedInstruction]) {
+    let addr2idx = instrs
+        .iter()
+        .enumerate()
+        .map(|(idx, instr)| (instr.addr, idx))
+        .collect::<BTreeMap<_, _>>();
+    let mut cache = HashMap::new();
+
+    for idx in 0..instrs.len() {
+        let next_addr = instrs.get(idx + 1).map(|next| next.addr);
+        let instr = &instrs[idx];
+        if instr.pred.is_none() || opcode_mnemonic(&instr.opcode) != "CALL" {
+            continue;
+        }
+        let Some(target) = decoded_target_addr(instr) else {
+            continue;
+        };
+        if target <= instr.addr {
+            continue;
+        }
+        if !helper_region_exits_without_return(target, instrs, &addr2idx, &mut cache) {
+            continue;
+        }
+        instrs[idx].terminator = TerminatorKind::CondBranch {
+            taken: Some(target),
+            fallthrough: next_addr,
+        };
+    }
+}
+
 pub fn build_cfg(mut instrs: Vec<DecodedInstruction>) -> ControlFlowGraph {
     instrs.sort_by_key(|instr| instr.addr);
+    rewrite_predicated_nonreturning_calls(&mut instrs);
     let mut graph: ControlFlowGraph = Graph::new();
     if instrs.is_empty() {
         return graph;
@@ -321,6 +458,21 @@ mod tests {
         let cfg = build_cfg(decode_sass(sass));
         assert_eq!(cfg.node_count(), 2);
         assert!(outgoing(&cfg, 0x0).is_empty());
+    }
+
+    #[test]
+    fn cfg_rewrites_predicated_nonreturning_calls_as_conditional_edges() {
+        let sass = r#"
+            /*0000*/ @P0 CALL.REL.NOINC 0x0020 ;
+            /*0010*/ BRA 0x0010 ;
+            /*0020*/ EXIT ;
+        "#;
+        let cfg = build_cfg(decode_sass(sass));
+        assert_eq!(cfg.node_count(), 3);
+        assert_eq!(
+            outgoing(&cfg, 0x0),
+            vec![(0x10, EdgeKind::FallThrough), (0x20, EdgeKind::CondBranch)]
+        );
     }
 
     #[test]

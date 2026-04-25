@@ -240,14 +240,40 @@ impl<'a> StructuredLowering<'a> {
                     jump_targets,
                     fallthrough_target_block,
                 );
+                let then_phi = Self::entry_block_id(then_branch)
+                    .map(|entry_block_id| {
+                        self.lower_phi_connector_chain_from_pred(
+                            entry_block_id,
+                            *condition_block_id,
+                        )
+                    })
+                    .filter(|stmt| !Self::stmt_is_empty(stmt));
+                let then_stmt = if let Some(then_phi) = then_phi {
+                    Self::stmt_sequence(vec![then_phi, then_stmt])
+                } else {
+                    then_stmt
+                };
                 let else_stmt = else_branch
                     .as_ref()
                     .map(|branch| {
-                        self.lower_structured_stmt_with_targets(
+                        let lowered = self.lower_structured_stmt_with_targets(
                             branch,
                             jump_targets,
                             fallthrough_target_block,
-                        )
+                        );
+                        let else_phi = Self::entry_block_id(branch)
+                            .map(|entry_block_id| {
+                                self.lower_phi_connector_chain_from_pred(
+                                    entry_block_id,
+                                    *condition_block_id,
+                                )
+                            })
+                            .filter(|stmt| !Self::stmt_is_empty(stmt));
+                        if let Some(else_phi) = else_phi {
+                            Self::stmt_sequence(vec![else_phi, lowered])
+                        } else {
+                            lowered
+                        }
                     })
                     .or_else(|| {
                         fallthrough_target_block.map(|target_block_id| {
@@ -260,7 +286,8 @@ impl<'a> StructuredLowering<'a> {
                     .filter(|stmt| !Self::stmt_is_empty(stmt));
                 let then_empty = Self::stmt_is_empty(&then_stmt);
                 let else_empty = else_stmt.as_ref().map(Self::stmt_is_empty).unwrap_or(true);
-                let condition = lower_scalar_expr_with_analysis(condition_expr, Some(self.analysis));
+                let condition =
+                    lower_scalar_expr_with_analysis(condition_expr, Some(self.analysis));
                 let core = if then_empty && else_empty {
                     Stmt::Empty
                 } else if then_empty && !else_empty {
@@ -314,16 +341,14 @@ impl<'a> StructuredLowering<'a> {
                     (LoopType::DoWhile, Some(header_block_id)) => {
                         let body_entry = Self::entry_block_id(&printable_body);
                         match body_entry {
-                            Some(body_entry) if body_entry != *header_block_id => {
-                                self.lower_phi_connector_chain_from_pred(body_entry, *header_block_id)
-                            }
+                            Some(body_entry) if body_entry != *header_block_id => self
+                                .lower_phi_connector_chain_from_pred(body_entry, *header_block_id),
                             _ => Stmt::Empty,
                         }
                     }
                     _ => Stmt::Empty,
                 };
-                let loop_backedge =
-                    Self::stmt_sequence(vec![phi_backedge, body_entry_backedge]);
+                let loop_backedge = Self::stmt_sequence(vec![phi_backedge, body_entry_backedge]);
                 let condition_prelude = if *loop_type != LoopType::DoWhile {
                     header_block_id
                         .map(|block_id| self.lower_condition_prelude(block_id))
@@ -355,10 +380,9 @@ impl<'a> StructuredLowering<'a> {
                         Some(target_block_id),
                         Some(header_block_id),
                         LoopType::While | LoopType::DoWhile,
-                    ) => self.lower_phi_connector_chain_from_pred(
-                        target_block_id,
-                        *header_block_id,
-                    ),
+                    ) => {
+                        self.lower_phi_connector_chain_from_pred(target_block_id, *header_block_id)
+                    }
                     _ => Stmt::Empty,
                 };
                 let lowered = Self::stmt_sequence(vec![
@@ -382,9 +406,10 @@ impl<'a> StructuredLowering<'a> {
             }
             StructuredStatement::Break(_) => Stmt::Break,
             StructuredStatement::Continue(_) => Stmt::Continue,
-            StructuredStatement::Return(expr) => {
-                Stmt::Return(expr.as_ref().map(|expr| lower_scalar_expr_with_analysis(expr, Some(self.analysis))))
-            }
+            StructuredStatement::Return(expr) => Stmt::Return(
+                expr.as_ref()
+                    .map(|expr| lower_scalar_expr_with_analysis(expr, Some(self.analysis))),
+            ),
             StructuredStatement::UnstructuredJump {
                 from_block_id,
                 to_block_id,
@@ -471,6 +496,7 @@ impl<'a> StructuredLowering<'a> {
             if let RValue::Op { opcode, .. } = &stmt.value {
                 if Self::is_control_jump_opcode(opcode)
                     || (skip_brx && opcode.split('.').next().unwrap_or(opcode) == "BRX")
+                    || self.is_cfg_modeled_call_opcode(block_id, stmt_idx, stmts, opcode)
                     || Self::is_convergence_barrier_opcode(opcode)
                     || opcode == "NOP"
                 {
@@ -519,11 +545,7 @@ impl<'a> StructuredLowering<'a> {
         }
     }
 
-    fn lower_loop_phi_prelude(
-        &self,
-        header_block_id: usize,
-        body: &StructuredStatement,
-    ) -> Stmt {
+    fn lower_loop_phi_prelude(&self, header_block_id: usize, body: &StructuredStatement) -> Stmt {
         self.lower_phi_assignments_for_loop_preds(header_block_id, body, |preds, loop_blocks| {
             let external = preds
                 .iter()
@@ -815,6 +837,24 @@ impl<'a> StructuredLowering<'a> {
         matches!(opcode, "BRA" | "JMP" | "JMPP")
     }
 
+    fn is_cfg_modeled_call_opcode(
+        &self,
+        block_id: usize,
+        stmt_idx: usize,
+        stmts: &[IRStatement],
+        opcode: &str,
+    ) -> bool {
+        if opcode.split('.').next().unwrap_or(opcode) != "CALL" || stmt_idx + 1 != stmts.len() {
+            return false;
+        }
+        let Some(node) = self.cfg_node_for_block_id(block_id) else {
+            return false;
+        };
+        self.cfg
+            .edges_directed(node, Direction::Outgoing)
+            .any(|edge| !matches!(edge.weight(), crate::cfg::EdgeKind::FallThrough))
+    }
+
     fn is_convergence_barrier_opcode(opcode: &str) -> bool {
         matches!(
             opcode.split('.').next().unwrap_or(opcode),
@@ -912,7 +952,9 @@ impl<'a> StructuredLowering<'a> {
                         .unwrap_or(false)
             }
             Stmt::Switch { cases, default, .. } => {
-                cases.iter().any(|(_, body)| Self::stmt_contains_continue(body))
+                cases
+                    .iter()
+                    .any(|(_, body)| Self::stmt_contains_continue(body))
                     || default
                         .as_deref()
                         .map(Self::stmt_contains_continue)
@@ -958,7 +1000,9 @@ impl<'a> StructuredLowering<'a> {
                 if default.is_none() {
                     return true;
                 }
-                cases.iter().any(|(_, body)| Self::stmt_may_fallthrough(body))
+                cases
+                    .iter()
+                    .any(|(_, body)| Self::stmt_may_fallthrough(body))
                     || default
                         .as_deref()
                         .map(Self::stmt_may_fallthrough)
@@ -984,7 +1028,9 @@ impl<'a> StructuredLowering<'a> {
             ),
             Stmt::Label { name, body } => Stmt::Label {
                 name,
-                body: Box::new(Self::inject_loop_phi_updates_before_continue(*body, updates)),
+                body: Box::new(Self::inject_loop_phi_updates_before_continue(
+                    *body, updates,
+                )),
             },
             Stmt::If {
                 condition,
@@ -1018,7 +1064,9 @@ impl<'a> StructuredLowering<'a> {
                     })
                     .collect(),
                 default: default.map(|body| {
-                    Box::new(Self::inject_loop_phi_updates_before_continue(*body, updates))
+                    Box::new(Self::inject_loop_phi_updates_before_continue(
+                        *body, updates,
+                    ))
                 }),
             },
             Stmt::Loop {
@@ -1028,7 +1076,9 @@ impl<'a> StructuredLowering<'a> {
             } => Stmt::Loop {
                 kind,
                 condition,
-                body: Box::new(Self::inject_loop_phi_updates_before_continue(*body, updates)),
+                body: Box::new(Self::inject_loop_phi_updates_before_continue(
+                    *body, updates,
+                )),
             },
             other => other,
         }
@@ -1552,12 +1602,17 @@ fn lower_root_relative_global_index_expr(
     };
     let rooted_base_name = global_param_base_name(param_idx, analysis);
     let lowered_addr = lower_scalar_expr_with_analysis(addr_base, Some(analysis));
-    if let Expr::WidePtr { base, offset: rooted } = lowered_addr {
+    if let Expr::WidePtr {
+        base,
+        offset: rooted,
+    } = lowered_addr
+    {
         if matches!(base.as_ref(), Expr::Reg(name) if name == &rooted_base_name) {
             let byte_expr = match offset {
-                Some(offset) if !ir_expr_is_zero(offset) => {
-                    add_expr(*rooted, lower_scalar_expr_with_analysis(offset, Some(analysis)))
-                }
+                Some(offset) if !ir_expr_is_zero(offset) => add_expr(
+                    *rooted,
+                    lower_scalar_expr_with_analysis(offset, Some(analysis)),
+                ),
                 _ => *rooted,
             };
             return Some(scale_index_expr(byte_expr, bit_width));
@@ -3218,11 +3273,7 @@ fn lower_wide_input_expr(lo: &IRExpr, hi: &IRExpr, analysis: Option<&FunctionAna
     })
 }
 
-fn lower_rooted_wide_expr(
-    lo: &IRExpr,
-    hi: &IRExpr,
-    analysis: &FunctionAnalysis,
-) -> Option<Expr> {
+fn lower_rooted_wide_expr(lo: &IRExpr, hi: &IRExpr, analysis: &FunctionAnalysis) -> Option<Expr> {
     let lo_reg = lo.get_reg()?;
     let root = analysis.root_by_reg.get(lo_reg)?;
     let base = rooted_wide_base_expr(root, analysis)?;

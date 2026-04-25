@@ -3,8 +3,8 @@
 ## Status
 
 - Branch: `codex/memory-aware-backend-refactor`
-- Checkpoint commit: `6ec41ee`
-- Current stage: late phase 5 / phase 6 cleanup, with the canonical backend already live and the remaining work focused on helper-leak cleanup, validation, and final deletion sweep
+- Checkpoint commit: `3c01801`
+- Current stage: late phase 5 / early phase 6 control-flow cleanup, with the canonical backend already live and the remaining work focused on broader validation plus the last legacy deletion sweep
 
 ## Landed invariants
 
@@ -350,25 +350,43 @@
   edge phi connectors, loop-entry seeds, loop backedge updates, and jump-target
   labels are emitted directly in `src/ast_lowering.rs` on the live backend
   path.
+- CFG construction now rewrites predicated non-returning `CALL.REL.NOINC`
+  helper slowpaths into ordinary conditional edges before block partitioning,
+  so structurization can reason about those helpers as control flow instead of
+  opaque call opcodes.
+- Structured AST lowering now also materializes phi connector chains on
+  structured `if` entry edges, which keeps helper-entry SSA values defined
+  before the lowered branch body consumes them.
+- Structurizer node-splitting now allows duplication of short acyclic helper
+  composites (up to 6 constituent blocks) while still refusing loop/goto
+  composites, which is enough to recover the shared `box_blur_variable_radius`
+  slowpath without regressing `power_series`.
+- Canonical local cleanup continues to treat raw `CALL.REL.NOINC` sites as
+  pure helper placeholders; the live contract is to eliminate them by control-
+  flow recovery and reciprocal/division simplification rather than by pinning
+  them as effectful AST calls.
 
 ## Next safe step
 
-1. Finish the remaining front-half/control-flow slice for internal slow-path
-   `CALL.REL.NOINC` sites that are still surfacing as unsupported call
-   placeholders behind goto tails.
-2. Re-run the targeted corpus acceptance checks after each deletion/control
-   slice so the branch proves the live backend still owns: deterministic
-   output, no leaked SSA suffixes, no raw helper mnemonics, and the current
-   goto/control budgets.
+1. Re-run the broader helper-leak acceptance slice now that the
+   `box_blur_variable_radius` front-half/control-flow fix is live again and
+   `power_series` remains green after the cleanup re-tightening.
+2. Continue the final phase 6 deletion sweep: remove any remaining legacy-only
+   backend helpers/tests that no longer back the canonical pipeline, then
+   regenerate the curated acceptance outputs from the canonical driver only.
 3. Once another 2-4 atomic commits land, run the next review sub-agent and
-   wait for the result before starting the final deletion / corpus refresh
-   sweep.
+   wait for the result before starting the final corpus refresh / PR cleanup
+   pass.
 
 ## Open questions
 
 - Which remaining pieces of `semantic_lift` are still carrying real decode/IR
   knowledge that must be translated into canonical analysis/lowering before the
   module can be deleted outright.
+- Whether the new acyclic helper-duplication bound (`<= 6` blocks, no
+  loops/gotos) is enough for the remaining corpus slowpaths, or whether one
+  more structurizer-side heuristic is still needed for a few larger shared
+  helper tails.
 - Whether the remaining packed-pointer heavy kernels (`sobel_edge_detect`,
   broader affine `layer_norm_forward` slices, rotate-heavy SHA idioms) need
   another canonical lowering pass before their old smoke tests can be replaced
@@ -394,11 +412,13 @@
 - `src/canonical_ast_passes.rs`
 - `src/cfg.rs`
 - `src/structurizer/mod.rs`
+- `src/structurizer/collapse.rs`
 - `src/structurizer/tests.rs`
 
 ## Interrupt resume note
 
-Resume from the remaining semantic-lift deletion slice: the text-repair/name-
-recovery modules are gone, so the next safe work is collapsing or deleting the
-last lift-only hooks that still sit inside `semantic_lift`/docs while keeping
-the canonical corpus/tests green after each atomic commit.
+Resume from the post-`box_blur` control-flow slice: predicated helper calls now
+enter the CFG/structurizer as real branches again, so the next safe work is
+broader corpus validation followed by the last semantic-lift deletion cleanup
+while keeping the canonical helper-leak regressions green after each atomic
+commit.

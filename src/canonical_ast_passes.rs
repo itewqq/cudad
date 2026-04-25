@@ -423,6 +423,17 @@ fn simplify_local_cleanup_sequence(stmts: Vec<Stmt>, as_block: bool) -> Stmt {
     };
 
     for stmt in stmts.into_iter().map(simplify_local_cleanup_regions) {
+        if let Stmt::Label { name, body } = stmt {
+            flush_chunk(&mut out, &mut chunk);
+            let labeled = Stmt::Label {
+                name,
+                body: Box::new(*body),
+            };
+            if !stmt_is_trivial_empty(&labeled) {
+                out.push(labeled);
+            }
+            continue;
+        }
         if contains_unstructured_control_flow(&stmt) {
             flush_chunk(&mut out, &mut chunk);
             if !stmt_is_trivial_empty(&stmt) {

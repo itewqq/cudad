@@ -1261,10 +1261,10 @@
     const SPLIT_MAX_STMTS: usize = 8;
     /// Maximum number of basic-block headers/blocks represented by a
     /// composite region that we're willing to duplicate to recover a
-    /// reducible shape. Keeping this small avoids exploding code size while
-    /// still handling common shared-tail patterns like nested remainder
-    /// ladders.
-    const SPLIT_MAX_COMPOSITE_BLOCKS: usize = 3;
+    /// reducible shape. Keeping this modest avoids exploding code size while
+    /// still handling shared slowpaths that collapse into a short helper
+    /// chain before structurization can fold them.
+    const SPLIT_MAX_COMPOSITE_BLOCKS: usize = 6;
     /// Maximum number of node splits per structurization to avoid blowup.
     const SPLIT_BUDGET: usize = 12;
 
@@ -1305,6 +1305,43 @@
             | StructuredStatement::Return(_)
             | StructuredStatement::UnstructuredJump { .. }
             | StructuredStatement::Empty => 0,
+        }
+    }
+
+    /// Node splitting only duplicates short acyclic helper regions. Once a
+    /// composite already contains a loop or an explicit unstructured jump, a
+    /// duplicate usually hurts readability more than it helps reducibility.
+    fn structured_stmt_has_loop_or_unstructured_jump(stmt: &StructuredStatement) -> bool {
+        match stmt {
+            StructuredStatement::BasicBlock { .. }
+            | StructuredStatement::Break(_)
+            | StructuredStatement::Continue(_)
+            | StructuredStatement::Return(_)
+            | StructuredStatement::Empty => false,
+            StructuredStatement::Sequence(stmts) => stmts
+                .iter()
+                .any(structured_stmt_has_loop_or_unstructured_jump),
+            StructuredStatement::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                structured_stmt_has_loop_or_unstructured_jump(then_branch)
+                    || else_branch
+                        .as_deref()
+                        .map(structured_stmt_has_loop_or_unstructured_jump)
+                        .unwrap_or(false)
+            }
+            StructuredStatement::Loop { .. } | StructuredStatement::UnstructuredJump { .. } => true,
+            StructuredStatement::Switch { cases, default, .. } => {
+                cases
+                    .iter()
+                    .any(|(_, body)| structured_stmt_has_loop_or_unstructured_jump(body))
+                    || default
+                        .as_deref()
+                        .map(structured_stmt_has_loop_or_unstructured_jump)
+                        .unwrap_or(false)
+            }
         }
     }
 
@@ -1357,6 +1394,7 @@
                     .unwrap_or(false),
                 RegionKind::Composite { stmt, .. } => {
                     structured_stmt_block_count(stmt) <= SPLIT_MAX_COMPOSITE_BLOCKS
+                        && !structured_stmt_has_loop_or_unstructured_jump(stmt)
                 }
                 RegionKind::Tombstone => false,
             };
