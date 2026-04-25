@@ -22,7 +22,7 @@
 //! - inspect previously rendered code
 //! - repair names or declarations after rendering
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use crate::abi::ConstMemSemantic;
 use crate::ast::{Expr, LValue, PointerLane, Stmt};
@@ -161,12 +161,19 @@ impl<'a> StructuredLowering<'a> {
     }
 
     fn lower_function(&self, structured: &StructuredStatement) -> crate::ast::StructuredFunction {
-        let body = self.lower_structured_stmt(structured);
+        let (jump_targets, materialized_blocks) = self.plan_render_jump_targets(structured);
+        let body =
+            self.lower_structured_stmt_with_targets(structured, &jump_targets, &materialized_blocks, None);
         let seed = canonicalize_function(crate::ast::StructuredFunction {
             params: Vec::new(),
             locals: Vec::new(),
             body,
         });
+        let seed = crate::ast::StructuredFunction {
+            params: seed.params,
+            locals: seed.locals,
+            body: self.bind_missing_goto_labels(seed.body),
+        };
         let plan = plan_symbols(&seed, self.analysis);
         crate::ast::StructuredFunction {
             params: plan.params,
@@ -176,15 +183,33 @@ impl<'a> StructuredLowering<'a> {
     }
 
     fn lower_structured_stmt(&self, structured: &StructuredStatement) -> Stmt {
+        let (jump_targets, materialized_blocks) = self.plan_render_jump_targets(structured);
+        self.lower_structured_stmt_with_targets(
+            structured,
+            &jump_targets,
+            &materialized_blocks,
+            None,
+        )
+    }
+
+    fn plan_render_jump_targets(
+        &self,
+        structured: &StructuredStatement,
+    ) -> (HashSet<usize>, HashSet<usize>) {
+        let mut materialized_blocks = HashSet::new();
+        Self::collect_structured_block_ids(structured, &mut materialized_blocks);
+
         let mut jump_targets = HashSet::new();
-        Self::collect_jump_targets(structured, &mut jump_targets);
-        self.lower_structured_stmt_with_targets(structured, &jump_targets, None)
+        self.collect_render_jump_targets(structured, &materialized_blocks, &mut jump_targets);
+
+        (jump_targets, materialized_blocks)
     }
 
     fn lower_structured_stmt_with_targets(
         &self,
         structured: &StructuredStatement,
         jump_targets: &HashSet<usize>,
+        materialized_blocks: &HashSet<usize>,
         fallthrough_target_block: Option<usize>,
     ) -> Stmt {
         match structured {
@@ -220,6 +245,7 @@ impl<'a> StructuredLowering<'a> {
                     lowered.push(self.lower_structured_stmt_with_targets(
                         part,
                         jump_targets,
+                        materialized_blocks,
                         next_target,
                     ));
                     if Self::ends_with_unconditional_return(part) {
@@ -238,6 +264,7 @@ impl<'a> StructuredLowering<'a> {
                 let then_stmt = self.lower_structured_stmt_with_targets(
                     then_branch,
                     jump_targets,
+                    materialized_blocks,
                     fallthrough_target_block,
                 );
                 let then_phi = Self::entry_block_id(then_branch)
@@ -259,6 +286,7 @@ impl<'a> StructuredLowering<'a> {
                         let lowered = self.lower_structured_stmt_with_targets(
                             branch,
                             jump_targets,
+                            materialized_blocks,
                             fallthrough_target_block,
                         );
                         let else_phi = Self::entry_block_id(branch)
@@ -370,6 +398,7 @@ impl<'a> StructuredLowering<'a> {
                         self.lower_structured_stmt_with_targets(
                             &printable_body,
                             jump_targets,
+                            materialized_blocks,
                             None,
                         ),
                         &loop_backedge,
@@ -416,10 +445,17 @@ impl<'a> StructuredLowering<'a> {
                 condition,
             } => {
                 let phi_prelude =
-                    self.lower_phi_connector_chain_from_pred(*to_block_id, *from_block_id);
+                    self.lower_phi_connector_chain_from_pred(
+                        self.resolve_render_jump_target(*to_block_id, materialized_blocks)
+                            .unwrap_or(*to_block_id),
+                        *from_block_id,
+                    );
+                let render_target = self
+                    .resolve_render_jump_target(*to_block_id, materialized_blocks)
+                    .unwrap_or(*to_block_id);
                 let jump = Self::stmt_sequence(vec![
                     phi_prelude,
-                    Stmt::Goto(format!("BB{}", to_block_id)),
+                    Stmt::Goto(format!("BB{}", render_target)),
                 ]);
                 match condition {
                     Some(condition) => Stmt::If {
@@ -449,6 +485,7 @@ impl<'a> StructuredLowering<'a> {
                                 self.lower_structured_stmt_with_targets(
                                     body,
                                     jump_targets,
+                                    materialized_blocks,
                                     fallthrough_target_block,
                                 ),
                             )
@@ -458,6 +495,7 @@ impl<'a> StructuredLowering<'a> {
                         Box::new(self.lower_structured_stmt_with_targets(
                             body,
                             jump_targets,
+                            materialized_blocks,
                             fallthrough_target_block,
                         ))
                     }),
@@ -721,7 +759,7 @@ impl<'a> StructuredLowering<'a> {
             let connectors = self
                 .cfg_successor_block_ids(current_from)
                 .into_iter()
-                .filter(|succ| self.block_is_phi_only(*succ))
+                .filter(|succ| self.block_is_phi_connector(*succ))
                 .filter(|succ| self.cfg_path_exists(*succ, target_block_id))
                 .collect::<Vec<_>>();
             if connectors.len() != 1 {
@@ -768,12 +806,12 @@ impl<'a> StructuredLowering<'a> {
             .any(|succ| succ == to_block_id)
     }
 
-    fn block_is_phi_only(&self, block_id: usize) -> bool {
+    fn block_is_phi_connector(&self, block_id: usize) -> bool {
         let Some(block) = self.get_ir_block(block_id) else {
             return false;
         };
-        !block.stmts.is_empty()
-            && block
+        block.stmts.is_empty()
+            || block
                 .stmts
                 .iter()
                 .all(|stmt| matches!(stmt.value, RValue::Phi(_)))
@@ -1130,11 +1168,16 @@ impl<'a> StructuredLowering<'a> {
         }
     }
 
-    fn collect_jump_targets(stmt: &StructuredStatement, targets: &mut HashSet<usize>) {
+    fn collect_render_jump_targets(
+        &self,
+        stmt: &StructuredStatement,
+        materialized_blocks: &HashSet<usize>,
+        targets: &mut HashSet<usize>,
+    ) {
         match stmt {
             StructuredStatement::Sequence(stmts) => {
                 for stmt in stmts {
-                    Self::collect_jump_targets(stmt, targets);
+                    self.collect_render_jump_targets(stmt, materialized_blocks, targets);
                 }
             }
             StructuredStatement::If {
@@ -1142,30 +1185,323 @@ impl<'a> StructuredLowering<'a> {
                 else_branch,
                 ..
             } => {
-                Self::collect_jump_targets(then_branch, targets);
+                self.collect_render_jump_targets(then_branch, materialized_blocks, targets);
                 if let Some(else_branch) = else_branch {
-                    Self::collect_jump_targets(else_branch, targets);
+                    self.collect_render_jump_targets(else_branch, materialized_blocks, targets);
                 }
             }
             StructuredStatement::Loop { body, .. } => {
-                Self::collect_jump_targets(body, targets);
+                self.collect_render_jump_targets(body, materialized_blocks, targets);
             }
             StructuredStatement::Switch { cases, default, .. } => {
                 for (_, body) in cases {
-                    Self::collect_jump_targets(body, targets);
+                    self.collect_render_jump_targets(body, materialized_blocks, targets);
                 }
                 if let Some(default) = default {
-                    Self::collect_jump_targets(default, targets);
+                    self.collect_render_jump_targets(default, materialized_blocks, targets);
                 }
             }
             StructuredStatement::UnstructuredJump { to_block_id, .. } => {
-                targets.insert(*to_block_id);
+                targets.insert(
+                    self.resolve_render_jump_target(*to_block_id, materialized_blocks)
+                        .unwrap_or(*to_block_id),
+                );
             }
             StructuredStatement::BasicBlock { .. }
             | StructuredStatement::Break(_)
             | StructuredStatement::Continue(_)
             | StructuredStatement::Return(_)
             | StructuredStatement::Empty => {}
+        }
+    }
+
+    fn resolve_render_jump_target(
+        &self,
+        target_block_id: usize,
+        materialized_blocks: &HashSet<usize>,
+    ) -> Option<usize> {
+        let mut current = target_block_id;
+        let mut seen = HashSet::new();
+
+        loop {
+            if materialized_blocks.contains(&current) {
+                return Some(current);
+            }
+
+            if !self.block_is_phi_connector(current) || !seen.insert(current) {
+                return None;
+            }
+
+            let mut successors = self.cfg_successor_block_ids(current);
+            successors.sort_unstable();
+            successors.dedup();
+            if successors.len() != 1 {
+                return None;
+            }
+            current = successors[0];
+        }
+    }
+
+    fn bind_missing_goto_labels(&self, stmt: Stmt) -> Stmt {
+        let mut labels = BTreeSet::new();
+        Self::collect_label_names(&stmt, &mut labels);
+        let mut goto_targets = BTreeSet::new();
+        Self::collect_goto_label_names(&stmt, &mut goto_targets);
+
+        let mut insert_before = BTreeMap::<String, Vec<String>>::new();
+        let mut tail_labels = Vec::new();
+
+        for label in goto_targets.into_iter().filter(|label| !labels.contains(label)) {
+            if let Some(anchor) = self.resolve_existing_label_anchor(&label, &labels) {
+                insert_before.entry(anchor).or_default().push(label);
+            } else {
+                tail_labels.push(label);
+            }
+        }
+
+        if insert_before.is_empty() && tail_labels.is_empty() {
+            return stmt;
+        }
+
+        for labels in insert_before.values_mut() {
+            labels.sort();
+            labels.dedup();
+        }
+        tail_labels.sort();
+        tail_labels.dedup();
+
+        let stmt = Self::insert_missing_labels_before_anchors(stmt, &insert_before);
+        if tail_labels.is_empty() {
+            stmt
+        } else {
+            let mut out = vec![stmt];
+            out.extend(tail_labels.into_iter().map(Self::empty_label_stmt));
+            Self::stmt_sequence(out)
+        }
+    }
+
+    fn resolve_existing_label_anchor(
+        &self,
+        label: &str,
+        existing_labels: &BTreeSet<String>,
+    ) -> Option<String> {
+        let target_block_id = label.strip_prefix("BB")?.parse::<usize>().ok()?;
+        let mut current = target_block_id;
+        let mut seen = HashSet::new();
+
+        loop {
+            let current_label = format!("BB{}", current);
+            if existing_labels.contains(&current_label) {
+                return Some(current_label);
+            }
+            if !seen.insert(current) {
+                return None;
+            }
+
+            let mut successors = self.cfg_successor_block_ids(current);
+            successors.sort_unstable();
+            successors.dedup();
+            if successors.len() != 1 {
+                return None;
+            }
+            current = successors[0];
+        }
+    }
+
+    fn collect_label_names(stmt: &Stmt, out: &mut BTreeSet<String>) {
+        match stmt {
+            Stmt::Sequence(stmts) | Stmt::Block(stmts) => {
+                for stmt in stmts {
+                    Self::collect_label_names(stmt, out);
+                }
+            }
+            Stmt::Label { name, body } => {
+                out.insert(name.clone());
+                Self::collect_label_names(body, out);
+            }
+            Stmt::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                Self::collect_label_names(then_branch, out);
+                if let Some(else_branch) = else_branch {
+                    Self::collect_label_names(else_branch, out);
+                }
+            }
+            Stmt::Loop { body, .. } => Self::collect_label_names(body, out),
+            Stmt::Switch { cases, default, .. } => {
+                for (_, body) in cases {
+                    Self::collect_label_names(body, out);
+                }
+                if let Some(default) = default {
+                    Self::collect_label_names(default, out);
+                }
+            }
+            Stmt::Break
+            | Stmt::Continue
+            | Stmt::Return(_)
+            | Stmt::Assign { .. }
+            | Stmt::ExprStmt(_)
+            | Stmt::Goto(_)
+            | Stmt::Empty => {}
+        }
+    }
+
+    fn collect_goto_label_names(stmt: &Stmt, out: &mut BTreeSet<String>) {
+        match stmt {
+            Stmt::Sequence(stmts) | Stmt::Block(stmts) => {
+                for stmt in stmts {
+                    Self::collect_goto_label_names(stmt, out);
+                }
+            }
+            Stmt::Label { body, .. } => Self::collect_goto_label_names(body, out),
+            Stmt::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                Self::collect_goto_label_names(then_branch, out);
+                if let Some(else_branch) = else_branch {
+                    Self::collect_goto_label_names(else_branch, out);
+                }
+            }
+            Stmt::Loop { body, .. } => Self::collect_goto_label_names(body, out),
+            Stmt::Switch { cases, default, .. } => {
+                for (_, body) in cases {
+                    Self::collect_goto_label_names(body, out);
+                }
+                if let Some(default) = default {
+                    Self::collect_goto_label_names(default, out);
+                }
+            }
+            Stmt::Goto(label) => {
+                out.insert(label.clone());
+            }
+            Stmt::Break
+            | Stmt::Continue
+            | Stmt::Return(_)
+            | Stmt::Assign { .. }
+            | Stmt::ExprStmt(_)
+            | Stmt::Empty => {}
+        }
+    }
+
+    fn insert_missing_labels_before_anchors(
+        stmt: Stmt,
+        insert_before: &BTreeMap<String, Vec<String>>,
+    ) -> Stmt {
+        match stmt {
+            Stmt::Sequence(stmts) => {
+                Self::rebuild_sequence_with_inserted_labels(stmts, false, insert_before)
+            }
+            Stmt::Block(stmts) => {
+                Self::rebuild_sequence_with_inserted_labels(stmts, true, insert_before)
+            }
+            Stmt::Label { name, body } => {
+                let label = Stmt::Label {
+                    name: name.clone(),
+                    body: Box::new(Self::insert_missing_labels_before_anchors(
+                        *body,
+                        insert_before,
+                    )),
+                };
+                if let Some(missing) = insert_before.get(&name) {
+                    let mut out = missing
+                        .iter()
+                        .cloned()
+                        .map(Self::empty_label_stmt)
+                        .collect::<Vec<_>>();
+                    out.push(label);
+                    Stmt::Sequence(out)
+                } else {
+                    label
+                }
+            }
+            Stmt::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => Stmt::If {
+                condition,
+                then_branch: Box::new(Self::insert_missing_labels_before_anchors(
+                    *then_branch,
+                    insert_before,
+                )),
+                else_branch: else_branch.map(|branch| {
+                    Box::new(Self::insert_missing_labels_before_anchors(
+                        *branch,
+                        insert_before,
+                    ))
+                }),
+            },
+            Stmt::Loop {
+                kind,
+                condition,
+                body,
+            } => Stmt::Loop {
+                kind,
+                condition,
+                body: Box::new(Self::insert_missing_labels_before_anchors(
+                    *body,
+                    insert_before,
+                )),
+            },
+            Stmt::Switch {
+                discriminant,
+                cases,
+                default,
+            } => Stmt::Switch {
+                discriminant,
+                cases: cases
+                    .into_iter()
+                    .map(|(label, body)| {
+                        (
+                            label,
+                            Self::insert_missing_labels_before_anchors(body, insert_before),
+                        )
+                    })
+                    .collect(),
+                default: default.map(|body| {
+                    Box::new(Self::insert_missing_labels_before_anchors(
+                        *body,
+                        insert_before,
+                    ))
+                }),
+            },
+            other => other,
+        }
+    }
+
+    fn rebuild_sequence_with_inserted_labels(
+        stmts: Vec<Stmt>,
+        as_block: bool,
+        insert_before: &BTreeMap<String, Vec<String>>,
+    ) -> Stmt {
+        let mut out = Vec::new();
+        for stmt in stmts {
+            let stmt = Self::insert_missing_labels_before_anchors(stmt, insert_before);
+            match stmt {
+                Stmt::Label { name, body } => {
+                    if let Some(missing) = insert_before.get(&name) {
+                        out.extend(missing.iter().cloned().map(Self::empty_label_stmt));
+                    }
+                    out.push(Stmt::Label { name, body });
+                }
+                other => out.push(other),
+            }
+        }
+        if as_block {
+            Stmt::Block(out)
+        } else {
+            Stmt::Sequence(out)
+        }
+    }
+
+    fn empty_label_stmt(name: String) -> Stmt {
+        Stmt::Label {
+            name,
+            body: Box::new(Stmt::Empty),
         }
     }
 
@@ -4751,6 +5087,85 @@ mod tests {
         assert!(label_pos < phi_pos, "got:\n{rendered}");
         assert!(rendered.contains("goto BB1;"), "got:\n{rendered}");
         assert!(rendered.contains("r6_1 = r5_1;"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn redirects_jumps_away_from_elided_empty_connectors() {
+        let mut cfg = crate::cfg::ControlFlowGraph::new();
+        let bb0 = cfg.add_node(crate::cfg::BasicBlock {
+            id: 0,
+            start: 0x00,
+            instrs: Vec::new(),
+        });
+        let bb1 = cfg.add_node(crate::cfg::BasicBlock {
+            id: 1,
+            start: 0x10,
+            instrs: Vec::new(),
+        });
+        let bb2 = cfg.add_node(crate::cfg::BasicBlock {
+            id: 2,
+            start: 0x20,
+            instrs: Vec::new(),
+        });
+        cfg.add_edge(bb0, bb1, crate::cfg::EdgeKind::UncondBranch);
+        cfg.add_edge(bb1, bb2, crate::cfg::EdgeKind::FallThrough);
+
+        let fir = crate::ir::FunctionIR {
+            blocks: vec![
+                crate::ir::IRBlock {
+                    id: 0,
+                    start_addr: 0x00,
+                    irdst: vec![(Some(crate::ir::IRCond::True), 0x10)],
+                    stmts: vec![IRStatement {
+                        defs: vec![IRExpr::Reg(crate::ir::RegId::new("R", 1, 1).with_ssa(1))],
+                        value: RValue::ImmI(7),
+                        pred: None,
+                        mem_addr_args: None,
+                        pred_old_defs: Vec::new(),
+                    }],
+                },
+                crate::ir::IRBlock {
+                    id: 1,
+                    start_addr: 0x10,
+                    irdst: vec![(Some(crate::ir::IRCond::True), 0x20)],
+                    stmts: Vec::new(),
+                },
+                crate::ir::IRBlock {
+                    id: 2,
+                    start_addr: 0x20,
+                    irdst: vec![],
+                    stmts: vec![IRStatement {
+                        defs: vec![IRExpr::Reg(crate::ir::RegId::new("R", 2, 1).with_ssa(1))],
+                        value: RValue::ImmI(9),
+                        pred: None,
+                        mem_addr_args: None,
+                        pred_old_defs: Vec::new(),
+                    }],
+                },
+            ],
+        };
+        let structured = StructuredStatement::Sequence(vec![
+            StructuredStatement::BasicBlock {
+                block_id: 0,
+                stmts: fir.blocks[0].stmts.clone(),
+            },
+            StructuredStatement::UnstructuredJump {
+                from_block_id: 0,
+                to_block_id: 1,
+                condition: None,
+            },
+            StructuredStatement::BasicBlock {
+                block_id: 2,
+                stmts: fir.blocks[2].stmts.clone(),
+            },
+        ]);
+
+        let lowered = lower_structured_stmt(&structured, &cfg, &fir, &FunctionAnalysis::default());
+        let rendered = lowered.render_with_indent(0);
+        assert!(rendered.contains("goto BB2;"), "got:\n{rendered}");
+        assert!(rendered.contains("BB2:"), "got:\n{rendered}");
+        assert!(!rendered.contains("goto BB1;"), "got:\n{rendered}");
+        assert!(!rendered.contains("BB1:"), "got:\n{rendered}");
     }
 
     #[test]

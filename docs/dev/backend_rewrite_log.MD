@@ -390,16 +390,21 @@
   only the live `ast_simplify` contracts. The deleted cases were asserting the
   old pre-canonical addr64 / helper-cleanup / FCHK-repair pipeline rather than
   the canonical backend contract owned by `src/canonical_ast_passes.rs`.
+- Canonical lowering now binds dangling `goto BB...` targets against the CFG
+  before symbol planning/render: when cleanup leaves a jump to an elided
+  connector block, the live backend either redirects that jump through the
+  connector chain or synthesizes an empty anchor label before the surviving
+  successor label instead of emitting an unbound target into final output.
 
 ## Next safe step
 
 1. Re-run the remaining broader acceptance slices that still matter after the
-   `sha256_single_block` perf fix (mainly the corpus `goto` budgets and any
-   corpus-wide invariants that have not yet been refreshed on this branch tip).
+   dangling-goto fix, especially the strict SM89 `goto` budget gate and any
+   still-obsolete tests that are pinning deleted backend behavior.
 2. Continue the final phase 6 deletion sweep: remove any remaining legacy-only
    backend helpers/tests that no longer back the canonical pipeline, then
    regenerate the curated acceptance outputs from the canonical driver only.
-3. Once another 2-4 atomic commits land, run the next review sub-agent and
+3. Once another 1-3 atomic commits land, run the next review sub-agent and
    wait for the result before starting the final corpus refresh / PR cleanup
    pass.
 
