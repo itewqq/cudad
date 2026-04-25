@@ -230,6 +230,10 @@
   lowering falls back to root-relative `uintptr_t` index expressions instead
   of raw register-backed pointer casts. This fixes the `cumsum_linear`
   remainder paths without reintroducing text-driven recovery.
+- Canonical scalar lowering now also handles low-lane `IMAD.WIDE` /
+  `UIMAD.WIDE` expressions structurally, which removes another raw helper leak
+  from the canonical path and keeps widened pointer setup readable in kernels
+  like `cumsum_linear`.
 - Canonical targeted coverage now also pins this float-modifier slice:
   `dispatch_ops` no longer leaks raw `FRND.FLOOR(...)` / `FMUL.FTZ(...)`, and
   `softmax_forward` no longer leaks raw `FFMA.SAT(...)` / `FFMA.RM(...)` /

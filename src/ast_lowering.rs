@@ -858,6 +858,7 @@ fn lower_semantic_op_expr(
         .or_else(|| lower_fsel_expr(opcode, args, analysis))
         .or_else(|| lower_lop3_expr(opcode, args, analysis))
         .or_else(|| lower_lea_expr(opcode, args, analysis))
+        .or_else(|| lower_imad_wide_expr(opcode, args, analysis))
         .or_else(|| lower_imad_x_expr(opcode, args, analysis))
         .or_else(|| lower_imad_expr(opcode, args, analysis))
         .or_else(|| lower_iadd3_x_expr(opcode, args, analysis))
@@ -1464,6 +1465,27 @@ fn lower_imad_expr(
                 lower_scalar_expr_with_analysis(&args[2], analysis),
             ));
         }
+    }
+    Some(add_expr(
+        Expr::Binary {
+            op: "*".to_string(),
+            lhs: Box::new(lower_scalar_expr_with_analysis(&args[0], analysis)),
+            rhs: Box::new(lower_scalar_expr_with_analysis(&args[1], analysis)),
+        },
+        lower_scalar_expr_with_analysis(&args[2], analysis),
+    ))
+}
+
+fn lower_imad_wide_expr(
+    opcode: &str,
+    args: &[IRExpr],
+    analysis: Option<&FunctionAnalysis>,
+) -> Option<Expr> {
+    let parts = opcode.split('.').collect::<Vec<_>>();
+    let mnem = parts.first().copied().unwrap_or(opcode);
+    if !matches!(mnem, "IMAD" | "UIMAD") || !parts.iter().any(|part| *part == "WIDE") || args.len() != 3
+    {
+        return None;
     }
     Some(add_expr(
         Expr::Binary {
@@ -3270,6 +3292,16 @@ mod tests {
             ],
         );
         assert_eq!(imad.render(), "r1_0 * r2_0 + r3_0");
+
+        let imad_wide = lower_op_expr(
+            "IMAD.WIDE",
+            &[
+                IRExpr::Reg(crate::ir::RegId::new("R", 9, 1).with_ssa(0)),
+                IRExpr::ImmI(4),
+                IRExpr::Reg(crate::ir::RegId::new("R", 10, 1).with_ssa(0)),
+            ],
+        );
+        assert_eq!(imad_wide.render(), "r9_0 * 4 + r10_0");
 
         let imad_mov = lower_op_expr(
             "IMAD.MOV.U32",

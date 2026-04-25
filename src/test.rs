@@ -901,6 +901,10 @@ fn canonical_full_pass_lowers_imad_wide_param_roots_through_helper_path() {
         rendered.contains("arg0_ptr[r3_0]"),
         "expected IMAD.WIDE-rooted access to preserve the computed index, got:\n{rendered}"
     );
+    assert!(
+        !rendered.contains("IMAD.WIDE("),
+        "expected canonical IMAD.WIDE lowering to stay structural, got:\n{rendered}"
+    );
 }
 
 #[test]
