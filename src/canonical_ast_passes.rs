@@ -737,13 +737,13 @@ fn redirect_trivial_goto_sequence(stmts: Vec<Stmt>, as_block: bool) -> Stmt {
     }
 }
 
-fn trim_unreachable_linear_suffixes(stmt: Stmt) -> Stmt {
+fn trim_unreachable_linear_suffixes(stmt: Stmt, goto_targets: &BTreeSet<String>) -> Stmt {
     match stmt {
-        Stmt::Sequence(stmts) => trim_unreachable_sequence(stmts, false),
-        Stmt::Block(stmts) => trim_unreachable_sequence(stmts, true),
+        Stmt::Sequence(stmts) => trim_unreachable_sequence(stmts, false, goto_targets),
+        Stmt::Block(stmts) => trim_unreachable_sequence(stmts, true, goto_targets),
         Stmt::Label { name, body } => Stmt::Label {
             name,
-            body: Box::new(trim_unreachable_linear_suffixes(*body)),
+            body: Box::new(trim_unreachable_linear_suffixes(*body, goto_targets)),
         },
         Stmt::If {
             condition,
@@ -751,8 +751,9 @@ fn trim_unreachable_linear_suffixes(stmt: Stmt) -> Stmt {
             else_branch,
         } => Stmt::If {
             condition,
-            then_branch: Box::new(trim_unreachable_linear_suffixes(*then_branch)),
-            else_branch: else_branch.map(|branch| Box::new(trim_unreachable_linear_suffixes(*branch))),
+            then_branch: Box::new(trim_unreachable_linear_suffixes(*then_branch, goto_targets)),
+            else_branch: else_branch
+                .map(|branch| Box::new(trim_unreachable_linear_suffixes(*branch, goto_targets))),
         },
         Stmt::Loop {
             kind,
@@ -761,7 +762,7 @@ fn trim_unreachable_linear_suffixes(stmt: Stmt) -> Stmt {
         } => Stmt::Loop {
             kind,
             condition,
-            body: Box::new(trim_unreachable_linear_suffixes(*body)),
+            body: Box::new(trim_unreachable_linear_suffixes(*body, goto_targets)),
         },
         Stmt::Switch {
             discriminant,
@@ -771,28 +772,35 @@ fn trim_unreachable_linear_suffixes(stmt: Stmt) -> Stmt {
             discriminant,
             cases: cases
                 .into_iter()
-                .map(|(label, body)| (label, trim_unreachable_linear_suffixes(body)))
+                .map(|(label, body)| (label, trim_unreachable_linear_suffixes(body, goto_targets)))
                 .collect(),
-            default: default.map(|body| Box::new(trim_unreachable_linear_suffixes(*body))),
+            default: default
+                .map(|body| Box::new(trim_unreachable_linear_suffixes(*body, goto_targets))),
         },
         other => other,
     }
 }
 
 fn cleanup_local_control_flow(body: Stmt) -> Stmt {
-    redirect_trivial_gotos(trim_unreachable_linear_suffixes(body))
+    let mut goto_targets = BTreeSet::new();
+    collect_goto_targets(&body, &mut goto_targets);
+    redirect_trivial_gotos(trim_unreachable_linear_suffixes(body, &goto_targets))
 }
 
-fn trim_unreachable_sequence(stmts: Vec<Stmt>, as_block: bool) -> Stmt {
+fn trim_unreachable_sequence(
+    stmts: Vec<Stmt>,
+    as_block: bool,
+    goto_targets: &BTreeSet<String>,
+) -> Stmt {
     let mut out = Vec::new();
     let mut terminated = false;
 
     for stmt in stmts
         .into_iter()
-        .map(trim_unreachable_linear_suffixes)
+        .map(|stmt| trim_unreachable_linear_suffixes(stmt, goto_targets))
         .filter(|stmt| !stmt_is_linear_empty(stmt))
     {
-        if terminated && !matches!(stmt, Stmt::Label { .. }) {
+        if terminated && !stmt_contains_targeted_label(&stmt, goto_targets) {
             continue;
         }
         terminated = stmt_definitely_terminates(&stmt);
@@ -837,6 +845,37 @@ fn stmt_is_linear_empty(stmt: &Stmt) -> bool {
     match stmt {
         Stmt::Empty => true,
         Stmt::Sequence(stmts) | Stmt::Block(stmts) => stmts.iter().all(stmt_is_linear_empty),
+        _ => false,
+    }
+}
+
+fn stmt_contains_targeted_label(stmt: &Stmt, goto_targets: &BTreeSet<String>) -> bool {
+    match stmt {
+        Stmt::Label { name, body } => {
+            goto_targets.contains(name) || stmt_contains_targeted_label(body, goto_targets)
+        }
+        Stmt::Sequence(stmts) | Stmt::Block(stmts) => stmts
+            .iter()
+            .any(|stmt| stmt_contains_targeted_label(stmt, goto_targets)),
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            stmt_contains_targeted_label(then_branch, goto_targets)
+                || else_branch
+                    .as_deref()
+                    .is_some_and(|branch| stmt_contains_targeted_label(branch, goto_targets))
+        }
+        Stmt::Loop { body, .. } => stmt_contains_targeted_label(body, goto_targets),
+        Stmt::Switch { cases, default, .. } => {
+            cases
+                .iter()
+                .any(|(_, body)| stmt_contains_targeted_label(body, goto_targets))
+                || default
+                    .as_deref()
+                    .is_some_and(|body| stmt_contains_targeted_label(body, goto_targets))
+        }
         _ => false,
     }
 }
@@ -2575,6 +2614,37 @@ mod tests {
         assert!(rendered.contains("BB1:"), "got:\n{rendered}");
         assert!(rendered.contains("BB2:"), "got:\n{rendered}");
         assert!(!rendered.contains("if (p0) goto BB2;"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn post_bind_cleanup_keeps_target_labels_inside_structured_suffixes() {
+        let function = StructuredFunction {
+            params: Vec::new(),
+            locals: Vec::new(),
+            body: Stmt::Sequence(vec![
+                Stmt::Goto("BB1".to_string()),
+                Stmt::Return(None),
+                Stmt::If {
+                    condition: Expr::Reg("p0".to_string()),
+                    then_branch: Box::new(Stmt::Label {
+                        name: "BB1".to_string(),
+                        body: Box::new(Stmt::Assign {
+                            dst: LValue::Var("r0".to_string()),
+                            src: Expr::Imm("7".to_string()),
+                        }),
+                    }),
+                    else_branch: None,
+                },
+            ]),
+        };
+
+        let rendered = canonicalize_post_bind_control_flow(function)
+            .body
+            .render_with_indent(0);
+
+        assert!(rendered.contains("goto BB1;"), "got:\n{rendered}");
+        assert!(rendered.contains("BB1:"), "got:\n{rendered}");
+        assert!(rendered.contains("r0 = 7;"), "got:\n{rendered}");
     }
 
     #[test]

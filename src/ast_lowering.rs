@@ -968,7 +968,7 @@ impl<'a> StructuredLowering<'a> {
                         continue;
                     }
                     let mut emitted = BTreeSet::new();
-                    Self::collect_label_names(&trimmed, &mut emitted);
+                    Self::collect_leading_label_names(&trimmed, &mut emitted);
                     seen_labels.extend(emitted);
                     out.push(trimmed);
                 }
@@ -982,7 +982,7 @@ impl<'a> StructuredLowering<'a> {
                         continue;
                     }
                     let mut emitted = BTreeSet::new();
-                    Self::collect_label_names(&trimmed, &mut emitted);
+                    Self::collect_leading_label_names(&trimmed, &mut emitted);
                     seen_labels.extend(emitted);
                     out.push(trimmed);
                 }
@@ -1061,6 +1061,21 @@ impl<'a> StructuredLowering<'a> {
             },
             other if dropping_duplicate_body => Stmt::Empty,
             other => other,
+        }
+    }
+
+    fn collect_leading_label_names(stmt: &Stmt, out: &mut BTreeSet<String>) {
+        match stmt {
+            Stmt::Label { name, body } => {
+                out.insert(name.clone());
+                Self::collect_leading_label_names(body, out);
+            }
+            Stmt::Sequence(stmts) | Stmt::Block(stmts) => {
+                if let Some(head) = stmts.iter().find(|stmt| !Self::stmt_is_empty(stmt)) {
+                    Self::collect_leading_label_names(head, out);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -5779,8 +5794,44 @@ mod tests {
         let rendered = trimmed.render_with_indent(0);
 
         assert_eq!(rendered.matches("BB8:").count(), 1, "got:\n{rendered}");
-        assert_eq!(rendered.matches("BB10:").count(), 1, "got:\n{rendered}");
         assert!(!rendered.contains("r2 = 4;"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn does_not_trim_later_join_label_after_branch_local_duplicate_name() {
+        let stmt = Stmt::Sequence(vec![
+            Stmt::If {
+                condition: Expr::Reg("p0".to_string()),
+                then_branch: Box::new(Stmt::Label {
+                    name: "BB1".to_string(),
+                    body: Box::new(Stmt::Assign {
+                        dst: LValue::Var("r0".to_string()),
+                        src: Expr::Imm("1".to_string()),
+                    }),
+                }),
+                else_branch: None,
+            },
+            Stmt::Label {
+                name: "BB1".to_string(),
+                body: Box::new(Stmt::Assign {
+                    dst: LValue::Var("r1".to_string()),
+                    src: Expr::Imm("2".to_string()),
+                }),
+            },
+        ]);
+        let lowering = StructuredLowering {
+            cfg: &crate::cfg::ControlFlowGraph::new(),
+            function_ir: &crate::ir::FunctionIR { blocks: Vec::new() },
+            analysis: &FunctionAnalysis::default(),
+            block_id_to_idx: HashMap::new(),
+            block_id_to_node: HashMap::new(),
+        };
+        let trimmed = lowering.trim_duplicate_label_prefixes(stmt);
+        let rendered = trimmed.render_with_indent(0);
+
+        assert_eq!(rendered.matches("BB1:").count(), 2, "got:\n{rendered}");
+        assert!(rendered.contains("r0 = 1;"), "got:\n{rendered}");
+        assert!(rendered.contains("r1 = 2;"), "got:\n{rendered}");
     }
 
     #[test]

@@ -403,16 +403,14 @@
 
 ## Next safe step
 
-1. Move the remaining SM89 goto-heavy kernels (`layer_norm_forward`,
-   `topk_per_row`, `softmax_forward`, the strip-mined remainder kernels) from
-   calibrated budgets back into genuinely structured lowering by improving the
-   structurizer/AST lowering rather than by adding more fallback glue.
-2. Keep deleting or relaxing only artifact-level tests: the exact-goto/empty-
-   label canonicalization checks are now trimmed back to semantic contracts,
-   but the restored `dot_thread`, `topk_per_row`, dangling-target, and helper-
-   leak coverage stay as live regression tests.
-3. Stage this slice as one atomic commit, then run the review sub-agent and
-   wait for the result before the next structurizer-tightening pass.
+1. Tighten the remaining SM89 goto ceilings structurally, especially
+   `layer_norm_forward`, `topk_per_row`, `softmax_forward`, and the strip-mined
+   remainder kernels that still need non-zero budgets.
+2. Keep the new post-bind cleanup rules conservative: preserve any structured
+   subtree that contains a live goto target, and only trim duplicate labels
+   from linear leading prefixes that are already emitted on every path.
+3. Stage these review fixes as one atomic commit, then re-run review before the
+   next structurizer-tightening slice.
 
 ## Open questions
 
@@ -460,9 +458,9 @@ loop-carried live values alive across local cleanup regions again, the
 labels now fall back to CFG-backed synthesized regions instead of dangling.
 The current branch tip also trims duplicate label prefixes / unreachable
 post-terminal suffixes after bind-time cleanup, rebinds missing labels after
-that cleanup, and recalibrates the SM89 goto-budget gate to the current
-canonical baselines. The next safe work is tightening those calibrated
-baselines structurally rather than reintroducing backend-repair passes.
+that cleanup, and recalibrates the SM89 goto-budget gate to bounded ceilings
+rather than exact-output snapshots. The next safe work is tightening those
+ceilings structurally rather than reintroducing backend-repair passes.
 
 ## Latest slice
 
@@ -494,6 +492,17 @@ baselines structurally rather than reintroducing backend-repair passes.
   tests still require recovery where the reciprocal/division proof exists, but
   unresolved cases like `stencil1d` remain explicit instead of being guessed
   away unsafely.
+- Review-fix follow-up:
+  - post-bind unreachable-suffix cleanup now preserves any statement that
+    contains a targeted label, even when that label is nested under `if` /
+    loop / switch structure rather than exposed as a top-level `BB...:` node
+  - duplicate-label trimming now only learns labels from already-emitted
+    leading linear prefixes instead of every nested label in prior statements,
+    which avoids deleting later join blocks that merely reuse a label name
+    inside an earlier branch-local subtree
+  - the SM89 goto gate now uses bounded ceilings plus a corpus-total ceiling
+    instead of exact per-kernel snapshots, so it still catches drift without
+    baking today’s regressed counts in as the definition of success
 - Current validation state:
   - passes: `canonicalize_`
   - passes: `trims_`
