@@ -895,12 +895,12 @@ fn lower_setp_expr(
 
 fn setp_comparison_op(part: &str) -> Option<&'static str> {
     match part {
-        "LT" => Some("<"),
-        "LE" => Some("<="),
-        "GT" => Some(">"),
-        "GE" => Some(">="),
-        "EQ" => Some("=="),
-        "NE" => Some("!="),
+        "LT" | "LTU" => Some("<"),
+        "LE" | "LEU" => Some("<="),
+        "GT" | "GTU" => Some(">"),
+        "GE" | "GEU" => Some(">="),
+        "EQ" | "EQU" => Some("=="),
+        "NE" | "NEU" => Some("!="),
         _ => None,
     }
 }
@@ -2694,6 +2694,19 @@ mod tests {
             ],
         );
         assert_eq!(imad_shl.render(), "r8_0 << 4");
+    }
+
+    #[test]
+    fn lowers_float_setp_unordered_compare_tokens_to_native_ops() {
+        let expr = lower_op_expr(
+            "FSETP.GEU.AND",
+            &[
+                IRExpr::Reg(crate::ir::RegId::new("R", 1, 1).with_ssa(0)),
+                IRExpr::ImmI(0),
+                IRExpr::Reg(crate::ir::RegId::new("PT", 0, 1)),
+            ],
+        );
+        assert_eq!(expr.render(), "r1_0 >= 0");
     }
 
     #[test]

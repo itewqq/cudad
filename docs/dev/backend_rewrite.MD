@@ -69,6 +69,10 @@ constant array.
   facts, so canonical lowering can recover typed scalar semantics such as
   `copysignf(...)` / `FSEL` / `IMAD` directly from SSA instead of leaning on
   semantic-lift text helpers.
+- Predicate compare lowering must understand the real compare-token surface
+  (`EQ`/`EQU`, `NE`/`NEU`, `LT`/`LTU`, `GE`/`GEU`, etc.) so later structured
+  stages do not leak raw `FSETP.*` helpers just because the opcode used an
+  unordered token spelling.
 - New backend modules must document their inputs, outputs, invariants, and
   forbidden responsibilities in rustdoc headers.
 

@@ -3,7 +3,7 @@
 ## Status
 
 - Branch: `codex/memory-aware-backend-refactor`
-- Checkpoint commit: `dec1367`
+- Checkpoint commit: `e3794b5`
 - Current stage: phase 5 cutover of structured output entrypoints onto the canonical backend, with front-half address-contract fixes still landing as needed
 
 ## Landed invariants
@@ -190,6 +190,10 @@
 - The duplicated old-backend `sgemm_tiled` full-pass tests are now deleted; the
   canonical `sgemm_tiled` coverage owns the typed predicated-load and
   LEA-helper-elimination contracts directly.
+- Canonical predicate lowering now understands unordered compare spellings such
+  as `FSETP.GEU.*`, which removes one more raw control-helper leak from the
+  canonical `layer_norm_forward` path and gives the canonical backend ownership
+  of that compare contract.
 
 ## Next safe step
 
@@ -197,9 +201,10 @@
    canonical semantics are now genuinely stronger, not just cosmetically
    different.
 2. Tackle the next structurally visible canonical holes: shared index/root
-   recovery beyond direct `threadIdx` forms, unresolved control predicates, and
-   the remaining vector/half/special-scalar ops (for example `HFMA2`,
-   `PRMT`, rotate-heavy SHA idioms) that still force raw helper-shaped output.
+   recovery beyond direct `threadIdx` forms, the remaining predicate/control
+   outliers beyond the now-handled `GEU` compare spelling, and the remaining
+   vector/half/special-scalar ops (for example `HFMA2`, `PRMT`, rotate-heavy
+   SHA idioms) that still force raw helper-shaped output.
 3. Revisit the broader `sgemm_tiled` / shared-memory fixtures and migrate any
    additional smoke coverage that the new shared-scale and scalar-op lowering
    now makes trustworthy on the canonical driver.

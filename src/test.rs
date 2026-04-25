@@ -1982,6 +1982,29 @@ fn full_pass_layer_norm_forward_keeps_affine_pointer_pairs_typed() {
 }
 
 #[test]
+fn canonical_full_pass_layer_norm_forward_lowers_raw_fsetp_compares() {
+    let layer_norm =
+        split_decoded_functions(include_str!("../test_cu/corpus_sm120/ml_kernels.sass"))
+            .into_iter()
+            .find(|f| f.name == "layer_norm_forward")
+            .expect("layer_norm_forward fixture should exist");
+    let out =
+        run_canonical_output_full_pass_from_instrs(layer_norm.instrs, layer_norm.sm, "layer_norm_forward");
+    let geu_compare =
+        Regex::new(r"p\d+_\d+ = abs\(r\d+_\d+\) >= ").expect("valid canonical layernorm compare regex");
+    assert!(
+        geu_compare.is_match(&out),
+        "expected canonical layer_norm_forward to lower GEU compare structurally, got:\n{}",
+        out
+    );
+    assert!(
+        !out.contains("FSETP.GEU.AND("),
+        "expected canonical layer_norm_forward to avoid raw FSETP compare helpers, got:\n{}",
+        out
+    );
+}
+
+#[test]
 fn full_pass_old_softmax_forward_trims_post_loop_packed_pointer_tail() {
     let softmax = split_decoded_functions(include_str!("../test_cu/corpus/ml_kernels.sass"))
         .into_iter()
