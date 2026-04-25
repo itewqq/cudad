@@ -444,6 +444,136 @@ fn collapse_falls_back_to_goto_on_irreducible() {
 }
 
 #[test]
+fn collapse_splits_shared_terminal_helper_chain_without_goto() {
+    // Shape:
+    //   BB0 true  -> BB1
+    //   BB0 false -> BB3 (shared helper tail)
+    //   BB1 true  -> BB3
+    //   BB1 false -> BB2 (return)
+    //   BB3/BB4/BB5/BB6 form a short acyclic helper slowpath that ends in
+    //   a return. The shared entry BB3 would previously force goto fallback
+    //   once the helper had already collapsed into a 4+ block composite.
+    let p0 = RegId::new("P", 0, 1);
+    let p1 = RegId::new("P", 1, 1);
+    let p2 = RegId::new("P", 2, 1);
+    let p3 = RegId::new("P", 3, 1);
+    let specs = vec![
+        (
+            0,
+            0x00,
+            vec![
+                (
+                    Some(IRCond::Pred {
+                        reg: p0.clone(),
+                        sense: true,
+                    }),
+                    0x10,
+                ),
+                (
+                    Some(IRCond::Pred {
+                        reg: p0,
+                        sense: false,
+                    }),
+                    0x30,
+                ),
+            ],
+            vec![stmt("HEAD0")],
+        ),
+        (
+            1,
+            0x10,
+            vec![
+                (
+                    Some(IRCond::Pred {
+                        reg: p1.clone(),
+                        sense: true,
+                    }),
+                    0x30,
+                ),
+                (
+                    Some(IRCond::Pred {
+                        reg: p1,
+                        sense: false,
+                    }),
+                    0x20,
+                ),
+            ],
+            vec![stmt("HEAD1")],
+        ),
+        (2, 0x20, vec![], vec![stmt("RET")]),
+        (
+            3,
+            0x30,
+            vec![
+                (
+                    Some(IRCond::Pred {
+                        reg: p2.clone(),
+                        sense: true,
+                    }),
+                    0x40,
+                ),
+                (
+                    Some(IRCond::Pred {
+                        reg: p2,
+                        sense: false,
+                    }),
+                    0x60,
+                ),
+            ],
+            vec![stmt("HELPER0")],
+        ),
+        (
+            4,
+            0x40,
+            vec![
+                (
+                    Some(IRCond::Pred {
+                        reg: p3.clone(),
+                        sense: true,
+                    }),
+                    0x50,
+                ),
+                (
+                    Some(IRCond::Pred {
+                        reg: p3,
+                        sense: false,
+                    }),
+                    0x60,
+                ),
+            ],
+            vec![stmt("HELPER1")],
+        ),
+        (
+            5,
+            0x50,
+            vec![(Some(IRCond::True), 0x60)],
+            vec![stmt("CALL.REL.NOINC")],
+        ),
+        (6, 0x60, vec![], vec![stmt("RET")]),
+    ];
+    let edges = vec![
+        (0, 1, EdgeKind::CondBranch),
+        (0, 3, EdgeKind::FallThrough),
+        (1, 3, EdgeKind::CondBranch),
+        (1, 2, EdgeKind::FallThrough),
+        (3, 4, EdgeKind::CondBranch),
+        (3, 6, EdgeKind::FallThrough),
+        (4, 5, EdgeKind::CondBranch),
+        (4, 6, EdgeKind::FallThrough),
+        (5, 6, EdgeKind::UncondBranch),
+    ];
+    let (cfg, fir, _) = build_case(&specs, &edges);
+    let mut structurizer = Structurizer::new(&cfg, &fir);
+    let out = structurizer.structure_function().unwrap();
+    assert!(contains_if(&out), "expected structured helper split, got: {:?}", out);
+    assert!(
+        !contains_goto(&out),
+        "expected node split to avoid goto fallback, got: {:?}",
+        out
+    );
+}
+
+#[test]
 fn predicated_exit_is_not_unconditional_return() {
     let block = IRBlock {
         id: 0,

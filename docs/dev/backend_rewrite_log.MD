@@ -361,6 +361,9 @@
   composites (up to 6 constituent blocks) while still refusing loop/goto
   composites, which is enough to recover the shared `box_blur_variable_radius`
   slowpath without regressing `power_series`.
+- Structurizer unit coverage now pins that shared terminal helper chains use
+  node splitting instead of goto fallback once the helper tail is small,
+  acyclic, and return-terminated.
 - Canonical local cleanup continues to treat raw `CALL.REL.NOINC` sites as
   pure helper placeholders; the live contract is to eliminate them by control-
   flow recovery and reciprocal/division simplification rather than by pinning
