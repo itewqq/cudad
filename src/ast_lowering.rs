@@ -38,7 +38,7 @@ use crate::type_inference::InferredType;
 #[derive(Clone, Debug)]
 struct LoweredStmt {
     stmt: Stmt,
-    predicate_def_idx: Option<usize>,
+    predicate_def_indices: Vec<usize>,
 }
 
 pub fn lower_memory_stmt(
@@ -69,7 +69,7 @@ fn lower_memory_stmt_detail(
                     dst: LValue::Var(lower_reg_name(dst)),
                     src,
                 },
-                predicate_def_idx: Some(0),
+                predicate_def_indices: vec![0],
             })
         }
         MemAccessKind::Store => {
@@ -77,7 +77,7 @@ fn lower_memory_stmt_detail(
             let src = store_value_expr(stmt, Some(analysis))?;
             Some(LoweredStmt {
                 stmt: Stmt::Assign { dst, src },
-                predicate_def_idx: None,
+                predicate_def_indices: Vec::new(),
             })
         }
         MemAccessKind::Atomic | MemAccessKind::Reduction => {
@@ -112,12 +112,12 @@ fn lower_memory_stmt_detail(
                         dst: LValue::Var(lower_reg_name(def)),
                         src: call,
                     },
-                    predicate_def_idx: Some(def_idx),
+                    predicate_def_indices: vec![def_idx],
                 })
             } else {
                 Some(LoweredStmt {
                     stmt: Stmt::ExprStmt(call),
-                    predicate_def_idx: None,
+                    predicate_def_indices: Vec::new(),
                 })
             }
         }
@@ -338,7 +338,7 @@ fn lower_explicit_local_stmt(stmt: &IRStatement, access: &MemAccessInfo) -> Opti
                     dst: LValue::Var(lower_reg_name(dst)),
                     src,
                 },
-                predicate_def_idx: Some(0),
+                predicate_def_indices: vec![0],
             })
         }
         MemAccessKind::Store => {
@@ -348,7 +348,7 @@ fn lower_explicit_local_stmt(stmt: &IRStatement, access: &MemAccessInfo) -> Opti
                     func: local_space_helper_name("store", access),
                     args: vec![byte_expr, src],
                 }),
-                predicate_def_idx: None,
+                predicate_def_indices: Vec::new(),
             })
         }
         MemAccessKind::Atomic | MemAccessKind::Reduction => None,
@@ -696,12 +696,12 @@ fn lower_non_memory_stmt_with_analysis(
                         dst: LValue::Var(lower_reg_name(def)),
                         src: rhs,
                     },
-                    predicate_def_idx: Some(def_idx),
+                    predicate_def_indices: vec![def_idx],
                 }
             } else {
                 LoweredStmt {
                     stmt: Stmt::ExprStmt(rhs),
-                    predicate_def_idx: None,
+                    predicate_def_indices: Vec::new(),
                 }
             }
         }
@@ -719,12 +719,12 @@ fn lower_non_memory_stmt_with_analysis(
                         dst: LValue::Var(lower_reg_name(def)),
                         src: rhs,
                     },
-                    predicate_def_idx: Some(def_idx),
+                    predicate_def_indices: vec![def_idx],
                 }
             } else {
                 LoweredStmt {
                     stmt: Stmt::ExprStmt(rhs),
-                    predicate_def_idx: None,
+                    predicate_def_indices: Vec::new(),
                 }
             }
         }
@@ -736,12 +736,12 @@ fn lower_non_memory_stmt_with_analysis(
                         dst: LValue::Var(lower_reg_name(def)),
                         src,
                     },
-                    predicate_def_idx: Some(def_idx),
+                    predicate_def_indices: vec![def_idx],
                 }
             } else {
                 LoweredStmt {
                     stmt: Stmt::ExprStmt(src),
-                    predicate_def_idx: None,
+                    predicate_def_indices: Vec::new(),
                 }
             }
         }
@@ -753,12 +753,12 @@ fn lower_non_memory_stmt_with_analysis(
                         dst: LValue::Var(lower_reg_name(def)),
                         src,
                     },
-                    predicate_def_idx: Some(def_idx),
+                    predicate_def_indices: vec![def_idx],
                 }
             } else {
                 LoweredStmt {
                     stmt: Stmt::ExprStmt(src),
-                    predicate_def_idx: None,
+                    predicate_def_indices: Vec::new(),
                 }
             }
         }
@@ -787,7 +787,7 @@ fn lower_structural_control_stmt(stmt: &IRStatement) -> Option<LoweredStmt> {
     };
     Some(LoweredStmt {
         stmt: lowered_stmt,
-        predicate_def_idx: None,
+        predicate_def_indices: Vec::new(),
     })
 }
 
@@ -1071,16 +1071,18 @@ fn lower_multi_def_lop3_stmt(
     if !matches!(mnem, "LOP3" | "ULOP3") || stmt.defs.len() < 2 {
         return None;
     }
-    let pred_def = stmt
+    let (pred_def_idx, pred_def) = stmt
         .defs
         .iter()
-        .filter_map(|expr| expr.get_reg())
-        .find(|reg| matches!(reg.class.as_str(), "P" | "UP"))?;
-    let data_def = stmt
+        .enumerate()
+        .filter_map(|(idx, expr)| expr.get_reg().map(|reg| (idx, reg)))
+        .find(|(_, reg)| matches!(reg.class.as_str(), "P" | "UP"))?;
+    let (data_def_idx, data_def) = stmt
         .defs
         .iter()
-        .filter_map(|expr| expr.get_reg())
-        .find(|reg| matches!(reg.class.as_str(), "R" | "UR"))?;
+        .enumerate()
+        .filter_map(|(idx, expr)| expr.get_reg().map(|reg| (idx, reg)))
+        .find(|(_, reg)| matches!(reg.class.as_str(), "R" | "UR"))?;
     let data_expr = lower_lop3_expr(opcode, args, analysis)?;
     let pred_expr = Expr::Binary {
         op: "!=".to_string(),
@@ -1098,7 +1100,7 @@ fn lower_multi_def_lop3_stmt(
                 src: pred_expr,
             },
         ]),
-        predicate_def_idx: None,
+        predicate_def_indices: vec![data_def_idx, pred_def_idx],
     })
 }
 
@@ -1113,20 +1115,19 @@ fn lower_multi_def_lea_stmt(
     if !matches!(mnem, "LEA" | "ULEA") || opcode.split('.').any(|part| part == "HI") {
         return None;
     }
-    let data_def = stmt
+    let (data_def_idx, data_def) = stmt
         .defs
         .iter()
-        .filter_map(|expr| expr.get_reg())
-        .find(|reg| matches!(reg.class.as_str(), "R" | "UR"))?;
-    let pred_def = stmt
+        .enumerate()
+        .filter_map(|(idx, expr)| expr.get_reg().map(|reg| (idx, reg)))
+        .find(|(_, reg)| matches!(reg.class.as_str(), "R" | "UR"))?;
+    let (pred_def_idx, pred_def) = stmt
         .defs
         .iter()
-        .filter_map(|expr| expr.get_reg())
-        .find(|reg| matches!(reg.class.as_str(), "P" | "UP"));
+        .enumerate()
+        .filter_map(|(idx, expr)| expr.get_reg().map(|reg| (idx, reg)))
+        .find(|(_, reg)| matches!(reg.class.as_str(), "P" | "UP"))?;
     let data_expr = lower_lea_expr(opcode, args, analysis)?;
-    let Some(pred_def) = pred_def else {
-        return None;
-    };
     let carry_expr = lower_lea_carry_expr(args, analysis)?;
     Some(LoweredStmt {
         stmt: Stmt::Sequence(vec![
@@ -1139,7 +1140,7 @@ fn lower_multi_def_lea_stmt(
                 src: carry_expr,
             },
         ]),
-        predicate_def_idx: None,
+        predicate_def_indices: vec![data_def_idx, pred_def_idx],
     })
 }
 
@@ -1662,8 +1663,21 @@ fn lower_fadd_expr(
     if parts.first().copied() != Some("FADD") || args.len() < 2 {
         return None;
     }
-    if !parts.iter().skip(1).all(|part| *part == "FTZ") {
-        return None;
+    let mut ftz = false;
+    for part in parts.iter().skip(1) {
+        match *part {
+            "FTZ" => ftz = true,
+            _ => return None,
+        }
+    }
+    if ftz {
+        return Some(Expr::CallLike {
+            func: "__fadd_ftz".to_string(),
+            args: args
+                .iter()
+                .map(|arg| lower_scalar_expr_with_analysis(arg, analysis))
+                .collect(),
+        });
     }
     lower_add_expr(args, analysis)
 }
@@ -1677,15 +1691,31 @@ fn lower_fmul_expr(
     if parts.first().copied() != Some("FMUL") || args.len() != 2 {
         return None;
     }
+    let mut ftz = false;
     let mut rounding_mode = None;
     for part in parts.iter().skip(1) {
         match *part {
-            "FTZ" => {}
+            "FTZ" => ftz = true,
             "RM" | "RP" | "RZ" | "RN" => rounding_mode = Some(*part),
             _ => return None,
         }
     }
     if let Some(mode) = rounding_mode {
+        if ftz {
+            return Some(Expr::CallLike {
+                func: match mode {
+                    "RM" => "__fmul_rd_ftz".to_string(),
+                    "RP" => "__fmul_ru_ftz".to_string(),
+                    "RZ" => "__fmul_rz_ftz".to_string(),
+                    "RN" => "__fmul_rn_ftz".to_string(),
+                    _ => unreachable!(),
+                },
+                args: vec![
+                    lower_scalar_expr_with_analysis(&args[0], analysis),
+                    lower_scalar_expr_with_analysis(&args[1], analysis),
+                ],
+            });
+        }
         return Some(Expr::CallLike {
             func: match mode {
                 "RM" => "__fmul_rd".to_string(),
@@ -1694,6 +1724,15 @@ fn lower_fmul_expr(
                 "RN" => "__fmul_rn".to_string(),
                 _ => unreachable!(),
             },
+            args: vec![
+                lower_scalar_expr_with_analysis(&args[0], analysis),
+                lower_scalar_expr_with_analysis(&args[1], analysis),
+            ],
+        });
+    }
+    if ftz {
+        return Some(Expr::CallLike {
+            func: "__fmul_ftz".to_string(),
             args: vec![
                 lower_scalar_expr_with_analysis(&args[0], analysis),
                 lower_scalar_expr_with_analysis(&args[1], analysis),
@@ -1716,39 +1755,54 @@ fn lower_ffma_expr(
     if parts.first().copied() != Some("FFMA") || args.len() != 3 {
         return None;
     }
-    let base = Expr::Binary {
-        op: "+".to_string(),
-        lhs: Box::new(Expr::Binary {
-            op: "*".to_string(),
-            lhs: Box::new(lower_scalar_expr_with_analysis(&args[0], analysis)),
-            rhs: Box::new(lower_scalar_expr_with_analysis(&args[1], analysis)),
-        }),
-        rhs: Box::new(lower_scalar_expr_with_analysis(&args[2], analysis)),
+    let lowered_args = vec![
+        lower_scalar_expr_with_analysis(&args[0], analysis),
+        lower_scalar_expr_with_analysis(&args[1], analysis),
+        lower_scalar_expr_with_analysis(&args[2], analysis),
+    ];
+    let base = Expr::CallLike {
+        func: "fmaf".to_string(),
+        args: lowered_args.clone(),
     };
+    let mut ftz = false;
     let mut rounding_mode = None;
     let mut saturate = false;
     for part in parts.iter().skip(1) {
         match *part {
-            "FTZ" => {}
+            "FTZ" => ftz = true,
             "SAT" => saturate = true,
             "RM" | "RP" | "RZ" | "RN" => rounding_mode = Some(*part),
             _ => return None,
         }
     }
     let rounded = if let Some(mode) = rounding_mode {
+        if ftz {
+            Expr::CallLike {
+                func: match mode {
+                    "RM" => "__fmaf_rd_ftz".to_string(),
+                    "RP" => "__fmaf_ru_ftz".to_string(),
+                    "RZ" => "__fmaf_rz_ftz".to_string(),
+                    "RN" => "__fmaf_rn_ftz".to_string(),
+                    _ => unreachable!(),
+                },
+                args: lowered_args,
+            }
+        } else {
+            Expr::CallLike {
+                func: match mode {
+                    "RM" => "__fmaf_rd".to_string(),
+                    "RP" => "__fmaf_ru".to_string(),
+                    "RZ" => "__fmaf_rz".to_string(),
+                    "RN" => "__fmaf_rn".to_string(),
+                    _ => unreachable!(),
+                },
+                args: lowered_args,
+            }
+        }
+    } else if ftz {
         Expr::CallLike {
-            func: match mode {
-                "RM" => "__fmaf_rd".to_string(),
-                "RP" => "__fmaf_ru".to_string(),
-                "RZ" => "__fmaf_rz".to_string(),
-                "RN" => "__fmaf_rn".to_string(),
-                _ => unreachable!(),
-            },
-            args: vec![
-                lower_scalar_expr_with_analysis(&args[0], analysis),
-                lower_scalar_expr_with_analysis(&args[1], analysis),
-                lower_scalar_expr_with_analysis(&args[2], analysis),
-            ],
+            func: "__fmaf_ftz".to_string(),
+            args: lowered_args,
         }
     } else {
         base
@@ -2233,7 +2287,7 @@ fn is_sink_reg(reg: &crate::ir::RegId) -> bool {
 fn apply_stmt_predicate(stmt: &IRStatement, lowered: LoweredStmt) -> Stmt {
     let LoweredStmt {
         stmt: lowered_stmt,
-        predicate_def_idx,
+        predicate_def_indices,
     } = lowered;
     if matches!(lowered_stmt, Stmt::Empty) {
         return Stmt::Empty;
@@ -2241,17 +2295,44 @@ fn apply_stmt_predicate(stmt: &IRStatement, lowered: LoweredStmt) -> Stmt {
     let Some(pred) = &stmt.pred else {
         return lowered_stmt;
     };
-    if let Some(def_idx) = predicate_def_idx {
-        if let Some(old_def) = stmt.pred_old_defs.get(def_idx) {
-            if let Stmt::Assign { dst, src } = lowered_stmt {
-                return Stmt::Assign {
-                    dst,
-                    src: Expr::Ternary {
-                        cond: Box::new(lower_scalar_expr(pred)),
-                        then_expr: Box::new(src),
-                        else_expr: Box::new(lower_scalar_expr(old_def)),
-                    },
-                };
+    if predicate_def_indices.len() == 1 {
+        if let Some(def_idx) = predicate_def_indices.first().copied() {
+            if let Some(old_def) = stmt.pred_old_defs.get(def_idx) {
+                if let Stmt::Assign { dst, src } = lowered_stmt {
+                    return Stmt::Assign {
+                        dst,
+                        src: Expr::Ternary {
+                            cond: Box::new(lower_scalar_expr(pred)),
+                            then_expr: Box::new(src),
+                            else_expr: Box::new(lower_scalar_expr(old_def)),
+                        },
+                    };
+                }
+            }
+        }
+    } else if !predicate_def_indices.is_empty() {
+        if let Stmt::Sequence(stmts) = &lowered_stmt {
+            let rewritten = stmts
+                .iter()
+                .cloned()
+                .zip(predicate_def_indices.into_iter())
+                .map(|(lowered_stmt, def_idx)| {
+                    let old_def = stmt.pred_old_defs.get(def_idx)?;
+                    let Stmt::Assign { dst, src } = lowered_stmt else {
+                        return None;
+                    };
+                    Some(Stmt::Assign {
+                        dst,
+                        src: Expr::Ternary {
+                            cond: Box::new(lower_scalar_expr(pred)),
+                            then_expr: Box::new(src),
+                            else_expr: Box::new(lower_scalar_expr(old_def)),
+                        },
+                    })
+                })
+                .collect::<Option<Vec<_>>>();
+            if let Some(rewritten) = rewritten {
+                return Stmt::Sequence(rewritten);
             }
         }
     }
@@ -3077,7 +3158,7 @@ mod tests {
                 IRExpr::Reg(crate::ir::RegId::new("R", 3, 1).with_ssa(0)),
             ],
         );
-        assert_eq!(ffma.render(), "r1_0 * r2_0 + r3_0");
+        assert_eq!(ffma.render(), "fmaf(r1_0, r2_0, r3_0)");
 
         let fmnmx = lower_op_expr(
             "FMNMX",
@@ -3127,7 +3208,7 @@ mod tests {
                 IRExpr::ImmF(0.5),
             ],
         );
-        assert_eq!(fmul_ftz.render(), "r1_0 * 0.5");
+        assert_eq!(fmul_ftz.render(), "__fmul_ftz(r1_0, 0.5)");
 
         let fmul_rm = lower_op_expr(
             "FMUL.RM",
@@ -3145,7 +3226,7 @@ mod tests {
                 IRExpr::ImmI(1),
             ],
         );
-        assert_eq!(fadd_ftz.render(), "r3_0 + 1");
+        assert_eq!(fadd_ftz.render(), "__fadd_ftz(r3_0, 1)");
 
         let imad = lower_op_expr(
             "IMAD",
@@ -3245,6 +3326,47 @@ mod tests {
         assert!(rendered.contains("p0_1 ="), "got:\n{rendered}");
         assert!(rendered.contains(">> 32"), "got:\n{rendered}");
         assert!(rendered.contains("!= 0;"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn lowers_predicated_multidef_lea_with_false_path_values() {
+        let stmt = IRStatement {
+            defs: vec![
+                IRExpr::Reg(crate::ir::RegId::new("R", 4, 1).with_ssa(2)),
+                IRExpr::Reg(crate::ir::RegId::new("P", 5, 1).with_ssa(1)),
+            ],
+            value: RValue::Op {
+                opcode: "LEA".to_string(),
+                args: vec![
+                    IRExpr::Reg(crate::ir::RegId::new("R", 1, 1).with_ssa(0)),
+                    IRExpr::Reg(crate::ir::RegId::new("R", 2, 1).with_ssa(0)),
+                    IRExpr::ImmI(2),
+                ],
+            },
+            pred: Some(IRExpr::Reg(crate::ir::RegId::new("P", 0, 1))),
+            mem_addr_args: None,
+            pred_old_defs: vec![
+                IRExpr::Reg(crate::ir::RegId::new("R", 4, 1).with_ssa(1)),
+                IRExpr::Reg(crate::ir::RegId::new("P", 5, 1).with_ssa(0)),
+            ],
+        };
+        let lowered = lower_basic_stmt(0, 0, &stmt, &FunctionAnalysis::default());
+        let Stmt::Sequence(stmts) = lowered else {
+            panic!("expected sequence");
+        };
+        assert_eq!(stmts.len(), 2);
+        let Stmt::Assign { dst, src } = &stmts[0] else {
+            panic!("expected data assignment");
+        };
+        assert_eq!(dst.render(), "r4_2");
+        assert_eq!(src.render(), "p0 ? ((r1_0 << 2) + r2_0) : r4_1");
+        let Stmt::Assign { dst, src } = &stmts[1] else {
+            panic!("expected carry assignment");
+        };
+        assert_eq!(dst.render(), "p5_1");
+        let rendered = src.render();
+        assert!(rendered.starts_with("p0 ? "), "got: {rendered}");
+        assert!(rendered.ends_with(" : p5_0"), "got: {rendered}");
     }
 
     #[test]
@@ -3378,7 +3500,17 @@ mod tests {
                 IRExpr::ImmF(0.5),
             ],
         );
-        assert_eq!(ffma_sat.render(), "__saturatef(r4_0 * 0.5 + 0.5)");
+        assert_eq!(ffma_sat.render(), "__saturatef(fmaf(r4_0, 0.5, 0.5))");
+
+        let ffma_ftz = lower_op_expr(
+            "FFMA.FTZ",
+            &[
+                IRExpr::Reg(crate::ir::RegId::new("R", 6, 1).with_ssa(0)),
+                IRExpr::Reg(crate::ir::RegId::new("R", 7, 1).with_ssa(0)),
+                IRExpr::ImmF(1.0),
+            ],
+        );
+        assert_eq!(ffma_ftz.render(), "__fmaf_ftz(r6_0, r7_0, 1)");
 
         let frnd = lower_op_expr(
             "FRND.FLOOR",

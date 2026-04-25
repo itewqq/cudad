@@ -207,10 +207,11 @@
   `ur7_2 + (up0_2 ? 1 : 0)` instead of `UIADD3.X(...)`).
 - Canonical scalar lowering now also models the common float modifier surface
   that still leaked through the canonical path: `FRND.FLOOR`/`FRND.TRUNC`
-  lower to `floorf(...)` / `truncf(...)`, `FADD.FTZ` and `FMUL.FTZ` collapse
-  to native arithmetic, and modeled `FFMA` variants (`.SAT`, `.RM`, `.RP`,
-  `.RZ`, `.RN`) lower to structural CUDA math intrinsics such as
-  `__saturatef(...)` / `__fmaf_rd(...)` instead of raw helper-shaped calls.
+  lower to `floorf(...)` / `truncf(...)`, `FADD.FTZ` / `FMUL.FTZ` now stay
+  explicit through canonical FTZ helper calls instead of silently erasing the
+  modifier, and modeled `FFMA` variants (`.SAT`, `.RM`, `.RP`, `.RZ`, `.RN`)
+  lower to structural CUDA math intrinsics such as `__saturatef(...)` /
+  `__fmaf_rd(...)` instead of raw helper-shaped calls.
 - Canonical float compare lowering now preserves unordered predicate semantics
   instead of treating `GEU`/`GTU`/`LEU`/`LTU`/`EQU`/`NEU` as ordered compares;
   the canonical path emits explicit `isnan(...)` disjuncts and also lowers
@@ -219,6 +220,11 @@
   and non-`.HI` `LEA` address expressions structurally; multi-def `LEA`
   statements now keep both the data result and the carry predicate on the
   canonical path instead of leaking raw `LEA(...)` / `IMAD.X(...)` helpers.
+- Sub-agent review fixes are now folded back into the canonical lowering
+  contract: predicated multi-def `LEA`/`LOP3` statements preserve false-path
+  SSA old-def values for every written result, unqualified `FFMA` now lowers
+  through fused `fmaf(...)` instead of a decomposed multiply-plus-add, and
+  `FFMA.SAT` saturates that fused form rather than a two-rounding expression.
 - Canonical targeted coverage now also pins this float-modifier slice:
   `dispatch_ops` no longer leaks raw `FRND.FLOOR(...)` / `FMUL.FTZ(...)`, and
   `softmax_forward` no longer leaks raw `FFMA.SAT(...)` / `FFMA.RM(...)` /
