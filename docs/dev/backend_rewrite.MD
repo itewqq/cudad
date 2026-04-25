@@ -32,6 +32,10 @@ function dumps are not allowed to collapse every rendered function back to
   `.X8`, `.X16`) must survive decode and IR lowering as structured data, not
   only as raw strings.
 - CFG stays control-flow-only.
+- CFG may rewrite predicated non-returning helper calls into conditional
+  branch edges when a conservative forward walk proves the helper never
+  returns to the caller; that rewrite is still control-flow modeling, not
+  semantic lifting.
 - SSA stays the canonical mid-level control/dataflow representation.
 - Memory-space information must become explicit before AST lowering.
 
@@ -86,6 +90,9 @@ constant array.
 - Canonical address/arithmetic lowering should also cover carry-aware helper
   forms such as non-`.HI` `LEA` and `IMAD.X` structurally, preserving any
   predicate carry defs without dropping back to raw opcode-shaped helper calls.
+- Structurization may duplicate only short acyclic helper tails to recover a
+  reducible CFG shape; loop-bearing or goto-bearing composites must not be
+  duplicated just to paper over irreducible control flow.
 - Canonical compare lowering must preserve unordered floating-point predicate
   semantics: `*U` compare tokens and `NUM`/`NAN` forms need explicit NaN-aware
   logic, not ordered C relational operators that silently change branch

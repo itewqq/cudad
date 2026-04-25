@@ -53,6 +53,9 @@ The control-flow layer depends on a few invariants:
 2. successor edges are derived from `TerminatorKind`, not ad hoc opcode matching
 3. CFG node payloads carry decoded instructions all the way into SSA construction
 4. pseudo-register sentinels such as `RZ`, `PT`, `URZ`, and `UPT` are never treated as normal SSA definition targets
+5. predicated non-returning helper calls can be rewritten into conditional CFG
+   edges when a forward-only reachability walk proves the helper falls back
+   into the caller instead of returning
 
 `build_ssa` then creates the mid-end IR used by optimization, analysis,
 structurization, and canonical lowering.
@@ -76,6 +79,9 @@ Key pieces:
   idioms; it is not allowed to re-run text-based backend repair
 - `src/semantic_lift.rs` remains only as a test-only harness for targeted
   legacy lift coverage that has not yet been translated into canonical tests
+- the structurizer is allowed to duplicate short acyclic terminal helper tails
+  when that is the cleanest way to avoid goto fallback, but it refuses to
+  duplicate loop/goto-bearing composites
 
 Symbol planning is intentionally conservative:
 
