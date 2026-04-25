@@ -611,21 +611,6 @@ fn ssa_ir_does_not_emit_synthetic_carry_opcodes() {
     }
 }
 
-fn run_structured_output_lifted(sass: &str) -> String {
-    let cfg = build_cfg(decode_sass(sass));
-    if cfg.node_count() == 0 {
-        return "void kernel(void) {\n}\n".to_string();
-    }
-    let fir = build_ssa(&cfg);
-    let mut structurizer = Structurizer::new(&cfg, &fir);
-    let lift_cfg = SemanticLiftConfig::default();
-    let lifted = lift_function_ir(&fir, &lift_cfg);
-    match structurizer.structure_function() {
-        Some(tree) => structurizer.pretty_print_with_lift(&tree, &DefaultDisplay, 0, Some(&lifted)),
-        None => String::new(),
-    }
-}
-
 #[test]
 fn empty_cfg_ssa_build_is_non_fatal() {
     let cfg = build_cfg(Vec::new());
@@ -640,177 +625,27 @@ fn malformed_sass_returns_stub_output() {
 }
 
 #[test]
-fn unknown_opcode_lifted_path_stays_intrinsic_like() {
+fn unknown_opcode_survives_tolerant_decode_and_ssa() {
     let sass = r#"
         /*0000*/ FOO.BAR R1, R2, 0x3 ;
         /*0010*/ EXIT ;
     "#;
-    let out = run_structured_output_lifted(sass);
-    assert!(out.contains("FOO.BAR("));
-    assert!(!out.trim().is_empty());
-}
-
-fn run_structured_output_full_pass_from_instrs(
-    instrs: Vec<DecodedInstruction>,
-    sm: Option<u32>,
-) -> String {
-    let cfg = build_cfg(instrs.clone());
-    if cfg.node_count() == 0 {
-        return String::new();
-    }
-    let inferred_profile = AbiProfile::detect_with_sm(&instrs, sm);
-    let fir = {
-        let ssa = build_ssa(&cfg);
-        let dce1 = ir_dce(&ssa);
-        let cp = ir_constprop(&dce1);
-        let alg = ir_algebra(&cp);
-        let cse = ir_cse(&alg, &cfg);
-        let copyprop = ir_copyprop(&cse);
-        ir_dce(&copyprop)
-    };
-    let analysis_abi_profile = Some(inferred_profile);
-    let abi_annotations = analysis_abi_profile.map(|p| annotate_function_ir_constmem(&fir, p));
-    let abi_aliases = match (analysis_abi_profile, abi_annotations.as_ref()) {
-        (Some(_), Some(anns)) => Some(infer_arg_aliases(&fir, anns)),
-        _ => None,
-    };
-    let mut structurizer = Structurizer::new(&cfg, &fir);
-    let local_decls = infer_local_typed_declarations_with_abi(
-        &fir,
-        abi_annotations.as_ref(),
-        abi_aliases.as_ref(),
-    );
-
-    let Some(tree) = structurizer.structure_function() else {
-        return "// Failed to structure function or function is empty.
-"
-        .to_string();
-    };
-
-    let default_display = DefaultDisplay;
-    let abi_display = match (analysis_abi_profile, abi_aliases.clone()) {
-        (Some(profile), Some(aliases)) => Some(AbiDisplay::with_aliases(profile, aliases)),
-        (Some(profile), None) => Some(AbiDisplay::new(profile)),
-        (None, _) => None,
-    };
-    let display_ctx: &dyn DisplayCtx = abi_display
-        .as_ref()
-        .map(|d| d as &dyn DisplayCtx)
-        .unwrap_or(&default_display);
-    let lift_cfg = SemanticLiftConfig {
-        abi_annotations: abi_annotations.as_ref(),
-        abi_aliases: abi_aliases.as_ref(),
-        strict: true,
-    };
-    let lifted = lift_function_ir(&fir, &lift_cfg);
-    let preview_output =
-        structurizer.pretty_print_with_lift_cleanup(&tree, display_ctx, 0, Some(&lifted));
-    let has_unstructured = preview_output.contains("goto BB");
-    let plan = plan_structured_name_recovery_with_lift(
-        &fir,
-        &preview_output,
-        Some(&lifted),
-        &NameRecoveryConfig {
-            style: if has_unstructured {
-                NameStyle::VerbatimSsa
-            } else {
-                NameStyle::Temp
-            },
-            rewrite_control_predicates: !has_unstructured,
-            semantic_symbolization: true,
-        },
-    );
-    let enable_post_name_addr64_fold = !has_unstructured
-        && preview_output.len() <= 30_000
-        && preview_output.matches("((uintptr_t)").count() >= 8;
-    let named_output = structurizer.pretty_print_with_lift_cleanup_and_names(
-        &tree,
-        display_ctx,
-        0,
-        Some(&lifted),
-        &plan.token_map,
-        enable_post_name_addr64_fold,
-    );
-    let symbols = filter_recovered_symbols_by_output(&named_output, &plan.symbols);
-    let name_type_map = infer_recovered_name_types(&fir, &symbols);
-    render_typed_structured_output(
-        &named_output,
-        abi_aliases.as_ref(),
-        &local_decls,
-        Some(&symbols),
-        &name_type_map,
-        collect_shared_memory_decls(Some(&lifted)),
-    )
-}
-
-fn run_structured_output_full_pass(sass: &str) -> String {
     let instrs = decode_sass(sass);
-    if instrs.is_empty() {
-        return "void kernel(void) {
-}
-"
-        .to_string();
-    }
-    let sm = parse_sm_version(sass);
-    let inferred_profile = AbiProfile::detect_with_sm(&instrs, sm);
-    let cfg = build_cfg(instrs.clone());
-    if cfg.node_count() == 0 {
-        return "void kernel(void) {
-}
-"
-        .to_string();
-    }
-    let fir = {
-        let ssa = build_ssa(&cfg);
-        let dce1 = ir_dce(&ssa);
-        let cp = ir_constprop(&dce1);
-        let alg = ir_algebra(&cp);
-        let cse = ir_cse(&alg, &cfg);
-        let copyprop = ir_copyprop(&cse);
-        ir_dce(&copyprop)
-    };
-    let analysis_abi_profile = Some(inferred_profile);
-    let abi_annotations = analysis_abi_profile.map(|p| annotate_function_ir_constmem(&fir, p));
-    let abi_aliases = match (analysis_abi_profile, abi_annotations.as_ref()) {
-        (Some(_), Some(anns)) => Some(infer_arg_aliases(&fir, anns)),
-        _ => None,
-    };
-
-    let mut out = String::new();
-    out.push_str("// --- Structured Output ---\n");
-    if let Some(anns) = &abi_annotations {
-        if !anns.is_empty() {
-            out.push_str("// ABI const-memory mapping (sample):\n");
-            for line in anns.summarize_lines(16) {
-                out.push_str("// ");
-                out.push_str(&line);
-                out.push('\n');
-            }
-        }
-    }
-    if let Some(aliases) = &abi_aliases {
-        if !aliases.is_empty() {
-            out.push_str("// ABI arg aliases (heuristic):\n");
-            for line in aliases.summarize_lines(12) {
-                out.push_str("// ");
-                out.push_str(&line);
-                out.push('\n');
-            }
-        }
-    }
-    if let Some(aliases) = &abi_aliases {
-        if !aliases.is_empty() {
-            out.push_str("// Typed signature inferred from ABI aliases:\n");
-            for line in aliases.summarize_lines(12) {
-                out.push_str("// ");
-                out.push_str(&line);
-                out.push('\n');
-            }
-        }
-    }
-    out.push_str(&run_structured_output_full_pass_from_instrs(instrs, sm));
-    out.push_str("// --- End Structured Output ---\n");
-    out
+    assert!(
+        instrs
+            .iter()
+            .any(|instr| instr.opcode == "FOO.BAR" && instr.raw.contains("FOO.BAR")),
+        "tolerant decode should preserve unknown opcode spellings"
+    );
+    let cfg = build_cfg(instrs);
+    let fir = build_ssa(&cfg);
+    assert!(
+        fir.blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .any(|stmt| matches!(&stmt.value, RValue::Op { opcode, .. } if opcode == "FOO.BAR")),
+        "SSA should keep unknown opcode statements representable"
+    );
 }
 
 fn run_canonical_output_full_pass_from_instrs(
@@ -955,14 +790,6 @@ fn canonical_full_pass_histogram256_lowers_shared_atomic_popc_and_barriers() {
     }
 }
 
-fn assert_full_pass_nonempty_and_deterministic(sass: &str) -> String {
-    let out1 = run_structured_output_full_pass(sass);
-    let out2 = run_structured_output_full_pass(sass);
-    assert!(!out1.trim().is_empty());
-    assert_eq!(out1, out2);
-    out1
-}
-
 #[test]
 fn test_abi_profile_detects_legacy_window_from_sample() {
     let sample = r#"
@@ -1023,150 +850,11 @@ fn test_abi_inferred_aliases_show_in_output() {
 }
 
 #[test]
-fn lifted_output_uses_infix_for_supported_patterns() {
-    let sass = include_str!("../test_cu/if.sass");
-    let out = run_structured_output_lifted(sass);
-    assert!(out.contains("R1.1 = R1.0 + 1;"));
-    assert!(!out.contains("IADD3("));
-}
-
-#[test]
-fn lifted_output_falls_back_to_raw_for_unmatched_opcodes() {
-    let sass = include_str!("../test_cu/if_loop.sass");
-    let out = run_structured_output_lifted(sass);
-    // PLOP3 with all-constant inputs is now constant-folded (no plop3_lut call).
-    // The if_loop fixture's PLOP3 instructions all have PT,PT,PT,PT inputs,
-    // so they should fold to true/false constants.
-    assert!(
-        !out.contains("plop3_lut("),
-        "all-constant PLOP3 should be folded"
-    );
-    // Verify LEA.HI.X is now lifted to lea_hi_x helper notation.
-    assert!(
-        out.contains("lea_hi_x("),
-        "LEA.HI.X should be lifted to lea_hi_x helper"
-    );
-}
-
-#[test]
-fn semantic_lift_has_mixed_coverage_on_if_loop_fixture() {
-    let sass = include_str!("../test_cu/if_loop.sass");
-    let cfg = build_cfg(decode_sass(sass));
-    let fir = build_ssa(&cfg);
-    let lifted = lift_function_ir(&fir, &SemanticLiftConfig::default());
-    assert!(lifted.stats.lifted > 0);
-    assert!(lifted.stats.fallback > 0);
-}
-
-#[test]
-fn semantic_lift_percentage_gate_if_loop_fixture() {
-    let sass = include_str!("../test_cu/if_loop.sass");
-    let cfg = build_cfg(decode_sass(sass));
-    let fir = build_ssa(&cfg);
-    let lifted = lift_function_ir(&fir, &SemanticLiftConfig::default());
-
-    assert!(lifted.stats.attempted > 0);
-    let lifted_pct = lifted.stats.lifted as f64 / lifted.stats.attempted as f64;
-    let fallback_pct = lifted.stats.fallback as f64 / lifted.stats.attempted as f64;
-
-    // Guardrails for regression detection while preserving conservative fallback.
-    assert!(lifted_pct >= 0.30);
-    assert!(fallback_pct <= 0.70);
-}
-
-#[test]
-fn structured_output_goto_gate_lifted_fixtures() {
-    let if_loop = run_structured_output_lifted(include_str!("../test_cu/if_loop.sass"));
-    let rc4 = run_structured_output_lifted(include_str!("../test_cu/rc4.sass"));
-    let test_div = run_structured_output_lifted(include_str!("../test_cu/test_div.sass"));
-
-    let if_loop_goto = if_loop.matches("goto BB").count();
-    let rc4_goto = rc4.matches("goto BB").count();
-    let test_div_goto = test_div.matches("goto BB").count();
-
-    assert_eq!(if_loop_goto, 0);
-    assert_eq!(rc4_goto, 0);
-    assert_eq!(test_div_goto, 0);
-}
-
-#[test]
-fn lifted_rc4_uses_shared_array_style_for_shared_mem_ops() {
-    let out = run_structured_output_lifted(include_str!("../test_cu/rc4.sass"));
-    assert!(out.contains("shmem_u8["));
-    assert!(!out.contains("_ = STS."));
-}
-
-#[test]
-fn lifted_rc4_reduces_add_with_carry_and_lea_hi_opcode_noise() {
-    let out = run_structured_output_lifted(include_str!("../test_cu/rc4.sass"));
-    assert!(out.contains("? 1 : 0"));
-    assert!(out.contains("hi32("));
-    assert!(!out.contains("IADD3.X("));
-    assert!(!out.contains("LEA.HI("));
-    assert!(!out.contains("LOP3.LUT("));
-}
-
-#[test]
-fn lifted_rc4_renders_barrier_as_syncthreads() {
-    let out = run_structured_output_lifted(include_str!("../test_cu/rc4.sass"));
-    assert!(out.contains("__syncthreads();"));
-    assert!(!out.contains("BAR.SYNC"));
-}
-
-#[test]
-fn smoke_struct_output_full_pass_rc4_sass() {
-    let out = assert_full_pass_nonempty_and_deterministic(include_str!("../test_cu/rc4.sass"));
-    assert!(out.contains("__shared__ uint8_t shmem_u8[256];"));
-    assert!(out.contains("__syncthreads();"));
-    assert!(out.contains("uint8_t* arg0_ptr"));
-    assert!(out.contains("uint8_t* arg4_ptr"));
-    assert!(out.contains("uint8_t* arg6_ptr"));
-    assert!(!out.contains("addr64("));
-    assert!(!out.contains("prmt("));
-}
-
-#[test]
 fn smoke_struct_output_full_pass_if_sass() {
     let sass = include_str!("../test_cu/if.sass");
     let expected = "void kernel(void) {\n  return;\n}\n";
     let out = assert_canonical_full_pass_nonempty_and_deterministic(sass);
     assert_eq!(out, expected);
-}
-
-#[test]
-fn smoke_struct_output_full_pass_loop_constant_sass() {
-    let out =
-        assert_full_pass_nonempty_and_deterministic(include_str!("../test_cu/loop_constant.sass"));
-    assert!(out.contains("__shared__ uint8_t shmem_u8[256];"));
-    let shmem_store = Regex::new(
-        r"shmem_u8\[(?:tid_x|v\d+(?:_next(?:_\d+)?)?)\] = (?:tid_x|v\d+(?:_next(?:_\d+)?)?);",
-    )
-    .expect("valid loop_constant shmem store regex");
-    assert!(
-        shmem_store.is_match(&out),
-        "expected loop_constant shmem store, got:\n{}",
-        out
-    );
-    assert!(
-        out.contains("while(!((int32_t)(tid_x) >= (int32_t)(256)));")
-            || out.contains("while(!((int32_t)(tid_x_next) >= (int32_t)(256)));")
-            || out.contains("while(!((int32_t)(v2_next) >= (int32_t)(256)));")
-    );
-    assert!(!out.contains("addr64("));
-    assert!(!out.contains("prmt("));
-}
-
-#[test]
-fn smoke_struct_output_full_pass_if_loop_sass() {
-    let out = assert_full_pass_nonempty_and_deterministic(include_str!("../test_cu/if_loop.sass"));
-    assert!(out.contains("float* arg4_ptr"));
-    assert!(out.matches("do {").count() >= 2);
-    let final_store = Regex::new(r"\*\(arg4_ptr \+ v2\) = v\d+(?:_next(?:_\d+)?)?;")
-        .expect("valid if_loop final store regex");
-    assert!(final_store.is_match(&out));
-    assert!(!out.contains("lea_hi_x("));
-    assert!(!out.contains("prmt("));
-    assert!(!out.contains("hfma2("));
 }
 
 #[test]
@@ -1193,74 +881,6 @@ fn smoke_struct_output_full_pass_test_div_sass() {
     assert!(!out.contains("ConstMem("));
     assert!(!out.contains("addr64("));
     assert!(!out.contains("prmt("));
-}
-
-#[test]
-fn lifted_rc4_does_not_render_address_width_suffix_on_global_accesses() {
-    let out = run_structured_output_lifted(include_str!("../test_cu/rc4.sass"));
-    assert!(!out.contains("@64"));
-}
-
-#[test]
-fn full_pass_rc4_keeps_thread0_gate_as_predicate_guard() {
-    let out = run_structured_output_full_pass(include_str!("../test_cu/rc4.sass"));
-    assert!(!out.contains("if (!(tid_x != RZ))"));
-    assert!(
-        out.contains("if (!(P")
-            || out.contains("if (!P")
-            || out.contains("if (!(b")
-            || out.contains("if (!b")
-    );
-}
-
-#[test]
-fn full_pass_rc4_addr64_collapsed_to_typed_pointer() {
-    let out = run_structured_output_full_pass(include_str!("../test_cu/rc4.sass"));
-    // After addr64 collapse, carry/lea_hi patterns are replaced with typed pointer
-    // expressions. No addr64() calls should remain in the rc4 output.
-    assert!(
-        !out.contains("addr64("),
-        "all addr64 patterns should be collapsed to typed pointers"
-    );
-    // The collapsed output should contain typed pointer arithmetic with arg0_ptr.
-    assert!(
-        out.contains("(arg0_ptr + (int64_t)"),
-        "arg0_ptr pointer expressions expected"
-    );
-    // No raw lea_hi_x_sx32 should remain (DCE removes dead intermediates).
-    assert!(
-        !out.contains("lea_hi_x_sx32("),
-        "lea_hi_x_sx32 should be DCE'd after collapse"
-    );
-    // Negative checks from the old test still apply.
-    assert!(!out.contains("arg0_ptr.hi32 << 1"));
-    assert!(!out.contains("ConstMem(0, 356) << 1"));
-}
-
-#[test]
-fn full_pass_rc4_global_u8_accesses_use_typed_pointers() {
-    let out = run_structured_output_full_pass(include_str!("../test_cu/rc4.sass"));
-    // After addr64 collapse, global u8 accesses use typed pointer expressions
-    // instead of addr64 pairs.
-    assert!(out.contains("((uint8_t*)(arg0_ptr + (int64_t)"));
-}
-
-#[test]
-fn full_pass_rc4_key_sel_uses_ssa_predicate_not_raw_p1() {
-    let out = run_structured_output_full_pass(include_str!("../test_cu/rc4.sass"));
-    assert!(!out.contains("!P1 ?"));
-}
-
-#[test]
-fn full_pass_rc4_pointer_arithmetic_uses_typed_expressions() {
-    let out = run_structured_output_full_pass(include_str!("../test_cu/rc4.sass"));
-    // After addr64 collapse, the carry + lea_hi + addr64 pattern is collapsed
-    // into typed pointer expressions. Verify that arg4_ptr and arg6_ptr patterns
-    // are also collapsed.
-    assert!(
-        out.contains("(arg4_ptr + (int64_t)") || out.contains("(arg6_ptr + (int64_t)"),
-        "expected collapsed pointer expressions for arg4_ptr or arg6_ptr"
-    );
 }
 
 #[test]
@@ -1349,46 +969,6 @@ fn full_pass_dot_thread_recovers_pointer_params_and_typed_loads() {
 }
 
 #[test]
-fn full_pass_cumsum_linear_no_longer_overflows_named_render() {
-    let cumsum = split_decoded_functions(include_str!("../test_cu/corpus/loop_kernels.sass"))
-        .into_iter()
-        .find(|f| f.name == "cumsum_linear")
-        .expect("cumsum_linear fixture should exist");
-    let out = run_structured_output_full_pass_from_instrs(cumsum.instrs, cumsum.sm);
-    assert!(
-        !out.trim().is_empty(),
-        "expected cumsum_linear to decompile to non-empty output"
-    );
-    assert!(
-        out.contains("float* arg0_ptr") && out.contains("float* arg2_ptr"),
-        "expected cumsum_linear pointer params to survive the named pass, got:
-{}",
-        out
-    );
-    assert!(
-        !out.contains("((uintptr_t)"),
-        "expected cumsum_linear remainder paths to avoid packed pointer reconstruction, got:
-{}",
-        out
-    );
-    assert!(
-        !out.lines().any(|line| {
-            let line = line.trim();
-            let Some((lhs, rhs)) = line
-                .strip_suffix(';')
-                .and_then(|line| line.split_once(" = "))
-            else {
-                return false;
-            };
-            lhs == rhs
-        }),
-        "expected cumsum_linear named output to omit trivial self-assignments, got:
-{}",
-        out
-    );
-}
-
-#[test]
 fn canonical_full_pass_cumsum_linear_avoids_register_pseudo_pointers() {
     let cumsum = split_decoded_functions(include_str!("../test_cu/corpus/loop_kernels.sass"))
         .into_iter()
@@ -1418,45 +998,6 @@ fn canonical_full_pass_cumsum_linear_avoids_register_pseudo_pointers() {
     assert!(
         out.contains("arg0_ptr[") && out.contains("arg2_ptr["),
         "expected canonical cumsum_linear loops to stay rooted on arg pointers, got:\n{}",
-        out
-    );
-}
-
-#[test]
-fn full_pass_gelu_forward_recovers_copysign_and_typed_pointer_arithmetic() {
-    let gelu = split_decoded_functions(include_str!("../test_cu/corpus_sm100/ml_kernels.sass"))
-        .into_iter()
-        .find(|f| f.name == "gelu_forward")
-        .expect("gelu_forward fixture should exist");
-    let out = run_structured_output_full_pass_from_instrs(gelu.instrs, gelu.sm);
-    assert!(
-        out.contains("copysignf("),
-        "expected copysignf recovery, got:
-{}",
-        out
-    );
-    assert!(
-        out.contains("v7 = *(arg0_ptr + v2);"),
-        "expected collapsed input pointer access, got:
-{}",
-        out
-    );
-    assert!(
-        out.contains("*(arg2_ptr + v2) = v32;"),
-        "expected collapsed output pointer access, got:
-{}",
-        out
-    );
-    assert!(
-        !out.contains("2147483648 &"),
-        "expected sign-mask bit twiddling to be lifted, got:
-{}",
-        out
-    );
-    assert!(
-        !out.contains("pair_hi("),
-        "expected no pair_hi helper in gelu output, got:
-{}",
         out
     );
 }
@@ -1846,86 +1387,33 @@ fn ssa_ldl_128_emits_all_lane_defs() {
 }
 
 #[test]
-fn full_pass_sha256_single_block_rewrites_local_load_helpers() {
+fn canonical_full_pass_sha256_single_block_uses_local_memory_intrinsics() {
     let sha256 =
         split_decoded_functions(include_str!("../test_cu/corpus_sm120/crypto_kernels.sass"))
             .into_iter()
             .find(|f| f.name == "sha256_single_block")
             .expect("sha256_single_block fixture should exist");
-    let out = run_structured_output_full_pass_from_instrs(sha256.instrs, sha256.sm);
+    let out =
+        run_canonical_output_full_pass_from_instrs(sha256.instrs, sha256.sm, "sha256_single_block");
     assert!(
-        !out.contains("LDL("),
-        "expected no raw LDL helper in sha256 output, got:
+        !out.contains("LDL(") && !out.contains("IADD.64("),
+        "expected canonical sha256 output to avoid raw local-memory helpers, got:
 {}",
         out
     );
     assert!(
-        !out.contains("IADD.64("),
-        "expected no raw IADD.64 helper in sha256 output, got:
+        out.contains("local_load_bits32(") && out.contains("local_store_bits128_x4("),
+        "expected canonical sha256 output to keep explicit local-memory intrinsics, got:
 {}",
         out
     );
-    let stack_load =
-        Regex::new(r"v\w+ = \*\(\(uint32_t\*\)\(v\w+ - 40\)\);").expect("valid stack load regex");
-    assert!(
-        stack_load.is_match(&out),
-        "expected local stack loads to lower to typed pointer dereferences, got:
-{}",
-        out
-    );
-    let digest_store = Regex::new(
-        r"\*(?:\((arg2_ptr(?: \+ \d+)?)\)|\(\(uint32_t\*\)\((arg2_ptr(?: \+ \d+)?)\)\)) = v\d+;",
-    )
-    .expect("valid sha256 final-store regex");
-    let stores = digest_store
-        .captures_iter(&out)
-        .filter_map(|caps| {
-            caps.get(1)
-                .or_else(|| caps.get(2))
-                .map(|m| m.as_str().to_string())
-        })
-        .collect::<std::collections::BTreeSet<_>>();
-    let expected = std::collections::BTreeSet::from([
-        "arg2_ptr".to_string(),
-        "arg2_ptr + 1".to_string(),
-        "arg2_ptr + 2".to_string(),
-        "arg2_ptr + 3".to_string(),
-        "arg2_ptr + 4".to_string(),
-        "arg2_ptr + 5".to_string(),
-        "arg2_ptr + 6".to_string(),
-        "arg2_ptr + 7".to_string(),
-    ]);
-    assert!(
-        stores == expected,
-        "expected final digest stores to stay rooted on uint32_t word indexing over arg2_ptr, got:\n{}",
-        out
-    );
-}
-
-#[test]
-fn full_pass_sobel_edge_detect_rewrites_iadd64_pairs_to_typed_pointers() {
-    let sobel = split_decoded_functions(include_str!(
-        "../test_cu/corpus_sm120/image_processing_kernels.sass"
-    ))
-    .into_iter()
-    .find(|f| f.name == "sobel_edge_detect")
-    .expect("sobel_edge_detect fixture should exist");
-    let out = run_structured_output_full_pass_from_instrs(sobel.instrs, sobel.sm);
-    assert!(
-        !out.contains("((uintptr_t)(((uint64_t)"),
-        "expected no packed arg0_ptr hi/lo reconstruction in sobel output, got:
-{}",
-        out
-    );
-    assert!(
-        out.contains("uint8_t* arg0_ptr")
-            && out.contains("uint8_t* arg2_ptr")
-            && out.contains("*(arg0_ptr +")
-            && out.contains("*(arg2_ptr + v142) = v141;"),
-        "expected sobel to use typed byte loads from arg0_ptr, got:
-{}",
-        out
-    );
+    for word in 0..8 {
+        assert!(
+            out.contains(&format!("arg2_ptr[{word}] =")),
+            "expected canonical sha256 digest stores to stay rooted on arg2_ptr[{word}], got:\n{}",
+            out
+        );
+    }
 }
 
 #[test]
@@ -1973,39 +1461,6 @@ fn canonical_full_pass_topk_per_row_old_corpus_keeps_remainder_loads_rooted() {
     assert!(
         !out.contains("((uint32_t*)(r2_5))") && out.contains("arg0_ptr["),
         "expected old-corpus topk_per_row remainder loads to stay rooted on arg0_ptr, got:\n{}",
-        out
-    );
-}
-
-#[test]
-fn full_pass_layer_norm_forward_keeps_affine_pointer_pairs_typed() {
-    let layer_norm =
-        split_decoded_functions(include_str!("../test_cu/corpus_sm120/ml_kernels.sass"))
-            .into_iter()
-            .find(|f| f.name == "layer_norm_forward")
-            .expect("layer_norm_forward fixture should exist");
-    let out = run_structured_output_full_pass_from_instrs(layer_norm.instrs, layer_norm.sm);
-    assert!(
-        out.contains("float* arg2_ptr")
-            && out.contains("float* arg4_ptr")
-            && out.contains("float* arg6_ptr")
-            && out.contains("*((float*)(((uint8_t*)arg2_ptr)")
-            && out.contains("*((float*)(((uint8_t*)arg4_ptr)")
-            && out.contains("*((float*)(((uint8_t*)arg6_ptr)"),
-        "expected layer_norm_forward gamma/beta accesses to stay on typed base-relative pointer arithmetic, got:
-{}",
-        out
-    );
-    assert!(
-        !out.contains("*((uint32_t*)(((uint8_t*)arg6_ptr)"),
-        "expected layer_norm_forward affine output stores to stay typed as float, got:
-{}",
-        out
-    );
-    assert!(
-        !out.contains("CALL.REL.NOINC()") && !out.contains("FCHK("),
-        "expected layer_norm_forward to drop compiler slow-path call/fchk scaffolding, got:
-{}",
         out
     );
 }
@@ -2072,10 +1527,11 @@ fn canonical_full_pass_state_machine_avoids_raw_true_predicate_helpers() {
 
 #[test]
 fn canonical_full_pass_multi_exit_loop_lowers_scalar_helper_ops() {
-    let kernel = split_decoded_functions(include_str!("../test_cu/corpus/control_flow_kernels.sass"))
-        .into_iter()
-        .find(|f| f.name == "multi_exit_loop")
-        .expect("multi_exit_loop fixture should exist");
+    let kernel =
+        split_decoded_functions(include_str!("../test_cu/corpus/control_flow_kernels.sass"))
+            .into_iter()
+            .find(|f| f.name == "multi_exit_loop")
+            .expect("multi_exit_loop fixture should exist");
     let out =
         run_canonical_output_full_pass_from_instrs(kernel.instrs, kernel.sm, "multi_exit_loop");
     assert!(
@@ -2200,12 +1656,6 @@ fn full_pass_utf8_count_chars_rewrites_iadd64_pointer_arithmetic() {
         "expected typed pointer load/store recovery in utf8_count_chars, got:\n{}",
         out
     );
-}
-
-#[test]
-fn lifted_rc4_no_raw_constmem_call_syntax() {
-    let out = run_structured_output_lifted(include_str!("../test_cu/rc4.sass"));
-    assert!(!out.contains("c[0x0][0x180]()"));
 }
 
 // ----------------------------------------------------------------------

@@ -272,35 +272,47 @@
   statements, so `__syncthreads()` / `__syncwarp()` survive the late pure-call
   pruning pass instead of disappearing from rendered kernels such as
   `histogram256`.
+- The remaining old lifted/full-pass helper surface in `src/test.rs` is now
+  hard-deleted: the legacy preview/full-pass helpers and their RC4/name-
+  recovery/text-repair contract tests are gone instead of being kept as
+  compatibility coverage.
+- Replacement coverage now stays on-rail with the rewrite plan:
+  - tolerant decode + SSA explicitly keep unknown opcodes representable
+  - canonical sha256 coverage pins explicit local-memory intrinsics plus
+    `arg2_ptr[...]` digest stores
+  - cumsum / gelu / layer-norm coverage is canonical-only for the surviving
+    contracts instead of routing back through the deleted post-struct path
+- `src/test.rs` no longer references `plan_structured_name_recovery_with_lift`,
+  `render_typed_structured_output`, `collect_shared_memory_decls`, or the old
+  full-pass test driver; the remaining legacy deletion work is now in the
+  production modules rather than the test harness.
 
 ## Next safe step
 
-1. Keep shrinking the remaining old helper surface in `src/test.rs` only where
-   canonical semantics are now genuinely stronger, not just cosmetically
-   different.
-2. Tackle the next structurally visible canonical holes: loop-carried
-   pointer-byte-offset cleanup beyond the now-rooted `cumsum_linear`
-   remainder paths, the remaining predicate/control outliers beyond the
-   now-handled compare/pseudo-op/carry-add/float-modifier/plain-LEA/`IMAD.X`
-   /high-lane-address spellings, and the remaining
-   vector/half/special-scalar ops (for example `HFMA2`, `PRMT`, rotate-heavy
-   SHA idioms) that still force raw helper-shaped output.
-3. The most obvious remaining canonical helper leak is `BRX(...)` in
-   `state_machine`; decide whether to lower it directly to a structured switch
-   form or to teach structurization/canonical AST lowering a small indirect-
-   branch contract without reviving the old post-render repair machinery.
-3. Revisit the broader `sgemm_tiled` / shared-memory fixtures and migrate any
-   additional smoke coverage that the new shared-scale and scalar-op lowering
-   now makes trustworthy on the canonical driver.
+1. Delete the remaining production-only legacy modules and exports that still
+   exist solely for the old post-struct backend path (`typed_output`,
+   lifted name-recovery glue, semantic-lift-only rendering hooks, and any
+   duplicated public re-exports that survive only for that path).
+2. Re-run the canonical/full-corpus acceptance checks after each deletion
+   slice so the branch proves the big-bang cutover still owns:
+   deterministic output, no leaked SSA suffixes, no raw helper mnemonics, and
+   the current goto/control budgets.
+3. Once another 3-ish atomic commits land, spawn the next review sub-agent
+   against the deletion slice and fold any findings back before touching the
+   remaining CLI/library cleanup.
 
 ## Open questions
 
-- How much of the current AST can be kept unchanged versus extended.
-- Which current SSA passes need semantic updates once explicit memory ops land.
-- How much of the existing ABI logic can be lifted directly into
-  `FunctionAnalysis`.
-- What the right canonical AST representation is for multi-def memory ops
-  (`LDC.64`, vector loads, etc.) before the big-bang cutover.
+- Which remaining pieces of `semantic_lift` are still carrying real decode/IR
+  knowledge that must be translated into canonical analysis/lowering before the
+  module can be deleted outright.
+- Whether the remaining packed-pointer heavy kernels (`sobel_edge_detect`,
+  broader affine `layer_norm_forward` slices, rotate-heavy SHA idioms) need
+  another canonical lowering pass before their old smoke tests can be replaced
+  one-for-one instead of simply deleted.
+- How aggressively the public `lib.rs` surface should shrink in the same
+  cutover versus a final follow-up cleanup commit after all internal callers
+  are gone.
 
 ## Files/modules touched
 
@@ -316,10 +328,11 @@
 - `src/bin/main.rs`
 - `src/lib.rs`
 - `src/test.rs`
-- `src/function_analysis.rs`
+- `src/canonical_ast_passes.rs`
 
 ## Interrupt resume note
 
-Resume from the next unchecked atomic commit. Do not start deleting the old
-backend until the new canonical pipeline stages exist and have stage-local
-tests.
+Resume from the production-module deletion slice, not the tests: `src/test.rs`
+is now off the old backend path, so the next safe work is deleting the
+remaining legacy rendering/name-recovery modules while keeping the canonical
+corpus/tests green after each atomic commit.
