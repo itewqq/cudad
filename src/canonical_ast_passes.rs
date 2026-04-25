@@ -531,24 +531,14 @@ fn recover_rcp_division_stmt_tree(
                 local_future[idx] = live_tail.clone();
                 collect_stmt_used_vars(stmt, &mut live_tail);
             }
-            let rewritten = simplify_trivial_stmt(
-                dce_stmt(
-                    Stmt::Sequence(
-                        stmts
-                            .into_iter()
-                            .enumerate()
-                            .map(|(idx, stmt)| {
-                                recover_rcp_division_stmt_tree(
-                                    stmt,
-                                    &mut local_defs,
-                                    &local_future[idx],
-                                )
-                            })
-                            .collect(),
-                    ),
-                    future_used.clone(),
-                )
-                .0,
+            let rewritten = Stmt::Sequence(
+                stmts
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, stmt)| {
+                        recover_rcp_division_stmt_tree(stmt, &mut local_defs, &local_future[idx])
+                    })
+                    .collect(),
             );
             let mut final_defs = entry_defs;
             update_linear_defs(&rewritten, &mut final_defs);
@@ -564,24 +554,14 @@ fn recover_rcp_division_stmt_tree(
                 local_future[idx] = live_tail.clone();
                 collect_stmt_used_vars(stmt, &mut live_tail);
             }
-            let rewritten = simplify_trivial_stmt(
-                dce_stmt(
-                    Stmt::Block(
-                        stmts
-                            .into_iter()
-                            .enumerate()
-                            .map(|(idx, stmt)| {
-                                recover_rcp_division_stmt_tree(
-                                    stmt,
-                                    &mut local_defs,
-                                    &local_future[idx],
-                                )
-                            })
-                            .collect(),
-                    ),
-                    future_used.clone(),
-                )
-                .0,
+            let rewritten = Stmt::Block(
+                stmts
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, stmt)| {
+                        recover_rcp_division_stmt_tree(stmt, &mut local_defs, &local_future[idx])
+                    })
+                    .collect(),
             );
             let mut final_defs = entry_defs;
             update_linear_defs(&rewritten, &mut final_defs);
@@ -602,7 +582,6 @@ fn recover_rcp_division_stmt_tree(
                 update_linear_defs(&rewritten, defs);
                 return rewritten;
             }
-
             let mut then_defs = defs.clone();
             let then_branch = Box::new(recover_rcp_division_stmt_tree(
                 *then_branch,
@@ -753,18 +732,6 @@ fn recover_fchk_division_stmt(
             });
             continue;
         }
-        if match_fchk_guided_division_expr(src_fast, defs, &fchk_num, &fchk_den) {
-            recovered_key = Some(dst_key);
-            recovered_stmt = Some(Stmt::Assign {
-                dst: dst_fast.clone(),
-                src: Expr::Binary {
-                    op: "/".to_string(),
-                    lhs: Box::new(fchk_num.clone()),
-                    rhs: Box::new(fchk_den.clone()),
-                },
-            });
-            continue;
-        }
 
         if let Some(name) = lvalue_symbol_name(dst_fast) {
             if !future_used.contains(&name) {
@@ -901,85 +868,6 @@ fn match_fchk_expr(expr: &Expr) -> Option<(Expr, Expr)> {
 
 fn match_division_expr(expr: &Expr, defs: &HashMap<String, Expr>) -> Option<(Expr, Expr)> {
     match_direct_division_expr(expr, defs).or_else(|| match_rcp_division_expr(expr, defs))
-}
-
-fn match_fchk_guided_division_expr(
-    expr: &Expr,
-    defs: &HashMap<String, Expr>,
-    expected_num: &Expr,
-    expected_den: &Expr,
-) -> bool {
-    let expr = normalize_match_expr(expr, defs, MATCH_RESOLVE_DEPTH);
-    let Some((lhs, rhs)) = match_binary_expr(&expr, "+", defs) else {
-        return false;
-    };
-    match_fchk_guided_division_parts(&lhs, &rhs, defs, expected_num, expected_den)
-        || match_fchk_guided_division_parts(&rhs, &lhs, defs, expected_num, expected_den)
-}
-
-fn match_fchk_guided_division_parts(
-    scaled_expr: &Expr,
-    refined_term: &Expr,
-    defs: &HashMap<String, Expr>,
-    expected_num: &Expr,
-    expected_den: &Expr,
-) -> bool {
-    let scaled_resolved = normalize_match_expr(scaled_expr, defs, MATCH_RESOLVE_DEPTH);
-    let expected_num = normalize_match_expr(expected_num, defs, MATCH_RESOLVE_DEPTH);
-    let expected_den = normalize_match_expr(expected_den, defs, MATCH_RESOLVE_DEPTH);
-    let Some(scaled_pairs) = match_mul_factor_pairs(&scaled_resolved, defs) else {
-        return false;
-    };
-    let Some(refined_pairs) = match_mul_factor_pairs(refined_term, defs) else {
-        return false;
-    };
-    for (approx_a, num) in &scaled_pairs {
-        if !same_match_expr(num, &expected_num) {
-            continue;
-        }
-        for (approx_b, corr) in &refined_pairs {
-            if !same_match_expr(approx_a, approx_b) {
-                continue;
-            }
-            if match_newton_correction_with_den(
-                corr,
-                &scaled_resolved,
-                &expected_num,
-                &expected_den,
-                defs,
-            ) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn match_newton_correction_with_den(
-    expr: &Expr,
-    expected_scaled: &Expr,
-    expected_num: &Expr,
-    expected_den: &Expr,
-    defs: &HashMap<String, Expr>,
-) -> bool {
-    let expr = normalize_match_expr(expr, defs, MATCH_RESOLVE_DEPTH);
-    let Some((lhs, rhs)) = match_binary_expr(&expr, "+", defs) else {
-        return false;
-    };
-    for (neg_mul_term, num_term) in [(lhs.clone(), rhs.clone()), (rhs, lhs)] {
-        if !same_match_expr(&num_term, expected_num) {
-            continue;
-        }
-        let Some((corr_den, corr_scaled)) = match_neg_mul_expr(&neg_mul_term, defs) else {
-            continue;
-        };
-        if same_match_expr(&corr_den, expected_den)
-            && same_match_expr(&corr_scaled, expected_scaled)
-        {
-            return true;
-        }
-    }
-    false
 }
 
 fn match_direct_division_expr(expr: &Expr, defs: &HashMap<String, Expr>) -> Option<(Expr, Expr)> {
@@ -1700,38 +1588,7 @@ mod tests {
     }
 
     #[test]
-    fn prune_dead_pure_stmt_removes_dead_fchk_inside_loop() {
-        let stmt = Stmt::Loop {
-            kind: LoopKind::DoWhile,
-            condition: Some(Expr::Reg("keep".to_string())),
-            body: Box::new(Stmt::Sequence(vec![
-                Stmt::Assign {
-                    dst: LValue::Var("p0".to_string()),
-                    src: Expr::CallLike {
-                        func: "FCHK".to_string(),
-                        args: vec![Expr::Reg("arg0".to_string()), Expr::Reg("arg1".to_string())],
-                    },
-                },
-                Stmt::Assign {
-                    dst: LValue::Var("out".to_string()),
-                    src: Expr::Binary {
-                        op: "/".to_string(),
-                        lhs: Box::new(Expr::Reg("arg0".to_string())),
-                        rhs: Box::new(Expr::Reg("arg1".to_string())),
-                    },
-                },
-                Stmt::Assign {
-                    dst: LValue::Var("keep".to_string()),
-                    src: Expr::Imm("0".to_string()),
-                },
-            ])),
-        };
-        let rendered = prune_dead_pure_stmt(stmt).render_with_indent(0);
-        assert!(!rendered.contains("FCHK("), "got:\n{}", rendered);
-    }
-
-    #[test]
-    fn canonicalize_recovers_fchk_guarded_division_from_constant_newton_seed() {
+    fn canonicalize_does_not_invent_division_without_reciprocal_proof() {
         let seq = vec![
             Stmt::Assign {
                 dst: LValue::Var("num".to_string()),
@@ -1820,7 +1677,38 @@ mod tests {
         })
         .body
         .render_with_indent(0);
-        assert!(rendered.contains("out = arg0 / 9;"), "got:\n{}", rendered);
+        assert!(!rendered.contains("arg0 / 9"), "got:\n{}", rendered);
+        assert!(rendered.contains("FCHK("), "got:\n{}", rendered);
+    }
+
+    #[test]
+    fn prune_dead_pure_stmt_removes_dead_fchk_inside_loop() {
+        let stmt = Stmt::Loop {
+            kind: LoopKind::DoWhile,
+            condition: Some(Expr::Reg("keep".to_string())),
+            body: Box::new(Stmt::Sequence(vec![
+                Stmt::Assign {
+                    dst: LValue::Var("p0".to_string()),
+                    src: Expr::CallLike {
+                        func: "FCHK".to_string(),
+                        args: vec![Expr::Reg("arg0".to_string()), Expr::Reg("arg1".to_string())],
+                    },
+                },
+                Stmt::Assign {
+                    dst: LValue::Var("out".to_string()),
+                    src: Expr::Binary {
+                        op: "/".to_string(),
+                        lhs: Box::new(Expr::Reg("arg0".to_string())),
+                        rhs: Box::new(Expr::Reg("arg1".to_string())),
+                    },
+                },
+                Stmt::Assign {
+                    dst: LValue::Var("keep".to_string()),
+                    src: Expr::Imm("0".to_string()),
+                },
+            ])),
+        };
+        let rendered = prune_dead_pure_stmt(stmt).render_with_indent(0);
         assert!(!rendered.contains("FCHK("), "got:\n{}", rendered);
     }
 }

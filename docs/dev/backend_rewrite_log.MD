@@ -104,6 +104,17 @@
 - The canonical `dot_thread` recurrence contract now accepts the deliberate
   `fmaf(...)` spelling as equivalent to `a * b + c`, so the test suite checks
   for preserved FFMA structure rather than an obsolete render-only spelling.
+- Canonical cleanup now intentionally refuses to synthesize `/` from a
+  guarded Newton-like polynomial unless the reciprocal seed can still be
+  proven structurally; correctness wins over helper-elimination coverage.
+- Companion-phi pointer-offset recovery now preserves any proven entry bias
+  instead of collapsing every loop-carried pointer phi to `idx * stride`.
+- Memory-access classification no longer falls back to the low 32-bit lane of
+  a mismatched `Addr64` pair, which avoids misclassifying stale mixed-width
+  addresses as rooted param/shared/local accesses.
+- The `dot_thread` regression test again requires the loop-carried induction
+  state to survive structurization, which protects the canonical path from
+  silently deleting accumulator/index updates inside remainder loops.
 - Canonical global-index lowering now recursively expands rooted byte-offset
   expressions before rendering, which collapses nested rooted temps out of
   typed global loads/stores instead of leaking intermediate offset registers

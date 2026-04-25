@@ -318,6 +318,7 @@ fn propagate_address_facts(
                                     args,
                                     &root,
                                     &roots,
+                                    &byte_offsets,
                                     &def_sites,
                                 )
                             }),
@@ -391,6 +392,7 @@ fn recover_pointer_phi_offset(
     args: &[IRExpr],
     root: &AddressRoot,
     roots: &BTreeMap<RegId, AddressRoot>,
+    byte_offsets: &BTreeMap<RegId, IRExpr>,
     def_sites: &BTreeMap<RegId, (usize, usize)>,
 ) -> Option<IRExpr> {
     let ptr_phi = stmt
@@ -424,11 +426,12 @@ fn recover_pointer_phi_offset(
             .collect::<Option<Vec<_>>>()?;
 
         let mut scale = None;
+        let mut bias = None;
         let matches = ptr_args
             .iter()
             .zip(idx_arg_regs.iter())
             .all(|(ptr_src, idx_src)| {
-                let Some(src_scale) = pointer_phi_source_scale(
+                let Some(match_info) = pointer_phi_source_scale(
                     function_ir,
                     ptr_src,
                     ptr_phi,
@@ -436,15 +439,32 @@ fn recover_pointer_phi_offset(
                     idx_phi,
                     root,
                     roots,
+                    byte_offsets,
                     def_sites,
                 ) else {
                     return false;
                 };
                 match scale {
-                    Some(existing) => existing == src_scale,
+                    Some(existing) if existing != match_info.scale => false,
                     None => {
-                        scale = Some(src_scale);
+                        scale = Some(match_info.scale);
+                        if let Some(src_bias) = match_info.bias.clone() {
+                            bias = Some(src_bias);
+                        }
                         true
+                    }
+                    Some(_) => {
+                        if let Some(src_bias) = match_info.bias {
+                            match &bias {
+                                Some(existing) => same_ir_expr(existing, &src_bias),
+                                None => {
+                                    bias = Some(src_bias);
+                                    true
+                                }
+                            }
+                        } else {
+                            true
+                        }
                     }
                 }
             });
@@ -452,10 +472,11 @@ fn recover_pointer_phi_offset(
             continue;
         };
         if matches {
-            return Some(mul_offset_expr(
-                IRExpr::Reg(idx_phi.clone()),
-                IRExpr::ImmI(scale),
-            ));
+            let idx_offset = mul_offset_expr(IRExpr::Reg(idx_phi.clone()), IRExpr::ImmI(scale));
+            return Some(match bias {
+                Some(bias) => add_offset_expr(bias, idx_offset),
+                None => idx_offset,
+            });
         }
     }
 
@@ -470,21 +491,61 @@ fn pointer_phi_source_scale(
     idx_phi: &RegId,
     root: &AddressRoot,
     roots: &BTreeMap<RegId, AddressRoot>,
+    byte_offsets: &BTreeMap<RegId, IRExpr>,
     def_sites: &BTreeMap<RegId, (usize, usize)>,
-) -> Option<i64> {
+) -> Option<PointerPhiMatch> {
     let (block_idx, stmt_idx) = *def_sites.get(ptr_src)?;
     let ptr_stmt = &function_ir.blocks[block_idx].stmts[stmt_idx];
     let (step, scale, base) = imad_wide_source_parts(ptr_stmt)?;
 
     if base.get_reg() == Some(ptr_phi) {
         scalar_reg_matches_additive_update(function_ir, idx_src, idx_phi, step, def_sites)
-            .then_some(scale)
+            .then_some(PointerPhiMatch { scale, bias: None })
     } else if roots.get(ptr_src) == Some(root) && same_ir_expr(step, &IRExpr::Reg(idx_src.clone()))
     {
-        Some(scale)
+        Some(PointerPhiMatch {
+            scale,
+            bias: pointer_seed_bias(ptr_src, idx_src, scale, byte_offsets)?,
+        })
     } else {
         None
     }
+}
+
+#[derive(Clone)]
+struct PointerPhiMatch {
+    scale: i64,
+    bias: Option<IRExpr>,
+}
+
+fn pointer_seed_bias(
+    ptr_src: &RegId,
+    idx_src: &RegId,
+    scale: i64,
+    byte_offsets: &BTreeMap<RegId, IRExpr>,
+) -> Option<Option<IRExpr>> {
+    let offset = byte_offsets.get(ptr_src)?;
+    let scaled_idx = mul_offset_expr(IRExpr::Reg(idx_src.clone()), IRExpr::ImmI(scale));
+    strip_offset_term(offset, &scaled_idx)
+}
+
+fn strip_offset_term(total: &IRExpr, term: &IRExpr) -> Option<Option<IRExpr>> {
+    if same_ir_expr(total, term) {
+        return Some(None);
+    }
+    let IRExpr::Op { op, args } = total else {
+        return None;
+    };
+    if op != "+" || args.len() != 2 {
+        return None;
+    }
+    if same_ir_expr(&args[0], term) {
+        return Some(Some(args[1].clone()));
+    }
+    if same_ir_expr(&args[1], term) {
+        return Some(Some(args[0].clone()));
+    }
+    None
 }
 
 fn imad_wide_source_parts(stmt: &IRStatement) -> Option<(&IRExpr, i64, &IRExpr)> {
@@ -841,12 +902,6 @@ fn collect_memory_accesses(
                 .as_ref()
                 .and_then(|args| args.first())
                 .and_then(|expr| expr_root(expr, root_by_reg))
-                .or_else(|| {
-                    stmt.mem_addr_args
-                        .as_ref()
-                        .and_then(|args| args.first())
-                        .and_then(|expr| fallback_addr64_root(expr, root_by_reg))
-                })
                 .or(annotated_root)
                 .unwrap_or_else(|| default_root_for_space(space, stmt));
             let bit_width = opcode_memory_bit_width(stmt_opcode(stmt));
@@ -881,21 +936,6 @@ fn refine_memory_space(
     match (seed_space, annotated_root) {
         (CudaMemorySpace::Const, Some(AddressRoot::ParamWord(_))) => CudaMemorySpace::Param,
         _ => seed_space,
-    }
-}
-
-fn fallback_addr64_root(
-    expr: &IRExpr,
-    roots: &BTreeMap<RegId, AddressRoot>,
-) -> Option<AddressRoot> {
-    match expr {
-        IRExpr::Addr64 { lo, hi } => {
-            let lo_root = expr_root(lo, roots)?;
-            let _ = expr_root(hi, roots);
-            Some(lo_root)
-        }
-        IRExpr::Mem { base, .. } => fallback_addr64_root(base, roots),
-        _ => None,
     }
 }
 
@@ -1487,6 +1527,178 @@ mod tests {
                 ],
             })
         );
+    }
+
+    #[test]
+    fn recovers_loop_phi_byte_offsets_with_entry_bias() {
+        let idx_seed = crate::ir::RegId::new("R", 5, 1).with_ssa(0);
+        let idx_phi = crate::ir::RegId::new("R", 5, 1).with_ssa(1);
+        let idx_step = crate::ir::RegId::new("R", 5, 1).with_ssa(2);
+        let base = crate::ir::RegId::new("R", 10, 1).with_ssa(0);
+        let ptr_seed = crate::ir::RegId::new("R", 6, 1).with_ssa(0);
+        let ptr_phi = crate::ir::RegId::new("R", 6, 1).with_ssa(1);
+        let ptr_step = crate::ir::RegId::new("R", 6, 1).with_ssa(2);
+
+        let block = IRBlock {
+            id: 0,
+            start_addr: 0,
+            irdst: Vec::new(),
+            stmts: vec![
+                IRStatement {
+                    defs: vec![IRExpr::Reg(ptr_seed.clone())],
+                    value: RValue::Op {
+                        opcode: "IMAD.WIDE".to_string(),
+                        args: vec![
+                            IRExpr::Reg(idx_seed.clone()),
+                            IRExpr::ImmI(4),
+                            IRExpr::Reg(base.clone()),
+                        ],
+                    },
+                    pred: None,
+                    mem_addr_args: None,
+                    pred_old_defs: Vec::new(),
+                },
+                IRStatement {
+                    defs: vec![IRExpr::Reg(idx_step.clone())],
+                    value: RValue::Op {
+                        opcode: "IADD3".to_string(),
+                        args: vec![
+                            IRExpr::Reg(idx_phi.clone()),
+                            IRExpr::ImmI(1),
+                            IRExpr::ImmI(0),
+                        ],
+                    },
+                    pred: None,
+                    mem_addr_args: None,
+                    pred_old_defs: Vec::new(),
+                },
+                IRStatement {
+                    defs: vec![IRExpr::Reg(ptr_step.clone())],
+                    value: RValue::Op {
+                        opcode: "IMAD.WIDE".to_string(),
+                        args: vec![
+                            IRExpr::ImmI(1),
+                            IRExpr::ImmI(4),
+                            IRExpr::Reg(ptr_phi.clone()),
+                        ],
+                    },
+                    pred: None,
+                    mem_addr_args: None,
+                    pred_old_defs: Vec::new(),
+                },
+                IRStatement {
+                    defs: vec![IRExpr::Reg(idx_phi.clone())],
+                    value: RValue::Phi(vec![
+                        IRExpr::Reg(idx_seed.clone()),
+                        IRExpr::Reg(idx_step.clone()),
+                    ]),
+                    pred: None,
+                    mem_addr_args: None,
+                    pred_old_defs: Vec::new(),
+                },
+                IRStatement {
+                    defs: vec![IRExpr::Reg(ptr_phi.clone())],
+                    value: RValue::Phi(vec![
+                        IRExpr::Reg(ptr_seed.clone()),
+                        IRExpr::Reg(ptr_step.clone()),
+                    ]),
+                    pred: None,
+                    mem_addr_args: None,
+                    pred_old_defs: Vec::new(),
+                },
+            ],
+        };
+        let function_ir = FunctionIR {
+            blocks: vec![block],
+        };
+        let def_sites = collect_reg_def_sites(&function_ir);
+        let mut roots = BTreeMap::new();
+        roots.insert(base.clone(), AddressRoot::ParamWord(0));
+        roots.insert(ptr_seed.clone(), AddressRoot::ParamWord(0));
+        roots.insert(ptr_phi.clone(), AddressRoot::ParamWord(0));
+        roots.insert(ptr_step.clone(), AddressRoot::ParamWord(0));
+        let mut byte_offsets = BTreeMap::new();
+        byte_offsets.insert(
+            ptr_seed.clone(),
+            IRExpr::Op {
+                op: "+".to_string(),
+                args: vec![
+                    IRExpr::Op {
+                        op: "*".to_string(),
+                        args: vec![IRExpr::Reg(idx_seed.clone()), IRExpr::ImmI(4)],
+                    },
+                    IRExpr::ImmI(8),
+                ],
+            },
+        );
+        let ptr_phi_stmt = &function_ir.blocks[0].stmts[4];
+        let recovered = recover_pointer_phi_offset(
+            &function_ir,
+            &function_ir.blocks[0],
+            ptr_phi_stmt,
+            match &ptr_phi_stmt.value {
+                RValue::Phi(args) => args.as_slice(),
+                _ => unreachable!("ptr phi should stay a phi"),
+            },
+            &AddressRoot::ParamWord(0),
+            &roots,
+            &byte_offsets,
+            &def_sites,
+        );
+        assert_eq!(
+            recovered,
+            Some(IRExpr::Op {
+                op: "+".to_string(),
+                args: vec![
+                    IRExpr::ImmI(8),
+                    IRExpr::Op {
+                        op: "*".to_string(),
+                        args: vec![IRExpr::Reg(idx_phi), IRExpr::ImmI(4)],
+                    },
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn does_not_classify_mismatched_addr64_pairs_from_lo_root_only() {
+        let lo = crate::ir::RegId::new("R", 6, 1).with_ssa(0);
+        let hi = crate::ir::RegId::new("R", 7, 1).with_ssa(0);
+        let function_ir = FunctionIR {
+            blocks: vec![IRBlock {
+                id: 0,
+                start_addr: 0,
+                irdst: Vec::new(),
+                stmts: vec![IRStatement {
+                    defs: vec![IRExpr::Reg(crate::ir::RegId::new("R", 8, 1).with_ssa(0))],
+                    value: RValue::Op {
+                        opcode: "LDG.E.U32".to_string(),
+                        args: vec![IRExpr::Addr64 {
+                            lo: Box::new(IRExpr::Reg(lo.clone())),
+                            hi: Box::new(IRExpr::Reg(hi.clone())),
+                        }],
+                    },
+                    pred: None,
+                    mem_addr_args: Some(vec![IRExpr::Addr64 {
+                        lo: Box::new(IRExpr::Reg(lo.clone())),
+                        hi: Box::new(IRExpr::Reg(hi.clone())),
+                    }]),
+                    pred_old_defs: Vec::new(),
+                }],
+            }],
+        };
+        let roots = BTreeMap::from([
+            (lo.clone(), AddressRoot::ParamWord(0)),
+            (hi.clone(), AddressRoot::ParamWord(6)),
+        ]);
+        let accesses = collect_memory_accesses(
+            &function_ir,
+            &AbiAnnotations::default(),
+            &AbiArgAliases::default(),
+            &roots,
+        );
+        assert_eq!(accesses.len(), 1);
+        assert_ne!(accesses[0].root, AddressRoot::ParamWord(0));
     }
 
     #[test]

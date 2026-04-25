@@ -969,6 +969,16 @@ fn full_pass_dot_thread_recovers_pointer_params_and_typed_loads() {
 {}",
         out
     );
+    assert!(
+        out.contains("r5_5 = r5_6;")
+            && out.contains("r4_5 = r4_6;")
+            && out.contains("r2_8 = r2_9;")
+            && out.contains("r5_8 = r5_10;")
+            && out.contains("r2_11 = r2_12;"),
+        "expected dot_thread loop-carried accumulator/index state to stay explicit, got:
+{}",
+        out
+    );
 }
 
 #[test]
