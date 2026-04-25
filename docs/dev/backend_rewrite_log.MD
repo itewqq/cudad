@@ -308,6 +308,11 @@
   describe semantic lift as a test-only legacy harness and document the live
   canonical pipeline as SSA optimization -> `FunctionAnalysis` ->
   structurization -> AST lowering -> symbol planning -> render.
+- Canonical structured lowering now owns structural phi materialization instead
+  of leaking raw `phi(...)` helpers from SSA blocks: condition-block preludes,
+  edge phi connectors, loop-entry seeds, loop backedge updates, and jump-target
+  labels are emitted directly in `src/ast_lowering.rs` on the live backend
+  path.
 
 ## Next safe step
 
@@ -318,8 +323,10 @@
 2. Drive the remaining late-phase red tests down, especially the `ast_passes`
    addr64-fold regressions and the corpus/goto-budget failures that still show
    canonical pointer/control-flow cleanup gaps.
-3. After another 2-4 atomic commits in that cleanup slice, run the next review
-   sub-agent and wait for the result before the final cutover summary.
+3. Finish the next canonical cleanup slice around loop-carried pointer roots
+   (`dot_thread` / addr64-style packed reconstruction) and unsupported call
+   placeholders such as `CALL.REL.NOINC()`, then run the next review sub-agent
+   after another 2-4 atomic commits.
 
 ## Open questions
 

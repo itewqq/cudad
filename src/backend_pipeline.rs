@@ -26,9 +26,9 @@
 //! - apply regex-based semantic fixes
 //! - duplicate the old post-struct pipeline
 
+use crate::abi::AbiProfile;
 use crate::ast::StructuredFunction;
 use crate::ast_lowering::lower_structured_function;
-use crate::abi::AbiProfile;
 use crate::cfg::ControlFlowGraph;
 use crate::function_analysis::FunctionAnalysis;
 use crate::ir::FunctionIR;
@@ -92,7 +92,7 @@ pub fn build_named_decompile_artifacts_with_profile(
     let structured = structurizer.structure_function();
     let ast = structured
         .as_ref()
-        .map(|structured| lower_structured_function(structured, &analysis));
+        .map(|structured| lower_structured_function(structured, &cfg, &optimized_ir, &analysis));
     let rendered = ast.as_ref().map(|function| function.render(function_name));
     artifacts.function_name = Some(function_name.to_string());
     artifacts.cfg = Some(cfg);
@@ -141,12 +141,10 @@ mod tests {
         "#;
         let artifacts = build_decompile_artifacts(decode_sass(sass), None);
         let analysis = artifacts.analysis.expect("analysis");
-        assert!(
-            analysis
-                .mem_accesses
-                .iter()
-                .any(|access| matches!(access.space, crate::memory_model::CudaMemorySpace::Global))
-        );
+        assert!(analysis
+            .mem_accesses
+            .iter()
+            .any(|access| matches!(access.space, crate::memory_model::CudaMemorySpace::Global)));
         assert!(artifacts.rendered.is_some());
     }
 
@@ -165,7 +163,10 @@ mod tests {
             .expect("rendered output");
         let raw_ssa = Regex::new(r"\b(?:R|UR|P|UP)\d+\.\d+\b").expect("raw ssa regex");
         assert!(rendered.contains("arg0_ptr[1]"));
-        assert!(!raw_ssa.is_match(&rendered), "rendered output leaked raw SSA tokens:\n{rendered}");
+        assert!(
+            !raw_ssa.is_match(&rendered),
+            "rendered output leaked raw SSA tokens:\n{rendered}"
+        );
     }
 
     #[test]
@@ -186,10 +187,14 @@ mod tests {
             /*0000*/ MOV R0, RZ ;
             /*0010*/ EXIT ;
         "#;
-        let rendered = build_named_decompile_artifacts(decode_sass(sass), None, Some("named_kernel"))
-            .rendered
-            .expect("rendered output");
-        assert!(rendered.starts_with("void named_kernel("), "unexpected render:\n{rendered}");
+        let rendered =
+            build_named_decompile_artifacts(decode_sass(sass), None, Some("named_kernel"))
+                .rendered
+                .expect("rendered output");
+        assert!(
+            rendered.starts_with("void named_kernel("),
+            "unexpected render:\n{rendered}"
+        );
     }
 
     #[test]

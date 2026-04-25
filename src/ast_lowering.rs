@@ -22,23 +22,34 @@
 //! - inspect previously rendered code
 //! - repair names or declarations after rendering
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use crate::abi::ConstMemSemantic;
 use crate::ast::{Expr, LValue, PointerLane, Stmt};
 use crate::backend_names::canonical_reg_ident;
 use crate::canonical_ast_passes::prune_dead_pure_defs;
+use crate::cfg::ControlFlowGraph;
 use crate::function_analysis::{AddressRoot, FunctionAnalysis, MemAccessInfo};
-use crate::ir::{IRExpr, IRStatement, RValue};
+use crate::ir::{FunctionIR, IRBlock, IRExpr, IRStatement, RValue};
 use crate::memory_model::{CudaMemorySpace, MemAccessKind};
 use crate::structurizer::{LoopType, StructuredStatement};
 use crate::symbol_plan::plan_symbols;
 use crate::type_inference::InferredType;
+use petgraph::graph::NodeIndex;
+use petgraph::Direction;
 
 #[derive(Clone, Debug)]
 struct LoweredStmt {
     stmt: Stmt,
     predicate_def_indices: Vec<usize>,
+}
+
+struct StructuredLowering<'a> {
+    cfg: &'a ControlFlowGraph,
+    function_ir: &'a FunctionIR,
+    analysis: &'a FunctionAnalysis,
+    block_id_to_idx: HashMap<usize, usize>,
+    block_id_to_node: HashMap<usize, NodeIndex>,
 }
 
 pub fn lower_memory_stmt(
@@ -124,90 +135,1085 @@ fn lower_memory_stmt_detail(
     }
 }
 
+impl<'a> StructuredLowering<'a> {
+    fn new(
+        cfg: &'a ControlFlowGraph,
+        function_ir: &'a FunctionIR,
+        analysis: &'a FunctionAnalysis,
+    ) -> Self {
+        let block_id_to_idx = function_ir
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(idx, block)| (block.id, idx))
+            .collect();
+        let block_id_to_node = cfg
+            .node_indices()
+            .map(|node| (cfg[node].id, node))
+            .collect();
+        Self {
+            cfg,
+            function_ir,
+            analysis,
+            block_id_to_idx,
+            block_id_to_node,
+        }
+    }
+
+    fn lower_function(&self, structured: &StructuredStatement) -> crate::ast::StructuredFunction {
+        let body = self.lower_structured_stmt(structured);
+        let seed = prune_dead_pure_defs(crate::ast::StructuredFunction {
+            params: Vec::new(),
+            locals: Vec::new(),
+            body,
+        });
+        let plan = plan_symbols(&seed, self.analysis);
+        crate::ast::StructuredFunction {
+            params: plan.params,
+            locals: plan.locals,
+            body: seed.body,
+        }
+    }
+
+    fn lower_structured_stmt(&self, structured: &StructuredStatement) -> Stmt {
+        let mut jump_targets = HashSet::new();
+        Self::collect_jump_targets(structured, &mut jump_targets);
+        self.lower_structured_stmt_with_targets(structured, &jump_targets, None)
+    }
+
+    fn lower_structured_stmt_with_targets(
+        &self,
+        structured: &StructuredStatement,
+        jump_targets: &HashSet<usize>,
+        fallthrough_target_block: Option<usize>,
+    ) -> Stmt {
+        match structured {
+            StructuredStatement::BasicBlock { block_id, stmts } => {
+                let body = self.lower_stmt_list(*block_id, stmts, true, false);
+                let body = if let Some(target_block_id) = fallthrough_target_block {
+                    Self::stmt_sequence(vec![
+                        body,
+                        self.lower_phi_connector_chain_from_pred(target_block_id, *block_id),
+                    ])
+                } else {
+                    body
+                };
+                if jump_targets.contains(block_id) {
+                    Stmt::Label {
+                        name: format!("BB{}", block_id),
+                        body: Box::new(body),
+                    }
+                } else {
+                    body
+                }
+            }
+            StructuredStatement::Sequence(parts) => {
+                let mut lowered = Vec::new();
+                for (idx, part) in parts.iter().enumerate() {
+                    if matches!(part, StructuredStatement::Empty) {
+                        continue;
+                    }
+                    let next_target = parts[idx + 1..]
+                        .iter()
+                        .find_map(Self::entry_block_id)
+                        .or(fallthrough_target_block);
+                    lowered.push(self.lower_structured_stmt_with_targets(
+                        part,
+                        jump_targets,
+                        next_target,
+                    ));
+                    if Self::ends_with_unconditional_return(part) {
+                        break;
+                    }
+                }
+                Self::stmt_sequence(lowered)
+            }
+            StructuredStatement::If {
+                condition_block_id,
+                condition_expr,
+                then_branch,
+                else_branch,
+            } => {
+                let prelude = self.lower_condition_prelude(*condition_block_id);
+                let then_stmt = self.lower_structured_stmt_with_targets(
+                    then_branch,
+                    jump_targets,
+                    fallthrough_target_block,
+                );
+                let else_stmt = else_branch
+                    .as_ref()
+                    .map(|branch| {
+                        self.lower_structured_stmt_with_targets(
+                            branch,
+                            jump_targets,
+                            fallthrough_target_block,
+                        )
+                    })
+                    .or_else(|| {
+                        fallthrough_target_block.map(|target_block_id| {
+                            self.lower_phi_connector_chain_from_pred(
+                                target_block_id,
+                                *condition_block_id,
+                            )
+                        })
+                    })
+                    .filter(|stmt| !Self::stmt_is_empty(stmt));
+                let then_empty = Self::stmt_is_empty(&then_stmt);
+                let else_empty = else_stmt.as_ref().map(Self::stmt_is_empty).unwrap_or(true);
+                let condition = lower_scalar_expr_with_analysis(condition_expr, Some(self.analysis));
+                let core = if then_empty && else_empty {
+                    Stmt::Empty
+                } else if then_empty && !else_empty {
+                    Stmt::If {
+                        condition: negate_expr(condition),
+                        then_branch: Box::new(else_stmt.expect("else branch")),
+                        else_branch: None,
+                    }
+                } else {
+                    Stmt::If {
+                        condition,
+                        then_branch: Box::new(then_stmt),
+                        else_branch: else_stmt.map(Box::new),
+                    }
+                };
+                let lowered = Self::stmt_sequence(vec![prelude, core]);
+                if jump_targets.contains(condition_block_id) {
+                    Stmt::Label {
+                        name: format!("BB{}", condition_block_id),
+                        body: Box::new(lowered),
+                    }
+                } else {
+                    lowered
+                }
+            }
+            StructuredStatement::Loop {
+                loop_type,
+                header_block_id,
+                condition_expr,
+                body,
+            } => {
+                let printable_body = Self::without_redundant_loop_tail_continue(body);
+                let phi_entry_block_id = match (loop_type, header_block_id) {
+                    (LoopType::DoWhile, Some(header_block_id)) => {
+                        let body_entry = Self::entry_block_id(&printable_body);
+                        match body_entry {
+                            Some(body_entry) if body_entry != *header_block_id => Some(body_entry),
+                            _ => Some(*header_block_id),
+                        }
+                    }
+                    (_, Some(header_block_id)) => Some(*header_block_id),
+                    _ => None,
+                };
+                let phi_prelude = phi_entry_block_id
+                    .map(|block_id| self.lower_loop_phi_prelude(block_id, &printable_body))
+                    .unwrap_or(Stmt::Empty);
+                let phi_backedge = header_block_id
+                    .map(|block_id| self.lower_loop_phi_backedge_updates(block_id, &printable_body))
+                    .unwrap_or(Stmt::Empty);
+                let body_entry_backedge = match (loop_type, header_block_id) {
+                    (LoopType::DoWhile, Some(header_block_id)) => {
+                        let body_entry = Self::entry_block_id(&printable_body);
+                        match body_entry {
+                            Some(body_entry) if body_entry != *header_block_id => {
+                                self.lower_phi_connector_chain_from_pred(body_entry, *header_block_id)
+                            }
+                            _ => Stmt::Empty,
+                        }
+                    }
+                    _ => Stmt::Empty,
+                };
+                let loop_backedge =
+                    Self::stmt_sequence(vec![phi_backedge, body_entry_backedge]);
+                let condition_prelude = if *loop_type != LoopType::DoWhile {
+                    header_block_id
+                        .map(|block_id| self.lower_condition_prelude(block_id))
+                        .unwrap_or(Stmt::Empty)
+                } else {
+                    Stmt::Empty
+                };
+                let condition = condition_expr
+                    .as_ref()
+                    .map(|expr| lower_scalar_expr_with_analysis(expr, Some(self.analysis)));
+                let loop_stmt = Stmt::Loop {
+                    kind: match loop_type {
+                        LoopType::While => crate::ast::LoopKind::While,
+                        LoopType::DoWhile => crate::ast::LoopKind::DoWhile,
+                        LoopType::Endless => crate::ast::LoopKind::Endless,
+                    },
+                    condition,
+                    body: Box::new(Self::inject_loop_phi_backedge_updates(
+                        self.lower_structured_stmt_with_targets(
+                            &printable_body,
+                            jump_targets,
+                            None,
+                        ),
+                        &loop_backedge,
+                    )),
+                };
+                let loop_exit_phi = match (fallthrough_target_block, header_block_id, loop_type) {
+                    (
+                        Some(target_block_id),
+                        Some(header_block_id),
+                        LoopType::While | LoopType::DoWhile,
+                    ) => self.lower_phi_connector_chain_from_pred(
+                        target_block_id,
+                        *header_block_id,
+                    ),
+                    _ => Stmt::Empty,
+                };
+                let lowered = Self::stmt_sequence(vec![
+                    phi_prelude,
+                    condition_prelude,
+                    loop_stmt,
+                    loop_exit_phi,
+                ]);
+                if let Some(header_block_id) = header_block_id {
+                    if jump_targets.contains(header_block_id) {
+                        Stmt::Label {
+                            name: format!("BB{}", header_block_id),
+                            body: Box::new(lowered),
+                        }
+                    } else {
+                        lowered
+                    }
+                } else {
+                    lowered
+                }
+            }
+            StructuredStatement::Break(_) => Stmt::Break,
+            StructuredStatement::Continue(_) => Stmt::Continue,
+            StructuredStatement::Return(expr) => {
+                Stmt::Return(expr.as_ref().map(|expr| lower_scalar_expr_with_analysis(expr, Some(self.analysis))))
+            }
+            StructuredStatement::UnstructuredJump {
+                from_block_id,
+                to_block_id,
+                condition,
+            } => {
+                let phi_prelude =
+                    self.lower_phi_connector_chain_from_pred(*to_block_id, *from_block_id);
+                let jump = Self::stmt_sequence(vec![
+                    phi_prelude,
+                    Stmt::Goto(format!("BB{}", to_block_id)),
+                ]);
+                match condition {
+                    Some(condition) => Stmt::If {
+                        condition: lower_scalar_expr_with_analysis(condition, Some(self.analysis)),
+                        then_branch: Box::new(jump),
+                        else_branch: None,
+                    },
+                    None => jump,
+                }
+            }
+            StructuredStatement::Switch {
+                header_block_id,
+                discriminant,
+                cases,
+                default,
+            } => {
+                let prelude = self.lower_switch_prelude(*header_block_id);
+                let switch_stmt = Stmt::Switch {
+                    discriminant: discriminant
+                        .as_ref()
+                        .map(|expr| lower_scalar_expr_with_analysis(expr, Some(self.analysis))),
+                    cases: cases
+                        .iter()
+                        .map(|(label, body)| {
+                            (
+                                *label,
+                                self.lower_structured_stmt_with_targets(
+                                    body,
+                                    jump_targets,
+                                    fallthrough_target_block,
+                                ),
+                            )
+                        })
+                        .collect(),
+                    default: default.as_ref().map(|body| {
+                        Box::new(self.lower_structured_stmt_with_targets(
+                            body,
+                            jump_targets,
+                            fallthrough_target_block,
+                        ))
+                    }),
+                };
+                let lowered = Self::stmt_sequence(vec![prelude, switch_stmt]);
+                if jump_targets.contains(header_block_id) {
+                    Stmt::Label {
+                        name: format!("BB{}", header_block_id),
+                        body: Box::new(lowered),
+                    }
+                } else {
+                    lowered
+                }
+            }
+            StructuredStatement::Empty => Stmt::Empty,
+        }
+    }
+
+    fn lower_stmt_list(
+        &self,
+        block_id: usize,
+        stmts: &[IRStatement],
+        emit_returns: bool,
+        skip_brx: bool,
+    ) -> Stmt {
+        let fir_block = self.get_ir_block(block_id);
+        let mut fir_search_from = 0usize;
+        let mut lowered = Vec::new();
+
+        for (stmt_idx, stmt) in stmts.iter().enumerate() {
+            let lookup_stmt_idx =
+                Self::resolve_stmt_lookup_idx(fir_block, &mut fir_search_from, stmt_idx, stmt);
+            if matches!(stmt.value, RValue::Phi(_)) {
+                continue;
+            }
+            if let RValue::Op { opcode, .. } = &stmt.value {
+                if Self::is_control_jump_opcode(opcode)
+                    || (skip_brx && opcode.split('.').next().unwrap_or(opcode) == "BRX")
+                    || Self::is_convergence_barrier_opcode(opcode)
+                    || opcode == "NOP"
+                {
+                    continue;
+                }
+                if Self::is_return_opcode(opcode) && !emit_returns {
+                    continue;
+                }
+            }
+            lowered.push(lower_basic_stmt(
+                block_id,
+                lookup_stmt_idx,
+                stmt,
+                self.analysis,
+            ));
+            if matches!(
+                &stmt.value,
+                RValue::Op { opcode, .. } if Self::is_return_opcode(opcode) && stmt.pred.is_none()
+            ) {
+                break;
+            }
+        }
+
+        Self::stmt_sequence(lowered)
+    }
+
+    fn lower_condition_prelude(&self, block_id: usize) -> Stmt {
+        let Some(block) = self.get_ir_block(block_id) else {
+            return Stmt::Empty;
+        };
+        match self.lower_stmt_list(block_id, &block.stmts, false, false) {
+            Stmt::Empty => Stmt::Empty,
+            Stmt::Sequence(stmts) => Stmt::Block(stmts),
+            stmt => Stmt::Block(vec![stmt]),
+        }
+    }
+
+    fn lower_switch_prelude(&self, block_id: usize) -> Stmt {
+        let Some(block) = self.get_ir_block(block_id) else {
+            return Stmt::Empty;
+        };
+        match self.lower_stmt_list(block_id, &block.stmts, false, true) {
+            Stmt::Empty => Stmt::Empty,
+            Stmt::Sequence(stmts) => Stmt::Block(stmts),
+            stmt => Stmt::Block(vec![stmt]),
+        }
+    }
+
+    fn lower_loop_phi_prelude(
+        &self,
+        header_block_id: usize,
+        body: &StructuredStatement,
+    ) -> Stmt {
+        self.lower_phi_assignments_for_loop_preds(header_block_id, body, |preds, loop_blocks| {
+            let external = preds
+                .iter()
+                .copied()
+                .filter(|pred| !loop_blocks.contains(&self.cfg[*pred].id))
+                .collect::<Vec<_>>();
+            (external.len() == 1).then_some(external)
+        })
+    }
+
+    fn lower_loop_phi_backedge_updates(
+        &self,
+        header_block_id: usize,
+        body: &StructuredStatement,
+    ) -> Stmt {
+        self.lower_phi_assignments_for_loop_preds(header_block_id, body, |preds, loop_blocks| {
+            let internal = preds
+                .iter()
+                .copied()
+                .filter(|pred| loop_blocks.contains(&self.cfg[*pred].id))
+                .collect::<Vec<_>>();
+            (!internal.is_empty()).then_some(internal)
+        })
+    }
+
+    fn lower_phi_assignments_for_loop_preds<F>(
+        &self,
+        header_block_id: usize,
+        body: &StructuredStatement,
+        pick_preds: F,
+    ) -> Stmt
+    where
+        F: Fn(&[NodeIndex], &HashSet<usize>) -> Option<Vec<NodeIndex>>,
+    {
+        let Some(header_node) = self.cfg_node_for_block_id(header_block_id) else {
+            return Stmt::Empty;
+        };
+        let Some(header_block) = self.get_ir_block(header_block_id) else {
+            return Stmt::Empty;
+        };
+
+        let mut loop_blocks = HashSet::new();
+        loop_blocks.insert(header_block_id);
+        Self::collect_structured_block_ids(body, &mut loop_blocks);
+
+        let preds: Vec<_> = self
+            .cfg
+            .neighbors_directed(header_node, Direction::Incoming)
+            .collect();
+        let Some(selected_preds) = pick_preds(&preds, &loop_blocks) else {
+            return Stmt::Empty;
+        };
+
+        let mut lowered = Vec::new();
+        for stmt in header_block
+            .stmts
+            .iter()
+            .filter(|stmt| matches!(stmt.value, RValue::Phi(_)))
+        {
+            let Some((_, def)) = select_non_memory_result_def(stmt) else {
+                continue;
+            };
+            let RValue::Phi(args) = &stmt.value else {
+                continue;
+            };
+            let Some(src_expr) = self.resolve_phi_source_for_preds(args, &preds, &selected_preds)
+            else {
+                continue;
+            };
+            let assign = Stmt::Assign {
+                dst: LValue::Var(lower_reg_name(def)),
+                src: lower_scalar_expr_with_analysis(&src_expr, Some(self.analysis)),
+            };
+            if !Self::stmt_is_trivial_self_assign(&assign) {
+                lowered.push(assign);
+            }
+        }
+        Self::stmt_sequence(lowered)
+    }
+
+    fn resolve_phi_source_for_preds(
+        &self,
+        args: &[IRExpr],
+        preds: &[NodeIndex],
+        selected_preds: &[NodeIndex],
+    ) -> Option<IRExpr> {
+        let mut chosen = None;
+        for pred in selected_preds {
+            let pred_idx = preds.iter().position(|candidate| candidate == pred)?;
+            let arg = args.get(pred_idx)?.clone();
+            match &chosen {
+                None => chosen = Some(arg),
+                Some(existing) if existing == &arg => {}
+                Some(_) => return None,
+            }
+        }
+        chosen
+    }
+
+    fn lower_block_phi_assignments_from_pred(
+        &self,
+        target_block_id: usize,
+        from_block_id: usize,
+    ) -> Stmt {
+        let Some(target_node) = self.cfg_node_for_block_id(target_block_id) else {
+            return Stmt::Empty;
+        };
+        let Some(target_block) = self.get_ir_block(target_block_id) else {
+            return Stmt::Empty;
+        };
+        let preds: Vec<_> = self
+            .cfg
+            .neighbors_directed(target_node, Direction::Incoming)
+            .collect();
+        let Some(selected_pred) = preds
+            .iter()
+            .copied()
+            .find(|pred| self.cfg[*pred].id == from_block_id)
+        else {
+            return Stmt::Empty;
+        };
+
+        let mut lowered = Vec::new();
+        for stmt in target_block
+            .stmts
+            .iter()
+            .filter(|stmt| matches!(stmt.value, RValue::Phi(_)))
+        {
+            let Some((_, def)) = select_non_memory_result_def(stmt) else {
+                continue;
+            };
+            let RValue::Phi(args) = &stmt.value else {
+                continue;
+            };
+            let Some(src_expr) = self.resolve_phi_source_for_preds(args, &preds, &[selected_pred])
+            else {
+                continue;
+            };
+            let assign = Stmt::Assign {
+                dst: LValue::Var(lower_reg_name(def)),
+                src: lower_scalar_expr_with_analysis(&src_expr, Some(self.analysis)),
+            };
+            if !Self::stmt_is_trivial_self_assign(&assign) {
+                lowered.push(assign);
+            }
+        }
+        Self::stmt_sequence(lowered)
+    }
+
+    fn lower_phi_connector_chain_from_pred(
+        &self,
+        target_block_id: usize,
+        from_block_id: usize,
+    ) -> Stmt {
+        let mut lowered = Vec::new();
+        let mut current_from = from_block_id;
+        let mut seen = HashSet::new();
+
+        for _ in 0..16 {
+            if current_from == target_block_id {
+                break;
+            }
+
+            if self.is_direct_cfg_successor(current_from, target_block_id) {
+                let direct =
+                    self.lower_block_phi_assignments_from_pred(target_block_id, current_from);
+                if !Self::stmt_is_empty(&direct) {
+                    lowered.push(direct);
+                }
+                break;
+            }
+
+            let connectors = self
+                .cfg_successor_block_ids(current_from)
+                .into_iter()
+                .filter(|succ| self.block_is_phi_only(*succ))
+                .filter(|succ| self.cfg_path_exists(*succ, target_block_id))
+                .collect::<Vec<_>>();
+            if connectors.len() != 1 {
+                break;
+            }
+
+            let connector = connectors[0];
+            if !seen.insert(connector) {
+                break;
+            }
+
+            let assigns = self.lower_block_phi_assignments_from_pred(connector, current_from);
+            if !Self::stmt_is_empty(&assigns) {
+                lowered.push(assigns);
+            }
+            current_from = connector;
+        }
+
+        Self::stmt_sequence(lowered)
+    }
+
+    fn get_ir_block(&self, block_id: usize) -> Option<&'a IRBlock> {
+        let idx = *self.block_id_to_idx.get(&block_id)?;
+        Some(&self.function_ir.blocks[idx])
+    }
+
+    fn cfg_node_for_block_id(&self, block_id: usize) -> Option<NodeIndex> {
+        self.block_id_to_node.get(&block_id).copied()
+    }
+
+    fn cfg_successor_block_ids(&self, block_id: usize) -> Vec<usize> {
+        let Some(node) = self.cfg_node_for_block_id(block_id) else {
+            return Vec::new();
+        };
+        self.cfg
+            .neighbors_directed(node, Direction::Outgoing)
+            .map(|succ| self.cfg[succ].id)
+            .collect()
+    }
+
+    fn is_direct_cfg_successor(&self, from_block_id: usize, to_block_id: usize) -> bool {
+        self.cfg_successor_block_ids(from_block_id)
+            .into_iter()
+            .any(|succ| succ == to_block_id)
+    }
+
+    fn block_is_phi_only(&self, block_id: usize) -> bool {
+        let Some(block) = self.get_ir_block(block_id) else {
+            return false;
+        };
+        !block.stmts.is_empty()
+            && block
+                .stmts
+                .iter()
+                .all(|stmt| matches!(stmt.value, RValue::Phi(_)))
+    }
+
+    fn cfg_path_exists(&self, start_block_id: usize, goal_block_id: usize) -> bool {
+        let Some(start) = self.cfg_node_for_block_id(start_block_id) else {
+            return false;
+        };
+        let Some(goal) = self.cfg_node_for_block_id(goal_block_id) else {
+            return false;
+        };
+        if start == goal {
+            return true;
+        }
+        let mut seen = HashSet::new();
+        let mut work = VecDeque::new();
+        seen.insert(start);
+        work.push_back(start);
+        while let Some(node) = work.pop_front() {
+            for succ in self.cfg.neighbors_directed(node, Direction::Outgoing) {
+                if succ == goal {
+                    return true;
+                }
+                if seen.insert(succ) {
+                    work.push_back(succ);
+                }
+            }
+        }
+        false
+    }
+
+    fn resolve_stmt_lookup_idx(
+        fir_block: Option<&IRBlock>,
+        fir_search_from: &mut usize,
+        fallback_idx: usize,
+        stmt: &IRStatement,
+    ) -> usize {
+        let Some(orig_block) = fir_block else {
+            return fallback_idx;
+        };
+        if let Some((found_idx, _)) = orig_block
+            .stmts
+            .iter()
+            .enumerate()
+            .skip(*fir_search_from)
+            .find(|(_, candidate)| {
+                candidate.defs == stmt.defs
+                    && candidate.value == stmt.value
+                    && candidate.pred == stmt.pred
+            })
+        {
+            *fir_search_from = found_idx + 1;
+            found_idx
+        } else {
+            fallback_idx
+        }
+    }
+
+    fn is_control_jump_opcode(opcode: &str) -> bool {
+        matches!(opcode, "BRA" | "JMP" | "JMPP")
+    }
+
+    fn is_convergence_barrier_opcode(opcode: &str) -> bool {
+        matches!(
+            opcode.split('.').next().unwrap_or(opcode),
+            "BSSY" | "BSYNC" | "SSY" | "SYNC" | "WARPSYNC"
+        )
+    }
+
+    fn is_return_opcode(opcode: &str) -> bool {
+        opcode == "RET" || opcode == "EXIT" || opcode.starts_with("RET")
+    }
+
+    fn stmt_sequence(stmts: Vec<Stmt>) -> Stmt {
+        let mut flat = Vec::new();
+        for stmt in stmts {
+            match stmt {
+                Stmt::Empty => {}
+                Stmt::Sequence(inner) => flat.extend(inner),
+                other => flat.push(other),
+            }
+        }
+        match flat.len() {
+            0 => Stmt::Empty,
+            1 => flat.into_iter().next().expect("single stmt"),
+            _ => Stmt::Sequence(flat),
+        }
+    }
+
+    fn stmt_is_empty(stmt: &Stmt) -> bool {
+        match stmt {
+            Stmt::Empty => true,
+            Stmt::Block(stmts) | Stmt::Sequence(stmts) => stmts.iter().all(Self::stmt_is_empty),
+            _ => false,
+        }
+    }
+
+    fn stmt_is_trivial_self_assign(stmt: &Stmt) -> bool {
+        match stmt {
+            Stmt::Assign {
+                dst: LValue::Var(dst),
+                src: Expr::Reg(src),
+            }
+            | Stmt::Assign {
+                dst: LValue::Var(dst),
+                src: Expr::Raw(src),
+            }
+            | Stmt::Assign {
+                dst: LValue::Raw(dst),
+                src: Expr::Reg(src),
+            }
+            | Stmt::Assign {
+                dst: LValue::Raw(dst),
+                src: Expr::Raw(src),
+            } => dst == src,
+            _ => false,
+        }
+    }
+
+    fn without_redundant_loop_tail_continue(stmt: &StructuredStatement) -> StructuredStatement {
+        match stmt {
+            StructuredStatement::Continue(_) => StructuredStatement::Empty,
+            StructuredStatement::Sequence(stmts) => {
+                if matches!(stmts.last(), Some(StructuredStatement::Continue(_))) {
+                    let trimmed = &stmts[..stmts.len() - 1];
+                    if trimmed.is_empty() {
+                        StructuredStatement::Empty
+                    } else if trimmed.len() == 1 {
+                        trimmed[0].clone()
+                    } else {
+                        StructuredStatement::Sequence(trimmed.to_vec())
+                    }
+                } else {
+                    stmt.clone()
+                }
+            }
+            _ => stmt.clone(),
+        }
+    }
+
+    fn stmt_contains_continue(stmt: &Stmt) -> bool {
+        match stmt {
+            Stmt::Continue => true,
+            Stmt::Block(stmts) | Stmt::Sequence(stmts) => {
+                stmts.iter().any(Self::stmt_contains_continue)
+            }
+            Stmt::Label { body, .. } => Self::stmt_contains_continue(body),
+            Stmt::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                Self::stmt_contains_continue(then_branch)
+                    || else_branch
+                        .as_deref()
+                        .map(Self::stmt_contains_continue)
+                        .unwrap_or(false)
+            }
+            Stmt::Switch { cases, default, .. } => {
+                cases.iter().any(|(_, body)| Self::stmt_contains_continue(body))
+                    || default
+                        .as_deref()
+                        .map(Self::stmt_contains_continue)
+                        .unwrap_or(false)
+            }
+            Stmt::Loop { .. }
+            | Stmt::Break
+            | Stmt::Return(_)
+            | Stmt::Assign { .. }
+            | Stmt::ExprStmt(_)
+            | Stmt::Goto(_)
+            | Stmt::Empty => false,
+        }
+    }
+
+    fn stmt_may_fallthrough(stmt: &Stmt) -> bool {
+        match stmt {
+            Stmt::Empty | Stmt::Assign { .. } | Stmt::ExprStmt(_) | Stmt::Loop { .. } => true,
+            Stmt::Break | Stmt::Continue | Stmt::Return(_) | Stmt::Goto(_) => false,
+            Stmt::Block(stmts) | Stmt::Sequence(stmts) => {
+                let mut reachable = true;
+                for stmt in stmts {
+                    if !reachable {
+                        return false;
+                    }
+                    reachable = Self::stmt_may_fallthrough(stmt);
+                }
+                reachable
+            }
+            Stmt::Label { body, .. } => Self::stmt_may_fallthrough(body),
+            Stmt::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                let then_fallthrough = Self::stmt_may_fallthrough(then_branch);
+                match else_branch {
+                    Some(branch) => then_fallthrough || Self::stmt_may_fallthrough(branch),
+                    None => true,
+                }
+            }
+            Stmt::Switch { cases, default, .. } => {
+                if default.is_none() {
+                    return true;
+                }
+                cases.iter().any(|(_, body)| Self::stmt_may_fallthrough(body))
+                    || default
+                        .as_deref()
+                        .map(Self::stmt_may_fallthrough)
+                        .unwrap_or(false)
+            }
+        }
+    }
+
+    fn inject_loop_phi_updates_before_continue(stmt: Stmt, updates: &Stmt) -> Stmt {
+        match stmt {
+            Stmt::Continue => Self::stmt_sequence(vec![updates.clone(), Stmt::Continue]),
+            Stmt::Block(stmts) => Stmt::Block(
+                stmts
+                    .into_iter()
+                    .map(|stmt| Self::inject_loop_phi_updates_before_continue(stmt, updates))
+                    .collect(),
+            ),
+            Stmt::Sequence(stmts) => Self::stmt_sequence(
+                stmts
+                    .into_iter()
+                    .map(|stmt| Self::inject_loop_phi_updates_before_continue(stmt, updates))
+                    .collect(),
+            ),
+            Stmt::Label { name, body } => Stmt::Label {
+                name,
+                body: Box::new(Self::inject_loop_phi_updates_before_continue(*body, updates)),
+            },
+            Stmt::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => Stmt::If {
+                condition,
+                then_branch: Box::new(Self::inject_loop_phi_updates_before_continue(
+                    *then_branch,
+                    updates,
+                )),
+                else_branch: else_branch.map(|branch| {
+                    Box::new(Self::inject_loop_phi_updates_before_continue(
+                        *branch, updates,
+                    ))
+                }),
+            },
+            Stmt::Switch {
+                discriminant,
+                cases,
+                default,
+            } => Stmt::Switch {
+                discriminant,
+                cases: cases
+                    .into_iter()
+                    .map(|(label, body)| {
+                        (
+                            label,
+                            Self::inject_loop_phi_updates_before_continue(body, updates),
+                        )
+                    })
+                    .collect(),
+                default: default.map(|body| {
+                    Box::new(Self::inject_loop_phi_updates_before_continue(*body, updates))
+                }),
+            },
+            Stmt::Loop {
+                kind,
+                condition,
+                body,
+            } => Stmt::Loop {
+                kind,
+                condition,
+                body: Box::new(Self::inject_loop_phi_updates_before_continue(*body, updates)),
+            },
+            other => other,
+        }
+    }
+
+    fn inject_loop_phi_backedge_updates(body: Stmt, updates: &Stmt) -> Stmt {
+        if Self::stmt_is_empty(updates) || Self::stmt_contains_continue(&body) {
+            return body;
+        }
+        let body = Self::inject_loop_phi_updates_before_continue(body, updates);
+        if Self::stmt_may_fallthrough(&body) {
+            Self::stmt_sequence(vec![body, updates.clone()])
+        } else {
+            body
+        }
+    }
+
+    fn collect_jump_targets(stmt: &StructuredStatement, targets: &mut HashSet<usize>) {
+        match stmt {
+            StructuredStatement::Sequence(stmts) => {
+                for stmt in stmts {
+                    Self::collect_jump_targets(stmt, targets);
+                }
+            }
+            StructuredStatement::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                Self::collect_jump_targets(then_branch, targets);
+                if let Some(else_branch) = else_branch {
+                    Self::collect_jump_targets(else_branch, targets);
+                }
+            }
+            StructuredStatement::Loop { body, .. } => {
+                Self::collect_jump_targets(body, targets);
+            }
+            StructuredStatement::Switch { cases, default, .. } => {
+                for (_, body) in cases {
+                    Self::collect_jump_targets(body, targets);
+                }
+                if let Some(default) = default {
+                    Self::collect_jump_targets(default, targets);
+                }
+            }
+            StructuredStatement::UnstructuredJump { to_block_id, .. } => {
+                targets.insert(*to_block_id);
+            }
+            StructuredStatement::BasicBlock { .. }
+            | StructuredStatement::Break(_)
+            | StructuredStatement::Continue(_)
+            | StructuredStatement::Return(_)
+            | StructuredStatement::Empty => {}
+        }
+    }
+
+    fn collect_structured_block_ids(stmt: &StructuredStatement, blocks: &mut HashSet<usize>) {
+        match stmt {
+            StructuredStatement::BasicBlock { block_id, .. } => {
+                blocks.insert(*block_id);
+            }
+            StructuredStatement::Sequence(stmts) => {
+                for stmt in stmts {
+                    Self::collect_structured_block_ids(stmt, blocks);
+                }
+            }
+            StructuredStatement::If {
+                condition_block_id,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                blocks.insert(*condition_block_id);
+                Self::collect_structured_block_ids(then_branch, blocks);
+                if let Some(else_branch) = else_branch {
+                    Self::collect_structured_block_ids(else_branch, blocks);
+                }
+            }
+            StructuredStatement::Loop {
+                header_block_id,
+                body,
+                ..
+            } => {
+                if let Some(header_block_id) = header_block_id {
+                    blocks.insert(*header_block_id);
+                }
+                Self::collect_structured_block_ids(body, blocks);
+            }
+            StructuredStatement::Switch {
+                header_block_id,
+                cases,
+                default,
+                ..
+            } => {
+                blocks.insert(*header_block_id);
+                for (_, body) in cases {
+                    Self::collect_structured_block_ids(body, blocks);
+                }
+                if let Some(default) = default {
+                    Self::collect_structured_block_ids(default, blocks);
+                }
+            }
+            StructuredStatement::UnstructuredJump { from_block_id, .. } => {
+                blocks.insert(*from_block_id);
+            }
+            StructuredStatement::Break(_)
+            | StructuredStatement::Continue(_)
+            | StructuredStatement::Return(_)
+            | StructuredStatement::Empty => {}
+        }
+    }
+
+    fn entry_block_id(stmt: &StructuredStatement) -> Option<usize> {
+        match stmt {
+            StructuredStatement::BasicBlock { block_id, .. } => Some(*block_id),
+            StructuredStatement::Sequence(stmts) => stmts.iter().find_map(Self::entry_block_id),
+            StructuredStatement::If {
+                condition_block_id, ..
+            } => Some(*condition_block_id),
+            StructuredStatement::Loop {
+                loop_type,
+                header_block_id,
+                body,
+                ..
+            } => match loop_type {
+                LoopType::DoWhile => Self::entry_block_id(body).or(*header_block_id),
+                LoopType::While | LoopType::Endless => {
+                    header_block_id.or_else(|| Self::entry_block_id(body))
+                }
+            },
+            StructuredStatement::Switch {
+                header_block_id, ..
+            } => Some(*header_block_id),
+            StructuredStatement::Empty
+            | StructuredStatement::Break(_)
+            | StructuredStatement::Continue(_)
+            | StructuredStatement::Return(_)
+            | StructuredStatement::UnstructuredJump { .. } => None,
+        }
+    }
+
+    fn ends_with_unconditional_return(stmt: &StructuredStatement) -> bool {
+        match stmt {
+            StructuredStatement::Return(_) => true,
+            StructuredStatement::BasicBlock { stmts, .. } => stmts.iter().any(|stmt| {
+                matches!(
+                    &stmt.value,
+                    RValue::Op { opcode, .. } if Self::is_return_opcode(opcode) && stmt.pred.is_none()
+                )
+            }),
+            StructuredStatement::Sequence(children) => children
+                .iter()
+                .rev()
+                .find(|child| !matches!(child, StructuredStatement::Empty))
+                .is_some_and(Self::ends_with_unconditional_return),
+            _ => false,
+        }
+    }
+}
+
 pub fn lower_structured_function(
     structured: &StructuredStatement,
+    cfg: &ControlFlowGraph,
+    function_ir: &FunctionIR,
     analysis: &FunctionAnalysis,
 ) -> crate::ast::StructuredFunction {
-    let body = lower_structured_stmt(structured, analysis);
-    let seed = prune_dead_pure_defs(crate::ast::StructuredFunction {
-        params: Vec::new(),
-        locals: Vec::new(),
-        body,
-    });
-    let plan = plan_symbols(&seed, analysis);
-    crate::ast::StructuredFunction {
-        params: plan.params,
-        locals: plan.locals,
-        body: seed.body,
-    }
+    StructuredLowering::new(cfg, function_ir, analysis).lower_function(structured)
 }
 
 pub fn lower_structured_stmt(
     structured: &StructuredStatement,
+    cfg: &ControlFlowGraph,
+    function_ir: &FunctionIR,
     analysis: &FunctionAnalysis,
 ) -> Stmt {
-    match structured {
-        StructuredStatement::BasicBlock { block_id, stmts } => Stmt::Sequence(
-            stmts
-                .iter()
-                .enumerate()
-                .map(|(stmt_idx, stmt)| lower_basic_stmt(*block_id, stmt_idx, stmt, analysis))
-                .collect(),
-        ),
-        StructuredStatement::Sequence(parts) => Stmt::Sequence(
-            parts
-                .iter()
-                .map(|part| lower_structured_stmt(part, analysis))
-                .collect(),
-        ),
-        StructuredStatement::If {
-            condition_expr,
-            then_branch,
-            else_branch,
-            ..
-        } => Stmt::If {
-            condition: lower_scalar_expr_with_analysis(condition_expr, Some(analysis)),
-            then_branch: Box::new(lower_structured_stmt(then_branch, analysis)),
-            else_branch: else_branch
-                .as_ref()
-                .map(|branch| Box::new(lower_structured_stmt(branch, analysis))),
+    StructuredLowering::new(cfg, function_ir, analysis).lower_structured_stmt(structured)
+}
+
+fn negate_expr(expr: Expr) -> Expr {
+    match expr {
+        Expr::Unary { op, arg } if op == "!" => *arg,
+        other => Expr::Unary {
+            op: "!".to_string(),
+            arg: Box::new(other),
         },
-        StructuredStatement::Loop {
-            loop_type,
-            condition_expr,
-            body,
-            ..
-        } => Stmt::Loop {
-            kind: match loop_type {
-                LoopType::While => crate::ast::LoopKind::While,
-                LoopType::DoWhile => crate::ast::LoopKind::DoWhile,
-                LoopType::Endless => crate::ast::LoopKind::Endless,
-            },
-            condition: condition_expr.as_ref().map(lower_scalar_expr),
-            body: Box::new(lower_structured_stmt(body, analysis)),
-        },
-        StructuredStatement::Break(_) => Stmt::Break,
-        StructuredStatement::Continue(_) => Stmt::Continue,
-        StructuredStatement::Return(expr) => Stmt::Return(expr.as_ref().map(lower_scalar_expr)),
-        StructuredStatement::UnstructuredJump { to_block_id, .. } => {
-            Stmt::Goto(format!("BB{}", to_block_id))
-        }
-        StructuredStatement::Switch {
-            discriminant,
-            cases,
-            default,
-            ..
-        } => Stmt::Switch {
-            discriminant: discriminant.as_ref().map(lower_scalar_expr),
-            cases: cases
-                .iter()
-                .map(|(label, body)| (*label, lower_structured_stmt(body, analysis)))
-                .collect(),
-            default: default
-                .as_ref()
-                .map(|body| Box::new(lower_structured_stmt(body, analysis))),
-        },
-        StructuredStatement::Empty => Stmt::Empty,
     }
 }
 
@@ -1173,18 +2179,12 @@ fn lower_multi_def_imad_wide_stmt(
         .defs
         .iter()
         .filter_map(|expr| expr.get_reg())
-        .find(|reg| {
-            reg.class == lo_def.class && reg.idx == lo_def.idx.saturating_add(1)
-        })?;
+        .find(|reg| reg.class == lo_def.class && reg.idx == lo_def.idx.saturating_add(1))?;
     let wide = lower_imad_wide_value_expr(opcode, args, analysis)?;
-    let hi_def_idx = stmt
-        .defs
-        .iter()
-        .enumerate()
-        .find_map(|(idx, expr)| {
-            let reg = expr.get_reg()?;
-            (reg == hi_def).then_some(idx)
-        })?;
+    let hi_def_idx = stmt.defs.iter().enumerate().find_map(|(idx, expr)| {
+        let reg = expr.get_reg()?;
+        (reg == hi_def).then_some(idx)
+    })?;
     Some(LoweredStmt {
         stmt: Stmt::Sequence(vec![
             Stmt::Assign {
@@ -1572,7 +2572,9 @@ fn lower_imad_wide_expr(
 ) -> Option<Expr> {
     let parts = opcode.split('.').collect::<Vec<_>>();
     let mnem = parts.first().copied().unwrap_or(opcode);
-    if !matches!(mnem, "IMAD" | "UIMAD") || !parts.iter().any(|part| *part == "WIDE") || args.len() != 3
+    if !matches!(mnem, "IMAD" | "UIMAD")
+        || !parts.iter().any(|part| *part == "WIDE")
+        || args.len() != 3
     {
         return None;
     }
@@ -1616,11 +2618,7 @@ fn lower_imad_wide_base_expr(arg: &IRExpr, analysis: Option<&FunctionAnalysis>) 
     if let Some(reg) = arg.get_reg() {
         let hi = crate::ir::RegId::new(&reg.class, reg.idx.saturating_add(1), reg.sign)
             .with_ssa(reg.ssa.unwrap_or(0));
-        return lower_wide_input_expr(
-            arg,
-            &IRExpr::Reg(hi),
-            analysis,
-        );
+        return lower_wide_input_expr(arg, &IRExpr::Reg(hi), analysis);
     }
     match lower_scalar_expr_with_analysis(arg, analysis) {
         Expr::PtrLane {
@@ -1854,10 +2852,34 @@ fn lower_i2f_expr(
     let mut func = None;
     for part in parts.iter().skip(1) {
         match *part {
-            "RP" => func = Some(if signed { "__int2float_ru" } else { "__uint2float_ru" }),
-            "RM" => func = Some(if signed { "__int2float_rd" } else { "__uint2float_rd" }),
-            "RN" => func = Some(if signed { "__int2float_rn" } else { "__uint2float_rn" }),
-            "RZ" => func = Some(if signed { "__int2float_rz" } else { "__uint2float_rz" }),
+            "RP" => {
+                func = Some(if signed {
+                    "__int2float_ru"
+                } else {
+                    "__uint2float_ru"
+                })
+            }
+            "RM" => {
+                func = Some(if signed {
+                    "__int2float_rd"
+                } else {
+                    "__uint2float_rd"
+                })
+            }
+            "RN" => {
+                func = Some(if signed {
+                    "__int2float_rn"
+                } else {
+                    "__uint2float_rn"
+                })
+            }
+            "RZ" => {
+                func = Some(if signed {
+                    "__int2float_rz"
+                } else {
+                    "__uint2float_rz"
+                })
+            }
             _ => return None,
         }
     }
@@ -2179,7 +3201,9 @@ fn lower_imad_hi_expr(
 ) -> Option<Expr> {
     let parts = opcode.split('.').collect::<Vec<_>>();
     let mnem = parts.first().copied().unwrap_or(opcode);
-    if !matches!(mnem, "IMAD" | "UIMAD") || !parts.iter().any(|part| *part == "HI") || args.len() != 3
+    if !matches!(mnem, "IMAD" | "UIMAD")
+        || !parts.iter().any(|part| *part == "HI")
+        || args.len() != 3
     {
         return None;
     }
@@ -2267,32 +3291,30 @@ fn lower_lea_hi_expr(
                 lane: PointerLane::Hi32,
             })
         }
-        [offset, ptr_hi, shift, carry] if matches!(shift, IRExpr::ImmI(_)) && is_predicate_expr(carry) => {
-            Some(add_lea_hi_terms(
-                vec![
-                    Expr::LaneExtract {
-                        value: Box::new(lower_shifted_wide_expr(offset, shift, sx32, analysis)?),
-                        lane: PointerLane::Hi32,
-                    },
-                    lower_scalar_expr_with_analysis(ptr_hi, analysis),
-                    lower_carry_inc_expr(carry, analysis)?,
-                ],
-            ))
+        [offset, ptr_hi, shift, carry]
+            if matches!(shift, IRExpr::ImmI(_)) && is_predicate_expr(carry) =>
+        {
+            Some(add_lea_hi_terms(vec![
+                Expr::LaneExtract {
+                    value: Box::new(lower_shifted_wide_expr(offset, shift, sx32, analysis)?),
+                    lane: PointerLane::Hi32,
+                },
+                lower_scalar_expr_with_analysis(ptr_hi, analysis),
+                lower_carry_inc_expr(carry, analysis)?,
+            ]))
         }
         [offset, ptr_hi, accum_hi, shift, carry]
             if matches!(shift, IRExpr::ImmI(_)) && is_predicate_expr(carry) =>
         {
-            Some(add_lea_hi_terms(
-                vec![
-                    Expr::LaneExtract {
-                        value: Box::new(lower_shifted_wide_expr(offset, shift, sx32, analysis)?),
-                        lane: PointerLane::Hi32,
-                    },
-                    lower_scalar_expr_with_analysis(ptr_hi, analysis),
-                    lower_scalar_expr_with_analysis(accum_hi, analysis),
-                    lower_carry_inc_expr(carry, analysis)?,
-                ],
-            ))
+            Some(add_lea_hi_terms(vec![
+                Expr::LaneExtract {
+                    value: Box::new(lower_shifted_wide_expr(offset, shift, sx32, analysis)?),
+                    lane: PointerLane::Hi32,
+                },
+                lower_scalar_expr_with_analysis(ptr_hi, analysis),
+                lower_scalar_expr_with_analysis(accum_hi, analysis),
+                lower_carry_inc_expr(carry, analysis)?,
+            ]))
         }
         _ => None,
     }
@@ -3247,10 +4269,158 @@ mod tests {
             }),
             else_branch: None,
         };
-        let lowered = lower_structured_stmt(&structured, &analysis);
+        let lowered = lower_structured_stmt(
+            &structured,
+            &crate::cfg::ControlFlowGraph::new(),
+            &crate::ir::FunctionIR { blocks: Vec::new() },
+            &analysis,
+        );
         let rendered = lowered.render_with_indent(0);
         assert!(rendered.contains("if (p0)"));
         assert!(rendered.contains("r4 = 1;"));
+    }
+
+    #[test]
+    fn lowers_phi_connectors_structurally_across_if_edges() {
+        let mut cfg = crate::cfg::ControlFlowGraph::new();
+        let bb0 = cfg.add_node(crate::cfg::BasicBlock {
+            id: 0,
+            start: 0x00,
+            instrs: Vec::new(),
+        });
+        let bb1 = cfg.add_node(crate::cfg::BasicBlock {
+            id: 1,
+            start: 0x10,
+            instrs: Vec::new(),
+        });
+        let bb2 = cfg.add_node(crate::cfg::BasicBlock {
+            id: 2,
+            start: 0x20,
+            instrs: Vec::new(),
+        });
+        let bb3 = cfg.add_node(crate::cfg::BasicBlock {
+            id: 3,
+            start: 0x30,
+            instrs: Vec::new(),
+        });
+        cfg.add_edge(bb0, bb1, crate::cfg::EdgeKind::CondBranch);
+        cfg.add_edge(bb0, bb2, crate::cfg::EdgeKind::FallThrough);
+        cfg.add_edge(bb1, bb3, crate::cfg::EdgeKind::UncondBranch);
+        cfg.add_edge(bb2, bb3, crate::cfg::EdgeKind::UncondBranch);
+
+        let pred = crate::ir::RegId::new("P", 0, 1);
+        let then_val = crate::ir::RegId::new("R", 4, 1).with_ssa(1);
+        let else_val = crate::ir::RegId::new("R", 4, 1).with_ssa(2);
+        let phi_val = crate::ir::RegId::new("R", 5, 1).with_ssa(1);
+        let use_val = crate::ir::RegId::new("R", 6, 1).with_ssa(1);
+        let fir = crate::ir::FunctionIR {
+            blocks: vec![
+                crate::ir::IRBlock {
+                    id: 0,
+                    start_addr: 0x00,
+                    irdst: vec![
+                        (
+                            Some(crate::ir::IRCond::Pred {
+                                reg: pred.clone(),
+                                sense: true,
+                            }),
+                            0x10,
+                        ),
+                        (
+                            Some(crate::ir::IRCond::Pred {
+                                reg: pred.clone(),
+                                sense: false,
+                            }),
+                            0x20,
+                        ),
+                    ],
+                    stmts: vec![IRStatement {
+                        defs: vec![IRExpr::Reg(pred.clone())],
+                        value: RValue::ImmI(1),
+                        pred: None,
+                        mem_addr_args: None,
+                        pred_old_defs: Vec::new(),
+                    }],
+                },
+                crate::ir::IRBlock {
+                    id: 1,
+                    start_addr: 0x10,
+                    irdst: vec![(Some(crate::ir::IRCond::True), 0x30)],
+                    stmts: vec![IRStatement {
+                        defs: vec![IRExpr::Reg(then_val.clone())],
+                        value: RValue::ImmI(11),
+                        pred: None,
+                        mem_addr_args: None,
+                        pred_old_defs: Vec::new(),
+                    }],
+                },
+                crate::ir::IRBlock {
+                    id: 2,
+                    start_addr: 0x20,
+                    irdst: vec![(Some(crate::ir::IRCond::True), 0x30)],
+                    stmts: vec![IRStatement {
+                        defs: vec![IRExpr::Reg(else_val.clone())],
+                        value: RValue::ImmI(22),
+                        pred: None,
+                        mem_addr_args: None,
+                        pred_old_defs: Vec::new(),
+                    }],
+                },
+                crate::ir::IRBlock {
+                    id: 3,
+                    start_addr: 0x30,
+                    irdst: vec![],
+                    stmts: vec![
+                        IRStatement {
+                            defs: vec![IRExpr::Reg(phi_val.clone())],
+                            value: RValue::Phi(vec![
+                                IRExpr::Reg(then_val.clone()),
+                                IRExpr::Reg(else_val.clone()),
+                            ]),
+                            pred: None,
+                            mem_addr_args: None,
+                            pred_old_defs: Vec::new(),
+                        },
+                        IRStatement {
+                            defs: vec![IRExpr::Reg(use_val)],
+                            value: RValue::Op {
+                                opcode: "MOV".to_string(),
+                                args: vec![IRExpr::Reg(phi_val)],
+                            },
+                            pred: None,
+                            mem_addr_args: None,
+                            pred_old_defs: Vec::new(),
+                        },
+                    ],
+                },
+            ],
+        };
+        let structured = StructuredStatement::Sequence(vec![
+            StructuredStatement::If {
+                condition_block_id: 0,
+                condition_expr: IRExpr::Reg(pred),
+                then_branch: Box::new(StructuredStatement::BasicBlock {
+                    block_id: 1,
+                    stmts: fir.blocks[1].stmts.clone(),
+                }),
+                else_branch: Some(Box::new(StructuredStatement::BasicBlock {
+                    block_id: 2,
+                    stmts: fir.blocks[2].stmts.clone(),
+                })),
+            },
+            StructuredStatement::BasicBlock {
+                block_id: 3,
+                stmts: fir.blocks[3].stmts.clone(),
+            },
+        ]);
+
+        let lowered = lower_structured_stmt(&structured, &cfg, &fir, &FunctionAnalysis::default());
+        let rendered = lowered.render_with_indent(0);
+        assert!(rendered.contains("p0 = 1;"), "got:\n{rendered}");
+        assert!(rendered.contains("r5_1 = r4_1;"), "got:\n{rendered}");
+        assert!(rendered.contains("r5_1 = r4_2;"), "got:\n{rendered}");
+        assert!(rendered.contains("r6_1 = r5_1;"), "got:\n{rendered}");
+        assert!(!rendered.contains("phi("), "got:\n{rendered}");
     }
 
     #[test]
@@ -3524,7 +4694,10 @@ mod tests {
         );
         let rendered = lea_hi.render();
         assert!(!rendered.contains("LEA.HI.X("), "got: {rendered}");
-        assert!(rendered.contains("r6_0") && rendered.contains("r7_0"), "got: {rendered}");
+        assert!(
+            rendered.contains("r6_0") && rendered.contains("r7_0"),
+            "got: {rendered}"
+        );
 
         let lea_hi_sx32 = lower_op_expr(
             "LEA.HI.X.SX32",
@@ -3739,8 +4912,14 @@ mod tests {
             ],
         );
         let rendered = imad_wide.render();
-        assert!(rendered.contains("(int64_t)((int32_t)(r9_0))"), "got: {rendered}");
-        assert!(rendered.contains("(int64_t)((int32_t)(4))"), "got: {rendered}");
+        assert!(
+            rendered.contains("(int64_t)((int32_t)(r9_0))"),
+            "got: {rendered}"
+        );
+        assert!(
+            rendered.contains("(int64_t)((int32_t)(4))"),
+            "got: {rendered}"
+        );
         assert!(
             rendered.contains("((uintptr_t)(((uint64_t)(r11_0) << 32) | (uint32_t)(r10_0)))"),
             "got: {rendered}"
@@ -3910,8 +5089,14 @@ mod tests {
         assert_eq!(dst.render(), "r6_2");
         let rendered = src.render();
         assert!(rendered.starts_with("p0 ? "), "got: {rendered}");
-        assert!(rendered.contains("(uint64_t)((uint32_t)(r1_0))"), "got: {rendered}");
-        assert!(rendered.contains("(uint64_t)((uint32_t)(16))"), "got: {rendered}");
+        assert!(
+            rendered.contains("(uint64_t)((uint32_t)(r1_0))"),
+            "got: {rendered}"
+        );
+        assert!(
+            rendered.contains("(uint64_t)((uint32_t)(16))"),
+            "got: {rendered}"
+        );
         assert!(rendered.ends_with(" : r6_1"), "got: {rendered}");
         let Stmt::Assign { dst, src } = &stmts[1] else {
             panic!("expected high-lane assignment");
