@@ -522,11 +522,44 @@ fn lower_global_index_expr(
     analysis: &FunctionAnalysis,
     bit_width: Option<u32>,
 ) -> Expr {
-    let Some(rooted_offset) = rooted_space_byte_offset(addr_base, access, analysis) else {
-        return lower_index_expr(offset, bit_width, Some(analysis));
+    if let Some(rooted_offset) = rooted_space_byte_offset(addr_base, access, analysis) {
+        let byte_expr = combine_byte_offset_expr(&rooted_offset, offset, Some(analysis));
+        return scale_index_expr(byte_expr, bit_width);
+    }
+    if let Some(root_relative) =
+        lower_root_relative_global_index_expr(addr_base, offset, access, analysis, bit_width)
+    {
+        return root_relative;
+    }
+    lower_index_expr(offset, bit_width, Some(analysis))
+}
+
+fn lower_root_relative_global_index_expr(
+    addr_base: &IRExpr,
+    offset: Option<&IRExpr>,
+    access: &MemAccessInfo,
+    analysis: &FunctionAnalysis,
+    bit_width: Option<u32>,
+) -> Option<Expr> {
+    let AddressRoot::ParamWord(param_idx) = access.root else {
+        return None;
     };
-    let byte_expr = combine_byte_offset_expr(&rooted_offset, offset, Some(analysis));
-    scale_index_expr(byte_expr, bit_width)
+    let absolute_addr = match addr_base {
+        IRExpr::Addr64 { .. } => combine_byte_offset_expr(addr_base, offset, Some(analysis)),
+        _ => return None,
+    };
+    let rooted_base = Expr::Cast {
+        ty: "uintptr_t".to_string(),
+        expr: Box::new(Expr::Reg(global_param_base_name(param_idx, analysis))),
+    };
+    Some(scale_index_expr(
+        Expr::Binary {
+            op: "-".to_string(),
+            lhs: Box::new(absolute_addr),
+            rhs: Box::new(rooted_base),
+        },
+        bit_width,
+    ))
 }
 
 fn global_param_base_name(param_idx: u32, analysis: &FunctionAnalysis) -> String {

@@ -1404,9 +1404,16 @@ fn canonical_full_pass_cumsum_linear_avoids_register_pseudo_pointers() {
         out
     );
     assert!(
-        out.contains("arg0_ptr[ur4_9 * ur5_0 / 4]")
-            && out.contains("arg2_ptr[ur4_9 * ur5_0 / 4] ="),
-        "expected canonical cumsum_linear tail loop to stay rooted on arg pointers, got:\n{}",
+        !out.contains("((uint32_t*)(r2_5))")
+            && !out.contains("((uint32_t*)(r4_4))")
+            && !out.contains("((uint32_t*)(r2_8))")
+            && !out.contains("((uint32_t*)(r4_7))"),
+        "expected canonical cumsum_linear remainder paths to stay rooted on arg pointers, got:\n{}",
+        out
+    );
+    assert!(
+        out.contains("arg0_ptr[") && out.contains("arg2_ptr["),
+        "expected canonical cumsum_linear loops to stay rooted on arg pointers, got:\n{}",
         out
     );
 }

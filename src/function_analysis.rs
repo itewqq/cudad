@@ -139,9 +139,8 @@ fn recover_builtin_regs(
                     block_id: block.id,
                     stmt_idx,
                 };
-                let propagated = builtin_seed_from_stmt(stmt, &builtins).or_else(|| {
-                    stmt_builtin_load_name(stmt, &stmt_ref, abi_annotations)
-                });
+                let propagated = builtin_seed_from_stmt(stmt, &builtins)
+                    .or_else(|| stmt_builtin_load_name(stmt, &stmt_ref, abi_annotations));
                 let Some(name) = propagated else {
                     continue;
                 };
@@ -172,14 +171,21 @@ fn builtin_seed_from_stmt(
     builtins: &BTreeMap<RegId, String>,
 ) -> Option<String> {
     match &stmt.value {
-        RValue::Phi(args) => merge_builtins(args.iter().filter_map(|expr| expr_builtin_name(expr, builtins))),
+        RValue::Phi(args) => merge_builtins(
+            args.iter()
+                .filter_map(|expr| expr_builtin_name(expr, builtins)),
+        ),
         RValue::Op { opcode, args } if is_root_copy_like(opcode) => args
             .iter()
             .find_map(|expr| expr_builtin_name(expr, builtins)),
         RValue::Op { opcode, args }
-            if matches!(opcode.split('.').next().unwrap_or(opcode), "S2R" | "CS2R" | "S2UR") =>
+            if matches!(
+                opcode.split('.').next().unwrap_or(opcode),
+                "S2R" | "CS2R" | "S2UR"
+            ) =>
         {
-            args.first().and_then(|expr| expr_builtin_name(expr, builtins))
+            args.first()
+                .and_then(|expr| expr_builtin_name(expr, builtins))
         }
         _ => None,
     }
@@ -222,8 +228,9 @@ fn merge_builtins(builtins: impl Iterator<Item = String>) -> Option<String> {
 fn expr_builtin_name(expr: &IRExpr, builtins: &BTreeMap<RegId, String>) -> Option<String> {
     match expr {
         IRExpr::Reg(reg) => builtins.get(reg).cloned(),
-        IRExpr::Op { op, args } if args.is_empty() => special_register_builtin_name(op)
-            .map(str::to_string),
+        IRExpr::Op { op, args } if args.is_empty() => {
+            special_register_builtin_name(op).map(str::to_string)
+        }
         _ => None,
     }
 }
@@ -293,27 +300,20 @@ fn propagate_address_facts(
                     .get(&stmt_ref)
                     .and_then(|annotations| root_from_annotation(0, annotations, abi_aliases));
                 let propagated = match &stmt.value {
-                    RValue::Phi(args) => {
-                        let merged =
-                            merge_roots(args.iter().filter_map(|expr| expr_root(expr, &roots)));
-                        let byte_offset = merge_offsets(
-                            args.iter()
-                                .filter_map(|expr| expr_byte_offset(expr, &roots, &byte_offsets)),
-                        );
-                        match (merged, byte_offset) {
-                            (Some(root), Some(byte_offset)) => {
-                                Some((root, byte_offset, stmt.defs.clone()))
-                            }
-                            _ => None,
-                        }
-                    }
-                    RValue::Op { opcode, args } if is_root_copy_like(opcode) => {
-                        args.iter().find_map(|expr| {
-                            let root = expr_root(expr, &roots)?;
-                            let byte_offset = expr_byte_offset(expr, &roots, &byte_offsets)?;
-                            Some((root, byte_offset, stmt.defs.clone()))
-                        })
-                    }
+                    RValue::Phi(args) => Some((
+                        merge_roots(args.iter().filter_map(|expr| expr_root(expr, &roots))),
+                        args.iter()
+                            .map(|expr| expr_byte_offset(expr, &roots, &byte_offsets))
+                            .collect::<Option<Vec<_>>>()
+                            .and_then(|offsets| merge_offsets(offsets.into_iter())),
+                        stmt.defs.clone(),
+                    )),
+                    RValue::Op { opcode, args } if is_root_copy_like(opcode) => Some((
+                        args.iter().find_map(|expr| expr_root(expr, &roots)),
+                        args.iter()
+                            .find_map(|expr| expr_byte_offset(expr, &roots, &byte_offsets)),
+                        stmt.defs.clone(),
+                    )),
                     RValue::Op { opcode, args } if is_pointer_arith_like(opcode) => {
                         propagate_pointer_arith(
                             opcode,
@@ -322,7 +322,7 @@ fn propagate_address_facts(
                             &roots,
                             &byte_offsets,
                         )
-                        .map(|(root, byte_offset)| (root, byte_offset, stmt.defs.clone()))
+                        .map(|(root, byte_offset)| (Some(root), byte_offset, stmt.defs.clone()))
                     }
                     _ => None,
                 };
@@ -337,13 +337,12 @@ fn propagate_address_facts(
                     if !can_carry_pointer_facts(reg) {
                         continue;
                     }
-                    let changed_root =
-                        insert_root_if_changed(&mut roots, reg.clone(), root.clone());
-                    let changed_offset = insert_offset_if_changed(
-                        &mut byte_offsets,
-                        reg.clone(),
-                        byte_offset.clone(),
-                    );
+                    let changed_root = root
+                        .clone()
+                        .is_some_and(|root| insert_root_if_changed(&mut roots, reg.clone(), root));
+                    let changed_offset = byte_offset.clone().is_some_and(|byte_offset| {
+                        insert_offset_if_changed(&mut byte_offsets, reg.clone(), byte_offset)
+                    });
                     if changed_root || changed_offset {
                         queue.push_back(reg.clone());
                     }
@@ -487,7 +486,7 @@ fn propagate_pointer_arith(
     annotated_root: Option<&AddressRoot>,
     roots: &BTreeMap<RegId, AddressRoot>,
     byte_offsets: &BTreeMap<RegId, IRExpr>,
-) -> Option<(AddressRoot, IRExpr)> {
+) -> Option<(AddressRoot, Option<IRExpr>)> {
     if opcode.starts_with("IMAD.WIDE") || opcode.starts_with("UIMAD.WIDE") {
         return propagate_imad_wide_pointer_arith(args, annotated_root, roots, byte_offsets);
     }
@@ -505,7 +504,7 @@ fn propagate_additive_pointer_arith(
     annotated_root: Option<&AddressRoot>,
     roots: &BTreeMap<RegId, AddressRoot>,
     byte_offsets: &BTreeMap<RegId, IRExpr>,
-) -> Option<(AddressRoot, IRExpr)> {
+) -> Option<(AddressRoot, Option<IRExpr>)> {
     let rooted_args = args
         .iter()
         .enumerate()
@@ -516,11 +515,11 @@ fn propagate_additive_pointer_arith(
         [(root_idx, root)] => (
             *root_idx,
             root.clone(),
-            expr_byte_offset(&args[*root_idx], roots, byte_offsets)?,
+            expr_byte_offset(&args[*root_idx], roots, byte_offsets),
         ),
         [] => {
             let root_idx = args.iter().position(is_constmem_like_expr)?;
-            (root_idx, annotated_root?.clone(), IRExpr::ImmI(0))
+            (root_idx, annotated_root?.clone(), Some(IRExpr::ImmI(0)))
         }
         _ => return None,
     };
@@ -528,7 +527,7 @@ fn propagate_additive_pointer_arith(
         if idx == root_idx || is_zero_like_expr(expr) {
             continue;
         }
-        byte_offset = add_offset_expr(byte_offset, expr.clone());
+        byte_offset = byte_offset.map(|offset| add_offset_expr(offset, expr.clone()));
     }
     Some((root, byte_offset))
 }
@@ -538,25 +537,25 @@ fn propagate_imad_wide_pointer_arith(
     annotated_root: Option<&AddressRoot>,
     roots: &BTreeMap<RegId, AddressRoot>,
     byte_offsets: &BTreeMap<RegId, IRExpr>,
-) -> Option<(AddressRoot, IRExpr)> {
+) -> Option<(AddressRoot, Option<IRExpr>)> {
     let base_expr = args.get(2)?;
     let (root, base_offset) = if let Some(root) = expr_root(base_expr, roots) {
-        let byte_offset = expr_byte_offset(base_expr, roots, byte_offsets)?;
+        let byte_offset = expr_byte_offset(base_expr, roots, byte_offsets);
         (root, byte_offset)
     } else if is_constmem_like_expr(base_expr) {
-        (annotated_root?.clone(), IRExpr::ImmI(0))
+        (annotated_root?.clone(), Some(IRExpr::ImmI(0)))
     } else {
         return None;
     };
     let product = mul_offset_expr(args.first()?.clone(), args.get(1)?.clone());
-    Some((root, add_offset_expr(base_offset, product)))
+    Some((root, base_offset.map(|offset| add_offset_expr(offset, product))))
 }
 
 fn propagate_iadd64_pointer_arith(
     args: &[IRExpr],
     roots: &BTreeMap<RegId, AddressRoot>,
     byte_offsets: &BTreeMap<RegId, IRExpr>,
-) -> Option<(AddressRoot, IRExpr)> {
+) -> Option<(AddressRoot, Option<IRExpr>)> {
     let lhs = wide_pair_expr(args.first()?.clone(), args.get(2)?.clone());
     let rhs = wide_pair_expr(args.get(1)?.clone(), args.get(3)?.clone());
     let lhs_root = expr_root(&lhs, roots).zip(expr_byte_offset(&lhs, roots, byte_offsets));
@@ -564,18 +563,19 @@ fn propagate_iadd64_pointer_arith(
     match (lhs_root, rhs_root) {
         (Some((root, base_offset)), None) => Some((
             root,
-            add_offset_expr(
+            Some(add_offset_expr(
                 base_offset,
                 wide_pair_offset_expr(args.get(1)?, args.get(3)?),
-            ),
+            )),
         )),
         (None, Some((root, base_offset))) => Some((
             root,
-            add_offset_expr(
+            Some(add_offset_expr(
                 base_offset,
                 wide_pair_offset_expr(args.first()?, args.get(2)?),
-            ),
+            )),
         )),
+        (Some((root, _)), Some(_)) => Some((root, None)),
         _ => None,
     }
 }
@@ -584,7 +584,7 @@ fn propagate_iadd3_64_pointer_arith(
     args: &[IRExpr],
     roots: &BTreeMap<RegId, AddressRoot>,
     byte_offsets: &BTreeMap<RegId, IRExpr>,
-) -> Option<(AddressRoot, IRExpr)> {
+) -> Option<(AddressRoot, Option<IRExpr>)> {
     let wide_inputs = [(0usize, 3usize), (1usize, 4usize), (2usize, 5usize)];
     let rooted_inputs = wide_inputs
         .iter()
@@ -608,7 +608,7 @@ fn propagate_iadd3_64_pointer_arith(
             wide_pair_offset_expr(args.get(lo_idx)?, args.get(hi_idx)?),
         );
     }
-    Some((root.clone(), byte_offset))
+    Some((root.clone(), Some(byte_offset)))
 }
 
 fn collect_memory_accesses(
@@ -1221,6 +1221,27 @@ mod tests {
             .find(|access| access.space == CudaMemorySpace::Global)
             .expect("global access");
         assert_eq!(global.root, AddressRoot::ParamWord(0));
+    }
+
+    #[test]
+    fn propagates_loop_carried_param_roots_even_when_offsets_diverge() {
+        let cumsum = split_decoded_functions(include_str!("../test_cu/corpus/loop_kernels.sass"))
+            .into_iter()
+            .find(|func| func.name == "cumsum_linear")
+            .expect("cumsum_linear fixture should exist");
+        let analysis = analyze_optimized_instrs(cumsum.instrs, cumsum.sm);
+        assert_eq!(
+            analysis
+                .root_by_reg
+                .get(&crate::ir::RegId::new("R", 2, 1).with_ssa(5)),
+            Some(&AddressRoot::ParamWord(0))
+        );
+        assert_eq!(
+            analysis
+                .root_by_reg
+                .get(&crate::ir::RegId::new("R", 4, 1).with_ssa(4)),
+            Some(&AddressRoot::ParamWord(2))
+        );
     }
 
     #[test]

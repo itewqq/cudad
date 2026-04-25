@@ -225,6 +225,11 @@
   SSA old-def values for every written result, unqualified `FFMA` now lowers
   through fused `fmaf(...)` instead of a decomposed multiply-plus-add, and
   `FFMA.SAT` saturates that fused form rather than a two-rounding expression.
+- `FunctionAnalysis` now propagates loop-carried global pointer roots even when
+  the relative byte offset is not yet recoverable, and canonical global
+  lowering falls back to root-relative `uintptr_t` index expressions instead
+  of raw register-backed pointer casts. This fixes the `cumsum_linear`
+  remainder paths without reintroducing text-driven recovery.
 - Canonical targeted coverage now also pins this float-modifier slice:
   `dispatch_ops` no longer leaks raw `FRND.FLOOR(...)` / `FMUL.FTZ(...)`, and
   `softmax_forward` no longer leaks raw `FFMA.SAT(...)` / `FFMA.RM(...)` /
@@ -239,9 +244,10 @@
    canonical semantics are now genuinely stronger, not just cosmetically
    different.
 2. Tackle the next structurally visible canonical holes: loop-carried
-   pointer-root/byte-offset recovery in `cumsum_linear`, the remaining
-   predicate/control outliers beyond the now-handled compare/pseudo-op/carry-
-   add/float-modifier/plain-LEA/`IMAD.X` spellings, and the remaining
+   pointer-byte-offset cleanup beyond the now-rooted `cumsum_linear`
+   remainder paths, the remaining predicate/control outliers beyond the
+   now-handled compare/pseudo-op/carry-add/float-modifier/plain-LEA/`IMAD.X`
+   spellings, and the remaining
    vector/half/special-scalar ops (for example `HFMA2`, `PRMT`, rotate-heavy
    SHA idioms) that still force raw helper-shaped output.
 3. Revisit the broader `sgemm_tiled` / shared-memory fixtures and migrate any
