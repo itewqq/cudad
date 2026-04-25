@@ -753,6 +753,18 @@ fn recover_fchk_division_stmt(
             });
             continue;
         }
+        if match_fchk_guided_division_expr(src_fast, defs, &fchk_num, &fchk_den) {
+            recovered_key = Some(dst_key);
+            recovered_stmt = Some(Stmt::Assign {
+                dst: dst_fast.clone(),
+                src: Expr::Binary {
+                    op: "/".to_string(),
+                    lhs: Box::new(fchk_num.clone()),
+                    rhs: Box::new(fchk_den.clone()),
+                },
+            });
+            continue;
+        }
 
         if let Some(name) = lvalue_symbol_name(dst_fast) {
             if !future_used.contains(&name) {
@@ -891,6 +903,85 @@ fn match_division_expr(expr: &Expr, defs: &HashMap<String, Expr>) -> Option<(Exp
     match_direct_division_expr(expr, defs).or_else(|| match_rcp_division_expr(expr, defs))
 }
 
+fn match_fchk_guided_division_expr(
+    expr: &Expr,
+    defs: &HashMap<String, Expr>,
+    expected_num: &Expr,
+    expected_den: &Expr,
+) -> bool {
+    let expr = normalize_match_expr(expr, defs, MATCH_RESOLVE_DEPTH);
+    let Some((lhs, rhs)) = match_binary_expr(&expr, "+", defs) else {
+        return false;
+    };
+    match_fchk_guided_division_parts(&lhs, &rhs, defs, expected_num, expected_den)
+        || match_fchk_guided_division_parts(&rhs, &lhs, defs, expected_num, expected_den)
+}
+
+fn match_fchk_guided_division_parts(
+    scaled_expr: &Expr,
+    refined_term: &Expr,
+    defs: &HashMap<String, Expr>,
+    expected_num: &Expr,
+    expected_den: &Expr,
+) -> bool {
+    let scaled_resolved = normalize_match_expr(scaled_expr, defs, MATCH_RESOLVE_DEPTH);
+    let expected_num = normalize_match_expr(expected_num, defs, MATCH_RESOLVE_DEPTH);
+    let expected_den = normalize_match_expr(expected_den, defs, MATCH_RESOLVE_DEPTH);
+    let Some(scaled_pairs) = match_mul_factor_pairs(&scaled_resolved, defs) else {
+        return false;
+    };
+    let Some(refined_pairs) = match_mul_factor_pairs(refined_term, defs) else {
+        return false;
+    };
+    for (approx_a, num) in &scaled_pairs {
+        if !same_match_expr(num, &expected_num) {
+            continue;
+        }
+        for (approx_b, corr) in &refined_pairs {
+            if !same_match_expr(approx_a, approx_b) {
+                continue;
+            }
+            if match_newton_correction_with_den(
+                corr,
+                &scaled_resolved,
+                &expected_num,
+                &expected_den,
+                defs,
+            ) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn match_newton_correction_with_den(
+    expr: &Expr,
+    expected_scaled: &Expr,
+    expected_num: &Expr,
+    expected_den: &Expr,
+    defs: &HashMap<String, Expr>,
+) -> bool {
+    let expr = normalize_match_expr(expr, defs, MATCH_RESOLVE_DEPTH);
+    let Some((lhs, rhs)) = match_binary_expr(&expr, "+", defs) else {
+        return false;
+    };
+    for (neg_mul_term, num_term) in [(lhs.clone(), rhs.clone()), (rhs, lhs)] {
+        if !same_match_expr(&num_term, expected_num) {
+            continue;
+        }
+        let Some((corr_den, corr_scaled)) = match_neg_mul_expr(&neg_mul_term, defs) else {
+            continue;
+        };
+        if same_match_expr(&corr_den, expected_den)
+            && same_match_expr(&corr_scaled, expected_scaled)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn match_direct_division_expr(expr: &Expr, defs: &HashMap<String, Expr>) -> Option<(Expr, Expr)> {
     let expr = normalize_match_expr(expr, defs, MATCH_RESOLVE_DEPTH);
     match expr {
@@ -1003,6 +1094,10 @@ fn match_negated_expr(expr: &Expr, defs: &HashMap<String, Expr>) -> Option<Expr>
         Expr::Unary { op, arg } if op == "-" => {
             Some(normalize_match_expr(&arg, defs, MATCH_RESOLVE_DEPTH))
         }
+        Expr::Imm(text) => text
+            .strip_prefix('-')
+            .filter(|inner| !inner.is_empty())
+            .map(|inner| Expr::Imm(inner.to_string())),
         _ => None,
     }
 }
@@ -1632,6 +1727,100 @@ mod tests {
             ])),
         };
         let rendered = prune_dead_pure_stmt(stmt).render_with_indent(0);
+        assert!(!rendered.contains("FCHK("), "got:\n{}", rendered);
+    }
+
+    #[test]
+    fn canonicalize_recovers_fchk_guarded_division_from_constant_newton_seed() {
+        let seq = vec![
+            Stmt::Assign {
+                dst: LValue::Var("num".to_string()),
+                src: Expr::Reg("arg0".to_string()),
+            },
+            Stmt::Assign {
+                dst: LValue::Var("pred".to_string()),
+                src: Expr::CallLike {
+                    func: "FCHK".to_string(),
+                    args: vec![Expr::Reg("num".to_string()), Expr::Imm("9".to_string())],
+                },
+            },
+            Stmt::Assign {
+                dst: LValue::Var("err".to_string()),
+                src: Expr::CallLike {
+                    func: "fmaf".to_string(),
+                    args: vec![
+                        Expr::Imm("0.1111111119389534".to_string()),
+                        Expr::Imm("-9".to_string()),
+                        Expr::Imm("1".to_string()),
+                    ],
+                },
+            },
+            Stmt::Assign {
+                dst: LValue::Var("approx".to_string()),
+                src: Expr::CallLike {
+                    func: "fmaf".to_string(),
+                    args: vec![
+                        Expr::Reg("err".to_string()),
+                        Expr::Imm("0.1111111119389534".to_string()),
+                        Expr::Imm("0.1111111119389534".to_string()),
+                    ],
+                },
+            },
+            Stmt::Assign {
+                dst: LValue::Var("scaled".to_string()),
+                src: Expr::CallLike {
+                    func: "fmaf".to_string(),
+                    args: vec![
+                        Expr::Reg("num".to_string()),
+                        Expr::Reg("approx".to_string()),
+                        Expr::Imm("0".to_string()),
+                    ],
+                },
+            },
+            Stmt::Assign {
+                dst: LValue::Var("corr".to_string()),
+                src: Expr::CallLike {
+                    func: "fmaf".to_string(),
+                    args: vec![
+                        Expr::Reg("scaled".to_string()),
+                        Expr::Imm("-9".to_string()),
+                        Expr::Reg("num".to_string()),
+                    ],
+                },
+            },
+            Stmt::Assign {
+                dst: LValue::Var("refined".to_string()),
+                src: Expr::CallLike {
+                    func: "fmaf".to_string(),
+                    args: vec![
+                        Expr::Reg("approx".to_string()),
+                        Expr::Reg("corr".to_string()),
+                        Expr::Reg("scaled".to_string()),
+                    ],
+                },
+            },
+            Stmt::If {
+                condition: Expr::Reg("pred".to_string()),
+                then_branch: Box::new(Stmt::Assign {
+                    dst: LValue::Var("out".to_string()),
+                    src: Expr::Reg("num".to_string()),
+                }),
+                else_branch: Some(Box::new(Stmt::Assign {
+                    dst: LValue::Var("out".to_string()),
+                    src: Expr::Reg("refined".to_string()),
+                })),
+            },
+            Stmt::Return(Some(Expr::Reg("out".to_string()))),
+        ];
+
+        let rendered = canonicalize_function(StructuredFunction {
+            params: Vec::new(),
+            locals: Vec::new(),
+            body: Stmt::Sequence(seq),
+        })
+        .body
+        .render_with_indent(0);
+        assert!(rendered.contains("out = arg0 / 9;"), "got:\n{}", rendered);
         assert!(!rendered.contains("FCHK("), "got:\n{}", rendered);
     }
 }
