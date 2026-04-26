@@ -1903,7 +1903,7 @@ fn corpus_goto_budget_is_tight() {
         // the hardest split-window reduction/remainder shapes in the corpus.
         ("ml_kernels.sass:layer_norm_forward", 32),
         ("ml_kernels.sass:softmax_forward", 8),
-        ("ml_kernels.sass:topk_per_row", 9),
+        ("ml_kernels.sass:topk_per_row", 8),
     ]
     .into();
     const SM89_TOTAL_GOTO_CEILING: usize = 100;

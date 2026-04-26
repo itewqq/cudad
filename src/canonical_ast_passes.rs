@@ -755,6 +755,9 @@ fn redundant_fallthrough_guarded_goto(stmt: &Stmt, trailing: &[Stmt]) -> bool {
     let Some((next_stmt, after_next)) = split_first_nonempty_stmt(trailing) else {
         return false;
     };
+    if guarded_goto_duplicates_fallthrough_terminator(target, trailing) {
+        return true;
+    }
     let Stmt::If {
         condition: next_condition,
         else_branch,
@@ -816,6 +819,22 @@ fn split_first_nonempty_stmt(stmts: &[Stmt]) -> Option<(&Stmt, &[Stmt])> {
         }
     }
     None
+}
+
+fn guarded_goto_duplicates_fallthrough_terminator(target: &str, trailing: &[Stmt]) -> bool {
+    let Some((fallthrough, after_fallthrough)) = split_first_nonempty_stmt(trailing) else {
+        return false;
+    };
+    if !stmt_definitely_terminates(fallthrough) {
+        return false;
+    }
+    let Some((next_stmt, _)) = split_first_nonempty_stmt(after_fallthrough) else {
+        return false;
+    };
+    let Stmt::Label { name, body } = next_stmt else {
+        return false;
+    };
+    name == target && body.as_ref() == fallthrough
 }
 
 fn exprs_are_boolean_complements(lhs: &Expr, rhs: &Expr) -> bool {
@@ -2715,6 +2734,30 @@ mod tests {
 
         assert!(rendered.contains("if (p0) goto BB1;"), "got:\n{rendered}");
         assert!(rendered.contains("if (p1)"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn canonicalize_drops_guarded_goto_to_duplicate_return_tail() {
+        let function = StructuredFunction {
+            params: Vec::new(),
+            locals: Vec::new(),
+            body: Stmt::Sequence(vec![
+                Stmt::If {
+                    condition: Expr::Reg("p0".to_string()),
+                    then_branch: Box::new(Stmt::Goto("BB1".to_string())),
+                    else_branch: None,
+                },
+                Stmt::Return(None),
+                Stmt::Label {
+                    name: "BB1".to_string(),
+                    body: Box::new(Stmt::Return(None)),
+                },
+            ]),
+        };
+
+        let rendered = canonicalize_function(function).body.render_with_indent(0);
+
+        assert_eq!(rendered.trim(), "return;", "got:\n{rendered}");
     }
 
     #[test]

@@ -521,6 +521,12 @@ ceilings structurally rather than reintroducing backend-repair passes.
   now test-only plumbing for structurizer pretty-print tests, so the canonical
   CLI/library path stops compiling a large dead backend-repair surface that the
   rewrite already superseded.
+- Another local guarded-goto cleanup now drops branch-to-label hops when the
+  fallthrough statement already terminates in exactly the same way as the
+  target label body (for example `if (P) goto BBx; return; BBx: return;`).
+  That shaved another redundant goto from `topk_per_row` and keeps the
+  simplifier rule bounded to exact AST equality instead of heuristic text
+  matching.
 - Current validation state:
   - passes: `canonicalize_`
   - passes: `trims_`
