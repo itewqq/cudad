@@ -517,6 +517,10 @@ ceilings structurally rather than reintroducing backend-repair passes.
   - `softmax_forward`: 10 -> 6
   - `topk_per_row`: 12 -> 7
   - total SM89 allow-list goto count: 92 (down from 140-ceiling era)
+- The old `ast_passes` pile is no longer part of normal binary builds. It is
+  now test-only plumbing for structurizer pretty-print tests, so the canonical
+  CLI/library path stops compiling a large dead backend-repair surface that the
+  rewrite already superseded.
 - Current validation state:
   - passes: `canonicalize_`
   - passes: `trims_`

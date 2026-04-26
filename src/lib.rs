@@ -3,6 +3,7 @@
 pub mod abi;
 pub mod ast;
 pub mod ast_lowering;
+#[cfg(test)]
 mod ast_passes;
 pub mod backend_names;
 pub mod backend_pipeline;
