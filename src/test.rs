@@ -1873,40 +1873,40 @@ fn corpus_goto_budget_is_tight() {
     let allow_list: std::collections::HashMap<&str, usize> = [
         // multi_exit_loop: 3 early-return paths inside a for-loop; the
         // compiler still tail-duplicates several exit ladders.
-        ("control_flow_kernels.sass:multi_exit_loop", 24),
+        ("control_flow_kernels.sass:multi_exit_loop", 12),
         // find_pattern: 4-deep nested loop with early return from the
         // innermost level + break propagation through 2 outer levels.
-        ("control_flow_kernels.sass:find_pattern", 8),
+        ("control_flow_kernels.sass:find_pattern", 4),
         // nested_loop_break_continue: 2-level loop with break+continue
         // at both levels — one inner/outer exit ladder remains explicit.
-        ("control_flow_kernels.sass:nested_loop_break_continue", 20),
+        ("control_flow_kernels.sass:nested_loop_break_continue", 13),
         // state_machine: one small latch still survives as an explicit goto.
         ("control_flow_kernels.sass:state_machine", 3),
         // box_blur_variable_radius: nested loop with continue (skip OOB).
         ("image_processing_kernels.sass:box_blur_variable_radius", 2),
         // string_search: loop with early break on mismatch.
-        ("data_processing_kernels.sass:string_search", 5),
+        ("data_processing_kernels.sass:string_search", 3),
         // utf8_count_chars: multi-way byte classification (if-chain on
         // byte ranges) + continuation-byte skip loop.
-        ("data_processing_kernels.sass:utf8_count_chars", 8),
+        ("data_processing_kernels.sass:utf8_count_chars", 6),
         // rle_compress: warp-level prefix/flush path still keeps a
         // scalar remainder handoff explicit.
-        ("data_processing_kernels.sass:rle_compress", 6),
+        ("data_processing_kernels.sass:rle_compress", 4),
         // count_above / cumsum_linear / batched_sgemv: strip-mined loops with
         // one entry split and one scalar remainder handoff each.
-        ("loop_kernels.sass:count_above", 6),
-        ("loop_kernels.sass:cumsum_linear", 6),
-        ("ml_kernels.sass:batched_sgemv", 6),
+        ("loop_kernels.sass:count_above", 4),
+        ("loop_kernels.sass:cumsum_linear", 3),
+        ("ml_kernels.sass:batched_sgemv", 4),
         // cross_entropy_loss: reduction + scalar cleanup path.
-        ("ml_kernels.sass:cross_entropy_loss", 8),
+        ("ml_kernels.sass:cross_entropy_loss", 4),
         // layer_norm_forward / softmax_forward / topk_per_row still exercise
         // the hardest split-window reduction/remainder shapes in the corpus.
-        ("ml_kernels.sass:layer_norm_forward", 38),
-        ("ml_kernels.sass:softmax_forward", 12),
-        ("ml_kernels.sass:topk_per_row", 14),
+        ("ml_kernels.sass:layer_norm_forward", 32),
+        ("ml_kernels.sass:softmax_forward", 8),
+        ("ml_kernels.sass:topk_per_row", 9),
     ]
     .into();
-    const SM89_TOTAL_GOTO_CEILING: usize = 140;
+    const SM89_TOTAL_GOTO_CEILING: usize = 100;
 
     let mut violations: Vec<(String, usize, usize)> = Vec::new();
     let outputs = run_corpus();

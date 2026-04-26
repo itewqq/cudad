@@ -503,6 +503,20 @@ ceilings structurally rather than reintroducing backend-repair passes.
   - the SM89 goto gate now uses bounded ceilings plus a corpus-total ceiling
     instead of exact per-kernel snapshots, so it still catches drift without
     baking today’s regressed counts in as the definition of success
+- Local canonical control-flow cleanup now also deletes redundant guarded
+  fallthrough gotos of the form `if (P) goto BBx; if (!P) { ... } BBx:` and
+  the simple `if (P) goto BBx; BBx:` case. This is still AST-native and local:
+  it only fires when the complement branch is immediately adjacent and the
+  target label is the next linear landing pad, so it does not guess across
+  arbitrary unstructured regions.
+- That local cleanup tightened the hard SM89 kernels substantially without
+  resurrecting backend-repair passes:
+  - `multi_exit_loop`: 20 -> 11 gotos
+  - `nested_loop_break_continue`: 16 -> 12
+  - `cross_entropy_loss`: 6 -> 3
+  - `softmax_forward`: 10 -> 6
+  - `topk_per_row`: 12 -> 7
+  - total SM89 allow-list goto count: 92 (down from 140-ceiling era)
 - Current validation state:
   - passes: `canonicalize_`
   - passes: `trims_`

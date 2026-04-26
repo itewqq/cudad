@@ -727,6 +727,9 @@ fn redirect_trivial_goto_sequence(stmts: Vec<Stmt>, as_block: bool) -> Stmt {
                 continue;
             }
         }
+        if redundant_fallthrough_guarded_goto(&stmt, &stmts[idx + 1..]) {
+            continue;
+        }
         out.push(stmt);
     }
 
@@ -734,6 +737,95 @@ fn redirect_trivial_goto_sequence(stmts: Vec<Stmt>, as_block: bool) -> Stmt {
         Stmt::Block(out)
     } else {
         Stmt::Sequence(out)
+    }
+}
+
+/// `if (cond) goto L; if (!cond) { ... } L:` is equivalent to
+/// `if (!cond) { ... } L:` because the guarded block is already skipped when
+/// `cond` is true. Dropping the redundant goto keeps this cleanup purely
+/// local and avoids relying on rendered-text post-processing.
+fn redundant_fallthrough_guarded_goto(stmt: &Stmt, trailing: &[Stmt]) -> bool {
+    let Some((condition, target)) = stmt_as_guarded_goto(stmt) else {
+        return false;
+    };
+    if next_stmt_is_label(trailing, target) {
+        return true;
+    }
+
+    let Some((next_stmt, after_next)) = split_first_nonempty_stmt(trailing) else {
+        return false;
+    };
+    let Stmt::If {
+        condition: next_condition,
+        else_branch,
+        ..
+    } = next_stmt
+    else {
+        return false;
+    };
+    if !else_branch
+        .as_deref()
+        .map(stmt_is_linear_empty)
+        .unwrap_or(true)
+    {
+        return false;
+    }
+    next_stmt_is_label(after_next, target)
+        && exprs_are_boolean_complements(condition, next_condition)
+}
+
+fn stmt_as_guarded_goto(stmt: &Stmt) -> Option<(&Expr, &str)> {
+    let Stmt::If {
+        condition,
+        then_branch,
+        else_branch,
+    } = stmt
+    else {
+        return None;
+    };
+    if !else_branch
+        .as_deref()
+        .map(stmt_is_linear_empty)
+        .unwrap_or(true)
+    {
+        return None;
+    }
+    let target = single_goto_target(then_branch)?;
+    Some((condition, target))
+}
+
+fn single_goto_target(stmt: &Stmt) -> Option<&str> {
+    match stmt {
+        Stmt::Goto(label) => Some(label.as_str()),
+        Stmt::Sequence(stmts) | Stmt::Block(stmts) => {
+            let mut nonempty = stmts.iter().filter(|stmt| !stmt_is_linear_empty(stmt));
+            let only = nonempty.next()?;
+            if nonempty.next().is_some() {
+                return None;
+            }
+            single_goto_target(only)
+        }
+        _ => None,
+    }
+}
+
+fn split_first_nonempty_stmt(stmts: &[Stmt]) -> Option<(&Stmt, &[Stmt])> {
+    for (idx, stmt) in stmts.iter().enumerate() {
+        if !stmt_is_linear_empty(stmt) {
+            return Some((stmt, &stmts[idx + 1..]));
+        }
+    }
+    None
+}
+
+fn exprs_are_boolean_complements(lhs: &Expr, rhs: &Expr) -> bool {
+    strip_boolean_not(lhs) == Some(rhs) || strip_boolean_not(rhs) == Some(lhs)
+}
+
+fn strip_boolean_not(expr: &Expr) -> Option<&Expr> {
+    match expr {
+        Expr::Unary { op, arg } if op == "!" => Some(arg.as_ref()),
+        _ => None,
     }
 }
 
@@ -2557,6 +2649,72 @@ mod tests {
 
         assert!(!rendered.contains("goto BB1;"), "got:\n{rendered}");
         assert!(rendered.contains("BB1:"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn canonicalize_drops_guarded_goto_around_complementary_fallthrough_branch() {
+        let function = StructuredFunction {
+            params: Vec::new(),
+            locals: Vec::new(),
+            body: Stmt::Sequence(vec![
+                Stmt::If {
+                    condition: Expr::Reg("p0".to_string()),
+                    then_branch: Box::new(Stmt::Goto("BB1".to_string())),
+                    else_branch: None,
+                },
+                Stmt::If {
+                    condition: Expr::Unary {
+                        op: "!".to_string(),
+                        arg: Box::new(Expr::Reg("p0".to_string())),
+                    },
+                    then_branch: Box::new(Stmt::Block(vec![Stmt::ExprStmt(Expr::Raw(
+                        "side_effect()".to_string(),
+                    ))])),
+                    else_branch: None,
+                },
+                Stmt::Label {
+                    name: "BB1".to_string(),
+                    body: Box::new(Stmt::Return(None)),
+                },
+            ]),
+        };
+
+        let rendered = canonicalize_function(function).body.render_with_indent(0);
+
+        assert!(!rendered.contains("goto BB1;"), "got:\n{rendered}");
+        assert!(rendered.contains("if (!p0)"), "got:\n{rendered}");
+        assert!(rendered.contains("BB1:"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn canonicalize_keeps_guarded_goto_when_following_branch_is_not_complementary() {
+        let function = StructuredFunction {
+            params: Vec::new(),
+            locals: Vec::new(),
+            body: Stmt::Sequence(vec![
+                Stmt::If {
+                    condition: Expr::Reg("p0".to_string()),
+                    then_branch: Box::new(Stmt::Goto("BB1".to_string())),
+                    else_branch: None,
+                },
+                Stmt::If {
+                    condition: Expr::Reg("p1".to_string()),
+                    then_branch: Box::new(Stmt::Block(vec![Stmt::ExprStmt(Expr::Raw(
+                        "side_effect()".to_string(),
+                    ))])),
+                    else_branch: None,
+                },
+                Stmt::Label {
+                    name: "BB1".to_string(),
+                    body: Box::new(Stmt::Return(None)),
+                },
+            ]),
+        };
+
+        let rendered = canonicalize_function(function).body.render_with_indent(0);
+
+        assert!(rendered.contains("if (p0) goto BB1;"), "got:\n{rendered}");
+        assert!(rendered.contains("if (p1)"), "got:\n{rendered}");
     }
 
     #[test]
