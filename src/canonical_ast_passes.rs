@@ -827,6 +827,10 @@ fn split_first_nonempty_stmt(stmts: &[Stmt]) -> Option<(&Stmt, &[Stmt])> {
     None
 }
 
+fn first_nonempty_stmt_index(stmts: &[Stmt]) -> Option<usize> {
+    stmts.iter().position(|stmt| !stmt_is_linear_empty(stmt))
+}
+
 fn guarded_goto_duplicates_fallthrough_terminator(target: &str, trailing: &[Stmt]) -> bool {
     let Some((fallthrough, after_fallthrough)) = split_first_nonempty_stmt(trailing) else {
         return false;
@@ -889,6 +893,18 @@ fn strip_boolean_not(expr: &Expr) -> Option<&Expr> {
     }
 }
 
+fn negate_boolean_expr(expr: Expr) -> Expr {
+    match expr {
+        Expr::Unary { op, arg } if op == "!" => *arg,
+        Expr::Imm(text) if text == "true" => Expr::Imm("false".to_string()),
+        Expr::Imm(text) if text == "false" => Expr::Imm("true".to_string()),
+        other => Expr::Unary {
+            op: "!".to_string(),
+            arg: Box::new(other),
+        },
+    }
+}
+
 fn trim_unreachable_linear_suffixes(stmt: Stmt, goto_targets: &BTreeSet<String>) -> Stmt {
     match stmt {
         Stmt::Sequence(stmts) => trim_unreachable_sequence(stmts, false, goto_targets),
@@ -936,7 +952,13 @@ fn trim_unreachable_linear_suffixes(stmt: Stmt, goto_targets: &BTreeSet<String>)
 fn cleanup_local_control_flow(body: Stmt) -> Stmt {
     let mut goto_targets = BTreeSet::new();
     collect_goto_targets(&body, &mut goto_targets);
-    redirect_trivial_gotos(trim_unreachable_linear_suffixes(body, &goto_targets))
+    let body = redirect_trivial_gotos(trim_unreachable_linear_suffixes(body, &goto_targets));
+    let mut goto_target_counts = HashMap::new();
+    collect_goto_target_counts(&body, &mut goto_target_counts);
+    redirect_trivial_gotos(fold_jump_over_branch_labels(
+        body,
+        &goto_target_counts,
+    ))
 }
 
 fn trim_unreachable_sequence(
@@ -993,6 +1015,198 @@ fn stmt_definitely_terminates(stmt: &Stmt) -> bool {
     }
 }
 
+fn collect_goto_target_counts(stmt: &Stmt, counts: &mut HashMap<String, usize>) {
+    match stmt {
+        Stmt::Block(stmts) | Stmt::Sequence(stmts) => {
+            for stmt in stmts {
+                collect_goto_target_counts(stmt, counts);
+            }
+        }
+        Stmt::Label { body, .. } => collect_goto_target_counts(body, counts),
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_goto_target_counts(then_branch, counts);
+            if let Some(else_branch) = else_branch {
+                collect_goto_target_counts(else_branch, counts);
+            }
+        }
+        Stmt::Loop { body, .. } => collect_goto_target_counts(body, counts),
+        Stmt::Switch { cases, default, .. } => {
+            for (_, body) in cases {
+                collect_goto_target_counts(body, counts);
+            }
+            if let Some(default) = default {
+                collect_goto_target_counts(default, counts);
+            }
+        }
+        Stmt::Goto(label) => {
+            *counts.entry(label.clone()).or_insert(0) += 1;
+        }
+        Stmt::Break
+        | Stmt::Continue
+        | Stmt::Return(_)
+        | Stmt::Assign { .. }
+        | Stmt::ExprStmt(_)
+        | Stmt::Empty => {}
+    }
+}
+
+/// Fold local jump-over-branch shapes that the structurizer still emits as a
+/// guarded goto plus a linear branch/label pair. This keeps the cleanup
+/// AST-native and local: it only removes a target label when that label is
+/// uniquely targeted and the moved branch bodies contain no labels.
+fn fold_jump_over_branch_labels(
+    stmt: Stmt,
+    goto_target_counts: &HashMap<String, usize>,
+) -> Stmt {
+    match stmt {
+        Stmt::Sequence(stmts) => {
+            fold_jump_over_branch_label_sequence(stmts, false, goto_target_counts)
+        }
+        Stmt::Block(stmts) => fold_jump_over_branch_label_sequence(stmts, true, goto_target_counts),
+        Stmt::Label { name, body } => Stmt::Label {
+            name,
+            body: Box::new(fold_jump_over_branch_labels(*body, goto_target_counts)),
+        },
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => Stmt::If {
+            condition,
+            then_branch: Box::new(fold_jump_over_branch_labels(
+                *then_branch,
+                goto_target_counts,
+            )),
+            else_branch: else_branch.map(|branch| {
+                Box::new(fold_jump_over_branch_labels(*branch, goto_target_counts))
+            }),
+        },
+        Stmt::Loop {
+            kind,
+            condition,
+            body,
+        } => Stmt::Loop {
+            kind,
+            condition,
+            body: Box::new(fold_jump_over_branch_labels(*body, goto_target_counts)),
+        },
+        Stmt::Switch {
+            discriminant,
+            cases,
+            default,
+        } => Stmt::Switch {
+            discriminant,
+            cases: cases
+                .into_iter()
+                .map(|(label, body)| {
+                    (label, fold_jump_over_branch_labels(body, goto_target_counts))
+                })
+                .collect(),
+            default: default.map(|body| {
+                Box::new(fold_jump_over_branch_labels(*body, goto_target_counts))
+            }),
+        },
+        other => other,
+    }
+}
+
+fn fold_jump_over_branch_label_sequence(
+    stmts: Vec<Stmt>,
+    as_block: bool,
+    goto_target_counts: &HashMap<String, usize>,
+) -> Stmt {
+    let stmts = stmts
+        .into_iter()
+        .map(|stmt| fold_jump_over_branch_labels(stmt, goto_target_counts))
+        .collect::<Vec<_>>();
+
+    let mut out = Vec::new();
+    let mut idx = 0usize;
+    while idx < stmts.len() {
+        if let Some((folded, consumed)) =
+            try_fold_jump_over_branch_label(&stmts[idx..], goto_target_counts)
+        {
+            out.push(folded);
+            idx += consumed;
+            continue;
+        }
+        out.push(stmts[idx].clone());
+        idx += 1;
+    }
+
+    if as_block {
+        Stmt::Block(out)
+    } else {
+        Stmt::Sequence(out)
+    }
+}
+
+fn try_fold_jump_over_branch_label(
+    stmts: &[Stmt],
+    goto_target_counts: &HashMap<String, usize>,
+) -> Option<(Stmt, usize)> {
+    let first = stmts.first()?;
+    let (jump_condition, target_label) = stmt_as_guarded_goto(first)?;
+    if goto_target_counts.get(target_label).copied().unwrap_or(0) != 1 {
+        return None;
+    }
+
+    let branch_idx = first_nonempty_stmt_index(&stmts[1..])?;
+    let branch_stmt = &stmts[branch_idx + 1];
+    let label_slice = &stmts[branch_idx + 2..];
+    let label_idx = first_nonempty_stmt_index(label_slice)?;
+    let label_stmt = &label_slice[label_idx];
+    let Stmt::Label { name, body } = label_stmt else {
+        return None;
+    };
+    if name != target_label || stmt_contains_any_label(body) {
+        return None;
+    }
+
+    if !stmt_contains_any_label(branch_stmt) && stmt_definitely_terminates(branch_stmt) {
+        return Some((
+            Stmt::If {
+                condition: negate_boolean_expr(jump_condition.clone()),
+                then_branch: Box::new(branch_stmt.clone()),
+                else_branch: Some(Box::new((**body).clone())),
+            },
+            branch_idx + 2 + label_idx + 1,
+        ));
+    }
+
+    let Stmt::If {
+        condition: branch_condition,
+        then_branch,
+        else_branch,
+    } = branch_stmt
+    else {
+        return None;
+    };
+    if else_branch.is_some()
+        || !stmt_definitely_terminates(then_branch)
+        || stmt_contains_any_label(then_branch)
+    {
+        return None;
+    }
+
+    Some((
+        Stmt::If {
+            condition: Expr::Binary {
+                op: "||".to_string(),
+                lhs: Box::new(jump_condition.clone()),
+                rhs: Box::new(negate_boolean_expr(branch_condition.clone())),
+            },
+            then_branch: Box::new((**body).clone()),
+            else_branch: Some(Box::new((**then_branch).clone())),
+        },
+        branch_idx + 2 + label_idx + 1,
+    ))
+}
+
 fn stmt_is_linear_empty(stmt: &Stmt) -> bool {
     match stmt {
         Stmt::Empty => true,
@@ -1029,6 +1243,39 @@ fn stmt_contains_targeted_label(stmt: &Stmt, goto_targets: &BTreeSet<String>) ->
                     .is_some_and(|body| stmt_contains_targeted_label(body, goto_targets))
         }
         _ => false,
+    }
+}
+
+fn stmt_contains_any_label(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Label { .. } => true,
+        Stmt::Sequence(stmts) | Stmt::Block(stmts) => {
+            stmts.iter().any(stmt_contains_any_label)
+        }
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            stmt_contains_any_label(then_branch)
+                || else_branch
+                    .as_deref()
+                    .is_some_and(stmt_contains_any_label)
+        }
+        Stmt::Loop { body, .. } => stmt_contains_any_label(body),
+        Stmt::Switch { cases, default, .. } => {
+            cases.iter().any(|(_, body)| stmt_contains_any_label(body))
+                || default
+                    .as_deref()
+                    .is_some_and(stmt_contains_any_label)
+        }
+        Stmt::Break
+        | Stmt::Continue
+        | Stmt::Return(_)
+        | Stmt::Assign { .. }
+        | Stmt::ExprStmt(_)
+        | Stmt::Goto(_)
+        | Stmt::Empty => false,
     }
 }
 
@@ -2822,8 +3069,8 @@ mod tests {
 
         let rendered = canonicalize_function(function).body.render_with_indent(0);
 
-        assert!(rendered.contains("if (atomicAdd(ptr, 1)) goto BB1;"), "got:\n{rendered}");
-        assert!(rendered.contains("BB1:"), "got:\n{rendered}");
+        assert!(rendered.contains("atomicAdd(ptr, 1)"), "got:\n{rendered}");
+        assert_ne!(rendered.trim(), "return;", "got:\n{rendered}");
     }
 
     #[test]
@@ -2858,6 +3105,69 @@ mod tests {
 
         assert!(rendered.contains("if (atomicAdd(ptr, 1)) goto BB1;"), "got:\n{rendered}");
         assert!(rendered.contains("if (!atomicAdd(ptr, 1))"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn canonicalize_folds_jump_over_terminating_branch_into_if_else() {
+        let function = StructuredFunction {
+            params: Vec::new(),
+            locals: Vec::new(),
+            body: Stmt::Sequence(vec![
+                Stmt::If {
+                    condition: Expr::Reg("p0".to_string()),
+                    then_branch: Box::new(Stmt::Goto("BB1".to_string())),
+                    else_branch: None,
+                },
+                Stmt::Return(Some(Expr::Imm("7".to_string()))),
+                Stmt::Label {
+                    name: "BB1".to_string(),
+                    body: Box::new(Stmt::ExprStmt(Expr::Raw("side_effect()".to_string()))),
+                },
+            ]),
+        };
+
+        let rendered = canonicalize_function(function).body.render_with_indent(0);
+
+        assert!(!rendered.contains("goto BB1;"), "got:\n{rendered}");
+        assert!(rendered.contains("if (!p0)"), "got:\n{rendered}");
+        assert!(rendered.contains("return 7;"), "got:\n{rendered}");
+        assert!(rendered.contains("side_effect();"), "got:\n{rendered}");
+        assert!(!rendered.contains("BB1:"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn canonicalize_folds_guarded_jump_over_guarded_terminating_branch() {
+        let function = StructuredFunction {
+            params: Vec::new(),
+            locals: Vec::new(),
+            body: Stmt::Sequence(vec![
+                Stmt::If {
+                    condition: Expr::Reg("p0".to_string()),
+                    then_branch: Box::new(Stmt::Goto("BB1".to_string())),
+                    else_branch: None,
+                },
+                Stmt::If {
+                    condition: Expr::Unary {
+                        op: "!".to_string(),
+                        arg: Box::new(Expr::Reg("p1".to_string())),
+                    },
+                    then_branch: Box::new(Stmt::Return(Some(Expr::Imm("9".to_string())))),
+                    else_branch: None,
+                },
+                Stmt::Label {
+                    name: "BB1".to_string(),
+                    body: Box::new(Stmt::ExprStmt(Expr::Raw("side_effect()".to_string()))),
+                },
+            ]),
+        };
+
+        let rendered = canonicalize_function(function).body.render_with_indent(0);
+
+        assert!(!rendered.contains("goto BB1;"), "got:\n{rendered}");
+        assert!(rendered.contains("if (p0 || p1)"), "got:\n{rendered}");
+        assert!(rendered.contains("return 9;"), "got:\n{rendered}");
+        assert!(rendered.contains("side_effect();"), "got:\n{rendered}");
+        assert!(!rendered.contains("BB1:"), "got:\n{rendered}");
     }
 
     #[test]

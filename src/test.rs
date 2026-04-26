@@ -1868,7 +1868,7 @@ fn corpus_goto_budget_is_tight() {
     let allow_list: std::collections::HashMap<&str, usize> = [
         // multi_exit_loop: 3 early-return paths inside a for-loop; the
         // compiler still tail-duplicates several exit ladders.
-        ("control_flow_kernels.sass:multi_exit_loop", 11),
+        ("control_flow_kernels.sass:multi_exit_loop", 10),
         // find_pattern: 4-deep nested loop with early return from the
         // innermost level + break propagation through 2 outer levels.
         ("control_flow_kernels.sass:find_pattern", 3),
@@ -1886,22 +1886,22 @@ fn corpus_goto_budget_is_tight() {
         ("data_processing_kernels.sass:utf8_count_chars", 5),
         // rle_compress: warp-level prefix/flush path still keeps a
         // scalar remainder handoff explicit.
-        ("data_processing_kernels.sass:rle_compress", 3),
+        ("data_processing_kernels.sass:rle_compress", 2),
         // count_above / cumsum_linear / batched_sgemv: strip-mined loops with
         // one entry split and one scalar remainder handoff each.
-        ("loop_kernels.sass:count_above", 3),
+        ("loop_kernels.sass:count_above", 2),
         ("loop_kernels.sass:cumsum_linear", 2),
-        ("ml_kernels.sass:batched_sgemv", 3),
+        ("ml_kernels.sass:batched_sgemv", 2),
         // cross_entropy_loss: reduction + scalar cleanup path.
         ("ml_kernels.sass:cross_entropy_loss", 3),
         // layer_norm_forward / softmax_forward / topk_per_row still exercise
         // the hardest split-window reduction/remainder shapes in the corpus.
         ("ml_kernels.sass:layer_norm_forward", 29),
-        ("ml_kernels.sass:softmax_forward", 6),
+        ("ml_kernels.sass:softmax_forward", 5),
         ("ml_kernels.sass:topk_per_row", 6),
     ]
     .into();
-    const SM89_TOTAL_GOTO_CEILING: usize = 91;
+    const SM89_TOTAL_GOTO_CEILING: usize = 86;
 
     let mut violations: Vec<(String, usize, usize)> = Vec::new();
     let outputs = run_corpus();

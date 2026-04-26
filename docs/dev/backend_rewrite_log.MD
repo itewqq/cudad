@@ -538,6 +538,20 @@ ceilings structurally rather than reintroducing backend-repair passes.
   `src/ast_passes/tests.rs` are gone, and structurizer pretty-print tests now
   run through the live canonical AST cleanup instead of the retired repair
   pipeline.
+- Canonical control-flow cleanup now folds another common jump-over-branch
+  shape into structured `if` / `if-else` directly in the AST:
+  - `if (P) goto BBx; <terminating branch>; BBx: ...` becomes a local `if-else`
+  - `if (P) goto BBx; if (Q) { <terminating branch> } BBx: ...` becomes
+    `if (P || !Q) { ... } else { <terminating branch> }`
+  This stays local and label-safe: it only fires when `BBx` has a unique goto
+  target and the moved branch bodies contain no labels.
+- That fold tightened the remaining SM89 goto debt again:
+  - `multi_exit_loop`: 11 -> 10
+  - `rle_compress`: 3 -> 2
+  - `count_above`: 3 -> 2
+  - `batched_sgemv`: 3 -> 2
+  - `softmax_forward`: 6 -> 5
+  - total SM89 allow-list goto count: 86
 - Current validation state:
   - passes: `canonicalize_`
   - passes: `trims_`
