@@ -534,6 +534,10 @@ ceilings structurally rather than reintroducing backend-repair passes.
   - the strict SM89 goto-budget test is now a true ratchet: the allow-list
     records the exact currently-observed counts and stale budgets fail the test
     instead of printing a hint
+- Deleted another dead backend surface entirely: `src/ast_passes.rs` and
+  `src/ast_passes/tests.rs` are gone, and structurizer pretty-print tests now
+  run through the live canonical AST cleanup instead of the retired repair
+  pipeline.
 - Current validation state:
   - passes: `canonicalize_`
   - passes: `trims_`

@@ -6,7 +6,9 @@ use crate::ast::{
     Expr as AstExpr, IntrinsicOp, LValue as AstLValue, LoopKind as AstLoopKind, Stmt as AstStmt,
 };
 #[cfg(test)]
-use crate::ast_passes::ast_simplify;
+use crate::ast::StructuredFunction;
+#[cfg(test)]
+use crate::canonical_ast_passes::canonicalize_function;
 use crate::cfg::ControlFlowGraph;
 use crate::ir::{DisplayCtx, FunctionIR, IRBlock, IRCond, IRExpr, IRStatement, RValue, RegId};
 
@@ -719,9 +721,10 @@ impl<'a> Structurizer<'a> {
         let side_effect_only =
             ir_s.defs.is_empty() || ir_s.defs.iter().all(Self::is_zero_or_true_reg);
         let value_expr = Self::ast_value_from_rvalue(ctx, &ir_s.value);
-        let pred_expr = ir_s.pred.as_ref().map(|pred| {
-            self.resolve_stmt_predicate_expr_ast(block_id, stmt_idx, pred, ctx)
-        });
+        let pred_expr = ir_s
+            .pred
+            .as_ref()
+            .map(|pred| self.resolve_stmt_predicate_expr_ast(block_id, stmt_idx, pred, ctx));
 
         if side_effect_only {
             return vec![Self::ast_guarded(pred_expr, AstStmt::ExprStmt(value_expr))];
@@ -848,12 +851,7 @@ impl<'a> Structurizer<'a> {
                 continue;
             }
 
-            out.extend(self.lower_non_control_stmt_ast(
-                block_id,
-                lookup_stmt_idx,
-                ir_s,
-                ctx,
-            ));
+            out.extend(self.lower_non_control_stmt_ast(block_id, lookup_stmt_idx, ir_s, ctx));
         }
 
         Self::ast_sequence(out)
@@ -1566,11 +1564,7 @@ impl<'a> Structurizer<'a> {
         }
     }
 
-    fn lower_condition_prelude_ast(
-        &self,
-        block_id: usize,
-        ctx: &dyn DisplayCtx,
-    ) -> AstStmt {
+    fn lower_condition_prelude_ast(&self, block_id: usize, ctx: &dyn DisplayCtx) -> AstStmt {
         let Some(block) = self.get_ir_block(block_id) else {
             return AstStmt::Empty;
         };
@@ -1609,11 +1603,7 @@ impl<'a> Structurizer<'a> {
         match condition_expr {
             IRExpr::Op { op, args } if op == "!" && args.len() == 1 => AstExpr::Unary {
                 op: "!".to_string(),
-                arg: Box::new(self.lower_condition_expr_ast(
-                    condition_block_id,
-                    &args[0],
-                    ctx,
-                )),
+                arg: Box::new(self.lower_condition_expr_ast(condition_block_id, &args[0], ctx)),
             },
             IRExpr::Reg(_) => Self::ast_expr_from_display(ctx, condition_expr),
             _ => Self::ast_expr_from_display(ctx, condition_expr),
@@ -1972,8 +1962,13 @@ impl<'a> Structurizer<'a> {
         ctx: &dyn DisplayCtx,
         indent_level: usize,
     ) -> String {
-        ast_simplify(self.lower_structured_stmt_ast(stmt, ctx))
-            .render_with_indent(indent_level)
+        canonicalize_function(StructuredFunction {
+            params: Vec::new(),
+            locals: Vec::new(),
+            body: self.lower_structured_stmt_ast(stmt, ctx),
+        })
+        .body
+        .render_with_indent(indent_level)
     }
 }
 
