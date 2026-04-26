@@ -527,6 +527,13 @@ ceilings structurally rather than reintroducing backend-repair passes.
   That shaved another redundant goto from `topk_per_row` and keeps the
   simplifier rule bounded to exact AST equality instead of heuristic text
   matching.
+- Review-fix follow-up:
+  - guarded-goto cleanup is now purity-gated, so we only erase the branch when
+    its predicate is syntactically side-effect free under a dedicated control-
+    cleanup purity rule (no raw helpers, no loads, no call-like nodes)
+  - the strict SM89 goto-budget test is now a true ratchet: the allow-list
+    records the exact currently-observed counts and stale budgets fail the test
+    instead of printing a hint
 - Current validation state:
   - passes: `canonicalize_`
   - passes: `trims_`

@@ -748,6 +748,9 @@ fn redundant_fallthrough_guarded_goto(stmt: &Stmt, trailing: &[Stmt]) -> bool {
     let Some((condition, target)) = stmt_as_guarded_goto(stmt) else {
         return false;
     };
+    if !expr_is_pure_for_control_cleanup(condition) {
+        return false;
+    }
     if next_stmt_is_label(trailing, target) {
         return true;
     }
@@ -771,6 +774,9 @@ fn redundant_fallthrough_guarded_goto(stmt: &Stmt, trailing: &[Stmt]) -> bool {
         .map(stmt_is_linear_empty)
         .unwrap_or(true)
     {
+        return false;
+    }
+    if !expr_is_pure_for_control_cleanup(next_condition) {
         return false;
     }
     next_stmt_is_label(after_next, target)
@@ -835,6 +841,41 @@ fn guarded_goto_duplicates_fallthrough_terminator(target: &str, trailing: &[Stmt
         return false;
     };
     name == target && body.as_ref() == fallthrough
+}
+
+/// Control-flow cleanup may erase an entire `if` statement, so keep the
+/// predicate vocabulary narrower than general DCE purity. In particular we do
+/// not fold away raw helpers, loads, or call-like nodes even if some of them
+/// are otherwise classified as pure for expression pruning.
+fn expr_is_pure_for_control_cleanup(expr: &Expr) -> bool {
+    match expr {
+        Expr::Raw(_) | Expr::CallLike { .. } | Expr::Load { .. } | Expr::Index { .. } => false,
+        Expr::Imm(_)
+        | Expr::Reg(_)
+        | Expr::PtrLane { .. }
+        | Expr::LaneExtract { .. }
+        | Expr::ConstMemSymbol(_)
+        | Expr::Builtin(_)
+        | Expr::Addr64 { .. } => true,
+        Expr::Unary { arg, .. } => expr_is_pure_for_control_cleanup(arg),
+        Expr::Binary { lhs, rhs, .. } => {
+            expr_is_pure_for_control_cleanup(lhs) && expr_is_pure_for_control_cleanup(rhs)
+        }
+        Expr::Ternary {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            expr_is_pure_for_control_cleanup(cond)
+                && expr_is_pure_for_control_cleanup(then_expr)
+                && expr_is_pure_for_control_cleanup(else_expr)
+        }
+        Expr::Intrinsic { args, .. } => args.iter().all(expr_is_pure_for_control_cleanup),
+        Expr::WidePtr { base, offset } => {
+            expr_is_pure_for_control_cleanup(base) && expr_is_pure_for_control_cleanup(offset)
+        }
+        Expr::Cast { expr, .. } => expr_is_pure_for_control_cleanup(expr),
+    }
 }
 
 fn exprs_are_boolean_complements(lhs: &Expr, rhs: &Expr) -> bool {
@@ -2758,6 +2799,65 @@ mod tests {
         let rendered = canonicalize_function(function).body.render_with_indent(0);
 
         assert_eq!(rendered.trim(), "return;", "got:\n{rendered}");
+    }
+
+    #[test]
+    fn canonicalize_keeps_impure_guarded_goto_to_duplicate_return_tail() {
+        let function = StructuredFunction {
+            params: Vec::new(),
+            locals: Vec::new(),
+            body: Stmt::Sequence(vec![
+                Stmt::If {
+                    condition: Expr::Raw("atomicAdd(ptr, 1)".to_string()),
+                    then_branch: Box::new(Stmt::Goto("BB1".to_string())),
+                    else_branch: None,
+                },
+                Stmt::Return(None),
+                Stmt::Label {
+                    name: "BB1".to_string(),
+                    body: Box::new(Stmt::Return(None)),
+                },
+            ]),
+        };
+
+        let rendered = canonicalize_function(function).body.render_with_indent(0);
+
+        assert!(rendered.contains("if (atomicAdd(ptr, 1)) goto BB1;"), "got:\n{rendered}");
+        assert!(rendered.contains("BB1:"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn canonicalize_keeps_impure_complementary_guarded_branch_pair() {
+        let function = StructuredFunction {
+            params: Vec::new(),
+            locals: Vec::new(),
+            body: Stmt::Sequence(vec![
+                Stmt::If {
+                    condition: Expr::Raw("atomicAdd(ptr, 1)".to_string()),
+                    then_branch: Box::new(Stmt::Goto("BB1".to_string())),
+                    else_branch: None,
+                },
+                Stmt::If {
+                    condition: Expr::Unary {
+                        op: "!".to_string(),
+                        arg: Box::new(Expr::Raw("atomicAdd(ptr, 1)".to_string())),
+                    },
+                    then_branch: Box::new(Stmt::Block(vec![Stmt::ExprStmt(Expr::Raw(
+                        "side_effect()".to_string(),
+                    ))])),
+                    else_branch: None,
+                },
+                Stmt::Label {
+                    name: "BB1".to_string(),
+                    body: Box::new(Stmt::Return(None)),
+                },
+            ]),
+        };
+
+        let rendered = canonicalize_function(function).body.render_with_indent(0);
+
+        assert!(rendered.contains("if (atomicAdd(ptr, 1)) goto BB1;"), "got:\n{rendered}");
+        assert!(rendered.contains("if (!atomicAdd(ptr, 1))"), "got:\n{rendered}");
     }
 
     #[test]

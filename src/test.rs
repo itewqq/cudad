@@ -1860,53 +1860,48 @@ fn corpus_output_is_deterministic() {
 
 #[test]
 fn corpus_goto_budget_is_tight() {
-    // Per-fixture goto budget. The aspiration is zero gotos everywhere, but
-    // until every pattern is covered by collapse rules we allow a small
-    // budget per function to keep progress visible. Tighten as the
-    // structurizer improves.
-    //
-    // Functions with genuinely complex multi-exit/early-return patterns get
-    // an explicit ceiling. Everything else must still be zero. These are not
-    // exact baselines: leave a little room for benign churn while still
-    // catching real regressions, and tighten them as the structurizer gains
-    // better loop/remainder recovery.
+    // Per-fixture goto ratchet. The aspiration is still zero gotos
+    // everywhere, but until every hard shape is structurized this test keeps
+    // the remaining allow-list at the exact currently-observed counts. Any
+    // regression or any structural improvement must update the table in the
+    // same commit so the debt stays visible.
     let allow_list: std::collections::HashMap<&str, usize> = [
         // multi_exit_loop: 3 early-return paths inside a for-loop; the
         // compiler still tail-duplicates several exit ladders.
-        ("control_flow_kernels.sass:multi_exit_loop", 12),
+        ("control_flow_kernels.sass:multi_exit_loop", 11),
         // find_pattern: 4-deep nested loop with early return from the
         // innermost level + break propagation through 2 outer levels.
-        ("control_flow_kernels.sass:find_pattern", 4),
+        ("control_flow_kernels.sass:find_pattern", 3),
         // nested_loop_break_continue: 2-level loop with break+continue
         // at both levels — one inner/outer exit ladder remains explicit.
-        ("control_flow_kernels.sass:nested_loop_break_continue", 13),
+        ("control_flow_kernels.sass:nested_loop_break_continue", 12),
         // state_machine: one small latch still survives as an explicit goto.
-        ("control_flow_kernels.sass:state_machine", 3),
+        ("control_flow_kernels.sass:state_machine", 2),
         // box_blur_variable_radius: nested loop with continue (skip OOB).
-        ("image_processing_kernels.sass:box_blur_variable_radius", 2),
+        ("image_processing_kernels.sass:box_blur_variable_radius", 1),
         // string_search: loop with early break on mismatch.
-        ("data_processing_kernels.sass:string_search", 3),
+        ("data_processing_kernels.sass:string_search", 2),
         // utf8_count_chars: multi-way byte classification (if-chain on
         // byte ranges) + continuation-byte skip loop.
-        ("data_processing_kernels.sass:utf8_count_chars", 6),
+        ("data_processing_kernels.sass:utf8_count_chars", 5),
         // rle_compress: warp-level prefix/flush path still keeps a
         // scalar remainder handoff explicit.
-        ("data_processing_kernels.sass:rle_compress", 4),
+        ("data_processing_kernels.sass:rle_compress", 3),
         // count_above / cumsum_linear / batched_sgemv: strip-mined loops with
         // one entry split and one scalar remainder handoff each.
-        ("loop_kernels.sass:count_above", 4),
-        ("loop_kernels.sass:cumsum_linear", 3),
-        ("ml_kernels.sass:batched_sgemv", 4),
+        ("loop_kernels.sass:count_above", 3),
+        ("loop_kernels.sass:cumsum_linear", 2),
+        ("ml_kernels.sass:batched_sgemv", 3),
         // cross_entropy_loss: reduction + scalar cleanup path.
-        ("ml_kernels.sass:cross_entropy_loss", 4),
+        ("ml_kernels.sass:cross_entropy_loss", 3),
         // layer_norm_forward / softmax_forward / topk_per_row still exercise
         // the hardest split-window reduction/remainder shapes in the corpus.
-        ("ml_kernels.sass:layer_norm_forward", 32),
-        ("ml_kernels.sass:softmax_forward", 8),
-        ("ml_kernels.sass:topk_per_row", 8),
+        ("ml_kernels.sass:layer_norm_forward", 29),
+        ("ml_kernels.sass:softmax_forward", 6),
+        ("ml_kernels.sass:topk_per_row", 6),
     ]
     .into();
-    const SM89_TOTAL_GOTO_CEILING: usize = 100;
+    const SM89_TOTAL_GOTO_CEILING: usize = 91;
 
     let mut violations: Vec<(String, usize, usize)> = Vec::new();
     let outputs = run_corpus();
@@ -1943,26 +1938,27 @@ fn corpus_goto_budget_is_tight() {
         SM89_TOTAL_GOTO_CEILING
     );
 
-    // Also verify the allow-list isn't stale: if a function's goto count
-    // drops below its budget, we want to tighten the budget.
-    let mut over_budget: Vec<String> = Vec::new();
+    // Also verify the allow-list isn't stale: structural improvements must
+    // ratchet the table downward immediately instead of silently carrying
+    // slack that would hide later regressions.
+    let mut stale_budgets: Vec<String> = Vec::new();
     for (file, name, out) in run_corpus() {
         let key = format!("{}:{}", file, name);
         let gotos = out.matches("goto BB").count();
         if let Some(&budget) = allow_list.get(key.as_str()) {
             if gotos < budget {
-                over_budget.push(format!(
+                stale_budgets.push(format!(
                     "  {} — gotos: {} but budget is {} (tighten!)",
                     key, gotos, budget
                 ));
             }
         }
     }
-    if !over_budget.is_empty() {
-        over_budget.sort();
-        eprintln!(
-            "HINT: some allow-list budgets can be tightened:\n{}",
-            over_budget.join("\n")
+    if !stale_budgets.is_empty() {
+        stale_budgets.sort();
+        panic!(
+            "corpus goto budget table is stale:\n{}",
+            stale_budgets.join("\n")
         );
     }
 }
