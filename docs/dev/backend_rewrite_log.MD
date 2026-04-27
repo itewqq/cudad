@@ -400,6 +400,10 @@
   deleted, `relu` accepts either inline or named comparison guards, and the
   `dot_thread` coverage now pins typed pointer symbols / resolved param words
   instead of exact loop-carried temp choreography from a transitional backend.
+- Jump-over-branch goto folding now requires the target label to be the
+  immediate next non-empty statement after the candidate branch, which keeps
+  canonical cleanup from skipping reachable side effects when collapsing
+  single-use goto ladders.
 
 ## Next safe step
 
@@ -409,8 +413,8 @@
 2. Keep the new post-bind cleanup rules conservative: preserve any structured
    subtree that contains a live goto target, and only trim duplicate labels
    from linear leading prefixes that are already emitted on every path.
-3. Stage these review fixes as one atomic commit, then re-run review before the
-   next structurizer-tightening slice.
+3. After the next 3-5 cleanup commits, run another sub-agent review and fold
+   its findings back in before touching the remaining goto-budget gates.
 
 ## Open questions
 

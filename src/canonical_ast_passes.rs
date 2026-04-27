@@ -1158,12 +1158,11 @@ fn try_fold_jump_over_branch_label(
     let branch_idx = first_nonempty_stmt_index(&stmts[1..])?;
     let branch_stmt = &stmts[branch_idx + 1];
     let label_slice = &stmts[branch_idx + 2..];
-    let label_idx = first_nonempty_stmt_index(label_slice)?;
-    let label_stmt = &label_slice[label_idx];
-    let Stmt::Label { name, body } = label_stmt else {
-        return None;
-    };
-    if name != target_label || stmt_contains_any_label(body) {
+    // Only linear-empty placeholders may sit between the terminating branch and
+    // the target label. Any real statement must block the fold so we never
+    // consume or reorder side effects while collapsing the goto ladder.
+    let (label_idx, body) = take_immediate_target_label(label_slice, target_label)?;
+    if stmt_contains_any_label(body) {
         return None;
     }
 
@@ -1172,7 +1171,7 @@ fn try_fold_jump_over_branch_label(
             Stmt::If {
                 condition: negate_boolean_expr(jump_condition.clone()),
                 then_branch: Box::new(branch_stmt.clone()),
-                else_branch: Some(Box::new((**body).clone())),
+                else_branch: Some(Box::new(body.clone())),
             },
             branch_idx + 2 + label_idx + 1,
         ));
@@ -1200,11 +1199,19 @@ fn try_fold_jump_over_branch_label(
                 lhs: Box::new(jump_condition.clone()),
                 rhs: Box::new(negate_boolean_expr(branch_condition.clone())),
             },
-            then_branch: Box::new((**body).clone()),
+            then_branch: Box::new(body.clone()),
             else_branch: Some(Box::new((**then_branch).clone())),
         },
         branch_idx + 2 + label_idx + 1,
     ))
+}
+
+fn take_immediate_target_label<'a>(stmts: &'a [Stmt], target_label: &str) -> Option<(usize, &'a Stmt)> {
+    let label_idx = first_nonempty_stmt_index(stmts)?;
+    let Stmt::Label { name, body } = &stmts[label_idx] else {
+        return None;
+    };
+    (name == target_label).then_some((label_idx, body.as_ref()))
 }
 
 fn stmt_is_linear_empty(stmt: &Stmt) -> bool {
@@ -3168,6 +3175,40 @@ mod tests {
         assert!(rendered.contains("return 9;"), "got:\n{rendered}");
         assert!(rendered.contains("side_effect();"), "got:\n{rendered}");
         assert!(!rendered.contains("BB1:"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn canonicalize_keeps_jump_over_branch_when_statement_intervenes_before_label() {
+        let function = StructuredFunction {
+            params: Vec::new(),
+            locals: Vec::new(),
+            body: Stmt::Sequence(vec![
+                Stmt::If {
+                    condition: Expr::Reg("p0".to_string()),
+                    then_branch: Box::new(Stmt::Goto("BB1".to_string())),
+                    else_branch: None,
+                },
+                Stmt::If {
+                    condition: Expr::Reg("p1".to_string()),
+                    then_branch: Box::new(Stmt::Return(Some(Expr::Imm("7".to_string())))),
+                    else_branch: None,
+                },
+                Stmt::ExprStmt(Expr::Raw("side_effect()".to_string())),
+                Stmt::Label {
+                    name: "BB1".to_string(),
+                    body: Box::new(Stmt::ExprStmt(Expr::Raw("tail_effect()".to_string()))),
+                },
+            ]),
+        };
+
+        let rendered = canonicalize_function(function).body.render_with_indent(0);
+
+        assert!(rendered.contains("if (p0) goto BB1;"), "got:\n{rendered}");
+        assert!(rendered.contains("if (p1)"), "got:\n{rendered}");
+        assert!(rendered.contains("return 7;"), "got:\n{rendered}");
+        assert!(rendered.contains("side_effect();"), "got:\n{rendered}");
+        assert!(rendered.contains("BB1:"), "got:\n{rendered}");
+        assert!(rendered.contains("tail_effect();"), "got:\n{rendered}");
     }
 
     #[test]
