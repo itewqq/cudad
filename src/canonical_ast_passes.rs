@@ -4099,7 +4099,7 @@ mod tests {
     }
 
     #[test]
-    fn canonicalize_keeps_guarded_goto_when_following_branch_is_not_complementary() {
+    fn canonicalize_folds_guarded_goto_over_noncomplementary_fallthrough_return() {
         let function = StructuredFunction {
             params: Vec::new(),
             locals: Vec::new(),
@@ -4181,7 +4181,7 @@ mod tests {
     }
 
     #[test]
-    fn canonicalize_keeps_impure_complementary_guarded_branch_pair() {
+    fn canonicalize_preserves_impure_double_eval_when_folding_branch_pair() {
         let function = StructuredFunction {
             params: Vec::new(),
             locals: Vec::new(),
@@ -4414,7 +4414,7 @@ mod tests {
     }
 
     #[test]
-    fn canonicalize_keeps_jump_over_branch_when_statement_intervenes_before_label() {
+    fn canonicalize_folds_jump_over_branch_even_with_intervening_fallthrough_work() {
         let function = StructuredFunction {
             params: Vec::new(),
             locals: Vec::new(),
@@ -4586,7 +4586,7 @@ mod tests {
     }
 
     #[test]
-    fn canonicalize_keeps_impure_fallthrough_guarded_goto() {
+    fn canonicalize_elides_impure_guarded_goto_to_immediate_fallthrough_label() {
         let function = StructuredFunction {
             params: Vec::new(),
             locals: Vec::new(),
