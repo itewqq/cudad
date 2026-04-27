@@ -371,7 +371,11 @@ fn simplify_local_cleanup_regions(
         Stmt::Block(stmts) => simplify_local_cleanup_sequence(stmts, true, goto_targets, live_out),
         Stmt::Label { name, body } => Stmt::Label {
             name,
-            body: Box::new(simplify_local_cleanup_regions(*body, goto_targets, live_out)),
+            body: Box::new(simplify_local_cleanup_regions(
+                *body,
+                goto_targets,
+                live_out,
+            )),
         },
         Stmt::If {
             condition,
@@ -386,7 +390,11 @@ fn simplify_local_cleanup_regions(
                     live_out,
                 )),
                 else_branch: else_branch.map(|branch| {
-                    Box::new(simplify_local_cleanup_regions(*branch, goto_targets, live_out))
+                    Box::new(simplify_local_cleanup_regions(
+                        *branch,
+                        goto_targets,
+                        live_out,
+                    ))
                 }),
             },
             goto_targets,
@@ -423,11 +431,19 @@ fn simplify_local_cleanup_regions(
                 cases: cases
                     .into_iter()
                     .map(|(label, body)| {
-                        (label, simplify_local_cleanup_regions(body, goto_targets, live_out))
+                        (
+                            label,
+                            simplify_local_cleanup_regions(body, goto_targets, live_out),
+                        )
                     })
                     .collect(),
-                default: default
-                    .map(|body| Box::new(simplify_local_cleanup_regions(*body, goto_targets, live_out))),
+                default: default.map(|body| {
+                    Box::new(simplify_local_cleanup_regions(
+                        *body,
+                        goto_targets,
+                        live_out,
+                    ))
+                }),
             },
             goto_targets,
         ),
@@ -454,25 +470,25 @@ fn simplify_local_cleanup_sequence(
 
     let flush_chunk =
         |out: &mut Vec<Stmt>, chunk: &mut Vec<Stmt>, chunk_live_out: &mut BTreeSet<String>| {
-        if chunk.is_empty() {
-            return;
-        }
-        let chunk_stmt = if as_block {
-            Stmt::Block(std::mem::take(chunk))
-        } else {
-            Stmt::Sequence(std::mem::take(chunk))
+            if chunk.is_empty() {
+                return;
+            }
+            let chunk_stmt = if as_block {
+                Stmt::Block(std::mem::take(chunk))
+            } else {
+                Stmt::Sequence(std::mem::take(chunk))
+            };
+            let simplified = simplify_trivial_stmt(
+                prune_dead_pure_stmt_with_live_out(chunk_stmt, chunk_live_out.clone()),
+                goto_targets,
+            );
+            match simplified {
+                Stmt::Empty => {}
+                Stmt::Sequence(inner) | Stmt::Block(inner) => out.extend(inner),
+                other => out.push(other),
+            }
+            *chunk_live_out = live_out.clone();
         };
-        let simplified = simplify_trivial_stmt(
-            prune_dead_pure_stmt_with_live_out(chunk_stmt, chunk_live_out.clone()),
-            goto_targets,
-        );
-        match simplified {
-            Stmt::Empty => {}
-            Stmt::Sequence(inner) | Stmt::Block(inner) => out.extend(inner),
-            other => out.push(other),
-        }
-        *chunk_live_out = live_out.clone();
-    };
 
     for (idx, stmt) in stmts.into_iter().enumerate() {
         let stmt = simplify_local_cleanup_regions(stmt, goto_targets, &future_used[idx]);
@@ -906,9 +922,9 @@ fn negate_boolean_expr(expr: Expr) -> Expr {
 }
 
 fn normalize_local_if_control(stmt: Stmt) -> Stmt {
-    simplify_empty_if_arms(strip_fallthrough_branch_gotos(
-        merge_nested_redundant_ifs(merge_complementary_linear_ifs(stmt)),
-    ))
+    simplify_empty_if_arms(strip_fallthrough_branch_gotos(merge_nested_redundant_ifs(
+        merge_complementary_linear_ifs(stmt),
+    )))
 }
 
 fn merge_complementary_linear_ifs(stmt: Stmt) -> Stmt {
@@ -948,8 +964,7 @@ fn merge_complementary_linear_ifs(stmt: Stmt) -> Stmt {
                 .into_iter()
                 .map(|(label, body)| (label, merge_complementary_linear_ifs(body)))
                 .collect(),
-            default: default
-                .map(|body| Box::new(merge_complementary_linear_ifs(*body))),
+            default: default.map(|body| Box::new(merge_complementary_linear_ifs(*body))),
         },
         other => other,
     }
@@ -957,9 +972,9 @@ fn merge_complementary_linear_ifs(stmt: Stmt) -> Stmt {
 
 fn merge_nested_redundant_ifs(stmt: Stmt) -> Stmt {
     match stmt {
-        Stmt::Sequence(stmts) => Stmt::Sequence(
-            stmts.into_iter().map(merge_nested_redundant_ifs).collect(),
-        ),
+        Stmt::Sequence(stmts) => {
+            Stmt::Sequence(stmts.into_iter().map(merge_nested_redundant_ifs).collect())
+        }
         Stmt::Block(stmts) => {
             Stmt::Block(stmts.into_iter().map(merge_nested_redundant_ifs).collect())
         }
@@ -1146,8 +1161,7 @@ fn strip_fallthrough_branch_gotos(stmt: Stmt) -> Stmt {
                 .into_iter()
                 .map(|(label, body)| (label, strip_fallthrough_branch_gotos(body)))
                 .collect(),
-            default: default
-                .map(|body| Box::new(strip_fallthrough_branch_gotos(*body))),
+            default: default.map(|body| Box::new(strip_fallthrough_branch_gotos(*body))),
         },
         other => other,
     }
@@ -1266,9 +1280,9 @@ fn strip_fallthrough_goto_from_if(stmt: &Stmt, trailing: &[Stmt]) -> Option<Stmt
     Some(Stmt::If {
         condition: condition.clone(),
         then_branch: Box::new(new_then.unwrap_or_else(|| then_branch.as_ref().clone())),
-        else_branch: else_branch.as_ref().map(|branch| {
-            Box::new(new_else.unwrap_or_else(|| branch.as_ref().clone()))
-        }),
+        else_branch: else_branch
+            .as_ref()
+            .map(|branch| Box::new(new_else.unwrap_or_else(|| branch.as_ref().clone()))),
     })
 }
 
@@ -1282,9 +1296,9 @@ fn next_immediate_label_name(stmts: &[Stmt]) -> Option<&str> {
 
 fn stmt_writes_any_named_var(stmt: &Stmt, vars: &BTreeSet<String>) -> bool {
     match stmt {
-        Stmt::Block(stmts) | Stmt::Sequence(stmts) => {
-            stmts.iter().any(|stmt| stmt_writes_any_named_var(stmt, vars))
-        }
+        Stmt::Block(stmts) | Stmt::Sequence(stmts) => stmts
+            .iter()
+            .any(|stmt| stmt_writes_any_named_var(stmt, vars)),
         Stmt::Label { body, .. } => stmt_writes_any_named_var(body, vars),
         Stmt::If {
             then_branch,
@@ -1411,6 +1425,7 @@ fn cleanup_local_control_flow(body: Stmt) -> Stmt {
     let mut goto_targets = BTreeSet::new();
     collect_goto_targets(&body, &mut goto_targets);
     let body = strip_untargeted_labels(body, &goto_targets);
+    let body = fold_branch_skip_to_enclosing_join(body);
     let mut goto_target_counts = HashMap::new();
     collect_goto_target_counts(&body, &mut goto_target_counts);
     let body = fold_guarded_skip_regions(body, &goto_target_counts);
@@ -1470,9 +1485,7 @@ fn stmt_definitely_terminates(stmt: &Stmt) -> bool {
                 && cases
                     .iter()
                     .all(|(_, body)| stmt_definitely_terminates(body))
-                && default
-                    .as_deref()
-                    .is_some_and(stmt_definitely_terminates)
+                && default.as_deref().is_some_and(stmt_definitely_terminates)
         }
         _ => false,
     }
@@ -1500,9 +1513,8 @@ fn inline_terminal_forward_gotos_with_future(stmt: Stmt, future: &[Stmt]) -> Stm
                 *then_branch,
                 future,
             )),
-            else_branch: else_branch.map(|branch| {
-                Box::new(inline_terminal_forward_gotos_with_future(*branch, future))
-            }),
+            else_branch: else_branch
+                .map(|branch| Box::new(inline_terminal_forward_gotos_with_future(*branch, future))),
         },
         Stmt::Loop {
             kind,
@@ -1528,9 +1540,8 @@ fn inline_terminal_forward_gotos_with_future(stmt: Stmt, future: &[Stmt]) -> Stm
                     )
                 })
                 .collect(),
-            default: default.map(|body| {
-                Box::new(inline_terminal_forward_gotos_with_future(*body, future))
-            }),
+            default: default
+                .map(|body| Box::new(inline_terminal_forward_gotos_with_future(*body, future))),
         },
         Stmt::Goto(label) => {
             find_first_inlineable_label_tail(future, &label).unwrap_or(Stmt::Goto(label))
@@ -1539,7 +1550,11 @@ fn inline_terminal_forward_gotos_with_future(stmt: Stmt, future: &[Stmt]) -> Stm
     }
 }
 
-fn inline_terminal_forward_goto_sequence(stmts: Vec<Stmt>, as_block: bool, future: &[Stmt]) -> Stmt {
+fn inline_terminal_forward_goto_sequence(
+    stmts: Vec<Stmt>,
+    as_block: bool,
+    future: &[Stmt],
+) -> Stmt {
     let mut out = Vec::with_capacity(stmts.len());
     for idx in 0..stmts.len() {
         let mut lexical_future = stmts[idx + 1..].to_vec();
@@ -1578,12 +1593,9 @@ fn find_first_inlineable_label_tail_in_stmt(
                 find_first_inlineable_label_tail_in_stmt(body, target_label, nested)
             }
         }
-        Stmt::Sequence(stmts) => find_first_inlineable_label_tail_in_sequence(
-            stmts,
-            target_label,
-            nested,
-            false,
-        ),
+        Stmt::Sequence(stmts) => {
+            find_first_inlineable_label_tail_in_sequence(stmts, target_label, nested, false)
+        }
         Stmt::Block(stmts) => {
             find_first_inlineable_label_tail_in_sequence(stmts, target_label, nested, true)
         }
@@ -1603,7 +1615,9 @@ fn find_first_inlineable_label_tail_in_stmt(
         }
         Stmt::Switch { cases, default, .. } => cases
             .iter()
-            .find_map(|(_, body)| find_first_inlineable_label_tail_in_stmt(body, target_label, true))
+            .find_map(|(_, body)| {
+                find_first_inlineable_label_tail_in_stmt(body, target_label, true)
+            })
             .or_else(|| {
                 default.as_deref().and_then(|body| {
                     find_first_inlineable_label_tail_in_stmt(body, target_label, true)
@@ -1639,7 +1653,9 @@ fn find_first_inlineable_label_tail_in_sequence(
                 }
             }
         }
-        if let Some(found) = find_first_inlineable_label_tail_in_stmt(&stmts[idx], target_label, nested) {
+        if let Some(found) =
+            find_first_inlineable_label_tail_in_stmt(&stmts[idx], target_label, nested)
+        {
             return Some(found);
         }
     }
@@ -1674,9 +1690,7 @@ fn stmt_contains_goto(stmt: &Stmt) -> bool {
             ..
         } => {
             stmt_contains_goto(then_branch)
-                || else_branch
-                    .as_deref()
-                    .is_some_and(stmt_contains_goto)
+                || else_branch.as_deref().is_some_and(stmt_contains_goto)
         }
         Stmt::Loop { body, .. } => stmt_contains_goto(body),
         Stmt::Switch { cases, default, .. } => {
@@ -1718,11 +1732,9 @@ fn stmt_contains_break_or_continue(stmt: &Stmt) -> bool {
                     .as_deref()
                     .is_some_and(stmt_contains_break_or_continue)
         }
-        Stmt::Goto(_)
-        | Stmt::Return(_)
-        | Stmt::Assign { .. }
-        | Stmt::ExprStmt(_)
-        | Stmt::Empty => false,
+        Stmt::Goto(_) | Stmt::Return(_) | Stmt::Assign { .. } | Stmt::ExprStmt(_) | Stmt::Empty => {
+            false
+        }
     }
 }
 
@@ -1861,10 +1873,7 @@ fn collect_goto_target_counts(stmt: &Stmt, counts: &mut HashMap<String, usize>) 
 /// guarded goto plus a linear branch/label pair. This keeps the cleanup
 /// AST-native and local: it only removes a target label when that label is
 /// uniquely targeted and the moved branch bodies contain no labels.
-fn fold_jump_over_branch_labels(
-    stmt: Stmt,
-    goto_target_counts: &HashMap<String, usize>,
-) -> Stmt {
+fn fold_jump_over_branch_labels(stmt: Stmt, goto_target_counts: &HashMap<String, usize>) -> Stmt {
     match stmt {
         Stmt::Sequence(stmts) => {
             fold_jump_over_branch_label_sequence(stmts, false, goto_target_counts)
@@ -1884,9 +1893,8 @@ fn fold_jump_over_branch_labels(
                 *then_branch,
                 goto_target_counts,
             )),
-            else_branch: else_branch.map(|branch| {
-                Box::new(fold_jump_over_branch_labels(*branch, goto_target_counts))
-            }),
+            else_branch: else_branch
+                .map(|branch| Box::new(fold_jump_over_branch_labels(*branch, goto_target_counts))),
         },
         Stmt::Loop {
             kind,
@@ -1906,12 +1914,14 @@ fn fold_jump_over_branch_labels(
             cases: cases
                 .into_iter()
                 .map(|(label, body)| {
-                    (label, fold_jump_over_branch_labels(body, goto_target_counts))
+                    (
+                        label,
+                        fold_jump_over_branch_labels(body, goto_target_counts),
+                    )
                 })
                 .collect(),
-            default: default.map(|body| {
-                Box::new(fold_jump_over_branch_labels(*body, goto_target_counts))
-            }),
+            default: default
+                .map(|body| Box::new(fold_jump_over_branch_labels(*body, goto_target_counts))),
         },
         other => other,
     }
@@ -1921,12 +1931,11 @@ fn fold_jump_over_branch_labels(
 /// into a structured `if` around the skipped region. This is still AST-local:
 /// the target label must be uniquely targeted and every label inside the moved
 /// region must only be referenced from the branch that now owns it.
-fn fold_guarded_skip_regions(
-    stmt: Stmt,
-    goto_target_counts: &HashMap<String, usize>,
-) -> Stmt {
+fn fold_guarded_skip_regions(stmt: Stmt, goto_target_counts: &HashMap<String, usize>) -> Stmt {
     match stmt {
-        Stmt::Sequence(stmts) => fold_guarded_skip_region_sequence(stmts, false, goto_target_counts),
+        Stmt::Sequence(stmts) => {
+            fold_guarded_skip_region_sequence(stmts, false, goto_target_counts)
+        }
         Stmt::Block(stmts) => fold_guarded_skip_region_sequence(stmts, true, goto_target_counts),
         Stmt::Label { name, body } => Stmt::Label {
             name,
@@ -1939,9 +1948,8 @@ fn fold_guarded_skip_regions(
         } => Stmt::If {
             condition,
             then_branch: Box::new(fold_guarded_skip_regions(*then_branch, goto_target_counts)),
-            else_branch: else_branch.map(|branch| {
-                Box::new(fold_guarded_skip_regions(*branch, goto_target_counts))
-            }),
+            else_branch: else_branch
+                .map(|branch| Box::new(fold_guarded_skip_regions(*branch, goto_target_counts))),
         },
         Stmt::Loop {
             kind,
@@ -1969,6 +1977,300 @@ fn fold_guarded_skip_regions(
     }
 }
 
+/// Fold a guarded goto inside an `if` branch when it targets the join label
+/// that immediately follows the enclosing `if` statement. Instead of jumping to
+/// the join, the guarded arm keeps its side effects and the remaining branch
+/// suffix becomes the opposite arm. This is intentionally narrow: it only
+/// rewrites direct branch bodies and only propagates the join label through
+/// tail-position nested statements, so inner blocks never "borrow" a join they
+/// do not fully own.
+fn fold_branch_skip_to_enclosing_join(stmt: Stmt) -> Stmt {
+    match stmt {
+        Stmt::Sequence(stmts) => fold_branch_skip_to_enclosing_join_sequence(stmts, false),
+        Stmt::Block(stmts) => fold_branch_skip_to_enclosing_join_sequence(stmts, true),
+        Stmt::Label { name, body } => Stmt::Label {
+            name,
+            body: Box::new(fold_branch_skip_to_enclosing_join(*body)),
+        },
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => Stmt::If {
+            condition,
+            then_branch: Box::new(fold_branch_skip_to_enclosing_join(*then_branch)),
+            else_branch: else_branch
+                .map(|branch| Box::new(fold_branch_skip_to_enclosing_join(*branch))),
+        },
+        Stmt::Loop {
+            kind,
+            condition,
+            body,
+        } => Stmt::Loop {
+            kind,
+            condition,
+            body: Box::new(fold_branch_skip_to_enclosing_join(*body)),
+        },
+        Stmt::Switch {
+            discriminant,
+            cases,
+            default,
+        } => Stmt::Switch {
+            discriminant,
+            cases: cases
+                .into_iter()
+                .map(|(label, body)| (label, fold_branch_skip_to_enclosing_join(body)))
+                .collect(),
+            default: default.map(|body| Box::new(fold_branch_skip_to_enclosing_join(*body))),
+        },
+        other => other,
+    }
+}
+
+fn fold_branch_skip_to_enclosing_join_sequence(stmts: Vec<Stmt>, as_block: bool) -> Stmt {
+    let stmts = stmts
+        .into_iter()
+        .map(fold_branch_skip_to_enclosing_join)
+        .collect::<Vec<_>>();
+
+    let mut out = Vec::with_capacity(stmts.len());
+    for idx in 0..stmts.len() {
+        if let Some(folded) = try_fold_branch_skip_to_following_join(&stmts[idx], &stmts[idx + 1..])
+        {
+            out.push(folded);
+        } else {
+            out.push(stmts[idx].clone());
+        }
+    }
+
+    if as_block {
+        Stmt::Block(out)
+    } else {
+        Stmt::Sequence(out)
+    }
+}
+
+fn try_fold_branch_skip_to_following_join(stmt: &Stmt, trailing: &[Stmt]) -> Option<Stmt> {
+    let join_label = immediate_following_label_name(trailing)?;
+    match stmt {
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            let (then_branch, then_changed) =
+                fold_branch_skip_stmt_to_join(then_branch, join_label);
+            let (else_branch, else_changed) = else_branch
+                .as_deref()
+                .map(|branch| fold_branch_skip_stmt_to_join(branch, join_label))
+                .map_or((None, false), |(branch, changed)| {
+                    (Some(Box::new(branch)), changed)
+                });
+
+            if !then_changed && !else_changed {
+                return None;
+            }
+
+            Some(Stmt::If {
+                condition: condition.clone(),
+                then_branch: Box::new(then_branch),
+                else_branch,
+            })
+        }
+        Stmt::Label { name, body } => {
+            let (body, changed) = fold_branch_skip_stmt_to_join(body, join_label);
+            changed.then_some(Stmt::Label {
+                name: name.clone(),
+                body: Box::new(body),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn immediate_following_label_name(stmts: &[Stmt]) -> Option<&str> {
+    let label_idx = first_nonempty_stmt_index(stmts)?;
+    let Stmt::Label { name, .. } = &stmts[label_idx] else {
+        return None;
+    };
+    Some(name.as_str())
+}
+
+fn fold_branch_skip_stmt_to_join(stmt: &Stmt, join_label: &str) -> (Stmt, bool) {
+    match stmt {
+        Stmt::Sequence(stmts) => fold_branch_skip_stmt_sequence_to_join(stmts, false, join_label),
+        Stmt::Block(stmts) => fold_branch_skip_stmt_sequence_to_join(stmts, true, join_label),
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            let (then_branch, then_changed) =
+                fold_branch_skip_stmt_to_join(then_branch, join_label);
+            let (else_branch, else_changed) = else_branch
+                .as_deref()
+                .map(|branch| fold_branch_skip_stmt_to_join(branch, join_label))
+                .map_or((None, false), |(branch, changed)| {
+                    (Some(Box::new(branch)), changed)
+                });
+
+            if !then_changed && !else_changed {
+                return (stmt.clone(), false);
+            }
+
+            (
+                Stmt::If {
+                    condition: condition.clone(),
+                    then_branch: Box::new(then_branch),
+                    else_branch,
+                },
+                true,
+            )
+        }
+        Stmt::Label { name, body } => {
+            let (body, changed) = fold_branch_skip_stmt_to_join(body, join_label);
+            if changed {
+                (
+                    Stmt::Label {
+                        name: name.clone(),
+                        body: Box::new(body),
+                    },
+                    true,
+                )
+            } else {
+                (stmt.clone(), false)
+            }
+        }
+        Stmt::Loop { .. }
+        | Stmt::Switch { .. }
+        | Stmt::Assign { .. }
+        | Stmt::ExprStmt(_)
+        | Stmt::Return(_)
+        | Stmt::Break
+        | Stmt::Continue
+        | Stmt::Goto(_)
+        | Stmt::Empty => (stmt.clone(), false),
+    }
+}
+
+fn fold_branch_skip_stmt_sequence_to_join(
+    stmts: &[Stmt],
+    as_block: bool,
+    join_label: &str,
+) -> (Stmt, bool) {
+    let mut rewritten = stmts.to_vec();
+    let mut changed = false;
+
+    if let Some(tail_idx) = stmts.iter().rposition(|stmt| !stmt_is_linear_empty(stmt)) {
+        let (tail, tail_changed) = fold_branch_skip_stmt_to_join(&stmts[tail_idx], join_label);
+        if tail_changed {
+            rewritten[tail_idx] = tail;
+            changed = true;
+        }
+    }
+
+    let (stmt, scan_changed) =
+        fold_branch_skip_sequence_to_join_impl(&rewritten, as_block, join_label);
+    (stmt, changed || scan_changed)
+}
+
+fn fold_branch_skip_sequence_to_join_impl(
+    stmts: &[Stmt],
+    as_block: bool,
+    join_label: &str,
+) -> (Stmt, bool) {
+    let mut out = Vec::new();
+    let mut idx = 0usize;
+    let mut changed = false;
+    while idx < stmts.len() {
+        if let Some((folded, consumed)) =
+            try_fold_branch_skip_to_join_suffix(&stmts[idx..], join_label)
+        {
+            out.push(folded);
+            idx += consumed;
+            changed = true;
+            continue;
+        }
+        out.push(stmts[idx].clone());
+        idx += 1;
+    }
+
+    (
+        if as_block {
+            Stmt::Block(out)
+        } else {
+            Stmt::Sequence(out)
+        },
+        changed,
+    )
+}
+
+fn try_fold_branch_skip_to_join_suffix(stmts: &[Stmt], join_label: &str) -> Option<(Stmt, usize)> {
+    let first = stmts.first()?;
+    let Stmt::If {
+        condition,
+        then_branch,
+        else_branch,
+    } = first
+    else {
+        return None;
+    };
+
+    if let Some(folded) = try_fold_branch_skip_to_join_arm(
+        condition,
+        then_branch,
+        else_branch.as_deref(),
+        true,
+        &stmts[1..],
+        join_label,
+    ) {
+        return Some(folded);
+    }
+
+    try_fold_branch_skip_to_join_arm(
+        condition,
+        else_branch.as_deref()?,
+        Some(then_branch.as_ref()),
+        false,
+        &stmts[1..],
+        join_label,
+    )
+}
+
+fn try_fold_branch_skip_to_join_arm(
+    condition: &Expr,
+    skip_arm: &Stmt,
+    run_arm: Option<&Stmt>,
+    skip_is_then: bool,
+    suffix: &[Stmt],
+    join_label: &str,
+) -> Option<(Stmt, usize)> {
+    if suffix.iter().any(stmt_contains_any_label) || run_arm.is_some_and(stmt_contains_any_label) {
+        return None;
+    }
+
+    let (skip_prefix, target_label) = extract_trailing_goto_prefix(skip_arm)?;
+    if target_label != join_label {
+        return None;
+    }
+
+    let moved_run = append_branch_region(run_arm, suffix);
+    let (then_branch, else_branch) = if skip_is_then {
+        (skip_prefix, branch_stmt_or_none(moved_run))
+    } else {
+        (moved_run, branch_stmt_or_none(skip_prefix))
+    };
+
+    Some((
+        Stmt::If {
+            condition: condition.clone(),
+            then_branch: Box::new(then_branch),
+            else_branch: else_branch.map(Box::new),
+        },
+        suffix.len() + 1,
+    ))
+}
+
 fn fold_guarded_skip_region_sequence(
     stmts: Vec<Stmt>,
     as_block: bool,
@@ -1982,7 +2284,8 @@ fn fold_guarded_skip_region_sequence(
     let mut out = Vec::new();
     let mut idx = 0usize;
     while idx < stmts.len() {
-        if let Some((folded, consumed)) = try_fold_guarded_skip_region(&stmts[idx..], goto_target_counts)
+        if let Some((folded, consumed)) =
+            try_fold_guarded_skip_region(&stmts[idx..], goto_target_counts)
         {
             out.extend(folded);
             idx += consumed;
@@ -2068,15 +2371,9 @@ fn try_fold_skip_region_arm(
     }
 
     let (then_branch, else_branch) = if skip_is_then {
-        (
-            skip_prefix,
-            branch_stmt_or_none(moved_run),
-        )
+        (skip_prefix, branch_stmt_or_none(moved_run))
     } else {
-        (
-            moved_run,
-            branch_stmt_or_none(skip_prefix),
-        )
+        (moved_run, branch_stmt_or_none(skip_prefix))
     };
 
     let mut folded = vec![Stmt::If {
@@ -2125,9 +2422,9 @@ fn extract_trailing_goto_prefix_from_sequence(
 }
 
 fn find_top_level_label_stmt(stmts: &[Stmt], target_label: &str) -> Option<usize> {
-    stmts.iter().position(|stmt| {
-        matches!(stmt, Stmt::Label { name, .. } if name == target_label)
-    })
+    stmts
+        .iter()
+        .position(|stmt| matches!(stmt, Stmt::Label { name, .. } if name == target_label))
 }
 
 fn append_branch_region(run_arm: Option<&Stmt>, middle_stmts: &[Stmt]) -> Stmt {
@@ -2258,7 +2555,10 @@ fn try_fold_jump_over_branch_label(
     ))
 }
 
-fn take_immediate_target_label<'a>(stmts: &'a [Stmt], target_label: &str) -> Option<(usize, &'a Stmt)> {
+fn take_immediate_target_label<'a>(
+    stmts: &'a [Stmt],
+    target_label: &str,
+) -> Option<(usize, &'a Stmt)> {
     let label_idx = first_nonempty_stmt_index(stmts)?;
     let Stmt::Label { name, body } = &stmts[label_idx] else {
         return None;
@@ -2308,25 +2608,19 @@ fn stmt_contains_targeted_label(stmt: &Stmt, goto_targets: &BTreeSet<String>) ->
 fn stmt_contains_any_label(stmt: &Stmt) -> bool {
     match stmt {
         Stmt::Label { .. } => true,
-        Stmt::Sequence(stmts) | Stmt::Block(stmts) => {
-            stmts.iter().any(stmt_contains_any_label)
-        }
+        Stmt::Sequence(stmts) | Stmt::Block(stmts) => stmts.iter().any(stmt_contains_any_label),
         Stmt::If {
             then_branch,
             else_branch,
             ..
         } => {
             stmt_contains_any_label(then_branch)
-                || else_branch
-                    .as_deref()
-                    .is_some_and(stmt_contains_any_label)
+                || else_branch.as_deref().is_some_and(stmt_contains_any_label)
         }
         Stmt::Loop { body, .. } => stmt_contains_any_label(body),
         Stmt::Switch { cases, default, .. } => {
             cases.iter().any(|(_, body)| stmt_contains_any_label(body))
-                || default
-                    .as_deref()
-                    .is_some_and(stmt_contains_any_label)
+                || default.as_deref().is_some_and(stmt_contains_any_label)
         }
         Stmt::Break
         | Stmt::Continue
@@ -2428,12 +2722,14 @@ fn resolve_label_alias(label: &str, aliases: &HashMap<String, String>) -> Option
 fn rewrite_stmt_gotos(stmt: Stmt, aliases: &HashMap<String, String>) -> Stmt {
     match stmt {
         Stmt::Sequence(stmts) => Stmt::Sequence(
-            stmts.into_iter()
+            stmts
+                .into_iter()
                 .map(|stmt| rewrite_stmt_gotos(stmt, aliases))
                 .collect(),
         ),
         Stmt::Block(stmts) => Stmt::Block(
-            stmts.into_iter()
+            stmts
+                .into_iter()
                 .map(|stmt| rewrite_stmt_gotos(stmt, aliases))
                 .collect(),
         ),
@@ -2471,17 +2767,16 @@ fn rewrite_stmt_gotos(stmt: Stmt, aliases: &HashMap<String, String>) -> Stmt {
                 .collect(),
             default: default.map(|body| Box::new(rewrite_stmt_gotos(*body, aliases))),
         },
-        Stmt::Goto(label) => Stmt::Goto(
-            resolve_label_alias(&label, aliases).unwrap_or(label),
-        ),
+        Stmt::Goto(label) => Stmt::Goto(resolve_label_alias(&label, aliases).unwrap_or(label)),
         other => other,
     }
 }
 
 fn next_stmt_is_label(stmts: &[Stmt], label: &str) -> bool {
-    stmts.iter().find(|stmt| !matches!(stmt, Stmt::Empty)).is_some_and(|stmt| {
-        matches!(stmt, Stmt::Label { name, .. } if name == label)
-    })
+    stmts
+        .iter()
+        .find(|stmt| !matches!(stmt, Stmt::Empty))
+        .is_some_and(|stmt| matches!(stmt, Stmt::Label { name, .. } if name == label))
 }
 
 fn next_stmt_label_or_goto(stmts: &[Stmt]) -> Option<String> {
@@ -4215,7 +4510,10 @@ mod tests {
             2,
             "got:\n{rendered}"
         );
-        assert!(rendered.contains("if (!atomicAdd(ptr, 1))"), "got:\n{rendered}");
+        assert!(
+            rendered.contains("if (!atomicAdd(ptr, 1))"),
+            "got:\n{rendered}"
+        );
         assert!(rendered.contains("side_effect();"), "got:\n{rendered}");
     }
 
@@ -4331,6 +4629,112 @@ mod tests {
         assert!(rendered.contains("consume(acc);"), "got:\n{rendered}");
         assert!(!rendered.contains("goto BB1;"), "got:\n{rendered}");
         assert!(!rendered.contains("BB1:"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn canonicalize_folds_branch_local_skip_to_enclosing_join_label() {
+        let function = StructuredFunction {
+            params: Vec::new(),
+            locals: Vec::new(),
+            body: Stmt::Sequence(vec![
+                Stmt::Label {
+                    name: "BB0".to_string(),
+                    body: Box::new(Stmt::Sequence(vec![Stmt::If {
+                        condition: Expr::Reg("outer".to_string()),
+                        then_branch: Box::new(Stmt::Sequence(vec![
+                            Stmt::Assign {
+                                dst: LValue::Var("acc".to_string()),
+                                src: Expr::Imm("0".to_string()),
+                            },
+                            Stmt::If {
+                                condition: Expr::Reg("p0".to_string()),
+                                then_branch: Box::new(Stmt::Block(vec![
+                                    Stmt::Assign {
+                                        dst: LValue::Var("mode".to_string()),
+                                        src: Expr::Imm("1".to_string()),
+                                    },
+                                    Stmt::Goto("BB1".to_string()),
+                                ])),
+                                else_branch: None,
+                            },
+                            Stmt::If {
+                                condition: Expr::Reg("p1".to_string()),
+                                then_branch: Box::new(Stmt::Goto("BB2".to_string())),
+                                else_branch: None,
+                            },
+                        ])),
+                        else_branch: Some(Box::new(Stmt::Assign {
+                            dst: LValue::Var("acc".to_string()),
+                            src: Expr::Imm("7".to_string()),
+                        })),
+                    }])),
+                },
+                Stmt::Label {
+                    name: "BB1".to_string(),
+                    body: Box::new(Stmt::ExprStmt(Expr::Raw("consume(acc)".to_string()))),
+                },
+                Stmt::Label {
+                    name: "BB2".to_string(),
+                    body: Box::new(Stmt::ExprStmt(Expr::Raw("tail_effect()".to_string()))),
+                },
+            ]),
+        };
+
+        let rendered = canonicalize_post_bind_control_flow(function)
+            .body
+            .render_with_indent(0);
+
+        assert!(!rendered.contains("goto BB1;"), "got:\n{rendered}");
+        assert!(rendered.contains("mode = 1;"), "got:\n{rendered}");
+        assert!(rendered.contains("goto BB2;"), "got:\n{rendered}");
+        assert!(rendered.contains("consume(acc);"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn canonicalize_keeps_nested_block_skip_to_outer_join_explicit() {
+        let function = StructuredFunction {
+            params: Vec::new(),
+            locals: Vec::new(),
+            body: Stmt::Sequence(vec![
+                Stmt::Label {
+                    name: "BB0".to_string(),
+                    body: Box::new(Stmt::Sequence(vec![Stmt::If {
+                        condition: Expr::Reg("outer".to_string()),
+                        then_branch: Box::new(Stmt::Sequence(vec![
+                            Stmt::Block(vec![
+                                Stmt::If {
+                                    condition: Expr::Reg("p0".to_string()),
+                                    then_branch: Box::new(Stmt::Block(vec![
+                                        Stmt::Assign {
+                                            dst: LValue::Var("mode".to_string()),
+                                            src: Expr::Imm("1".to_string()),
+                                        },
+                                        Stmt::Goto("BB1".to_string()),
+                                    ])),
+                                    else_branch: None,
+                                },
+                                Stmt::ExprStmt(Expr::Raw("side_effect()".to_string())),
+                            ]),
+                            Stmt::ExprStmt(Expr::Raw("after_block()".to_string())),
+                        ])),
+                        else_branch: None,
+                    }])),
+                },
+                Stmt::Label {
+                    name: "BB1".to_string(),
+                    body: Box::new(Stmt::ExprStmt(Expr::Raw("join_effect()".to_string()))),
+                },
+            ]),
+        };
+
+        let rendered = canonicalize_post_bind_control_flow(function)
+            .body
+            .render_with_indent(0);
+
+        assert!(rendered.contains("goto BB1;"), "got:\n{rendered}");
+        assert!(rendered.contains("side_effect();"), "got:\n{rendered}");
+        assert!(rendered.contains("after_block();"), "got:\n{rendered}");
+        assert!(rendered.contains("join_effect();"), "got:\n{rendered}");
     }
 
     #[test]
@@ -4666,11 +5070,7 @@ mod tests {
 
         let rendered = canonicalize_function(function).body.render_with_indent(0);
 
-        assert_eq!(
-            rendered.matches("if (p0)").count(),
-            1,
-            "got:\n{rendered}"
-        );
+        assert_eq!(rendered.matches("if (p0)").count(), 1, "got:\n{rendered}");
         assert!(rendered.contains("hot_path();"), "got:\n{rendered}");
     }
 
@@ -4771,7 +5171,9 @@ mod tests {
             ]),
         };
 
-        let rendered = canonicalize_post_bind_control_flow(function).body.render_with_indent(0);
+        let rendered = canonicalize_post_bind_control_flow(function)
+            .body
+            .render_with_indent(0);
 
         assert!(rendered.contains("BB1:"), "got:\n{rendered}");
         assert!(!rendered.contains("BB2:"), "got:\n{rendered}");
@@ -4871,7 +5273,10 @@ mod tests {
 
         let rendered = canonicalize_function(function).body.render_with_indent(0);
 
-        assert!(rendered.contains("acc = fmaf(lhs, rhs, acc);"), "got:\n{rendered}");
+        assert!(
+            rendered.contains("acc = fmaf(lhs, rhs, acc);"),
+            "got:\n{rendered}"
+        );
         assert!(rendered.contains("return acc;"), "got:\n{rendered}");
     }
 }

@@ -589,9 +589,9 @@ fn rendered_store_value_reaches_fmaf(rendered: &str, store_re: &Regex) -> bool {
 
     let assign_re = Regex::new(r"(?m)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+?)\s*;\s*$")
         .expect("valid assignment regex");
-    let bare_var_re =
-        Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$").expect("valid bare variable regex");
-    let mut assigns: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    let bare_var_re = Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$").expect("valid bare variable regex");
+    let mut assigns: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
     for caps in assign_re.captures_iter(rendered) {
         assigns
             .entry(caps[1].to_string())
@@ -958,10 +958,9 @@ fn canonical_full_pass_gelu_forward_recovers_structural_math_ops() {
         .find(|f| f.name == "gelu_forward")
         .expect("gelu_forward fixture should exist");
     let out = run_canonical_output_full_pass_from_instrs(gelu.instrs, gelu.sm, "gelu_forward");
-    let saturated_copysign_input = Regex::new(
-        r"(?m)^\s*r\d+_\d+ = !p\d+_\d+ \? [A-Za-z0-9_]+ : 1;\s*$",
-    )
-    .expect("valid gelu saturation regex");
+    let saturated_copysign_input =
+        Regex::new(r"(?m)^\s*r\d+_\d+ = !p\d+_\d+ \? [A-Za-z0-9_]+ : 1;\s*$")
+            .expect("valid gelu saturation regex");
     assert!(
         out.contains("blockDim.x * blockIdx.x + threadIdx.x"),
         "expected canonical gelu_forward launch index to lower structurally, got:\n{}",
@@ -1092,8 +1091,8 @@ fn canonical_full_pass_warp_reduce_sum_keeps_shuffle_intrinsics() {
         .find(|f| f.name == "warp_reduce_sum")
         .expect("warp_reduce_sum fixture should exist");
     let out = run_canonical_output_full_pass_from_instrs(warp.instrs, warp.sm, "warp_reduce_sum");
-    let lane_mask = Regex::new(r"(?m)^\s*r\d+_\d+ = threadIdx\.x & 31;\s*$")
-        .expect("valid lane mask regex");
+    let lane_mask =
+        Regex::new(r"(?m)^\s*r\d+_\d+ = threadIdx\.x & 31;\s*$").expect("valid lane mask regex");
     let lane_pred = Regex::new(r"(?m)^\s*p\d+_\d+ = \(threadIdx\.x & 31\) != 0;\s*$")
         .expect("valid lane predicate regex");
     assert!(
@@ -1150,14 +1149,12 @@ fn full_pass_stencil2d_top_halo_predicated_load_defaults_to_zero() {
         .expect("stencil2d_5pt fixture should exist");
     let out =
         run_canonical_output_full_pass_from_instrs(stencil.instrs, stencil.sm, "stencil2d_5pt");
-    let left_halo = Regex::new(
-        r"(?m)^\s*r\d+_\d+ = !p\d+_\d+ \? \(arg0_ptr\[[^\]]+\+ -1\]\) : 0;\s*$",
-    )
-    .expect("valid left halo regex");
-    let right_halo = Regex::new(
-        r"(?m)^\s*r\d+_\d+ = !p\d+_\d+ \? \(arg0_ptr\[[^\]]+\+ 16\]\) : 0;\s*$",
-    )
-    .expect("valid right halo regex");
+    let left_halo =
+        Regex::new(r"(?m)^\s*r\d+_\d+ = !p\d+_\d+ \? \(arg0_ptr\[[^\]]+\+ -1\]\) : 0;\s*$")
+            .expect("valid left halo regex");
+    let right_halo =
+        Regex::new(r"(?m)^\s*r\d+_\d+ = !p\d+_\d+ \? \(arg0_ptr\[[^\]]+\+ 16\]\) : 0;\s*$")
+            .expect("valid right halo regex");
     assert!(
         left_halo.is_match(&out),
         "expected predicated top-halo load to default to zero, got:\n{}",
@@ -1603,8 +1600,8 @@ fn full_pass_utf8_count_chars_rewrites_iadd64_pointer_arithmetic() {
     .find(|f| f.name == "utf8_count_chars")
     .expect("utf8_count_chars fixture should exist");
     let out = run_canonical_output_full_pass_from_instrs(utf8.instrs, utf8.sm, "utf8_count_chars");
-    let typed_store =
-        Regex::new(r"arg2_ptr\[[^\]]+\] = [A-Za-z_][A-Za-z0-9_]*;").expect("valid typed store regex");
+    let typed_store = Regex::new(r"arg2_ptr\[[^\]]+\] = [A-Za-z_][A-Za-z0-9_]*;")
+        .expect("valid typed store regex");
     assert!(
         !out.contains("IADD.64("),
         "expected no raw IADD.64 helper in utf8_count_chars output, got:
@@ -1968,13 +1965,15 @@ fn corpus_goto_budget_is_tight() {
         // cross_entropy_loss: reduction + scalar cleanup path.
         ("ml_kernels.sass:cross_entropy_loss", 1),
         // layer_norm_forward / softmax_forward / topk_per_row still exercise
-        // the hardest split-window reduction/remainder shapes in the corpus.
-        ("ml_kernels.sass:layer_norm_forward", 23),
+        // the hardest split-window reduction/remainder shapes in the corpus;
+        // layer_norm_forward now only keeps the genuinely hard join/remainder
+        // hops after the tail-owned branch-local skip-to-join fold.
+        ("ml_kernels.sass:layer_norm_forward", 18),
         ("ml_kernels.sass:softmax_forward", 2),
         ("ml_kernels.sass:topk_per_row", 4),
     ]
     .into();
-    const SM89_TOTAL_GOTO_CEILING: usize = 49;
+    const SM89_TOTAL_GOTO_CEILING: usize = 44;
 
     let mut violations: Vec<(String, usize, usize)> = Vec::new();
     let outputs = run_corpus();

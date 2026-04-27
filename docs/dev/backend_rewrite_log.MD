@@ -662,3 +662,24 @@ tests/contracts.
 - Current validation state after the nested-tail fix:
   - passes: `corpus_goto_budget_is_tight`
   - passes: `cargo test --quiet` (`354` + `7` tests)
+- Final narrow goto-ratchet pass stayed AST-native and local:
+  - canonical cleanup now folds branch-local "skip to the enclosing join"
+    hops when a guarded goto only jumps to the immediately following join
+    label and the skipped suffix is label-free
+  - review tightened the implementation so the join only propagates through
+    tail-owned nested statements; inner blocks cannot borrow an enclosing join
+    unless they own the entire remaining suffix to that join
+  - this is intentionally bounded: it never parses rendered text, never moves
+    labels, and never guesses across loops or switches; it only nests the
+    remaining branch suffix under the opposite arm of the existing predicate
+- Measured impact from that last pass:
+  - `layer_norm_forward`: 23 -> 18 gotos
+  - `topk_per_row`: unchanged at 4; the remaining jumps still sit behind the
+    harder split-window / nested-remainder shapes that would need broader CFG
+    or structurizer work, so this branch stops short of a riskier cleanup
+  - strict SM89 total goto ceiling tightened again: 49 -> 44
+- Current validation state after the final goto ratchet:
+  - passes: `canonicalize_folds_branch_local_skip_to_enclosing_join_label`
+  - passes: `canonicalize_keeps_nested_block_skip_to_outer_join_explicit`
+  - passes: `corpus_goto_budget_is_tight`
+  - passes: `cargo test --quiet`
