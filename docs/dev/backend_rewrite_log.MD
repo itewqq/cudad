@@ -19,6 +19,9 @@
   - symbol planning
 - `FunctionAnalysis` now classifies memory accesses by CUDA space and carries
   propagated address-root facts.
+- The public crate surface now exports only the live canonical pipeline
+  modules; dead helper analyses that were not consumed anywhere in the
+  rewrite (`semantic_propagation`, `ptr_verification`) are deleted.
 - Canonical AST lowering now emits C/CUDA-safe SSA identifiers instead of raw
   `R4.0` / `P0.0` register displays.
 - Predicated single-def statements now preserve their false-path value in the
@@ -447,9 +450,8 @@
 2. Delete any remaining stale test wording or contracts that still talk like
    the retired backend path (`old_*`, legacy cleanup phrasing, temp-choreography
    assertions) without dropping meaningful semantic coverage.
-3. After the next 1-3 commits, run another sub-agent review and either land
-   the findings or close out the branch if the remaining comments are purely
-   optional cleanup.
+3. Close out the branch with one last review/validation pass unless a newly
+   found corpus regression justifies another narrowly scoped cleanup.
 
 ## Open questions
 
@@ -461,7 +463,8 @@
   remaining join trampolines is worth a dedicated post-cutover cleanup.
 - How aggressively the public `lib.rs` surface should shrink in the same
   cutover versus a final follow-up cleanup commit after all internal callers
-  are gone.
+  are gone. Resolved for the clearly dead helpers: `semantic_propagation` and
+  `ptr_verification` are now deleted from the public surface.
 
 ## Files/modules touched
 
@@ -521,6 +524,11 @@ tests/contracts.
   - the goto-budget allow-list is ratcheted again to the exact live canonical
     counts, so any new structural improvement or regression must update the
     table in the same commit
+- Public-surface deletion sweep:
+  - removed `src/semantic_propagation.rs` and `src/ptr_verification.rs`
+  - `src/lib.rs` no longer exports those dead helper analyses
+  - the suite dropped from `358` to `352` library tests while preserving the
+    live canonical pipeline coverage
 - Explorer follow-up:
   - the candidate unique-target trampoline inline for `layer_norm_forward`
     was investigated but not kept in the live pass because the first generic
@@ -532,6 +540,7 @@ tests/contracts.
   - passes: `canonicalize_folds_else_arm_skip_region_into_then_path`
   - passes: `canonicalize_merges_nested_duplicate_pure_single_arm_ifs`
   - passes: `corpus_goto_budget_is_tight`
+  - passes: `cargo test --quiet` (`352` + `7` tests)
 
 - Canonical post-bind cleanup now owns one more real control-flow repair pass:
   it drops unreachable unlabeled suffix statements after definite terminators,
