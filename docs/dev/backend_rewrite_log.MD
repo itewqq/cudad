@@ -4,7 +4,7 @@
 
 - Branch: `codex/memory-aware-backend-refactor`
 - Checkpoint commit: `3c01801`
-- Current stage: phase 6 acceptance/perf cleanup, with the canonical backend already live and the remaining work focused on broader validation plus the last legacy deletion sweep
+- Current stage: phase 6 control-flow cleanup / validation, with the canonical backend live and the remaining work focused on final corpus ratchets, stale-contract deletion, and review-driven polish
 
 ## Landed invariants
 
@@ -441,28 +441,24 @@
 
 ## Next safe step
 
-1. Tighten the remaining SM89 goto ceilings structurally, especially
-   `multi_exit_loop`, `topk_per_row`, `softmax_forward`, and the still-heavy
-   `layer_norm_forward` remainder ladders.
-2. Keep the new post-bind cleanup rules conservative: preserve any structured
-   subtree that contains a live goto target, and only trim duplicate labels
-   from linear leading prefixes that are already emitted on every path.
-3. Delete any remaining backend-only test contracts or fixture expectations
-   that still encode transitional canonical/legacy choreography instead of
-   real pipeline invariants, then queue the next review cycle after another
-   1-3 implementation commits.
+1. Run the full suite after the new goto ratchets and keep an eye on any
+   corpus kernels that still rely on `BB...` trampolines (`layer_norm_forward`,
+   `softmax_forward`, `topk_per_row`) so the next cleanup stays narrow.
+2. Delete any remaining stale test wording or contracts that still talk like
+   the retired backend path (`old_*`, legacy cleanup phrasing, temp-choreography
+   assertions) without dropping meaningful semantic coverage.
+3. After the next 1-3 commits, run another sub-agent review and either land
+   the findings or close out the branch if the remaining comments are purely
+   optional cleanup.
 
 ## Open questions
 
-- Whether the new CFG-backed missing-region fallback should remain a narrow
-  correctness backstop only, or whether the structurizer should absorb those
-  still-missed tails (`layer_norm_forward` / similar post-return regions) so
-  the strict `goto` budget can come back down without fallback duplication.
-- Whether the remaining packed-pointer heavy kernels (`sobel_edge_detect`,
-  broader affine `layer_norm_forward` slices, and any still-temp-heavy SHA
-  idioms beyond the fixed `sha256_single_block` timeout) need another canonical
-  lowering pass before their old smoke tests can be replaced one-for-one
-  instead of simply deleted.
+- Whether the remaining `layer_norm_forward` goto clusters are best attacked by
+  one more canonical trampoline-inline tweak or are now low-value enough to
+  leave for a final follow-up after the rewrite lands.
+- Whether the CFG-backed missing-region fallback should remain only as a narrow
+  correctness backstop, or whether structurizer-side ownership of the
+  remaining join trampolines is worth a dedicated post-cutover cleanup.
 - How aggressively the public `lib.rs` surface should shrink in the same
   cutover versus a final follow-up cleanup commit after all internal callers
   are gone.
@@ -492,17 +488,50 @@
 
 ## Interrupt resume note
 
-Resume from the post-review correctness sweep: canonical cleanup now keeps
-loop-carried live values alive across local cleanup regions again, the
-`dot_thread` FFMA merge regression is pinned by tests, and missing rendered
-labels now fall back to CFG-backed synthesized regions instead of dangling.
-The current branch tip also trims duplicate label prefixes / unreachable
-post-terminal suffixes after bind-time cleanup, rebinds missing labels after
-that cleanup, and recalibrates the SM89 goto-budget gate to bounded ceilings
-rather than exact-output snapshots. The next safe work is tightening those
-ceilings structurally rather than reintroducing backend-repair passes.
+Resume from the current canonical control-cleanup sweep: guarded skip-region
+folding now pulls value-prep jump arms back into structured `if` regions and
+duplicate pure nested `if` wrappers collapse before post-bind cleanup. The
+SM89 corpus ratchet is tighter (`49` total gotos; `softmax_forward` down to
+`2`, `topk_per_row` to `4`) without reviving text repair, while
+`layer_norm_forward` still needs a narrower trampoline/join follow-up than the
+first explorer-guided attempt justified. The next safe work is a full
+validation pass plus one more review-driven deletion sweep on stale
+tests/contracts.
 
 ## Latest slice
+
+- Canonical control cleanup now folds guarded skip regions with explicit
+  value-setup prefixes back into structured branches instead of preserving
+  `if (...) { copies; goto BBx; } ... BBx:` ladders. The fold is still local:
+  the join label must be uniquely targeted and any labels moved into the owned
+  branch must only be referenced from that branch.
+- A second local cleanup now merges duplicate pure single-arm `if` wrappers
+  before post-bind normalization, which exposes more skip-region shapes instead
+  of leaving them hidden behind repeated guard shells.
+- Measured impact from the latest two passes:
+  - `softmax_forward`: 5 -> 2 gotos
+  - `topk_per_row`: 6 -> 4
+  - `find_pattern`: 3 -> 1
+  - `string_search`: 2 -> 1
+  - `cross_entropy_loss`: 3 -> 1
+  - strict SM89 total goto ceiling: 66 -> 49
+- Transitional test cleanup follow-up:
+  - the stale `old_softmax_forward` full-pass test is renamed back to canonical
+    `softmax_forward` wording
+  - the goto-budget allow-list is ratcheted again to the exact live canonical
+    counts, so any new structural improvement or regression must update the
+    table in the same commit
+- Explorer follow-up:
+  - the candidate unique-target trampoline inline for `layer_norm_forward`
+    was investigated but not kept in the live pass because the first generic
+    version bought unreliable corpus wins and overreached on nearby tests
+  - keep that idea as an open follow-up only if a more specific, label-shape
+    bounded rule shows real payoff without widening the cleanup surface
+- Current validation state:
+  - passes: `canonicalize_folds_guarded_skip_region_with_value_prep_prefix`
+  - passes: `canonicalize_folds_else_arm_skip_region_into_then_path`
+  - passes: `canonicalize_merges_nested_duplicate_pure_single_arm_ifs`
+  - passes: `corpus_goto_budget_is_tight`
 
 - Canonical post-bind cleanup now owns one more real control-flow repair pass:
   it drops unreachable unlabeled suffix statements after definite terminators,
