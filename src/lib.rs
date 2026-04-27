@@ -19,8 +19,6 @@ pub mod ir_dce;
 pub mod memory_model;
 pub mod op_semantics;
 pub mod parser;
-pub mod ptr_verification;
-pub mod semantic_propagation;
 pub mod structurizer;
 pub mod symbol_plan;
 pub mod type_inference;
@@ -50,8 +48,6 @@ pub use parser::{
     DecodedFunction, DecodedInstruction, DecodedOperand, Predicate, PredicateUse, SchedulingInfo,
     TerminatorKind,
 };
-pub use ptr_verification::*;
-pub use semantic_propagation::*;
 pub use structurizer::*;
 pub use symbol_plan::*;
 pub use type_inference::*;
