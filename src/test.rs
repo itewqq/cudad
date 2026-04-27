@@ -952,13 +952,17 @@ fn canonical_full_pass_gelu_forward_recovers_structural_math_ops() {
         .find(|f| f.name == "gelu_forward")
         .expect("gelu_forward fixture should exist");
     let out = run_canonical_output_full_pass_from_instrs(gelu.instrs, gelu.sm, "gelu_forward");
+    let saturated_copysign_input = Regex::new(
+        r"(?m)^\s*r\d+_\d+ = !p\d+_\d+ \? [A-Za-z0-9_]+ : 1;\s*$",
+    )
+    .expect("valid gelu saturation regex");
     assert!(
         out.contains("blockDim.x * blockIdx.x + threadIdx.x"),
         "expected canonical gelu_forward launch index to lower structurally, got:\n{}",
         out
     );
     assert!(
-        out.contains("!p0_1 ? r8_0 : 1;") && out.contains("copysignf("),
+        saturated_copysign_input.is_match(&out) && out.contains("copysignf("),
         "expected canonical gelu_forward to recover fsel/copysign math, got:\n{}",
         out
     );
@@ -1082,6 +1086,10 @@ fn canonical_full_pass_warp_reduce_sum_keeps_shuffle_intrinsics() {
         .find(|f| f.name == "warp_reduce_sum")
         .expect("warp_reduce_sum fixture should exist");
     let out = run_canonical_output_full_pass_from_instrs(warp.instrs, warp.sm, "warp_reduce_sum");
+    let lane_mask = Regex::new(r"(?m)^\s*r\d+_\d+ = threadIdx\.x & 31;\s*$")
+        .expect("valid lane mask regex");
+    let lane_pred = Regex::new(r"(?m)^\s*p\d+_\d+ = \(threadIdx\.x & 31\) != 0;\s*$")
+        .expect("valid lane predicate regex");
     assert!(
         out.contains("__shfl_down_sync"),
         "expected canonical warp_reduce_sum to keep CUDA shuffle intrinsics, got:\n{}",
@@ -1103,7 +1111,7 @@ fn canonical_full_pass_warp_reduce_sum_keeps_shuffle_intrinsics() {
         out
     );
     assert!(
-        out.contains("r8_0 = threadIdx.x & 31;") && out.contains("p0_1 = (threadIdx.x & 31) != 0;"),
+        lane_mask.is_match(&out) && lane_pred.is_match(&out),
         "expected canonical warp_reduce_sum to recover lane-mask lop3 semantics, got:\n{}",
         out
     );
@@ -1136,13 +1144,21 @@ fn full_pass_stencil2d_top_halo_predicated_load_defaults_to_zero() {
         .expect("stencil2d_5pt fixture should exist");
     let out =
         run_canonical_output_full_pass_from_instrs(stencil.instrs, stencil.sm, "stencil2d_5pt");
+    let left_halo = Regex::new(
+        r"(?m)^\s*r\d+_\d+ = !p\d+_\d+ \? \(arg0_ptr\[[^\]]+\+ -1\]\) : 0;\s*$",
+    )
+    .expect("valid left halo regex");
+    let right_halo = Regex::new(
+        r"(?m)^\s*r\d+_\d+ = !p\d+_\d+ \? \(arg0_ptr\[[^\]]+\+ 16\]\) : 0;\s*$",
+    )
+    .expect("valid right halo regex");
     assert!(
-        out.contains("r4_7 = !p2_1 ? (arg0_ptr[r8_0 + -1]) : 0;"),
+        left_halo.is_match(&out),
         "expected predicated top-halo load to default to zero, got:\n{}",
         out
     );
     assert!(
-        out.contains("r0_3 = !p1_5 ? (arg0_ptr[r8_0 + 16]) : 0;"),
+        right_halo.is_match(&out),
         "expected predicated right-halo load to default to zero, got:\n{}",
         out
     );

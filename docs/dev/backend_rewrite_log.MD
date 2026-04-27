@@ -423,6 +423,14 @@
   SSA/copy chain instead of matching one specific temp name, so it still
   proves the accumulation result reaches `arg4_ptr[...]` without reintroducing
   brittle choreography assertions.
+- Additional canonical full-pass regressions now avoid temp-name pinning where
+  the contract is really semantic:
+  - `gelu_forward` checks saturated `copysignf` recovery structurally
+  - `warp_reduce_sum` checks the lane-mask/lane-predicate lowering by shape
+  - `stencil2d_5pt` checks predicated halo loads by typed-pointer form rather
+    than one exact SSA temp spelling
+  which trims more transitional backend choreography out of the acceptance
+  suite without deleting the real pipeline coverage.
 
 ## Next safe step
 
