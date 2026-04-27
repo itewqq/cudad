@@ -17,64 +17,49 @@ This is a reverse-engineering and compiler-internals project, not a production d
 
 ## What the output looks like
 
-For `test_cu/if_loop.sass`, the canonical output already looks like real structured code rather than a flat opcode dump. This is an abridged excerpt from the current full-pass snapshot:
+The old README used an over-polished `test_cu/if_loop.sass` excerpt that no
+longer matched the real output. That was misleading.
+
+Today the backend is real and usable, but the output is still conservative and
+often temp-heavy. For a small kernel such as `test_cu/test_div.sass`, a literal
+trimmed excerpt from the current CLI output looks like this:
 
 ```c
-__global__ void kernel(uint32_t arg0, uint32_t arg2, uintptr_t arg4_ptr, uint32_t arg6, uint32_t arg7) {
-  uint32_t ctaid_x;
-  uint32_t tid_x;
+void _Z15test_2_para_intiiPi(int32_t arg0, int32_t arg1, uint32_t* arg2_ptr) {
+  uint32_t r5_0;
+  uint32_t ur4_0;
+  uint32_t ur4_1;
+  uint32_t r0_0;
+  bool p1_0;
+  uint32_t r0_1;
+  uint32_t r2_0;
+  uint32_t r3_0;
+  uint32_t r7_0;
   ...
 
-  ctaid_x = blockIdx.x;
-  tid_x = threadIdx.x;
-  v2 = ctaid_x * blockDim.x + tid_x;
-  if ((int32_t)(v2) >= (int32_t)(arg6)) return;
-  v3 = v2 * 4 + arg0;
-  v4 = v2 * 4 + arg2;
-  v5 = *addr64(v3, v6);
-  v7 = *addr64(v4, 4);
-  v8 = arg7;
-  v10 = v7 + v5;
-  b2 = v10 > 1;
-  v11 = !b2 ? (v7 * v5) : v10;
-
-  if ((int32_t)(v8) >= (int32_t)(1)) {
-    v3 = v8 - 1;
-    v8 = v8 & 3;
-    if (v3 >= 3) {
-      v7 = -v8 + arg7;
-      if ((int32_t)(v7) > (int32_t)(0)) b4 = (int32_t)(v7) > (int32_t)(12);
-    }
-  }
-
-  do {
-    b7 = v11 > 0.5;
-    v7 = v7 - 16;
-    ...
-    v11 = v3 * v41;
-  } while((int32_t)(v7) > (int32_t)(12));
-
-  do {
-    v8 = v8 - 1;
-    b1 = v11 > 0.5;
-    b2 = v8 != 0;
-    v3 = b1 ? 1066192077 : 0.8999999761581421;
-    v11 = v3 * v11;
-  } while(v8 != 0);
-
-  v61 = v2 + (arg4_ptr.lo32 << 2);
-  v62 = lea_hi_x(v2, arg4_ptr.hi32, 2, b2);
-  *addr64(v61, v62) = v11;
+  r5_0 = abs(arg1);
+  ur4_0 = arg0;
+  ur4_1 = ur4_0 ^ ur5_0;
+  r0_0 = __int2float_ru(r5_0);
+  p1_0 = (int32_t)(0) <= (int32_t)(ur4_1);
+  r0_1 = rcp_approx(r0_0);
+  r2_0 = r0_1 + 268435454;
+  r3_0 = __float2uint_rz(r2_0);
+  r7_0 = -r3_0 * r5_0;
+  ...
+  r5_3 = !p2_1 ? (~arg1) : r5_2;
+  arg2_ptr[0] = r5_3;
   return;
 }
 ```
 
-That is representative of an older snapshot of the backend:
-- signatures are inferred heuristically from ABI usage and CUDA builtins such as `blockIdx.x`, `threadIdx.x`, and `blockDim.x` are recovered
-- control flow is no longer raw `BRA` / `EXIT`; it becomes structured `if` / `do ... while` code when the CFG is recoverable
-- the canonical backend now recovers typed memory accesses, builtins, and arithmetic/comparison structure through `FunctionAnalysis` plus AST lowering instead of post-render text repair
-- locals are typed, but names are still generic (`vN`, `bN`, `uN`) unless stronger recovery exists
-- pointer reconstruction is improved but still incomplete, so `addr64(lo, hi)` style artifacts can remain in real kernels
+This is the current state of the project more honestly:
+- function signatures and many memory operands are recovered structurally
+- control flow is often structured, but large kernels can still be very rough
+- locals are still mostly generic temporaries (`rN_M`, `pN_M`, `vN`, `bN`)
+- the CLI currently prints an ABI-analysis banner ahead of the function body
+- `if_loop.sass` and the corpus kernels are harder cases, and they do not yet
+  look as clean as hand-written CUDA or a mature decompiler's output
 
 ### Real compute kernels covered
 
