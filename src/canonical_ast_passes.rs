@@ -905,6 +905,326 @@ fn negate_boolean_expr(expr: Expr) -> Expr {
     }
 }
 
+fn normalize_local_if_control(stmt: Stmt) -> Stmt {
+    simplify_empty_if_arms(strip_fallthrough_branch_gotos(
+        merge_complementary_linear_ifs(stmt),
+    ))
+}
+
+fn merge_complementary_linear_ifs(stmt: Stmt) -> Stmt {
+    match stmt {
+        Stmt::Sequence(stmts) => merge_complementary_if_sequence(stmts, false),
+        Stmt::Block(stmts) => merge_complementary_if_sequence(stmts, true),
+        Stmt::Label { name, body } => Stmt::Label {
+            name,
+            body: Box::new(merge_complementary_linear_ifs(*body)),
+        },
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => Stmt::If {
+            condition,
+            then_branch: Box::new(merge_complementary_linear_ifs(*then_branch)),
+            else_branch: else_branch
+                .map(|branch| Box::new(merge_complementary_linear_ifs(*branch))),
+        },
+        Stmt::Loop {
+            kind,
+            condition,
+            body,
+        } => Stmt::Loop {
+            kind,
+            condition,
+            body: Box::new(merge_complementary_linear_ifs(*body)),
+        },
+        Stmt::Switch {
+            discriminant,
+            cases,
+            default,
+        } => Stmt::Switch {
+            discriminant,
+            cases: cases
+                .into_iter()
+                .map(|(label, body)| (label, merge_complementary_linear_ifs(body)))
+                .collect(),
+            default: default
+                .map(|body| Box::new(merge_complementary_linear_ifs(*body))),
+        },
+        other => other,
+    }
+}
+
+fn merge_complementary_if_sequence(stmts: Vec<Stmt>, as_block: bool) -> Stmt {
+    let stmts = stmts
+        .into_iter()
+        .map(merge_complementary_linear_ifs)
+        .collect::<Vec<_>>();
+    let mut out = Vec::new();
+    let mut idx = 0usize;
+    while idx < stmts.len() {
+        if let Some((merged, consumed)) = try_merge_complementary_if_pair(&stmts[idx..]) {
+            out.push(merged);
+            idx += consumed;
+            continue;
+        }
+        out.push(stmts[idx].clone());
+        idx += 1;
+    }
+
+    if as_block {
+        Stmt::Block(out)
+    } else {
+        Stmt::Sequence(out)
+    }
+}
+
+fn try_merge_complementary_if_pair(stmts: &[Stmt]) -> Option<(Stmt, usize)> {
+    let first = stmts.first()?;
+    let (first_condition, first_branch) = stmt_as_single_arm_if(first)?;
+    if !expr_is_pure_for_control_cleanup(first_condition) || stmt_contains_any_label(first_branch) {
+        return None;
+    }
+
+    let second_idx = first_nonempty_stmt_index(&stmts[1..])?;
+    let second = &stmts[second_idx + 1];
+    let (second_condition, second_branch) = stmt_as_single_arm_if(second)?;
+    if !expr_is_pure_for_control_cleanup(second_condition)
+        || stmt_contains_any_label(second_branch)
+        || !exprs_are_boolean_complements(first_condition, second_condition)
+    {
+        return None;
+    }
+
+    Some((
+        Stmt::If {
+            condition: first_condition.clone(),
+            then_branch: Box::new(first_branch.clone()),
+            else_branch: Some(Box::new(second_branch.clone())),
+        },
+        second_idx + 2,
+    ))
+}
+
+fn stmt_as_single_arm_if(stmt: &Stmt) -> Option<(&Expr, &Stmt)> {
+    let Stmt::If {
+        condition,
+        then_branch,
+        else_branch,
+    } = stmt
+    else {
+        return None;
+    };
+    if !else_branch
+        .as_deref()
+        .map(stmt_is_linear_empty)
+        .unwrap_or(true)
+        || stmt_is_linear_empty(then_branch)
+    {
+        return None;
+    }
+    Some((condition, then_branch))
+}
+
+fn strip_fallthrough_branch_gotos(stmt: Stmt) -> Stmt {
+    match stmt {
+        Stmt::Sequence(stmts) => strip_fallthrough_branch_goto_sequence(stmts, false),
+        Stmt::Block(stmts) => strip_fallthrough_branch_goto_sequence(stmts, true),
+        Stmt::Label { name, body } => Stmt::Label {
+            name,
+            body: Box::new(strip_fallthrough_branch_gotos(*body)),
+        },
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => Stmt::If {
+            condition,
+            then_branch: Box::new(strip_fallthrough_branch_gotos(*then_branch)),
+            else_branch: else_branch
+                .map(|branch| Box::new(strip_fallthrough_branch_gotos(*branch))),
+        },
+        Stmt::Loop {
+            kind,
+            condition,
+            body,
+        } => Stmt::Loop {
+            kind,
+            condition,
+            body: Box::new(strip_fallthrough_branch_gotos(*body)),
+        },
+        Stmt::Switch {
+            discriminant,
+            cases,
+            default,
+        } => Stmt::Switch {
+            discriminant,
+            cases: cases
+                .into_iter()
+                .map(|(label, body)| (label, strip_fallthrough_branch_gotos(body)))
+                .collect(),
+            default: default
+                .map(|body| Box::new(strip_fallthrough_branch_gotos(*body))),
+        },
+        other => other,
+    }
+}
+
+fn simplify_empty_if_arms(stmt: Stmt) -> Stmt {
+    match stmt {
+        Stmt::Sequence(stmts) => {
+            Stmt::Sequence(stmts.into_iter().map(simplify_empty_if_arms).collect())
+        }
+        Stmt::Block(stmts) => Stmt::Block(stmts.into_iter().map(simplify_empty_if_arms).collect()),
+        Stmt::Label { name, body } => Stmt::Label {
+            name,
+            body: Box::new(simplify_empty_if_arms(*body)),
+        },
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            let then_branch = Box::new(simplify_empty_if_arms(*then_branch));
+            let else_branch = else_branch.map(|branch| Box::new(simplify_empty_if_arms(*branch)));
+            let then_empty = stmt_is_linear_empty(&then_branch);
+            let else_empty = else_branch
+                .as_deref()
+                .map(stmt_is_linear_empty)
+                .unwrap_or(true);
+            if then_empty && else_empty {
+                return Stmt::Empty;
+            }
+            if then_empty {
+                return Stmt::If {
+                    condition: negate_boolean_expr(condition),
+                    then_branch: else_branch.unwrap_or_else(|| Box::new(Stmt::Empty)),
+                    else_branch: None,
+                };
+            }
+            Stmt::If {
+                condition,
+                then_branch,
+                else_branch: (!else_empty).then_some(else_branch).flatten(),
+            }
+        }
+        Stmt::Loop {
+            kind,
+            condition,
+            body,
+        } => Stmt::Loop {
+            kind,
+            condition,
+            body: Box::new(simplify_empty_if_arms(*body)),
+        },
+        Stmt::Switch {
+            discriminant,
+            cases,
+            default,
+        } => Stmt::Switch {
+            discriminant,
+            cases: cases
+                .into_iter()
+                .map(|(label, body)| (label, simplify_empty_if_arms(body)))
+                .collect(),
+            default: default.map(|body| Box::new(simplify_empty_if_arms(*body))),
+        },
+        other => other,
+    }
+}
+
+fn strip_fallthrough_branch_goto_sequence(stmts: Vec<Stmt>, as_block: bool) -> Stmt {
+    let stmts = stmts
+        .into_iter()
+        .map(strip_fallthrough_branch_gotos)
+        .collect::<Vec<_>>();
+    let mut out = Vec::with_capacity(stmts.len());
+    for idx in 0..stmts.len() {
+        if let Some(rewritten) = strip_fallthrough_goto_from_if(&stmts[idx], &stmts[idx + 1..]) {
+            out.push(rewritten);
+        } else {
+            out.push(stmts[idx].clone());
+        }
+    }
+
+    if as_block {
+        Stmt::Block(out)
+    } else {
+        Stmt::Sequence(out)
+    }
+}
+
+fn strip_fallthrough_goto_from_if(stmt: &Stmt, trailing: &[Stmt]) -> Option<Stmt> {
+    let target_label = next_immediate_label_name(trailing)?;
+    let Stmt::If {
+        condition,
+        then_branch,
+        else_branch,
+    } = stmt
+    else {
+        return None;
+    };
+
+    let new_then = drop_trailing_goto_to_label(then_branch, target_label);
+    let new_else = else_branch
+        .as_deref()
+        .and_then(|branch| drop_trailing_goto_to_label(branch, target_label));
+    if new_then.is_none() && new_else.is_none() {
+        return None;
+    }
+
+    Some(Stmt::If {
+        condition: condition.clone(),
+        then_branch: Box::new(new_then.unwrap_or_else(|| then_branch.as_ref().clone())),
+        else_branch: else_branch.as_ref().map(|branch| {
+            Box::new(new_else.unwrap_or_else(|| branch.as_ref().clone()))
+        }),
+    })
+}
+
+fn next_immediate_label_name(stmts: &[Stmt]) -> Option<&str> {
+    let (stmt, _) = split_first_nonempty_stmt(stmts)?;
+    let Stmt::Label { name, .. } = stmt else {
+        return None;
+    };
+    Some(name.as_str())
+}
+
+fn drop_trailing_goto_to_label(stmt: &Stmt, target_label: &str) -> Option<Stmt> {
+    if stmt_contains_any_label(stmt) {
+        return None;
+    }
+    match stmt {
+        Stmt::Goto(label) if label == target_label => Some(Stmt::Empty),
+        Stmt::Sequence(stmts) => drop_trailing_goto_to_label_sequence(stmts, false, target_label),
+        Stmt::Block(stmts) => drop_trailing_goto_to_label_sequence(stmts, true, target_label),
+        _ => None,
+    }
+}
+
+fn drop_trailing_goto_to_label_sequence(
+    stmts: &[Stmt],
+    as_block: bool,
+    target_label: &str,
+) -> Option<Stmt> {
+    let idx = stmts.iter().rposition(|stmt| !stmt_is_linear_empty(stmt))?;
+    let Stmt::Goto(label) = &stmts[idx] else {
+        return None;
+    };
+    if label != target_label {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(stmts.len().saturating_sub(1));
+    out.extend(stmts[..idx].iter().cloned());
+    out.extend(stmts[idx + 1..].iter().cloned());
+    Some(if as_block {
+        Stmt::Block(out)
+    } else {
+        Stmt::Sequence(out)
+    })
+}
+
 fn trim_unreachable_linear_suffixes(stmt: Stmt, goto_targets: &BTreeSet<String>) -> Stmt {
     match stmt {
         Stmt::Sequence(stmts) => trim_unreachable_sequence(stmts, false, goto_targets),
@@ -950,15 +1270,17 @@ fn trim_unreachable_linear_suffixes(stmt: Stmt, goto_targets: &BTreeSet<String>)
 }
 
 fn cleanup_local_control_flow(body: Stmt) -> Stmt {
+    let body = normalize_local_if_control(body);
     let mut goto_targets = BTreeSet::new();
     collect_goto_targets(&body, &mut goto_targets);
     let body = redirect_trivial_gotos(trim_unreachable_linear_suffixes(body, &goto_targets));
     let mut goto_target_counts = HashMap::new();
     collect_goto_target_counts(&body, &mut goto_target_counts);
-    redirect_trivial_gotos(fold_jump_over_branch_labels(
+    let body = normalize_local_if_control(fold_jump_over_branch_labels(
         body,
         &goto_target_counts,
-    ))
+    ));
+    redirect_trivial_gotos(body)
 }
 
 fn trim_unreachable_sequence(
@@ -3208,6 +3530,112 @@ mod tests {
         assert!(rendered.contains("return 7;"), "got:\n{rendered}");
         assert!(rendered.contains("side_effect();"), "got:\n{rendered}");
         assert!(rendered.contains("BB1:"), "got:\n{rendered}");
+        assert!(rendered.contains("tail_effect();"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn canonicalize_merges_complementary_single_arm_ifs() {
+        let function = StructuredFunction {
+            params: Vec::new(),
+            locals: Vec::new(),
+            body: Stmt::Sequence(vec![
+                Stmt::If {
+                    condition: Expr::Reg("p0".to_string()),
+                    then_branch: Box::new(Stmt::ExprStmt(Expr::Raw("hot_path()".to_string()))),
+                    else_branch: None,
+                },
+                Stmt::If {
+                    condition: Expr::Unary {
+                        op: "!".to_string(),
+                        arg: Box::new(Expr::Reg("p0".to_string())),
+                    },
+                    then_branch: Box::new(Stmt::ExprStmt(Expr::Raw("cold_path()".to_string()))),
+                    else_branch: None,
+                },
+            ]),
+        };
+
+        let rendered = canonicalize_function(function).body.render_with_indent(0);
+
+        assert!(rendered.contains("if (p0)"), "got:\n{rendered}");
+        assert!(rendered.contains("} else {"), "got:\n{rendered}");
+        assert!(rendered.contains("hot_path();"), "got:\n{rendered}");
+        assert!(rendered.contains("cold_path();"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn canonicalize_strips_fallthrough_goto_from_if_branch() {
+        let function = StructuredFunction {
+            params: Vec::new(),
+            locals: Vec::new(),
+            body: Stmt::Sequence(vec![
+                Stmt::If {
+                    condition: Expr::Reg("p0".to_string()),
+                    then_branch: Box::new(Stmt::Block(vec![
+                        Stmt::ExprStmt(Expr::Raw("prepare()".to_string())),
+                        Stmt::Goto("BB1".to_string()),
+                    ])),
+                    else_branch: None,
+                },
+                Stmt::Label {
+                    name: "BB1".to_string(),
+                    body: Box::new(Stmt::ExprStmt(Expr::Raw("consume()".to_string()))),
+                },
+            ]),
+        };
+
+        let rendered = canonicalize_function(function).body.render_with_indent(0);
+
+        assert!(rendered.contains("if (p0)"), "got:\n{rendered}");
+        assert!(rendered.contains("prepare();"), "got:\n{rendered}");
+        assert!(rendered.contains("consume();"), "got:\n{rendered}");
+        assert!(!rendered.contains("goto BB1;"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn canonicalize_drops_duplicate_complementary_terminal_pair_suffix() {
+        let function = StructuredFunction {
+            params: Vec::new(),
+            locals: Vec::new(),
+            body: Stmt::Sequence(vec![
+                Stmt::If {
+                    condition: Expr::Reg("p0".to_string()),
+                    then_branch: Box::new(Stmt::Goto("BB1".to_string())),
+                    else_branch: None,
+                },
+                Stmt::If {
+                    condition: Expr::Unary {
+                        op: "!".to_string(),
+                        arg: Box::new(Expr::Reg("p0".to_string())),
+                    },
+                    then_branch: Box::new(Stmt::Return(Some(Expr::Imm("7".to_string())))),
+                    else_branch: None,
+                },
+                Stmt::If {
+                    condition: Expr::Reg("p0".to_string()),
+                    then_branch: Box::new(Stmt::Goto("BB1".to_string())),
+                    else_branch: None,
+                },
+                Stmt::If {
+                    condition: Expr::Unary {
+                        op: "!".to_string(),
+                        arg: Box::new(Expr::Reg("p0".to_string())),
+                    },
+                    then_branch: Box::new(Stmt::Return(Some(Expr::Imm("9".to_string())))),
+                    else_branch: None,
+                },
+                Stmt::Label {
+                    name: "BB1".to_string(),
+                    body: Box::new(Stmt::ExprStmt(Expr::Raw("tail_effect()".to_string()))),
+                },
+            ]),
+        };
+
+        let rendered = canonicalize_function(function).body.render_with_indent(0);
+
+        assert!(rendered.contains("if (!p0)"), "got:\n{rendered}");
+        assert!(rendered.contains("return 7;"), "got:\n{rendered}");
+        assert!(!rendered.contains("return 9;"), "got:\n{rendered}");
         assert!(rendered.contains("tail_effect();"), "got:\n{rendered}");
     }
 

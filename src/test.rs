@@ -1873,17 +1873,17 @@ fn corpus_goto_budget_is_tight() {
         // innermost level + break propagation through 2 outer levels.
         ("control_flow_kernels.sass:find_pattern", 3),
         // nested_loop_break_continue: 2-level loop with break+continue
-        // at both levels — one inner/outer exit ladder remains explicit.
-        ("control_flow_kernels.sass:nested_loop_break_continue", 12),
-        // state_machine: one small latch still survives as an explicit goto.
-        ("control_flow_kernels.sass:state_machine", 2),
+        // now only keeps the core inner/outer latch exits explicit.
+        ("control_flow_kernels.sass:nested_loop_break_continue", 8),
+        // state_machine: one tiny latch still survives as an explicit goto.
+        ("control_flow_kernels.sass:state_machine", 1),
         // box_blur_variable_radius: nested loop with continue (skip OOB).
         ("image_processing_kernels.sass:box_blur_variable_radius", 1),
         // string_search: loop with early break on mismatch.
         ("data_processing_kernels.sass:string_search", 2),
         // utf8_count_chars: multi-way byte classification (if-chain on
-        // byte ranges) + continuation-byte skip loop.
-        ("data_processing_kernels.sass:utf8_count_chars", 5),
+        // byte ranges) + one continuation-byte skip loop latch.
+        ("data_processing_kernels.sass:utf8_count_chars", 3),
         // rle_compress: warp-level prefix/flush path still keeps a
         // scalar remainder handoff explicit.
         ("data_processing_kernels.sass:rle_compress", 2),
@@ -1896,12 +1896,12 @@ fn corpus_goto_budget_is_tight() {
         ("ml_kernels.sass:cross_entropy_loss", 3),
         // layer_norm_forward / softmax_forward / topk_per_row still exercise
         // the hardest split-window reduction/remainder shapes in the corpus.
-        ("ml_kernels.sass:layer_norm_forward", 29),
+        ("ml_kernels.sass:layer_norm_forward", 25),
         ("ml_kernels.sass:softmax_forward", 5),
         ("ml_kernels.sass:topk_per_row", 6),
     ]
     .into();
-    const SM89_TOTAL_GOTO_CEILING: usize = 86;
+    const SM89_TOTAL_GOTO_CEILING: usize = 75;
 
     let mut violations: Vec<(String, usize, usize)> = Vec::new();
     let outputs = run_corpus();

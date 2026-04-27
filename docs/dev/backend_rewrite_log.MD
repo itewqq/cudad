@@ -404,17 +404,27 @@
   immediate next non-empty statement after the candidate branch, which keeps
   canonical cleanup from skipping reachable side effects when collapsing
   single-use goto ladders.
+- Canonical local-control cleanup now also:
+  - merges complementary single-arm `if` pairs into explicit `if/else`
+  - strips terminal branch gotos that only jump to the immediate fallthrough
+    label
+  - normalizes empty-arm `if` shells back to single-arm conditionals
+  which ratchets the strict SM89 goto ceiling down to `75` (`nested_loop_`
+  `break_continue` 8, `state_machine` 1, `utf8_count_chars` 3,
+  `layer_norm_forward` 25).
 
 ## Next safe step
 
 1. Tighten the remaining SM89 goto ceilings structurally, especially
-   `layer_norm_forward`, `topk_per_row`, `softmax_forward`, and the strip-mined
-   remainder kernels that still need non-zero budgets.
+   `multi_exit_loop`, `topk_per_row`, `softmax_forward`, and the still-heavy
+   `layer_norm_forward` remainder ladders.
 2. Keep the new post-bind cleanup rules conservative: preserve any structured
    subtree that contains a live goto target, and only trim duplicate labels
    from linear leading prefixes that are already emitted on every path.
-3. After the next 3-5 cleanup commits, run another sub-agent review and fold
-   its findings back in before touching the remaining goto-budget gates.
+3. Delete any remaining backend-only test contracts or fixture expectations
+   that still encode transitional canonical/legacy choreography instead of
+   real pipeline invariants, then run another review cycle after the next 3-5
+   commits.
 
 ## Open questions
 
