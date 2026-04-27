@@ -860,8 +860,8 @@ fn full_pass_dot_thread_keeps_pointer_param_symbols() {
         out
     );
     assert!(
-        out.contains("fmaf(") && out.matches("r2_13 =").count() >= 2,
-        "expected dot_thread to keep the FFMA accumulation and phi-lowered merge assignments, got:
+        out.contains("fmaf(") && out.contains("arg4_ptr[r3_1] ="),
+        "expected dot_thread to keep the FFMA accumulation live through the final typed store, got:
 {}",
         out
     );
