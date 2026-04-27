@@ -578,6 +578,50 @@ fn assert_canonical_full_pass_nonempty_and_deterministic(sass: &str) -> String {
     out1
 }
 
+fn rendered_store_value_reaches_fmaf(rendered: &str, store_lvalue: &str) -> bool {
+    let store_re = Regex::new(&format!(
+        r"(?m)^\s*{}\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*;\s*$",
+        regex::escape(store_lvalue)
+    ))
+    .expect("valid store regex");
+    let Some(stored) = store_re
+        .captures(rendered)
+        .and_then(|caps| caps.get(1))
+        .map(|m| m.as_str().to_string())
+    else {
+        return false;
+    };
+
+    let assign_re = Regex::new(r"(?m)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+?)\s*;\s*$")
+        .expect("valid assignment regex");
+    let bare_var_re =
+        Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$").expect("valid bare variable regex");
+    let mut assigns: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    for caps in assign_re.captures_iter(rendered) {
+        assigns
+            .entry(caps[1].to_string())
+            .or_default()
+            .push(caps[2].to_string());
+    }
+
+    let mut worklist = vec![stored];
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(name) = worklist.pop() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        for rhs in assigns.get(&name).into_iter().flatten() {
+            if rhs.contains("fmaf(") {
+                return true;
+            }
+            if bare_var_re.is_match(rhs) {
+                worklist.push(rhs.clone());
+            }
+        }
+    }
+    false
+}
+
 #[test]
 fn canonical_full_pass_emits_clean_pointer_and_shared_forms() {
     let sass = r#"
@@ -860,8 +904,8 @@ fn full_pass_dot_thread_keeps_pointer_param_symbols() {
         out
     );
     assert!(
-        out.contains("fmaf(") && out.contains("arg4_ptr[r3_1] ="),
-        "expected dot_thread to keep the FFMA accumulation live through the final typed store, got:
+        rendered_store_value_reaches_fmaf(&out, "arg4_ptr[r3_1]"),
+        "expected dot_thread to keep the FFMA accumulation on the stored value path, got:
 {}",
         out
     );

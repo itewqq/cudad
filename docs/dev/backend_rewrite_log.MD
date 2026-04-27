@@ -412,6 +412,17 @@
   which ratchets the strict SM89 goto ceiling down to `75` (`nested_loop_`
   `break_continue` 8, `state_machine` 1, `utf8_count_chars` 3,
   `layer_norm_forward` 25).
+- Review-driven guardrails now pin two safety contracts in local control
+  cleanup:
+  - fallthrough-goto stripping only fires for side-effect-free predicates
+  - complementary-`if` merging only fires when the first arm cannot rewrite
+    variables read by either condition
+  and the canonical regression suite now includes targeted tests for both
+  hazards.
+- The `dot_thread` FFMA regression test now follows the final typed store's
+  SSA/copy chain instead of matching one specific temp name, so it still
+  proves the accumulation result reaches `arg4_ptr[...]` without reintroducing
+  brittle choreography assertions.
 
 ## Next safe step
 
@@ -423,8 +434,8 @@
    from linear leading prefixes that are already emitted on every path.
 3. Delete any remaining backend-only test contracts or fixture expectations
    that still encode transitional canonical/legacy choreography instead of
-   real pipeline invariants, then run another review cycle after the next 3-5
-   commits.
+   real pipeline invariants, then queue the next review cycle after another
+   1-3 implementation commits.
 
 ## Open questions
 

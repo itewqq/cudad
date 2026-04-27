@@ -995,6 +995,12 @@ fn try_merge_complementary_if_pair(stmts: &[Stmt]) -> Option<(Stmt, usize)> {
     {
         return None;
     }
+    let mut condition_vars = BTreeSet::new();
+    collect_used_expr_vars(first_condition, &mut condition_vars);
+    collect_used_expr_vars(second_condition, &mut condition_vars);
+    if stmt_writes_any_named_var(first_branch, &condition_vars) {
+        return None;
+    }
 
     Some((
         Stmt::If {
@@ -1093,7 +1099,11 @@ fn simplify_empty_if_arms(stmt: Stmt) -> Stmt {
                 .map(stmt_is_linear_empty)
                 .unwrap_or(true);
             if then_empty && else_empty {
-                return Stmt::Empty;
+                return if expr_is_pure_for_control_cleanup(&condition) {
+                    Stmt::Empty
+                } else {
+                    Stmt::ExprStmt(condition)
+                };
             }
             if then_empty {
                 return Stmt::If {
@@ -1164,6 +1174,9 @@ fn strip_fallthrough_goto_from_if(stmt: &Stmt, trailing: &[Stmt]) -> Option<Stmt
     else {
         return None;
     };
+    if !expr_is_pure_for_control_cleanup(condition) {
+        return None;
+    }
 
     let new_then = drop_trailing_goto_to_label(then_branch, target_label);
     let new_else = else_branch
@@ -1188,6 +1201,49 @@ fn next_immediate_label_name(stmts: &[Stmt]) -> Option<&str> {
         return None;
     };
     Some(name.as_str())
+}
+
+fn stmt_writes_any_named_var(stmt: &Stmt, vars: &BTreeSet<String>) -> bool {
+    match stmt {
+        Stmt::Block(stmts) | Stmt::Sequence(stmts) => {
+            stmts.iter().any(|stmt| stmt_writes_any_named_var(stmt, vars))
+        }
+        Stmt::Label { body, .. } => stmt_writes_any_named_var(body, vars),
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            stmt_writes_any_named_var(then_branch, vars)
+                || else_branch
+                    .as_deref()
+                    .is_some_and(|branch| stmt_writes_any_named_var(branch, vars))
+        }
+        Stmt::Loop { body, .. } => stmt_writes_any_named_var(body, vars),
+        Stmt::Switch { cases, default, .. } => {
+            cases
+                .iter()
+                .any(|(_, body)| stmt_writes_any_named_var(body, vars))
+                || default
+                    .as_deref()
+                    .is_some_and(|body| stmt_writes_any_named_var(body, vars))
+        }
+        Stmt::Assign { dst, .. } => lvalue_writes_any_named_var(dst, vars),
+        Stmt::Break
+        | Stmt::Continue
+        | Stmt::Return(_)
+        | Stmt::ExprStmt(_)
+        | Stmt::Goto(_)
+        | Stmt::Empty => false,
+    }
+}
+
+fn lvalue_writes_any_named_var(dst: &LValue, vars: &BTreeSet<String>) -> bool {
+    match dst {
+        LValue::Raw(name) | LValue::Var(name) => vars.contains(name),
+        LValue::PtrLane { base, .. } => vars.contains(base),
+        LValue::Deref { .. } | LValue::Indexed { .. } => false,
+    }
 }
 
 fn drop_trailing_goto_to_label(stmt: &Stmt, target_label: &str) -> Option<Stmt> {
@@ -3590,6 +3646,65 @@ mod tests {
         assert!(rendered.contains("prepare();"), "got:\n{rendered}");
         assert!(rendered.contains("consume();"), "got:\n{rendered}");
         assert!(!rendered.contains("goto BB1;"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn canonicalize_keeps_impure_fallthrough_guarded_goto() {
+        let function = StructuredFunction {
+            params: Vec::new(),
+            locals: Vec::new(),
+            body: Stmt::Sequence(vec![
+                Stmt::If {
+                    condition: Expr::Raw("atomicAdd(ptr, 1)".to_string()),
+                    then_branch: Box::new(Stmt::Goto("BB1".to_string())),
+                    else_branch: None,
+                },
+                Stmt::Label {
+                    name: "BB1".to_string(),
+                    body: Box::new(Stmt::ExprStmt(Expr::Raw("tail_effect()".to_string()))),
+                },
+            ]),
+        };
+
+        let rendered = canonicalize_function(function).body.render_with_indent(0);
+
+        assert!(rendered.contains("atomicAdd(ptr, 1)"), "got:\n{rendered}");
+        assert!(rendered.contains("goto BB1;"), "got:\n{rendered}");
+        assert!(rendered.contains("tail_effect();"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn canonicalize_keeps_complementary_ifs_when_first_arm_mutates_condition_var() {
+        let function = StructuredFunction {
+            params: Vec::new(),
+            locals: Vec::new(),
+            body: Stmt::Sequence(vec![
+                Stmt::If {
+                    condition: Expr::Reg("p0".to_string()),
+                    then_branch: Box::new(Stmt::Assign {
+                        dst: LValue::Var("p0".to_string()),
+                        src: Expr::Imm("false".to_string()),
+                    }),
+                    else_branch: None,
+                },
+                Stmt::If {
+                    condition: Expr::Unary {
+                        op: "!".to_string(),
+                        arg: Box::new(Expr::Reg("p0".to_string())),
+                    },
+                    then_branch: Box::new(Stmt::ExprStmt(Expr::Raw("slow_path()".to_string()))),
+                    else_branch: None,
+                },
+            ]),
+        };
+
+        let rendered = canonicalize_function(function).body.render_with_indent(0);
+
+        assert!(rendered.contains("if (p0)"), "got:\n{rendered}");
+        assert!(rendered.contains("p0 = false;"), "got:\n{rendered}");
+        assert!(rendered.contains("if (!p0)"), "got:\n{rendered}");
+        assert!(rendered.contains("slow_path();"), "got:\n{rendered}");
+        assert!(!rendered.contains("} else {"), "got:\n{rendered}");
     }
 
     #[test]
