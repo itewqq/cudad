@@ -1899,9 +1899,9 @@ const CONVERGENCE_BARRIER_BANNED_NEEDLES: &[&str] = &[
 
 #[test]
 fn corpus_output_contains_no_raw_convergence_barriers() {
-    // BSSY/BSYNC/SSY/SYNC/WARPSYNC are control-flow scaffolding the lifter
-    // should fold away. Seeing them verbatim in the rendered C means the
-    // semantic-lift and structurizer pipeline missed one.
+    // BSSY/BSYNC/SSY/SYNC/WARPSYNC are control-flow scaffolding the canonical
+    // pipeline should fold away. Seeing them verbatim in the rendered C means
+    // CFG/structurization/canonical lowering leaked backend-only scaffolding.
     for (file, name, out) in run_corpus() {
         for needle in CONVERGENCE_BARRIER_BANNED_NEEDLES {
             assert!(
@@ -1939,9 +1939,9 @@ fn corpus_goto_budget_is_tight() {
     // regression or any structural improvement must update the table in the
     // same commit so the debt stays visible.
     let allow_list: std::collections::HashMap<&str, usize> = [
-        // multi_exit_loop: 3 early-return paths inside a for-loop; the
-        // compiler still tail-duplicates several exit ladders.
-        ("control_flow_kernels.sass:multi_exit_loop", 10),
+        // multi_exit_loop: only the loop latch still survives as an explicit
+        // goto after nested terminal exit tails inline structurally.
+        ("control_flow_kernels.sass:multi_exit_loop", 1),
         // find_pattern: 4-deep nested loop with early return from the
         // innermost level + break propagation through 2 outer levels.
         ("control_flow_kernels.sass:find_pattern", 3),
@@ -1974,7 +1974,7 @@ fn corpus_goto_budget_is_tight() {
         ("ml_kernels.sass:topk_per_row", 6),
     ]
     .into();
-    const SM89_TOTAL_GOTO_CEILING: usize = 75;
+    const SM89_TOTAL_GOTO_CEILING: usize = 66;
 
     let mut violations: Vec<(String, usize, usize)> = Vec::new();
     let outputs = run_corpus();
@@ -2038,9 +2038,8 @@ fn corpus_goto_budget_is_tight() {
 
 #[test]
 fn corpus_output_no_raw_ffma() {
-    // After semantic lifting, FFMA instructions should be rendered as
-    // `a * b + c`, not as raw `FFMA(...)` opcode calls. This guards
-    // against regressions in the FFMA lift rule.
+    // Canonical scalar lowering should render FFMA as `a * b + c`, not as
+    // raw `FFMA(...)` opcode calls.
     for (file, name, out) in run_corpus() {
         assert!(
             !out.contains("FFMA("),

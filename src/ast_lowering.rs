@@ -178,8 +178,9 @@ impl<'a> StructuredLowering<'a> {
         let seed = crate::ast::StructuredFunction {
             params: seed.params,
             locals: seed.locals,
-            body: self.bind_missing_goto_labels(seed.body),
+            body: self.trim_duplicate_label_prefixes(self.bind_missing_goto_labels(seed.body)),
         };
+        let seed = canonicalize_post_bind_control_flow(seed);
         let plan = plan_symbols(&seed, self.analysis);
         crate::ast::StructuredFunction {
             params: plan.params,

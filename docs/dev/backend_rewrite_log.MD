@@ -604,3 +604,23 @@ ceilings structurally rather than reintroducing backend-repair passes.
   - passes: `full_pass_dot_thread_keeps_pointer_param_symbols`
   - passes: `full_pass_topk_per_row_rewrites_split_window_pointer_pair`
   - passes: `cargo test --quiet`
+- Follow-up control cleanup landed for the real shared-tail goto case the
+  synthetic tests were missing:
+  - the explorer trace showed `multi_exit_loop` still lowering `goto BB29` /
+    `goto BB30` into nested branch tails because the label bodies themselves
+    were non-terminal while the enclosing nested branch suffixes were terminal
+  - canonical local cleanup now only targets nested labels, but it can inline
+    the full terminal suffix after a nested target label (`if { BB29: ...;
+    return; }`) rather than requiring the bare label body to terminate
+  - untargeted-label stripping is likewise limited to nested labels, so direct
+    linear labels that still act as visible join points stay intact
+- Pipeline follow-up:
+  - `ast_lowering` now runs one more post-bind canonical control cleanup after
+    the final missing-label bind / duplicate-prefix trim, so late-bound labels
+    cannot bypass the canonical AST simplifier
+- Measured impact:
+  - `multi_exit_loop`: 10 -> 1 goto (only the loop latch remains)
+  - strict SM89 total goto ceiling tightened again: 75 -> 66
+- Current validation state after the nested-tail fix:
+  - passes: `corpus_goto_budget_is_tight`
+  - passes: `cargo test --quiet` (`354` + `7` tests)

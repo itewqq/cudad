@@ -1330,13 +1330,21 @@ fn cleanup_local_control_flow(body: Stmt) -> Stmt {
     let mut goto_targets = BTreeSet::new();
     collect_goto_targets(&body, &mut goto_targets);
     let body = redirect_trivial_gotos(trim_unreachable_linear_suffixes(body, &goto_targets));
+    let body = inline_terminal_forward_gotos(body);
+    let mut goto_targets = BTreeSet::new();
+    collect_goto_targets(&body, &mut goto_targets);
+    let body = strip_untargeted_labels(body, &goto_targets);
     let mut goto_target_counts = HashMap::new();
     collect_goto_target_counts(&body, &mut goto_target_counts);
     let body = normalize_local_if_control(fold_jump_over_branch_labels(
         body,
         &goto_target_counts,
     ));
-    redirect_trivial_gotos(body)
+    let body = inline_terminal_forward_gotos(body);
+    let mut goto_targets = BTreeSet::new();
+    collect_goto_targets(&body, &mut goto_targets);
+    let body = strip_untargeted_labels(body, &goto_targets);
+    redirect_trivial_gotos(trim_unreachable_linear_suffixes(body, &goto_targets))
 }
 
 fn trim_unreachable_sequence(
@@ -1390,6 +1398,346 @@ fn stmt_definitely_terminates(stmt: &Stmt) -> bool {
                     .is_some_and(stmt_definitely_terminates)
         }
         _ => false,
+    }
+}
+
+fn inline_terminal_forward_gotos(stmt: Stmt) -> Stmt {
+    inline_terminal_forward_gotos_with_future(stmt, &[])
+}
+
+fn inline_terminal_forward_gotos_with_future(stmt: Stmt, future: &[Stmt]) -> Stmt {
+    match stmt {
+        Stmt::Sequence(stmts) => inline_terminal_forward_goto_sequence(stmts, false, future),
+        Stmt::Block(stmts) => inline_terminal_forward_goto_sequence(stmts, true, future),
+        Stmt::Label { name, body } => Stmt::Label {
+            name,
+            body: Box::new(inline_terminal_forward_gotos_with_future(*body, future)),
+        },
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => Stmt::If {
+            condition,
+            then_branch: Box::new(inline_terminal_forward_gotos_with_future(
+                *then_branch,
+                future,
+            )),
+            else_branch: else_branch.map(|branch| {
+                Box::new(inline_terminal_forward_gotos_with_future(*branch, future))
+            }),
+        },
+        Stmt::Loop {
+            kind,
+            condition,
+            body,
+        } => Stmt::Loop {
+            kind,
+            condition,
+            body: Box::new(inline_terminal_forward_gotos_with_future(*body, future)),
+        },
+        Stmt::Switch {
+            discriminant,
+            cases,
+            default,
+        } => Stmt::Switch {
+            discriminant,
+            cases: cases
+                .into_iter()
+                .map(|(label, body)| {
+                    (
+                        label,
+                        inline_terminal_forward_gotos_with_future(body, future),
+                    )
+                })
+                .collect(),
+            default: default.map(|body| {
+                Box::new(inline_terminal_forward_gotos_with_future(*body, future))
+            }),
+        },
+        Stmt::Goto(label) => {
+            find_first_inlineable_label_tail(future, &label).unwrap_or(Stmt::Goto(label))
+        }
+        other => other,
+    }
+}
+
+fn inline_terminal_forward_goto_sequence(stmts: Vec<Stmt>, as_block: bool, future: &[Stmt]) -> Stmt {
+    let mut out = Vec::with_capacity(stmts.len());
+    for idx in 0..stmts.len() {
+        let mut lexical_future = stmts[idx + 1..].to_vec();
+        lexical_future.extend_from_slice(future);
+        out.push(inline_terminal_forward_gotos_with_future(
+            stmts[idx].clone(),
+            &lexical_future,
+        ));
+    }
+    if as_block {
+        Stmt::Block(out)
+    } else {
+        Stmt::Sequence(out)
+    }
+}
+
+fn find_first_inlineable_label_tail(stmts: &[Stmt], target_label: &str) -> Option<Stmt> {
+    for stmt in stmts {
+        if let Some(body) = find_first_inlineable_label_tail_in_stmt(stmt, target_label, false) {
+            return Some(body);
+        }
+    }
+    None
+}
+
+fn find_first_inlineable_label_tail_in_stmt(
+    stmt: &Stmt,
+    target_label: &str,
+    nested: bool,
+) -> Option<Stmt> {
+    match stmt {
+        Stmt::Label { name, body } => {
+            if nested && name == target_label && stmt_is_inlineable_terminal_tail(body) {
+                Some((**body).clone())
+            } else {
+                find_first_inlineable_label_tail_in_stmt(body, target_label, nested)
+            }
+        }
+        Stmt::Sequence(stmts) => find_first_inlineable_label_tail_in_sequence(
+            stmts,
+            target_label,
+            nested,
+            false,
+        ),
+        Stmt::Block(stmts) => {
+            find_first_inlineable_label_tail_in_sequence(stmts, target_label, nested, true)
+        }
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => find_first_inlineable_label_tail_in_stmt(then_branch, target_label, true).or_else(
+            || {
+                else_branch.as_deref().and_then(|branch| {
+                    find_first_inlineable_label_tail_in_stmt(branch, target_label, true)
+                })
+            },
+        ),
+        Stmt::Loop { body, .. } => {
+            find_first_inlineable_label_tail_in_stmt(body, target_label, true)
+        }
+        Stmt::Switch { cases, default, .. } => cases
+            .iter()
+            .find_map(|(_, body)| find_first_inlineable_label_tail_in_stmt(body, target_label, true))
+            .or_else(|| {
+                default.as_deref().and_then(|body| {
+                    find_first_inlineable_label_tail_in_stmt(body, target_label, true)
+                })
+            }),
+        Stmt::Goto(_)
+        | Stmt::Break
+        | Stmt::Continue
+        | Stmt::Return(_)
+        | Stmt::Assign { .. }
+        | Stmt::ExprStmt(_)
+        | Stmt::Empty => None,
+    }
+}
+
+fn find_first_inlineable_label_tail_in_sequence(
+    stmts: &[Stmt],
+    target_label: &str,
+    nested: bool,
+    as_block: bool,
+) -> Option<Stmt> {
+    for idx in 0..stmts.len() {
+        if nested {
+            if let Stmt::Label { name, body } = &stmts[idx] {
+                if name == target_label {
+                    let mut tail = Vec::with_capacity(stmts.len() - idx);
+                    tail.push((**body).clone());
+                    tail.extend(stmts[idx + 1..].iter().cloned());
+                    let candidate = wrap_stmt_tail(tail, as_block);
+                    if stmt_is_inlineable_terminal_tail(&candidate) {
+                        return Some(candidate);
+                    }
+                }
+            }
+        }
+        if let Some(found) = find_first_inlineable_label_tail_in_stmt(&stmts[idx], target_label, nested) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn wrap_stmt_tail(tail: Vec<Stmt>, as_block: bool) -> Stmt {
+    if tail.len() == 1 {
+        tail.into_iter().next().unwrap_or(Stmt::Empty)
+    } else if as_block {
+        Stmt::Block(tail)
+    } else {
+        Stmt::Sequence(tail)
+    }
+}
+
+fn stmt_is_inlineable_terminal_tail(stmt: &Stmt) -> bool {
+    stmt_definitely_terminates(stmt)
+        && !stmt_contains_any_label(stmt)
+        && !stmt_contains_goto(stmt)
+        && !stmt_contains_break_or_continue(stmt)
+}
+
+fn stmt_contains_goto(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Goto(_) => true,
+        Stmt::Label { body, .. } => stmt_contains_goto(body),
+        Stmt::Sequence(stmts) | Stmt::Block(stmts) => stmts.iter().any(stmt_contains_goto),
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            stmt_contains_goto(then_branch)
+                || else_branch
+                    .as_deref()
+                    .is_some_and(stmt_contains_goto)
+        }
+        Stmt::Loop { body, .. } => stmt_contains_goto(body),
+        Stmt::Switch { cases, default, .. } => {
+            cases.iter().any(|(_, body)| stmt_contains_goto(body))
+                || default.as_deref().is_some_and(stmt_contains_goto)
+        }
+        Stmt::Break
+        | Stmt::Continue
+        | Stmt::Return(_)
+        | Stmt::Assign { .. }
+        | Stmt::ExprStmt(_)
+        | Stmt::Empty => false,
+    }
+}
+
+fn stmt_contains_break_or_continue(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Break | Stmt::Continue => true,
+        Stmt::Label { body, .. } => stmt_contains_break_or_continue(body),
+        Stmt::Sequence(stmts) | Stmt::Block(stmts) => {
+            stmts.iter().any(stmt_contains_break_or_continue)
+        }
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            stmt_contains_break_or_continue(then_branch)
+                || else_branch
+                    .as_deref()
+                    .is_some_and(stmt_contains_break_or_continue)
+        }
+        Stmt::Loop { body, .. } => stmt_contains_break_or_continue(body),
+        Stmt::Switch { cases, default, .. } => {
+            cases
+                .iter()
+                .any(|(_, body)| stmt_contains_break_or_continue(body))
+                || default
+                    .as_deref()
+                    .is_some_and(stmt_contains_break_or_continue)
+        }
+        Stmt::Goto(_)
+        | Stmt::Return(_)
+        | Stmt::Assign { .. }
+        | Stmt::ExprStmt(_)
+        | Stmt::Empty => false,
+    }
+}
+
+fn strip_untargeted_labels(stmt: Stmt, goto_targets: &BTreeSet<String>) -> Stmt {
+    strip_untargeted_labels_with_nesting(stmt, goto_targets, false)
+}
+
+fn strip_untargeted_labels_with_nesting(
+    stmt: Stmt,
+    goto_targets: &BTreeSet<String>,
+    nested: bool,
+) -> Stmt {
+    match stmt {
+        Stmt::Sequence(stmts) => Stmt::Sequence(
+            stmts
+                .into_iter()
+                .map(|stmt| strip_untargeted_labels_with_nesting(stmt, goto_targets, nested))
+                .collect(),
+        ),
+        Stmt::Block(stmts) => Stmt::Block(
+            stmts
+                .into_iter()
+                .map(|stmt| strip_untargeted_labels_with_nesting(stmt, goto_targets, nested))
+                .collect(),
+        ),
+        Stmt::Label { name, body } => {
+            let body = strip_untargeted_labels_with_nesting(*body, goto_targets, nested);
+            if !nested || goto_targets.contains(&name) {
+                Stmt::Label {
+                    name,
+                    body: Box::new(body),
+                }
+            } else {
+                body
+            }
+        }
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => Stmt::If {
+            condition,
+            then_branch: Box::new(strip_untargeted_labels_with_nesting(
+                *then_branch,
+                goto_targets,
+                true,
+            )),
+            else_branch: else_branch.map(|branch| {
+                Box::new(strip_untargeted_labels_with_nesting(
+                    *branch,
+                    goto_targets,
+                    true,
+                ))
+            }),
+        },
+        Stmt::Loop {
+            kind,
+            condition,
+            body,
+        } => Stmt::Loop {
+            kind,
+            condition,
+            body: Box::new(strip_untargeted_labels_with_nesting(
+                *body,
+                goto_targets,
+                true,
+            )),
+        },
+        Stmt::Switch {
+            discriminant,
+            cases,
+            default,
+        } => Stmt::Switch {
+            discriminant,
+            cases: cases
+                .into_iter()
+                .map(|(label, body)| {
+                    (
+                        label,
+                        strip_untargeted_labels_with_nesting(body, goto_targets, true),
+                    )
+                })
+                .collect(),
+            default: default.map(|body| {
+                Box::new(strip_untargeted_labels_with_nesting(
+                    *body,
+                    goto_targets,
+                    true,
+                ))
+            }),
+        },
+        other => other,
     }
 }
 
@@ -3649,6 +3997,84 @@ mod tests {
     }
 
     #[test]
+    fn canonicalize_inlines_goto_into_nested_terminal_label_body() {
+        let function = StructuredFunction {
+            params: Vec::new(),
+            locals: Vec::new(),
+            body: Stmt::Sequence(vec![
+                Stmt::If {
+                    condition: Expr::Reg("p0".to_string()),
+                    then_branch: Box::new(Stmt::Block(vec![
+                        Stmt::Assign {
+                            dst: LValue::Var("x".to_string()),
+                            src: Expr::Imm("7".to_string()),
+                        },
+                        Stmt::Goto("BB1".to_string()),
+                    ])),
+                    else_branch: None,
+                },
+                Stmt::If {
+                    condition: Expr::Reg("p1".to_string()),
+                    then_branch: Box::new(Stmt::Label {
+                        name: "BB1".to_string(),
+                        body: Box::new(Stmt::Block(vec![
+                            Stmt::ExprStmt(Expr::Raw("consume(x)".to_string())),
+                            Stmt::Return(Some(Expr::Reg("x".to_string()))),
+                        ])),
+                    }),
+                    else_branch: None,
+                },
+            ]),
+        };
+
+        let rendered = canonicalize_function(function).body.render_with_indent(0);
+
+        assert!(rendered.contains("x = 7;"), "got:\n{rendered}");
+        assert!(rendered.contains("consume(x);"), "got:\n{rendered}");
+        assert!(rendered.contains("return x;"), "got:\n{rendered}");
+        assert!(!rendered.contains("goto BB1;"), "got:\n{rendered}");
+        assert!(!rendered.contains("BB1:"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn canonicalize_inlines_goto_across_intermediate_label_wrapper() {
+        let function = StructuredFunction {
+            params: Vec::new(),
+            locals: Vec::new(),
+            body: Stmt::Sequence(vec![Stmt::Label {
+                name: "BB2".to_string(),
+                body: Box::new(Stmt::Sequence(vec![
+                    Stmt::If {
+                        condition: Expr::Reg("p0".to_string()),
+                        then_branch: Box::new(Stmt::Goto("BB30".to_string())),
+                        else_branch: None,
+                    },
+                    Stmt::Label {
+                        name: "BB3".to_string(),
+                        body: Box::new(Stmt::If {
+                            condition: Expr::Reg("p1".to_string()),
+                            then_branch: Box::new(Stmt::Label {
+                                name: "BB30".to_string(),
+                                body: Box::new(Stmt::Return(Some(Expr::Imm("7".to_string())))),
+                            }),
+                            else_branch: None,
+                        }),
+                    },
+                ])),
+            }]),
+        };
+
+        let rendered = canonicalize_post_bind_control_flow(function)
+            .body
+            .render_with_indent(0);
+
+        assert!(rendered.contains("if (p0)"), "got:\n{rendered}");
+        assert!(rendered.contains("return 7;"), "got:\n{rendered}");
+        assert!(!rendered.contains("goto BB30;"), "got:\n{rendered}");
+        assert!(!rendered.contains("BB30:"), "got:\n{rendered}");
+    }
+
+    #[test]
     fn canonicalize_keeps_impure_fallthrough_guarded_goto() {
         let function = StructuredFunction {
             params: Vec::new(),
@@ -3807,8 +4233,9 @@ mod tests {
         let rendered = canonicalize_post_bind_control_flow(function).body.render_with_indent(0);
 
         assert!(rendered.contains("BB1:"), "got:\n{rendered}");
-        assert!(rendered.contains("BB2:"), "got:\n{rendered}");
+        assert!(!rendered.contains("BB2:"), "got:\n{rendered}");
         assert!(!rendered.contains("if (p0) goto BB2;"), "got:\n{rendered}");
+        assert!(rendered.contains("return;"), "got:\n{rendered}");
     }
 
     #[test]
@@ -3840,6 +4267,33 @@ mod tests {
         assert!(rendered.contains("goto BB1;"), "got:\n{rendered}");
         assert!(rendered.contains("BB1:"), "got:\n{rendered}");
         assert!(rendered.contains("r0 = 7;"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn post_bind_cleanup_drops_untargeted_nonempty_labels() {
+        let function = StructuredFunction {
+            params: Vec::new(),
+            locals: Vec::new(),
+            body: Stmt::If {
+                condition: Expr::Reg("p0".to_string()),
+                then_branch: Box::new(Stmt::Label {
+                    name: "BB1".to_string(),
+                    body: Box::new(Stmt::Assign {
+                        dst: LValue::Var("r0".to_string()),
+                        src: Expr::Imm("7".to_string()),
+                    }),
+                }),
+                else_branch: None,
+            },
+        };
+
+        let rendered = canonicalize_post_bind_control_flow(function)
+            .body
+            .render_with_indent(0);
+
+        assert!(rendered.contains("if (p0)"), "got:\n{rendered}");
+        assert!(rendered.contains("r0 = 7;"), "got:\n{rendered}");
+        assert!(!rendered.contains("BB1:"), "got:\n{rendered}");
     }
 
     #[test]
