@@ -58,15 +58,20 @@ At the moment:
 - `if_loop.sass` and the corpus kernels are harder cases, and they do not yet
   look as clean as hand-written CUDA or a mature decompiler's output
 
-### Real compute kernels covered
+### Corpus coverage
 
-The corpus also exercises real compute kernels beyond the small single-file fixtures. Good examples in `test_cu/corpus/compute_kernels.cu` include:
+Beyond the small single-file fixtures, the repo also keeps a multi-kernel test
+corpus under `test_cu/corpus/`.
 
-- `bitonic_sort` — nested compare/swap passes with `__syncthreads()` and pairwise exchange logic recovered from real sorting code
-- `sgemm_tiled` — 2D block indexing, `__shared__` tile buffers, synchronized load/compute phases, and a final matrix-store path
-- `stencil2d_5pt` — shared-memory tile + halo loads, `blockIdx.{x,y}` / `threadIdx.{x,y}` recovery, boundary guards, and a weighted output store
+Representative examples from `test_cu/corpus/compute_kernels.cu` include:
 
-Those kernels are still more temp-heavy than ideal, but they are real corpus workloads that the canonical backend decompiles and regression-tests today.
+- `bitonic_sort`
+- `sgemm_tiled`
+- `stencil2d_5pt`
+
+These are useful stress cases for shared memory, block/thread builtin recovery,
+barriers, indexing, and non-trivial control flow. They are part of the
+regression surface, not polished showcase outputs.
 
 For a larger shared-memory example, see `test_cu/golden_full_pass/rc4.pseudo.c`.
 For concrete snapshots, see `test_cu/golden_full_pass/`.
