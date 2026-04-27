@@ -907,7 +907,7 @@ fn negate_boolean_expr(expr: Expr) -> Expr {
 
 fn normalize_local_if_control(stmt: Stmt) -> Stmt {
     simplify_empty_if_arms(strip_fallthrough_branch_gotos(
-        merge_complementary_linear_ifs(stmt),
+        merge_nested_redundant_ifs(merge_complementary_linear_ifs(stmt)),
     ))
 }
 
@@ -950,6 +950,83 @@ fn merge_complementary_linear_ifs(stmt: Stmt) -> Stmt {
                 .collect(),
             default: default
                 .map(|body| Box::new(merge_complementary_linear_ifs(*body))),
+        },
+        other => other,
+    }
+}
+
+fn merge_nested_redundant_ifs(stmt: Stmt) -> Stmt {
+    match stmt {
+        Stmt::Sequence(stmts) => Stmt::Sequence(
+            stmts.into_iter().map(merge_nested_redundant_ifs).collect(),
+        ),
+        Stmt::Block(stmts) => {
+            Stmt::Block(stmts.into_iter().map(merge_nested_redundant_ifs).collect())
+        }
+        Stmt::Label { name, body } => Stmt::Label {
+            name,
+            body: Box::new(merge_nested_redundant_ifs(*body)),
+        },
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            let then_branch = merge_nested_redundant_ifs(*then_branch);
+            let else_branch =
+                else_branch.map(|branch| Box::new(merge_nested_redundant_ifs(*branch)));
+            if else_branch
+                .as_deref()
+                .map(stmt_is_linear_empty)
+                .unwrap_or(true)
+                && expr_is_pure_for_control_cleanup(&condition)
+            {
+                if let Stmt::If {
+                    condition: nested_condition,
+                    then_branch: nested_then,
+                    else_branch: nested_else,
+                } = &then_branch
+                {
+                    if nested_else
+                        .as_deref()
+                        .map(stmt_is_linear_empty)
+                        .unwrap_or(true)
+                        && *nested_condition == condition
+                    {
+                        return Stmt::If {
+                            condition,
+                            then_branch: nested_then.clone(),
+                            else_branch: None,
+                        };
+                    }
+                }
+            }
+            Stmt::If {
+                condition,
+                then_branch: Box::new(then_branch),
+                else_branch,
+            }
+        }
+        Stmt::Loop {
+            kind,
+            condition,
+            body,
+        } => Stmt::Loop {
+            kind,
+            condition,
+            body: Box::new(merge_nested_redundant_ifs(*body)),
+        },
+        Stmt::Switch {
+            discriminant,
+            cases,
+            default,
+        } => Stmt::Switch {
+            discriminant,
+            cases: cases
+                .into_iter()
+                .map(|(label, body)| (label, merge_nested_redundant_ifs(body)))
+                .collect(),
+            default: default.map(|body| Box::new(merge_nested_redundant_ifs(*body))),
         },
         other => other,
     }
@@ -1336,10 +1413,10 @@ fn cleanup_local_control_flow(body: Stmt) -> Stmt {
     let body = strip_untargeted_labels(body, &goto_targets);
     let mut goto_target_counts = HashMap::new();
     collect_goto_target_counts(&body, &mut goto_target_counts);
-    let body = normalize_local_if_control(fold_jump_over_branch_labels(
-        body,
-        &goto_target_counts,
-    ));
+    let body = fold_guarded_skip_regions(body, &goto_target_counts);
+    let mut goto_target_counts = HashMap::new();
+    collect_goto_target_counts(&body, &mut goto_target_counts);
+    let body = normalize_local_if_control(fold_jump_over_branch_labels(body, &goto_target_counts));
     let body = inline_terminal_forward_gotos(body);
     let mut goto_targets = BTreeSet::new();
     collect_goto_targets(&body, &mut goto_targets);
@@ -1840,6 +1917,255 @@ fn fold_jump_over_branch_labels(
     }
 }
 
+/// Fold a branch arm that only prepares values and jumps to a later join label
+/// into a structured `if` around the skipped region. This is still AST-local:
+/// the target label must be uniquely targeted and every label inside the moved
+/// region must only be referenced from the branch that now owns it.
+fn fold_guarded_skip_regions(
+    stmt: Stmt,
+    goto_target_counts: &HashMap<String, usize>,
+) -> Stmt {
+    match stmt {
+        Stmt::Sequence(stmts) => fold_guarded_skip_region_sequence(stmts, false, goto_target_counts),
+        Stmt::Block(stmts) => fold_guarded_skip_region_sequence(stmts, true, goto_target_counts),
+        Stmt::Label { name, body } => Stmt::Label {
+            name,
+            body: Box::new(fold_guarded_skip_regions(*body, goto_target_counts)),
+        },
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => Stmt::If {
+            condition,
+            then_branch: Box::new(fold_guarded_skip_regions(*then_branch, goto_target_counts)),
+            else_branch: else_branch.map(|branch| {
+                Box::new(fold_guarded_skip_regions(*branch, goto_target_counts))
+            }),
+        },
+        Stmt::Loop {
+            kind,
+            condition,
+            body,
+        } => Stmt::Loop {
+            kind,
+            condition,
+            body: Box::new(fold_guarded_skip_regions(*body, goto_target_counts)),
+        },
+        Stmt::Switch {
+            discriminant,
+            cases,
+            default,
+        } => Stmt::Switch {
+            discriminant,
+            cases: cases
+                .into_iter()
+                .map(|(label, body)| (label, fold_guarded_skip_regions(body, goto_target_counts)))
+                .collect(),
+            default: default
+                .map(|body| Box::new(fold_guarded_skip_regions(*body, goto_target_counts))),
+        },
+        other => other,
+    }
+}
+
+fn fold_guarded_skip_region_sequence(
+    stmts: Vec<Stmt>,
+    as_block: bool,
+    goto_target_counts: &HashMap<String, usize>,
+) -> Stmt {
+    let stmts = stmts
+        .into_iter()
+        .map(|stmt| fold_guarded_skip_regions(stmt, goto_target_counts))
+        .collect::<Vec<_>>();
+
+    let mut out = Vec::new();
+    let mut idx = 0usize;
+    while idx < stmts.len() {
+        if let Some((folded, consumed)) = try_fold_guarded_skip_region(&stmts[idx..], goto_target_counts)
+        {
+            out.extend(folded);
+            idx += consumed;
+            continue;
+        }
+        out.push(stmts[idx].clone());
+        idx += 1;
+    }
+
+    if as_block {
+        Stmt::Block(out)
+    } else {
+        Stmt::Sequence(out)
+    }
+}
+
+fn try_fold_guarded_skip_region(
+    stmts: &[Stmt],
+    goto_target_counts: &HashMap<String, usize>,
+) -> Option<(Vec<Stmt>, usize)> {
+    let first = stmts.first()?;
+    let Stmt::If {
+        condition,
+        then_branch,
+        else_branch,
+    } = first
+    else {
+        return None;
+    };
+
+    if let Some(folded) = try_fold_skip_region_arm(
+        condition,
+        then_branch,
+        else_branch.as_deref(),
+        true,
+        &stmts[1..],
+        goto_target_counts,
+    ) {
+        return Some(folded);
+    }
+
+    try_fold_skip_region_arm(
+        condition,
+        else_branch.as_deref()?,
+        Some(then_branch.as_ref()),
+        false,
+        &stmts[1..],
+        goto_target_counts,
+    )
+}
+
+fn try_fold_skip_region_arm(
+    condition: &Expr,
+    skip_arm: &Stmt,
+    run_arm: Option<&Stmt>,
+    skip_is_then: bool,
+    trailing: &[Stmt],
+    goto_target_counts: &HashMap<String, usize>,
+) -> Option<(Vec<Stmt>, usize)> {
+    let (skip_prefix, target_label) = extract_trailing_goto_prefix(skip_arm)?;
+    if goto_target_counts.get(&target_label).copied().unwrap_or(0) != 1 {
+        return None;
+    }
+
+    let label_idx = find_top_level_label_stmt(trailing, &target_label)?;
+    let middle_stmts = trailing[..label_idx].to_vec();
+    let label_stmt = trailing.get(label_idx)?;
+    let Stmt::Label { body, .. } = label_stmt else {
+        return None;
+    };
+
+    let mut moved_labels = BTreeSet::new();
+    collect_label_names_in_stmt_slice(&middle_stmts, &mut moved_labels);
+    let moved_run = append_branch_region(run_arm, &middle_stmts);
+    let mut internal_target_counts = HashMap::new();
+    collect_goto_target_counts(&moved_run, &mut internal_target_counts);
+    for label in moved_labels {
+        if goto_target_counts.get(&label).copied().unwrap_or(0)
+            != internal_target_counts.get(&label).copied().unwrap_or(0)
+        {
+            return None;
+        }
+    }
+
+    let (then_branch, else_branch) = if skip_is_then {
+        (
+            skip_prefix,
+            branch_stmt_or_none(moved_run),
+        )
+    } else {
+        (
+            moved_run,
+            branch_stmt_or_none(skip_prefix),
+        )
+    };
+
+    let mut folded = vec![Stmt::If {
+        condition: condition.clone(),
+        then_branch: Box::new(then_branch),
+        else_branch: else_branch.map(Box::new),
+    }];
+    if !stmt_is_linear_empty(body) {
+        folded.push((**body).clone());
+    }
+    Some((folded, label_idx + 2))
+}
+
+fn extract_trailing_goto_prefix(stmt: &Stmt) -> Option<(Stmt, String)> {
+    if stmt_contains_any_label(stmt) {
+        return None;
+    }
+    match stmt {
+        Stmt::Goto(label) => Some((Stmt::Empty, label.clone())),
+        Stmt::Sequence(stmts) => extract_trailing_goto_prefix_from_sequence(stmts, false),
+        Stmt::Block(stmts) => extract_trailing_goto_prefix_from_sequence(stmts, true),
+        _ => None,
+    }
+}
+
+fn extract_trailing_goto_prefix_from_sequence(
+    stmts: &[Stmt],
+    as_block: bool,
+) -> Option<(Stmt, String)> {
+    let idx = stmts.iter().rposition(|stmt| !stmt_is_linear_empty(stmt))?;
+    let Stmt::Goto(label) = &stmts[idx] else {
+        return None;
+    };
+
+    let mut out = Vec::with_capacity(stmts.len().saturating_sub(1));
+    out.extend(stmts[..idx].iter().cloned());
+    out.extend(stmts[idx + 1..].iter().cloned());
+    Some((
+        if as_block {
+            Stmt::Block(out)
+        } else {
+            Stmt::Sequence(out)
+        },
+        label.clone(),
+    ))
+}
+
+fn find_top_level_label_stmt(stmts: &[Stmt], target_label: &str) -> Option<usize> {
+    stmts.iter().position(|stmt| {
+        matches!(stmt, Stmt::Label { name, .. } if name == target_label)
+    })
+}
+
+fn append_branch_region(run_arm: Option<&Stmt>, middle_stmts: &[Stmt]) -> Stmt {
+    let middle = match middle_stmts {
+        [] => Stmt::Empty,
+        [single] => single.clone(),
+        many => Stmt::Sequence(many.to_vec()),
+    };
+
+    if stmt_is_linear_empty(&middle) {
+        return run_arm.cloned().unwrap_or(Stmt::Empty);
+    }
+
+    match run_arm {
+        None => middle,
+        Some(branch) if stmt_is_linear_empty(branch) => middle,
+        Some(Stmt::Sequence(stmts)) => {
+            let mut out = stmts.clone();
+            out.push(middle);
+            Stmt::Sequence(out)
+        }
+        Some(Stmt::Block(stmts)) => {
+            let mut out = stmts.clone();
+            out.push(middle);
+            Stmt::Block(out)
+        }
+        Some(branch) => Stmt::Sequence(vec![branch.clone(), middle]),
+    }
+}
+
+fn branch_stmt_or_none(stmt: Stmt) -> Option<Stmt> {
+    if stmt_is_linear_empty(&stmt) {
+        None
+    } else {
+        Some(stmt)
+    }
+}
+
 fn fold_jump_over_branch_label_sequence(
     stmts: Vec<Stmt>,
     as_block: bool,
@@ -2009,6 +2335,52 @@ fn stmt_contains_any_label(stmt: &Stmt) -> bool {
         | Stmt::ExprStmt(_)
         | Stmt::Goto(_)
         | Stmt::Empty => false,
+    }
+}
+
+fn collect_label_names_in_stmt_slice(stmts: &[Stmt], out: &mut BTreeSet<String>) {
+    for stmt in stmts {
+        collect_label_names_in_stmt(stmt, out);
+    }
+}
+
+fn collect_label_names_in_stmt(stmt: &Stmt, out: &mut BTreeSet<String>) {
+    match stmt {
+        Stmt::Label { name, body } => {
+            out.insert(name.clone());
+            collect_label_names_in_stmt(body, out);
+        }
+        Stmt::Sequence(stmts) | Stmt::Block(stmts) => {
+            for stmt in stmts {
+                collect_label_names_in_stmt(stmt, out);
+            }
+        }
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_label_names_in_stmt(then_branch, out);
+            if let Some(else_branch) = else_branch {
+                collect_label_names_in_stmt(else_branch, out);
+            }
+        }
+        Stmt::Loop { body, .. } => collect_label_names_in_stmt(body, out),
+        Stmt::Switch { cases, default, .. } => {
+            for (_, body) in cases {
+                collect_label_names_in_stmt(body, out);
+            }
+            if let Some(default) = default {
+                collect_label_names_in_stmt(default, out);
+            }
+        }
+        Stmt::Goto(_)
+        | Stmt::Break
+        | Stmt::Continue
+        | Stmt::Return(_)
+        | Stmt::Assign { .. }
+        | Stmt::ExprStmt(_)
+        | Stmt::Empty => {}
     }
 }
 
@@ -3753,8 +4125,10 @@ mod tests {
 
         let rendered = canonicalize_function(function).body.render_with_indent(0);
 
-        assert!(rendered.contains("if (p0) goto BB1;"), "got:\n{rendered}");
+        assert!(!rendered.contains("goto BB1;"), "got:\n{rendered}");
+        assert!(rendered.contains("if (!p0)"), "got:\n{rendered}");
         assert!(rendered.contains("if (p1)"), "got:\n{rendered}");
+        assert!(rendered.contains("return;"), "got:\n{rendered}");
     }
 
     #[test]
@@ -3836,8 +4210,13 @@ mod tests {
 
         let rendered = canonicalize_function(function).body.render_with_indent(0);
 
-        assert!(rendered.contains("if (atomicAdd(ptr, 1)) goto BB1;"), "got:\n{rendered}");
+        assert_eq!(
+            rendered.matches("atomicAdd(ptr, 1)").count(),
+            2,
+            "got:\n{rendered}"
+        );
         assert!(rendered.contains("if (!atomicAdd(ptr, 1))"), "got:\n{rendered}");
+        assert!(rendered.contains("side_effect();"), "got:\n{rendered}");
     }
 
     #[test]
@@ -3897,10 +4276,141 @@ mod tests {
         let rendered = canonicalize_function(function).body.render_with_indent(0);
 
         assert!(!rendered.contains("goto BB1;"), "got:\n{rendered}");
-        assert!(rendered.contains("if (p0 || p1)"), "got:\n{rendered}");
+        assert!(rendered.contains("if (!p0)"), "got:\n{rendered}");
+        assert!(rendered.contains("if (!p1)"), "got:\n{rendered}");
         assert!(rendered.contains("return 9;"), "got:\n{rendered}");
         assert!(rendered.contains("side_effect();"), "got:\n{rendered}");
         assert!(!rendered.contains("BB1:"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn canonicalize_folds_guarded_skip_region_with_value_prep_prefix() {
+        let function = StructuredFunction {
+            params: Vec::new(),
+            locals: Vec::new(),
+            body: Stmt::Sequence(vec![
+                Stmt::If {
+                    condition: Expr::Reg("p0".to_string()),
+                    then_branch: Box::new(Stmt::Block(vec![
+                        Stmt::Assign {
+                            dst: LValue::Var("acc".to_string()),
+                            src: Expr::Imm("0".to_string()),
+                        },
+                        Stmt::Goto("BB1".to_string()),
+                    ])),
+                    else_branch: None,
+                },
+                Stmt::Label {
+                    name: "BB2".to_string(),
+                    body: Box::new(Stmt::If {
+                        condition: Expr::Reg("p1".to_string()),
+                        then_branch: Box::new(Stmt::Goto("BB3".to_string())),
+                        else_branch: None,
+                    }),
+                },
+                Stmt::Label {
+                    name: "BB3".to_string(),
+                    body: Box::new(Stmt::Assign {
+                        dst: LValue::Var("acc".to_string()),
+                        src: Expr::Imm("7".to_string()),
+                    }),
+                },
+                Stmt::Label {
+                    name: "BB1".to_string(),
+                    body: Box::new(Stmt::ExprStmt(Expr::Raw("consume(acc)".to_string()))),
+                },
+            ]),
+        };
+
+        let rendered = canonicalize_post_bind_control_flow(function)
+            .body
+            .render_with_indent(0);
+
+        assert!(rendered.contains("acc = 0;"), "got:\n{rendered}");
+        assert!(rendered.contains("acc = 7;"), "got:\n{rendered}");
+        assert!(rendered.contains("consume(acc);"), "got:\n{rendered}");
+        assert!(!rendered.contains("goto BB1;"), "got:\n{rendered}");
+        assert!(!rendered.contains("BB1:"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn canonicalize_folds_else_arm_skip_region_into_then_path() {
+        let function = StructuredFunction {
+            params: Vec::new(),
+            locals: Vec::new(),
+            body: Stmt::Sequence(vec![
+                Stmt::If {
+                    condition: Expr::Reg("p0".to_string()),
+                    then_branch: Box::new(Stmt::Assign {
+                        dst: LValue::Var("mode".to_string()),
+                        src: Expr::Imm("1".to_string()),
+                    }),
+                    else_branch: Some(Box::new(Stmt::Block(vec![
+                        Stmt::Assign {
+                            dst: LValue::Var("mode".to_string()),
+                            src: Expr::Imm("0".to_string()),
+                        },
+                        Stmt::Goto("BB1".to_string()),
+                    ]))),
+                },
+                Stmt::ExprStmt(Expr::Raw("hot_path(mode)".to_string())),
+                Stmt::Label {
+                    name: "BB1".to_string(),
+                    body: Box::new(Stmt::ExprStmt(Expr::Raw("join(mode)".to_string()))),
+                },
+            ]),
+        };
+
+        let rendered = canonicalize_post_bind_control_flow(function)
+            .body
+            .render_with_indent(0);
+
+        assert!(rendered.contains("if (p0)"), "got:\n{rendered}");
+        assert!(rendered.contains("hot_path(mode);"), "got:\n{rendered}");
+        assert!(rendered.contains("join(mode);"), "got:\n{rendered}");
+        assert!(!rendered.contains("goto BB1;"), "got:\n{rendered}");
+        assert!(!rendered.contains("BB1:"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn canonicalize_keeps_skip_region_when_middle_label_has_external_target() {
+        let function = StructuredFunction {
+            params: Vec::new(),
+            locals: Vec::new(),
+            body: Stmt::Sequence(vec![
+                Stmt::If {
+                    condition: Expr::Reg("p0".to_string()),
+                    then_branch: Box::new(Stmt::Block(vec![
+                        Stmt::Assign {
+                            dst: LValue::Var("acc".to_string()),
+                            src: Expr::Imm("0".to_string()),
+                        },
+                        Stmt::Goto("BB1".to_string()),
+                    ])),
+                    else_branch: None,
+                },
+                Stmt::Label {
+                    name: "BB2".to_string(),
+                    body: Box::new(Stmt::Assign {
+                        dst: LValue::Var("acc".to_string()),
+                        src: Expr::Imm("7".to_string()),
+                    }),
+                },
+                Stmt::Label {
+                    name: "BB1".to_string(),
+                    body: Box::new(Stmt::ExprStmt(Expr::Raw("consume(acc)".to_string()))),
+                },
+                Stmt::Goto("BB2".to_string()),
+            ]),
+        };
+
+        let rendered = canonicalize_post_bind_control_flow(function)
+            .body
+            .render_with_indent(0);
+
+        assert!(rendered.contains("goto BB1;"), "got:\n{rendered}");
+        assert!(rendered.contains("BB1:"), "got:\n{rendered}");
+        assert!(rendered.contains("goto BB2;"), "got:\n{rendered}");
     }
 
     #[test]
@@ -3929,11 +4439,12 @@ mod tests {
 
         let rendered = canonicalize_function(function).body.render_with_indent(0);
 
-        assert!(rendered.contains("if (p0) goto BB1;"), "got:\n{rendered}");
+        assert!(!rendered.contains("goto BB1;"), "got:\n{rendered}");
+        assert!(rendered.contains("if (!p0)"), "got:\n{rendered}");
         assert!(rendered.contains("if (p1)"), "got:\n{rendered}");
         assert!(rendered.contains("return 7;"), "got:\n{rendered}");
         assert!(rendered.contains("side_effect();"), "got:\n{rendered}");
-        assert!(rendered.contains("BB1:"), "got:\n{rendered}");
+        assert!(!rendered.contains("BB1:"), "got:\n{rendered}");
         assert!(rendered.contains("tail_effect();"), "got:\n{rendered}");
     }
 
@@ -4094,8 +4605,12 @@ mod tests {
 
         let rendered = canonicalize_function(function).body.render_with_indent(0);
 
-        assert!(rendered.contains("atomicAdd(ptr, 1)"), "got:\n{rendered}");
-        assert!(rendered.contains("goto BB1;"), "got:\n{rendered}");
+        assert_eq!(
+            rendered.matches("atomicAdd(ptr, 1)").count(),
+            1,
+            "got:\n{rendered}"
+        );
+        assert!(!rendered.contains("goto BB1;"), "got:\n{rendered}");
         assert!(rendered.contains("tail_effect();"), "got:\n{rendered}");
     }
 
@@ -4131,6 +4646,32 @@ mod tests {
         assert!(rendered.contains("if (!p0)"), "got:\n{rendered}");
         assert!(rendered.contains("slow_path();"), "got:\n{rendered}");
         assert!(!rendered.contains("} else {"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn canonicalize_merges_nested_duplicate_pure_single_arm_ifs() {
+        let function = StructuredFunction {
+            params: Vec::new(),
+            locals: Vec::new(),
+            body: Stmt::If {
+                condition: Expr::Reg("p0".to_string()),
+                then_branch: Box::new(Stmt::If {
+                    condition: Expr::Reg("p0".to_string()),
+                    then_branch: Box::new(Stmt::ExprStmt(Expr::Raw("hot_path()".to_string()))),
+                    else_branch: None,
+                }),
+                else_branch: None,
+            },
+        };
+
+        let rendered = canonicalize_function(function).body.render_with_indent(0);
+
+        assert_eq!(
+            rendered.matches("if (p0)").count(),
+            1,
+            "got:\n{rendered}"
+        );
+        assert!(rendered.contains("hot_path();"), "got:\n{rendered}");
     }
 
     #[test]
