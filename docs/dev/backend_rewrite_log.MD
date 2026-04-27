@@ -432,6 +432,10 @@
   - the small decode/lowering smokes for IMAD-wide, IADD.64, and shared
     byte-offset roots now match structural index shapes instead of one chosen
     temp name
+  - `dot_thread`, `cumsum_linear`, `topk_per_row`, `utf8_count_chars`,
+    `reduce_block`, and `stencil1d` now check store/pointer/shared-index
+    contracts with regex or def-use reachability instead of naming one exact
+    transient SSA temp
   which trims more transitional backend choreography out of the acceptance
   suite without deleting the real pipeline coverage.
 

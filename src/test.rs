@@ -578,12 +578,7 @@ fn assert_canonical_full_pass_nonempty_and_deterministic(sass: &str) -> String {
     out1
 }
 
-fn rendered_store_value_reaches_fmaf(rendered: &str, store_lvalue: &str) -> bool {
-    let store_re = Regex::new(&format!(
-        r"(?m)^\s*{}\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*;\s*$",
-        regex::escape(store_lvalue)
-    ))
-    .expect("valid store regex");
+fn rendered_store_value_reaches_fmaf(rendered: &str, store_re: &Regex) -> bool {
     let Some(stored) = store_re
         .captures(rendered)
         .and_then(|caps| caps.get(1))
@@ -912,7 +907,11 @@ fn full_pass_dot_thread_keeps_pointer_param_symbols() {
         out
     );
     assert!(
-        rendered_store_value_reaches_fmaf(&out, "arg4_ptr[r3_1]"),
+        rendered_store_value_reaches_fmaf(
+            &out,
+            &Regex::new(r"(?m)^\s*arg4_ptr\[[^\]]+\]\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*;\s*$")
+                .expect("valid dot_thread store regex"),
+        ),
         "expected dot_thread to keep the FFMA accumulation on the stored value path, got:
 {}",
         out
@@ -928,6 +927,8 @@ fn canonical_full_pass_cumsum_linear_avoids_register_pseudo_pointers() {
     let out = run_canonical_output_full_pass_from_instrs(cumsum.instrs, cumsum.sm, "cumsum_linear");
     let raw_reg_index =
         Regex::new(r"\b(?:r|ur)\d+_\d+\[").expect("valid raw register pseudo-pointer regex");
+    let raw_reg_ptr_cast = Regex::new(r"\(\(uint32_t\*\)\((?:r|ur)\d+_\d+\)\)")
+        .expect("valid raw register pointer-cast regex");
     assert!(
         !raw_reg_index.is_match(&out),
         "expected canonical cumsum_linear output to avoid raw register pseudo-pointers, got:\n{}",
@@ -939,10 +940,7 @@ fn canonical_full_pass_cumsum_linear_avoids_register_pseudo_pointers() {
         out
     );
     assert!(
-        !out.contains("((uint32_t*)(r2_5))")
-            && !out.contains("((uint32_t*)(r4_4))")
-            && !out.contains("((uint32_t*)(r2_8))")
-            && !out.contains("((uint32_t*)(r4_7))"),
+        !raw_reg_ptr_cast.is_match(&out),
         "expected canonical cumsum_linear remainder paths to stay rooted on arg pointers, got:\n{}",
         out
     );
@@ -1214,13 +1212,15 @@ fn full_pass_reduce_block_scales_shared_word_indices_by_element_size() {
         .find(|f| f.name == "reduce_block")
         .expect("reduce_block fixture should exist");
     let out = run_canonical_output_full_pass_from_instrs(reduce.instrs, reduce.sm, "reduce_block");
+    let raw_shared_byte_offset = Regex::new(r"shmem\[\((?:r|ur)\d+_\d+ \+ \d+\) / 4\]")
+        .expect("valid raw shared-byte-offset regex");
     assert!(
         out.contains("shmem[threadIdx.x + 128]"),
         "expected reduce_block to use float-element shared offsets, got:\n{}",
         out
     );
     assert!(
-        !out.contains("shmem[(r7_0 + 512) / 4]"),
+        !raw_shared_byte_offset.is_match(&out),
         "reduce_block should not leak raw byte offsets into shared indices, got:\n{}",
         out
     );
@@ -1234,6 +1234,8 @@ fn full_pass_stencil1d_scales_shared_word_indices_by_element_size() {
             .find(|f| f.name == "stencil1d")
             .expect("stencil1d fixture should exist");
     let out = run_canonical_output_full_pass_from_instrs(stencil.instrs, stencil.sm, "stencil1d");
+    let raw_shared_byte_offset = Regex::new(r"shmem\[\((?:r|ur)\d+_\d+ \+ \d+\) / 4\]")
+        .expect("valid raw shared-byte-offset regex");
     assert!(
         out.contains("shmem[threadIdx.x]"),
         "expected stencil1d base shared index to use threadIdx.x directly, got:\n{}",
@@ -1245,7 +1247,7 @@ fn full_pass_stencil1d_scales_shared_word_indices_by_element_size() {
         out
     );
     assert!(
-        !out.contains("shmem[(r19_0 + 528) / 4]"),
+        !raw_shared_byte_offset.is_match(&out),
         "stencil1d should not leak raw byte offsets into shared indices, got:\n{}",
         out
     );
@@ -1390,6 +1392,8 @@ fn full_pass_topk_per_row_rewrites_split_window_pointer_pair() {
         .find(|f| f.name == "topk_per_row")
         .expect("topk_per_row fixture should exist");
     let out = run_canonical_output_full_pass_from_instrs(topk.instrs, topk.sm, "topk_per_row");
+    let raw_reg_ptr_cast = Regex::new(r"\(\(uint32_t\*\)\((?:r|ur)\d+_\d+\)\)")
+        .expect("valid raw register pointer-cast regex");
     assert!(
         !out.contains("IADD.64("),
         "expected topk_per_row to lower raw wide-add helpers, got:\n{}",
@@ -1403,8 +1407,7 @@ fn full_pass_topk_per_row_rewrites_split_window_pointer_pair() {
             && out.contains("arg2_ptr[")
             && out.contains("arg4_ptr[")
             && !out.contains("addr64(")
-            && !out.contains("((uint32_t*)(r2_5))")
-            && !out.contains("((uint32_t*)(r2_7))"),
+            && !raw_reg_ptr_cast.is_match(&out),
         "expected topk_per_row to keep arg2_ptr/arg4_ptr typed in canonical output, got:
 {}",
         out
@@ -1600,6 +1603,8 @@ fn full_pass_utf8_count_chars_rewrites_iadd64_pointer_arithmetic() {
     .find(|f| f.name == "utf8_count_chars")
     .expect("utf8_count_chars fixture should exist");
     let out = run_canonical_output_full_pass_from_instrs(utf8.instrs, utf8.sm, "utf8_count_chars");
+    let typed_store =
+        Regex::new(r"arg2_ptr\[[^\]]+\] = [A-Za-z_][A-Za-z0-9_]*;").expect("valid typed store regex");
     assert!(
         !out.contains("IADD.64("),
         "expected no raw IADD.64 helper in utf8_count_chars output, got:
@@ -1607,7 +1612,7 @@ fn full_pass_utf8_count_chars_rewrites_iadd64_pointer_arithmetic() {
         out
     );
     assert!(
-        out.contains("arg0_ptr[") && out.contains("arg2_ptr[r0_1] = r7_7;"),
+        out.contains("arg0_ptr[") && typed_store.is_match(&out),
         "expected typed pointer load/store recovery in utf8_count_chars, got:\n{}",
         out
     );
