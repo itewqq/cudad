@@ -17,12 +17,9 @@ This is a reverse-engineering and compiler-internals project, not a production d
 
 ## What the output looks like
 
-The old README used an over-polished `test_cu/if_loop.sass` excerpt that no
-longer matched the real output. That was misleading.
-
-Today the backend is real and usable, but the output is still conservative and
-often temp-heavy. For a small kernel such as `test_cu/test_div.sass`, a literal
-trimmed excerpt from the current CLI output looks like this:
+The backend is real and usable, but the output is still conservative and often
+temp-heavy. For a small kernel such as `test_cu/test_div.sass`, a trimmed
+excerpt from the current CLI output looks like this:
 
 ```c
 void _Z15test_2_para_intiiPi(int32_t arg0, int32_t arg1, uint32_t* arg2_ptr) {
@@ -53,7 +50,7 @@ void _Z15test_2_para_intiiPi(int32_t arg0, int32_t arg1, uint32_t* arg2_ptr) {
 }
 ```
 
-This is the current state of the project more honestly:
+At the moment:
 - function signatures and many memory operands are recovered structurally
 - control flow is often structured, but large kernels can still be very rough
 - locals are still mostly generic temporaries (`rN_M`, `pN_M`, `vN`, `bN`)
