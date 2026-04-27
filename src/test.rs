@@ -635,6 +635,8 @@ fn canonical_full_pass_emits_clean_pointer_and_shared_forms() {
     "#;
     let out = assert_canonical_full_pass_nonempty_and_deterministic(sass);
     let raw_ssa = Regex::new(r"\b(?:R|UR|P|UP)\d+\.\d+\b").expect("raw ssa regex");
+    let shared_byte_offset =
+        Regex::new(r"shmem\[\([A-Za-z0-9_]+ \+ 8\) / 4\]").expect("shared byte-offset regex");
     assert!(
         out.contains("arg0_ptr[1]"),
         "expected typed pointer access, got:\n{out}"
@@ -644,7 +646,7 @@ fn canonical_full_pass_emits_clean_pointer_and_shared_forms() {
         "expected atomic lowering, got:\n{out}"
     );
     assert!(
-        out.contains("shmem[(r2_0 + 8) / 4]"),
+        shared_byte_offset.is_match(&out),
         "expected shared byte-offset indexing, got:\n{out}"
     );
     assert!(
@@ -680,8 +682,10 @@ fn canonical_full_pass_lowers_imad_wide_param_roots_through_helper_path() {
         None,
         "kernel",
     );
+    let rooted_index =
+        Regex::new(r"arg0_ptr\[r\d+_\d+\]").expect("valid IMAD.WIDE rooted-index regex");
     assert!(
-        rendered.contains("arg0_ptr[r3_0]"),
+        rooted_index.is_match(&rendered),
         "expected IMAD.WIDE-rooted access to preserve the computed index, got:\n{rendered}"
     );
     assert!(
@@ -705,8 +709,12 @@ fn canonical_full_pass_lowers_iadd64_param_roots_into_typed_loads() {
         None,
         "kernel",
     );
+    let widened_index = Regex::new(
+        r"arg0_ptr\[\(\(uintptr_t\)\(\(\(uint64_t\)\(r\d+_\d+\) << 32\) \| \(uint32_t\)\(r\d+_\d+\)\)\)\]",
+    )
+    .expect("valid widened IADD.64 index regex");
     assert!(
-        rendered.contains("arg0_ptr[((uintptr_t)(((uint64_t)(r7_0) << 32) | (uint32_t)(r6_0)))]"),
+        widened_index.is_match(&rendered),
         "expected IADD.64-rooted load to stay on arg0_ptr with a widened byte offset, got:\n{rendered}"
     );
     assert!(

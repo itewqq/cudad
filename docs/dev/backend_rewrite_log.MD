@@ -429,6 +429,9 @@
   - `warp_reduce_sum` checks the lane-mask/lane-predicate lowering by shape
   - `stencil2d_5pt` checks predicated halo loads by typed-pointer form rather
     than one exact SSA temp spelling
+  - the small decode/lowering smokes for IMAD-wide, IADD.64, and shared
+    byte-offset roots now match structural index shapes instead of one chosen
+    temp name
   which trims more transitional backend choreography out of the acceptance
   suite without deleting the real pipeline coverage.
 
