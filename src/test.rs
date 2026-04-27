@@ -1535,7 +1535,7 @@ fn canonical_full_pass_dispatch_ops_avoids_raw_qnan_helpers() {
 }
 
 #[test]
-fn full_pass_old_softmax_forward_trims_post_loop_packed_pointer_tail() {
+fn full_pass_softmax_forward_trims_post_loop_packed_pointer_tail() {
     let softmax = split_decoded_functions(include_str!("../test_cu/corpus/ml_kernels.sass"))
         .into_iter()
         .find(|f| f.name == "softmax_forward")
@@ -1544,36 +1544,36 @@ fn full_pass_old_softmax_forward_trims_post_loop_packed_pointer_tail() {
         run_canonical_output_full_pass_from_instrs(softmax.instrs, softmax.sm, "softmax_forward");
     assert!(
         !out.contains("IADD.64("),
-        "expected old-corpus softmax to lower raw wide-add helpers, got:\n{}",
+        "expected canonical softmax_forward to lower raw wide-add helpers, got:\n{}",
         out
     );
     assert!(
         out.contains("exp2f(")
             && out.contains("arg2_ptr[")
             && !out.contains("addr64("),
-        "expected old-corpus softmax cleanup to keep the hot path rooted on typed arg2_ptr arithmetic, got:
+        "expected canonical softmax_forward to keep the hot path rooted on typed arg2_ptr arithmetic, got:
 {}",
         out
     );
     assert!(
         !out.contains("CALL.REL.NOINC()"),
-        "expected old-corpus softmax cleanup to drop compiler slow-path calls, got:
+        "expected canonical softmax_forward to drop compiler slow-path calls, got:
 {}",
         out
     );
     assert!(
         !out.contains("FFMA.SAT(") && !out.contains("FFMA.RM(") && !out.contains("FADD.FTZ("),
-        "expected old-corpus softmax to lower modeled float modifier ops structurally, got:\n{}",
+        "expected canonical softmax_forward to lower modeled float modifier ops structurally, got:\n{}",
         out
     );
     assert!(
         !out.contains("LEA.HI.X(") && !out.contains("SHF.L.U64.HI("),
-        "expected old-corpus softmax to lower hi-lane address helpers structurally, got:\n{}",
+        "expected canonical softmax_forward to lower hi-lane address helpers structurally, got:\n{}",
         out
     );
     assert!(
         out.contains("__saturatef(") && out.contains("__fmaf_rd("),
-        "expected old-corpus softmax to render saturating/rounded FFMA forms structurally, got:\n{}",
+        "expected canonical softmax_forward to render saturating/rounded FFMA forms structurally, got:\n{}",
         out
     );
 }
@@ -1944,37 +1944,37 @@ fn corpus_goto_budget_is_tight() {
         ("control_flow_kernels.sass:multi_exit_loop", 1),
         // find_pattern: 4-deep nested loop with early return from the
         // innermost level + break propagation through 2 outer levels.
-        ("control_flow_kernels.sass:find_pattern", 3),
+        ("control_flow_kernels.sass:find_pattern", 1),
         // nested_loop_break_continue: 2-level loop with break+continue
         // now only keeps the core inner/outer latch exits explicit.
-        ("control_flow_kernels.sass:nested_loop_break_continue", 8),
+        ("control_flow_kernels.sass:nested_loop_break_continue", 7),
         // state_machine: one tiny latch still survives as an explicit goto.
         ("control_flow_kernels.sass:state_machine", 1),
         // box_blur_variable_radius: nested loop with continue (skip OOB).
         ("image_processing_kernels.sass:box_blur_variable_radius", 1),
         // string_search: loop with early break on mismatch.
-        ("data_processing_kernels.sass:string_search", 2),
+        ("data_processing_kernels.sass:string_search", 1),
         // utf8_count_chars: multi-way byte classification (if-chain on
         // byte ranges) + one continuation-byte skip loop latch.
         ("data_processing_kernels.sass:utf8_count_chars", 3),
         // rle_compress: warp-level prefix/flush path still keeps a
         // scalar remainder handoff explicit.
-        ("data_processing_kernels.sass:rle_compress", 2),
+        ("data_processing_kernels.sass:rle_compress", 1),
         // count_above / cumsum_linear / batched_sgemv: strip-mined loops with
         // one entry split and one scalar remainder handoff each.
-        ("loop_kernels.sass:count_above", 2),
-        ("loop_kernels.sass:cumsum_linear", 2),
-        ("ml_kernels.sass:batched_sgemv", 2),
+        ("loop_kernels.sass:count_above", 1),
+        ("loop_kernels.sass:cumsum_linear", 1),
+        ("ml_kernels.sass:batched_sgemv", 1),
         // cross_entropy_loss: reduction + scalar cleanup path.
-        ("ml_kernels.sass:cross_entropy_loss", 3),
+        ("ml_kernels.sass:cross_entropy_loss", 1),
         // layer_norm_forward / softmax_forward / topk_per_row still exercise
         // the hardest split-window reduction/remainder shapes in the corpus.
-        ("ml_kernels.sass:layer_norm_forward", 25),
-        ("ml_kernels.sass:softmax_forward", 5),
-        ("ml_kernels.sass:topk_per_row", 6),
+        ("ml_kernels.sass:layer_norm_forward", 23),
+        ("ml_kernels.sass:softmax_forward", 2),
+        ("ml_kernels.sass:topk_per_row", 4),
     ]
     .into();
-    const SM89_TOTAL_GOTO_CEILING: usize = 66;
+    const SM89_TOTAL_GOTO_CEILING: usize = 49;
 
     let mut violations: Vec<(String, usize, usize)> = Vec::new();
     let outputs = run_corpus();
